@@ -1112,6 +1112,50 @@ for (const scheme of ["light", "dark"] as const) {
   }
   await s.keyboard.press("Escape");
   check(!(await graphOpen(s)), "Esc closes the drawing of a node table");
+  // The explore session (#440): commands typed in the terminal change the
+  // engine's graph, which answers with what changed and a delta. (Drawing the
+  // delta in the pane is #443, so the counts here are the engine's.)
+  {
+    const explored = (): Promise<any> => s.evaluate(() => (window as any).ursaShell.explored());
+    const said = async (line: string) => {
+      await type(line, s);
+      return squeezed(await after(line, s));
+    };
+    await type(hop.replace("n => 2", "n => 1"), s);
+    await type(".graph", s);
+    await graphSettled(s);
+    const base = await graphInfo(s);
+    const before = await errors(s);
+    const expanded = await said(".expand 2 LIMIT 3");
+    const first = await explored();
+    check(
+      base.nodes === 17 && base.edges === 34 && expanded.startsWith(squeezed("+3 nodes, +6 edges (1 more neighbour of 2 is not shown")) && first.nodes === 20 && first.edges === 40 && first.deltaBytes > 0,
+      ".expand typed in the terminal adds the node's neighbours: the node count changes",
+      `${expanded.slice(0, 80)} | ${JSON.stringify(base)} | ${JSON.stringify(first)}`,
+    );
+    const hidden = await said(".hide 32 0");
+    const second = await explored();
+    check(hidden.startsWith(squeezed("-2 nodes, -")) && second.nodes === 18 && second.deltaBytes > 0, ".hide hides nodes and their edges", `${hidden.slice(0, 60)} | ${JSON.stringify(second)}`);
+    const history = await said(".graph history");
+    check(history.includes(squeezed("1 .expand 2 LIMIT 3 +3 nodes, +6 edges")) && history.includes(squeezed("Shown: 18 nodes")) && (await graphOpen(s)), ".graph history lists the steps, and draws nothing", history.slice(0, 200));
+    await type(".undo\n.undo", s);
+    const undone = await explored();
+    const again = await said(".undo");
+    check(undone.nodes === 17 && undone.edges === 34 && undone.deltaBytes > 0 && again.startsWith(squeezed("Nothing to undo")) && (await explored()).deltaBytes === 0, ".undo takes the steps back, to the graph as it was drawn", `${JSON.stringify(undone)} | ${again.slice(0, 40)}`);
+    const redone = await said(".redo");
+    check(redone.startsWith(squeezed("Redid .expand 2 LIMIT 3: +3 nodes, +6 edges")) && (await explored()).nodes === 20, ".redo applies the step again", redone.slice(0, 60));
+    const sql = await said(".expand 32 --sql");
+    check(sql.startsWith(squeezed('SELECT h.id, count(*) OVER () AS neighbours FROM hop("karate", seeds => [32]')) && sql.includes(squeezed('FROM induced_edges("karate", nodes => [')) && (await explored()).nodes === 20, ".expand --sql prints the SQL and changes nothing", sql.slice(0, 120));
+    check((await errors(s)) === before, "the explore commands print no error");
+    const missing = await said(".expand 99");
+    check(missing.includes(squeezed("Error: no node '99' in the graph that is drawn")), "an id that is not in the graph says so", missing.slice(0, 80));
+    await type(".help", s);
+    const help = squeezed(await after(".help", s));
+    check([".expand ID", ".hide ID", ".show ID", ".undo", ".redo", ".graph history"].every((c) => help.includes(squeezed(c))), ".help lists the explore commands", help.slice(0, 200));
+    await s.keyboard.press("Escape");
+    const closed = await said(".expand 2");
+    check(closed.includes(squeezed("Error: no graph is open")), "with the pane closed, .expand says no graph is open", closed.slice(0, 80));
+  }
   // Two columns of ids, whatever their names, draw as before: integers, and strings.
   for (const sql of ["SELECT src AS a, dst AS b FROM ties", "SELECT src::VARCHAR, dst::VARCHAR, 0.5 FROM ties"]) {
     await type(`.graph ${sql}`, s);

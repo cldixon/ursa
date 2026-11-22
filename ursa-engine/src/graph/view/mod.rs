@@ -68,8 +68,8 @@ mod tests;
 use build::{build_indexed, EdgeList, NodeIndex};
 pub use clauses::{identifier, parse, Name, Style};
 pub use rules::Rule;
-pub use session::{Command, Outcome, Session, Step};
 use rules::{MatchEdge, Shape};
+pub use session::{Command, Outcome, Session, Step};
 use style::{
     color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, ColorBy, Found,
     NodeValues,

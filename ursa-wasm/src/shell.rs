@@ -26,7 +26,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::SessionContext;
 use js_sys::{Promise, Uint8Array};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -718,6 +717,83 @@ mod tests {
         run(&shell, "SELECT 42 AS answer;").await;
         let err = graph_of(&shell.shell, "").await.unwrap_err();
         assert!(err.to_string().contains("1 column"), "{err}");
+    }
+
+    /// An explore command changes the shell's open graph and gives the page
+    /// what it printed and the change as UGR bytes. The commands themselves
+    /// are tested in `ursa-shell` (`explore_tests.rs`).
+    #[tokio::test]
+    async fn explore_gives_the_page_a_line_and_a_delta() {
+        use ursa_viz::model::{GraphDelta, GraphResult};
+        let shell = WebShell::new();
+        let explore =
+            |command: &'static str| explore(&shell.shell, &shell.out, &shell.err, command);
+        // The commands are the shell's own: listed, and handed back.
+        let help = run(&shell, ".help").await;
+        assert!(
+            help["out"].as_str().unwrap().contains(".expand ID"),
+            "{help}"
+        );
+        let back = run(&shell, ".expand 3;").await;
+        assert_eq!(
+            (back["flow"].as_str(), back["command"].as_str()),
+            (Some("host"), Some(".expand 3"))
+        );
+        let none = explore(".expand 3").await.unwrap();
+        assert!(none.err.contains("Error: no graph is open"), "{}", none.err);
+        assert!(none.out.is_empty() && none.delta.is_empty());
+
+        run(&shell, "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (3, 4), (4, 5)) AS t(src, dst);").await;
+        run(
+            &shell,
+            "CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+        )
+        .await;
+        let g = graph_of(
+            &shell.shell,
+            "SELECT * FROM hop(club, seeds => [1], direction => 'both')",
+        )
+        .await
+        .unwrap();
+        let mut view = GraphResult::from_bytes(&g.result.to_bytes()).unwrap();
+        assert_eq!((view.n_nodes(), view.n_edges()), (3, 3));
+
+        let mut expanded = explore(".expand 3").await.unwrap();
+        assert_eq!(
+            (expanded.out(), expanded.err()),
+            ("+1 node, +1 edge\n".to_string(), String::new())
+        );
+        assert_eq!((expanded.nodes(), expanded.edges()), (4, 4));
+        let bytes = expanded.take_delta();
+        assert!(expanded.take_delta().is_empty());
+        view.apply(&GraphDelta::from_bytes(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(
+            view.node_keys().iter().collect::<Vec<_>>(),
+            ["1", "2", "3", "4"]
+        );
+
+        let mut undone = explore(".undo").await.unwrap();
+        assert_eq!(undone.out(), "Undid .expand 3: -1 node, -1 edge\n");
+        view.apply(&GraphDelta::from_bytes(&undone.take_delta()).unwrap())
+            .unwrap();
+        assert_eq!(view.to_bytes(), g.result.to_bytes());
+
+        let missing = explore(".hide 9").await.unwrap();
+        assert!(
+            missing
+                .err()
+                .contains("no node '9' in the graph that is drawn"),
+            "{}",
+            missing.err()
+        );
+        assert_eq!((missing.nodes(), missing.edges()), (3, 3));
+        shell.close_graph().unwrap();
+        assert!(explore(".undo")
+            .await
+            .unwrap()
+            .err()
+            .contains("no graph is open"));
     }
 
     #[tokio::test]

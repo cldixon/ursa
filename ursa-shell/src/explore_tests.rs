@@ -212,13 +212,13 @@ async fn a_script_of_expansions_a_hide_and_undos() {
         .await;
     assert_eq!(host.says(".graph").await, "");
     host.shows(&AROUND_0).await;
-    assert_eq!(host.session().shown(), (17, 53));
+    assert_eq!(host.session().shown(), (17, 34));
 
     // 2's neighbours that are not shown are 32 (degree 12), 27 (4), 28 (3)
     // and 9 (2): the three of highest degree, in that order.
     assert_eq!(
         host.says(".expand 2 LIMIT 3").await,
-        "+3 nodes, +7 edges (1 more neighbour of 2 is not shown: .expand 2 again adds the next)"
+        "+3 nodes, +6 edges (1 more neighbour of 2 is not shown: .expand 2 again adds the next)"
     );
     let first = with(&AROUND_0, &[27, 28, 32]);
     host.shows(&first).await;
@@ -230,7 +230,7 @@ async fn a_script_of_expansions_a_hide_and_undos() {
     );
 
     // 32's: 33 (17), 23 (5), 29 and 30 (4), then the five of degree 2 by key.
-    assert_eq!(host.says(".expand 32").await, "+9 nodes, +21 edges");
+    assert_eq!(host.says(".expand 32").await, "+9 nodes, +27 edges");
     let second = with(&first, &[14, 15, 18, 20, 22, 23, 29, 30, 33]);
     host.shows(&second).await;
     let keys = host.session().result().node_keys();
@@ -269,7 +269,10 @@ async fn a_script_of_expansions_a_hide_and_undos() {
         "Redid .expand 5: +1 node, +2 edges"
     );
     host.shows(&third).await;
-    assert_eq!(host.says(".undo").await, "Undid .expand 5: -1 node, -2 edges");
+    assert_eq!(
+        host.says(".undo").await,
+        "Undid .expand 5: -1 node, -2 edges"
+    );
     assert_eq!(host.says(".hide 0").await, "-1 node, -16 edges");
     assert_eq!(host.says(".redo").await, "Nothing to redo");
     assert_eq!(host.session().steps().len(), 3);
@@ -303,7 +306,7 @@ async fn undoing_everything_restores_the_graph_bit_for_bit() {
         .await;
     host.says(".graph").await;
     let base = host.session().result().to_bytes();
-    for line in [".expand 2", ".hide 9 0", ".expand 33 LIMIT 2", ".show all"] {
+    for line in [".expand 2", ".hide 9 0", ".expand 32 LIMIT 2", ".show all"] {
         host.says(line).await;
     }
     for _ in 0..4 {
@@ -319,22 +322,37 @@ async fn hidden_nodes_come_back_with_their_edges() {
     let mut host = Host::karate().await;
     host.says(".graph SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')")
         .await;
-    assert_eq!(host.says(".hide 2 8").await, "-2 nodes, -11 edges");
+    assert_eq!(host.says(".hide 2 8").await, "-2 nodes, -7 edges");
     // 32 is a neighbour of 2 and of 8, which are hidden when it arrives.
-    assert_eq!(host.says(".expand 31 LIMIT 1").await.split(" (").next(), Some("+1 node, +1 edge"));
+    assert_eq!(
+        host.says(".expand 31 LIMIT 1").await.split(" (").next(),
+        Some("+1 node, +3 edges")
+    );
     assert_eq!(host.nodes(), without(&with(&AROUND_0, &[33]), &[2, 8]));
-    assert_eq!(host.says(".expand 33 LIMIT 1").await.split(" (").next(), Some("+1 node, +2 edges"));
+    assert_eq!(
+        host.says(".expand 33 LIMIT 1").await.split(" (").next(),
+        Some("+1 node, +2 edges")
+    );
     // .show runs no query, and 2 and 8 have their edges to 32.
-    assert_eq!(host.says(".show 2 8").await, "+2 nodes, +13 edges");
+    assert_eq!(host.says(".show 2 8").await, "+2 nodes, +10 edges");
     host.shows(&with(&AROUND_0, &[32, 33])).await;
     // An expansion brings a hidden neighbour back.
     host.says(".hide 32").await;
-    assert_eq!(host.says(".expand 2 LIMIT 1").await.split(" (").next(), Some("+1 node, +5 edges"));
+    assert_eq!(
+        host.says(".expand 2 LIMIT 1").await.split(" (").next(),
+        Some("+1 node, +4 edges")
+    );
     host.shows(&with(&AROUND_0, &[32, 33])).await;
-    assert_eq!(host.says(".show all").await, "Nothing changed: no node is hidden");
-    assert_eq!(host.says(".hide 32 32").await, "-1 node, -5 edges");
-    assert_eq!(host.says(".hide 32").await, "Nothing changed: 32 is already hidden");
-    assert_eq!(host.says(".show all").await, "+1 node, +5 edges");
+    assert_eq!(
+        host.says(".show all").await,
+        "Nothing changed: no node is hidden"
+    );
+    assert_eq!(host.says(".hide 32 32").await, "-1 node, -4 edges");
+    assert_eq!(
+        host.says(".hide 32").await,
+        "Nothing changed: 32 is already hidden"
+    );
+    assert_eq!(host.says(".show all").await, "+1 node, +4 edges");
 }
 
 #[tokio::test]
@@ -344,7 +362,7 @@ async fn directions_and_what_is_left() {
         .await;
     // Karate's ties are stored from the lower id: 31's out-edges go to 32
     // and 33, its in-edges come from 0, 24, 25 and 28.
-    assert_eq!(host.says(".expand 31 out").await, "+2 nodes, +7 edges");
+    assert_eq!(host.says(".expand 31 out").await, "+2 nodes, +8 edges");
     assert_eq!(host.says(".expand 31 in").await, "+3 nodes, +6 edges");
     assert_eq!(
         host.says(".expand 31").await,
@@ -371,8 +389,8 @@ async fn sql_is_printed_instead() {
         sql,
         "SELECT h.id, count(*) OVER () AS neighbours FROM hop(\"karate\", seeds => [6], n => 1, \
          direction => 'both') AS h JOIN degree(\"karate\", direction => 'both') AS d ON d.id = \
-         h.id WHERE h.id NOT IN (5, 0, 6, 10, 16) ORDER BY d.degree DESC, h.id LIMIT 2;\n\
-         SELECT src, dst, edge FROM induced_edges(\"karate\", nodes => [5, 0, 6, 10, 16, 4]);"
+         h.id WHERE h.id NOT IN (5, 6, 10, 16, 0) ORDER BY d.degree DESC, h.id LIMIT 2;\n\
+         SELECT src, dst, edge FROM induced_edges(\"karate\", nodes => [5, 6, 10, 16, 0, 4]);"
     );
     assert_eq!(host.session().result().to_bytes(), before);
     assert!(host.session().steps().is_empty());
@@ -386,7 +404,10 @@ async fn sql_is_printed_instead() {
     assert_eq!(host.says(".expand 6 LIMIT 2").await, "+1 node, +3 edges");
     let step = &host.session().steps()[0];
     assert_eq!(step.sql.join(";\n") + ";", sql);
-    assert_eq!(step.delta.provenance.sql.as_deref(), Some(sql.trim_end_matches(';')));
+    assert_eq!(
+        step.delta.provenance.sql.as_deref(),
+        Some(sql.trim_end_matches(';'))
+    );
     assert_eq!(
         host.says(".hide 4 --sql").await,
         "-- .hide runs no SQL: it changes what is shown of the graph"
@@ -403,25 +424,32 @@ async fn history_lists_the_steps() {
         host.says(".graph history").await,
         "Explored from: SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')\n\
          No steps yet: .expand ID adds a node's neighbours\n\
-         Shown: 5 nodes, 6 edges"
+         Shown: 5 nodes, 7 edges"
     );
-    for line in [".expand 6;", ".hide 0", ".expand 16", ".undo"] {
+    for line in [".expand 6;", ".hide 0", ".hide 4", ".undo"] {
         host.says(line).await;
     }
     assert_eq!(
         host.says(".graph history").await,
         "Explored from: SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')\n\
-         1  .expand 6   +1 node, +3 edges\n\
-         2  .hide 0     -1 node, -5 edges\n\
-         3  .expand 16  +0 nodes, +0 edges  (undone)\n\
-         Shown: 5 nodes, 4 edges (1 hidden)"
+         1  .expand 6  +1 node, +3 edges\n\
+         2  .hide 0    -1 node, -4 edges\n\
+         3  .hide 4    -1 node, -2 edges  (undone)\n\
+         Shown: 5 nodes, 6 edges (1 hidden)"
     );
 }
 
 #[tokio::test]
 async fn no_open_graph_and_ids_that_are_not_nodes_say_so() {
     let mut host = Host::karate().await;
-    for line in [".expand 0", ".hide 0", ".show all", ".undo", ".redo", ".graph history"] {
+    for line in [
+        ".expand 0",
+        ".hide 0",
+        ".show all",
+        ".undo",
+        ".redo",
+        ".graph history",
+    ] {
         let (out, err) = host.run(line).await;
         assert_eq!(out, "", "{line}");
         assert_eq!(
@@ -437,11 +465,23 @@ async fn no_open_graph_and_ids_that_are_not_nodes_say_so() {
     for (line, want) in [
         (".expand 33", "no node '33' in the graph that is drawn"),
         (".hide 5 99", "no node '99' in the graph that is drawn"),
-        (".show nobody", "no node 'nobody' in the graph that is drawn"),
+        (
+            ".show nobody",
+            "no node 'nobody' in the graph that is drawn",
+        ),
         (".expand", "usage: .expand ID [in|out|both] [LIMIT n]"),
-        (".expand 5 6", "'6' is not part of .expand (one node at a time)"),
-        (".expand 5 LIMIT 0", "LIMIT takes a number of neighbours from 1 to 5,000"),
-        (".expand 5 LIMIT 5001", "LIMIT takes a number of neighbours from 1 to 5,000"),
+        (
+            ".expand 5 6",
+            "'6' is not part of .expand (one node at a time)",
+        ),
+        (
+            ".expand 5 LIMIT 0",
+            "LIMIT takes a number of neighbours from 1 to 5,000",
+        ),
+        (
+            ".expand 5 LIMIT 5001",
+            "LIMIT takes a number of neighbours from 1 to 5,000",
+        ),
         (".expand 5 sideways", "'sideways' is not part of .expand"),
         (".hide", "usage: .hide ID…"),
         (".show", "usage: .show ID… or .show all"),
@@ -450,7 +490,10 @@ async fn no_open_graph_and_ids_that_are_not_nodes_say_so() {
     ] {
         let (out, err) = host.run(line).await;
         assert_eq!(out, "", "{line}");
-        assert!(err.starts_with("Error: ") && err.contains(want), "{line}: {err}");
+        assert!(
+            err.starts_with("Error: ") && err.contains(want),
+            "{line}: {err}"
+        );
     }
     assert_eq!(host.says(".hide 5").await, "-1 node, -4 edges");
     let (_, err) = host.run(".expand 5").await;
@@ -461,7 +504,10 @@ async fn no_open_graph_and_ids_that_are_not_nodes_say_so() {
     // A drawing that is of no property graph has no neighbours to add.
     host.says(".graph SELECT 1 AS src, 2 AS dst").await;
     let (_, err) = host.run(".expand 1").await;
-    assert!(err.contains("this drawing is not of a property graph"), "{err}");
+    assert!(
+        err.contains("this drawing is not of a property graph"),
+        "{err}"
+    );
     assert_eq!(host.says(".hide 1").await, "-1 node, -1 edge");
 
     // A failed .graph leaves the open graph and its steps.
@@ -507,7 +553,10 @@ async fn help_lists_the_commands_and_feed_hands_them_back() {
     let mut host = Host::karate().await;
     let help = host.says(".help").await;
     for (name, args, _) in EXPLORE_COMMANDS {
-        assert!(help.contains(&format!("{name} {args}").trim().to_string()), "{name}: {help}");
+        assert!(
+            help.contains(&format!("{name} {args}").trim().to_string()),
+            "{name}: {help}"
+        );
     }
     assert_eq!(
         host.shell.feed(".expand 33 in LIMIT 5;").await,
@@ -538,12 +587,25 @@ async fn text_keys_are_quoted() {
     };
     host.shell.add_host_command(".graph", "", "");
     host.shell.add_explore_commands();
-    host.says(".graph SELECT * FROM hop(social, seeds => ['ann'])").await;
+    host.says(".graph SELECT * FROM hop(social, seeds => ['ann'])")
+        .await;
     assert_eq!(host.says(".expand 'cy d'").await, "+1 node, +2 edges");
     let keys = host.session().result().node_keys();
-    assert_eq!(keys.iter().collect::<Vec<_>>(), ["ann", "bob", "cy d", "o'neil"]);
-    assert_eq!(host.says(".hide \"o'neil\" bob").await, "-2 nodes, -3 edges");
+    assert_eq!(
+        keys.iter().collect::<Vec<_>>(),
+        ["ann", "bob", "cy d", "o'neil"]
+    );
+    assert_eq!(
+        host.says(".hide \"o'neil\" bob").await,
+        "-2 nodes, -3 edges"
+    );
     let sql = host.says(".expand ann --sql").await;
-    assert!(sql.contains("seeds => ['ann']") && sql.contains("NOT IN ('ann', 'cy d')"), "{sql}");
-    assert!(sql.contains("nodes => ['ann', 'bob', 'cy d', 'o''neil']"), "{sql}");
+    assert!(
+        sql.contains("seeds => ['ann']") && sql.contains("NOT IN ('ann', 'cy d')"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("nodes => ['ann', 'bob', 'cy d', 'o''neil']"),
+        "{sql}"
+    );
 }

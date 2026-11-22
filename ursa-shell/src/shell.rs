@@ -335,7 +335,8 @@ impl<O: Write, E: Write> Shell<O, E> {
     pub async fn explore(&mut self, line: &str) -> Option<GraphDelta> {
         let ran = match &mut self.explorer {
             // A line that is no command says so with or without a graph.
-            None => ExploreCommand::parse(line).and_then(|_| Err(DataFusionError::Plan(NO_GRAPH.into()))),
+            None => ExploreCommand::parse(line)
+                .and_then(|_| Err(DataFusionError::Plan(NO_GRAPH.into()))),
             Some(session) => session.run(&self.ctx, &ursa_sql::Sql, line).await,
         };
         match ran {

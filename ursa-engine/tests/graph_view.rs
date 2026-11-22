@@ -770,3 +770,82 @@ async fn paths_and_edges_without_metadata() {
         Values::F32(vec![0.5, 1.5])
     );
 }
+
+/// The explore session (#440) on DataFusion's SQL alone: an expansion adds
+/// the neighbours of highest degree, then by key, and the same nodes and
+/// edges in the same order every time. The commands as a shell runs them are
+/// tested in `ursa-shell`.
+#[tokio::test]
+async fn an_expansion_is_capped_by_degree_then_key_and_is_the_same_every_time() {
+    use ursa_engine::graph::view::Session;
+    use ursa_viz::model::{GraphDelta, GraphResult, Op};
+
+    let ctx = karate().await;
+    let base = interpreted(
+        &ctx,
+        "SELECT * FROM hop(karate, seeds => [16], n => 1, direction => 'both')",
+    )
+    .await
+    .result;
+    assert_eq!(
+        base.node_keys().iter().collect::<Vec<_>>(),
+        ["16", "5", "6"]
+    );
+
+    let mut sent = Vec::new();
+    for _ in 0..3 {
+        let mut session = Session::new(base.clone());
+        let mut bytes = Vec::new();
+        let first = session
+            .run(&ctx, &DataFusionSql, ".expand 5 LIMIT 2")
+            .await
+            .unwrap();
+        // 5's neighbours not shown are 0 (degree 16) and 10 (3).
+        assert_eq!(first.text, "+2 nodes, +4 edges");
+        let second = session
+            .run(&ctx, &DataFusionSql, ".expand 0 LIMIT 5")
+            .await
+            .unwrap();
+        assert_eq!(
+            second.text,
+            "+5 nodes, +9 edges (8 more neighbours of 0 are not shown: .expand 0 again adds \
+             the next)"
+        );
+        let keys: Vec<&str> = session.result().node_keys().iter().collect();
+        // 0 has 16 neighbours, of which 5, 6 and 10 are shown. Of the rest:
+        // 2 (degree 10), 1 (9), then 3 and 31 with 6 each, by key, and of
+        // those with 5 (8 and 13) the lower key.
+        assert_eq!(keys[3..], ["0", "10", "2", "1", "3", "31", "8"]);
+        // The delta: new nodes, then new edges in the edge table's order,
+        // each with its row.
+        let delta = second.delta.unwrap();
+        let [Op::AddNodes(nodes), Op::AddEdges(edges)] = &delta.ops[..] else {
+            panic!("{:?}", delta.ops);
+        };
+        assert_eq!(nodes.len(), 5);
+        let rows = edges.rows.as_ref().unwrap();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "{rows:?}");
+        assert_eq!(
+            delta.provenance.sql.as_deref(),
+            Some(session.steps()[1].sql.join(";\n").as_str())
+        );
+        // A view that has the base applies the bytes, and undoes them.
+        let mut view = GraphResult::from_bytes(&base.to_bytes()).unwrap();
+        for step in session.steps() {
+            let wire = step.delta.to_bytes();
+            view.apply(&GraphDelta::from_bytes(&wire).unwrap()).unwrap();
+            bytes.push(wire);
+        }
+        assert_eq!(view, *session.result());
+        for step in session.steps().iter().rev() {
+            view.apply(&step.inverse()).unwrap();
+        }
+        assert_eq!(view.to_bytes(), base.to_bytes());
+        bytes.push(session.result().to_bytes());
+        sent.push(bytes);
+    }
+    assert!(
+        sent.windows(2).all(|w| w[0] == w[1]),
+        "the same bytes every time"
+    );
+}

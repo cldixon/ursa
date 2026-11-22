@@ -38,8 +38,8 @@
 //!    order. Expanding again adds the next ones.
 //! 2. The edges: `induced_edges` over every node of the session and the new
 //!    ones. An edge the session already has is left out: by its label and
-//!    its row in the edge table where both are known, else by its endpoints
-//!    and its place among their parallel edges.
+//!    its row in the edge table where both are known, else by the two nodes
+//!    it joins and its place among their parallel edges.
 //!
 //! The delta restores the neighbours that were hidden, appends the new nodes
 //! (in the order of statement 1) and then the new edges (in the order of
@@ -325,9 +325,15 @@ impl Outcome {
     }
 }
 
+/// Two nodes, whichever way an edge joins them. A drawing's edge with no row
+/// may be drawn against the way the graph stores it (a path's steps are).
+fn pair(a: u32, b: u32) -> (u32, u32) {
+    (a.min(b), a.max(b))
+}
+
 /// The session's edges, by what makes one the same edge: its label and row
-/// where the engine knew the row, else its endpoints (and how many edges
-/// join them).
+/// where the engine knew the row, else the two nodes it joins (and how many
+/// such edges join them).
 #[derive(Debug, Default)]
 struct EdgeIndex {
     rows: HashSet<(u16, u64)>,
@@ -349,7 +355,7 @@ impl EdgeIndex {
             Some(row) => {
                 self.rows.insert((label, row));
             }
-            None => *self.pairs.entry((src, dst)).or_insert(0) += 1,
+            None => *self.pairs.entry(pair(src, dst)).or_insert(0) += 1,
         }
     }
 
@@ -359,10 +365,11 @@ impl EdgeIndex {
                 self.rows.remove(&(label, row));
             }
             None => {
-                if let Some(count) = self.pairs.get_mut(&(src, dst)) {
+                let pair = pair(src, dst);
+                if let Some(count) = self.pairs.get_mut(&pair) {
                     *count -= 1;
                     if *count == 0 {
-                        self.pairs.remove(&(src, dst));
+                        self.pairs.remove(&pair);
                     }
                 }
             }
@@ -647,7 +654,11 @@ impl Session {
         }
         let step = &self.steps[self.done - 1];
         let delta = step.inverse();
-        let text = format!("Undid {}: {}", step.command, changed(-step.nodes, -step.edges));
+        let text = format!(
+            "Undid {}: {}",
+            step.command,
+            changed(-step.nodes, -step.edges)
+        );
         self.result.apply(&delta).map_err(model)?;
         if let Some(edges) = &mut self.edges {
             edges.track(&delta);
@@ -852,8 +863,8 @@ impl Session {
                 if row.is_some_and(|row| edges.rows.contains(&(e_label, row))) {
                     continue;
                 }
-                if let Some(&have) = edges.pairs.get(&(s, d)) {
-                    let used = matched.entry((s, d)).or_insert(0);
+                if let Some(&have) = edges.pairs.get(&pair(s, d)) {
+                    let used = matched.entry(pair(s, d)).or_insert(0);
                     if *used < have {
                         *used += 1;
                         continue;
@@ -900,9 +911,16 @@ impl Session {
         let mut outcome = self.step(command, statements, delta)?;
         let brought = new_nodes + outcome_restored(&outcome);
         if not_shown > brought {
+            let more = not_shown - brought;
+            let are = if more == 1 {
+                "neighbour of {id} is"
+            } else {
+                "neighbours of {id} are"
+            };
             outcome.text.push_str(&format!(
-                " ({} more neighbours of {id} are not shown: .expand {id} again adds the next)",
-                thousands(not_shown - brought)
+                " ({} more {} not shown: .expand {id} again adds the next)",
+                thousands(more),
+                are.replace("{id}", id)
             ));
         }
         Ok(outcome)
@@ -921,4 +939,89 @@ fn outcome_restored(outcome: &Outcome) -> usize {
             })
             .sum()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(line: &str) -> Command {
+        Command::parse(line).unwrap().unwrap().command
+    }
+
+    #[test]
+    fn commands_are_read_from_their_lines() {
+        assert_eq!(
+            parsed(".expand 33"),
+            Command::Expand {
+                id: "33".into(),
+                direction: Direction::Both,
+                limit: EXPAND_LIMIT
+            }
+        );
+        assert_eq!(
+            parsed("  .EXPAND 'a b' In limit 7 ; "),
+            Command::Expand {
+                id: "a b".into(),
+                direction: Direction::In,
+                limit: 7
+            }
+        );
+        assert_eq!(
+            parsed(".hide 1 \"it's\" 'o''neil'"),
+            Command::Hide(vec!["1".into(), "it's".into(), "o'neil".into()])
+        );
+        assert_eq!(parsed(".show ALL"), Command::Show(Vec::new()));
+        assert_eq!(
+            parsed(".show all 3"),
+            Command::Show(vec!["all".into(), "3".into()])
+        );
+        assert_eq!(parsed(".undo;"), Command::Undo);
+        assert_eq!(parsed(".redo"), Command::Redo);
+        assert_eq!(parsed(".graph History"), Command::History);
+        let sql = Command::parse(".expand 5 --sql out").unwrap().unwrap();
+        assert!(sql.sql_only);
+        assert_eq!(sql.text, ".expand 5 --sql out");
+        assert_eq!(
+            sql.command,
+            Command::Expand {
+                id: "5".into(),
+                direction: Direction::Out,
+                limit: EXPAND_LIMIT
+            }
+        );
+    }
+
+    #[test]
+    fn other_lines_are_not_explore_commands() {
+        for line in [
+            ".graph",
+            ".graph karate",
+            ".graph SELECT history FROM t",
+            ".tables",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(Command::parse(line).unwrap(), None, "{line}");
+        }
+        for line in [
+            ".expand",
+            ".expand 1 2",
+            ".expand 1 in out",
+            ".expand 1 LIMIT",
+            ".expand 1 LIMIT x",
+            ".hide",
+            ".hide 'open",
+            ".redo 2",
+        ] {
+            assert!(Command::parse(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn changes_are_signed_and_counted() {
+        assert_eq!(changed(16, 41), "+16 nodes, +41 edges");
+        assert_eq!(changed(-1, -1), "-1 node, -1 edge");
+        assert_eq!(changed(0, 1200), "+0 nodes, +1,200 edges");
+    }
 }

@@ -37,7 +37,9 @@ static assets and an R2 bucket.
     own, which the shell lists in `.help` and hands back to the page:
     `.clear`, `.dataset ?NAME?`, `.export FORMAT` (downloads the last result as
     CSV, Parquet, JSON or Arrow), `.files ?add?`, `.graph ?QUERY|NAME? ?SIZE BY x? ?COLOR BY y?`,
-    `.history ?N?` and `.share`.
+    `.history ?N?` and `.share`. The explore commands (`.expand`, `.hide`, `.show`,
+    `.undo`, `.redo`, `.graph history`) are the shell's own list
+    (`ursa-shell`'s `EXPLORE_COMMANDS`), handed back the same way.
   - **Datasets.** Picking one starts a fresh session and runs its commands at
     the prompt, as if typed: its views and `CREATE PROPERTY GRAPH`, then two or
     three queries that show the graph functions, `GRAPH_TABLE` patterns and
@@ -132,6 +134,23 @@ static assets and an R2 bucket.
     legend's labels and counts. The legend, under the pane's
     header, names what sizes the nodes (with its range) and each colour's
     category and count, in text.
+  - **The explore session** (#440, design §4): the engine keeps the graph
+    `.graph` opened (`ursa-engine`'s `graph::view::Session`: the graph as it
+    stands, what is shown, and the history), and the commands change it:
+    `.expand ID [in|out|both] [LIMIT n]` adds a node's neighbours that are
+    not shown (the 100 of highest degree, then by key, so it is the same
+    every time; again for the next ones) and the graph's edges among every
+    node; `.hide ID…` and `.show ID…|all`; `.undo` and `.redo`, with no
+    query; `.graph history` lists the steps; `--sql` prints a command's SQL
+    and changes nothing. The page hands each to the worker's `explore` op
+    (`WebShell.explore`), which answers `{out, err, delta, nodes, edges}`:
+    the line to print (`+16 nodes, +41 edges`), the change as one UGR delta
+    buffer (transferred; `null` for none), and how many nodes and edges the
+    engine shows after it. Closing the pane closes the engine's graph
+    (`closeGraph`), after which the commands say none is open. **The pane
+    does not draw the deltas yet** (#443): it keeps what `.graph` drew.
+    `window.ursaShell.explored()` gives the last command's
+    `{command, nodes, edges, deltaBytes}`, which the e2e test reads.
   - **The engine's graph** (#425): `.graph` is resolved in `ursa-engine`
     (`graph::view`: the clauses, the source, the ids as dense node indexes,
     `SIZE BY`, `COLOR BY` and `NODES`), not in `ursa-wasm`, so the CLI and
