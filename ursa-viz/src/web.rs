@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::highlight::{flag, BadHighlight, HighlightState};
-use crate::interact::{nearest_edge, EdgePick, Interact};
+use crate::interact::{EdgePick, Interact};
 use std::sync::Arc;
 
 use ursa_core::topology::UndirectedCsr;
@@ -49,6 +49,11 @@ pub struct GraphView {
     /// Draw the selection's incident edges wide
     /// ([`GraphView::set_selection_edges`]).
     selection_edges: bool,
+    /// The last frame left edges out ([`GraphView::render_frame`]).
+    partial: bool,
+    /// How many calls in a row [`GraphView::order_edges`] has waited for
+    /// the GPU to take what the last one wrote.
+    order_waits: u32,
 }
 
 /// A view of the graph of `n_nodes` nodes and the edges `(src[i], dst[i])`
@@ -98,6 +103,31 @@ enum Scene {
     Graph(Graph),
     /// A result as UGR, in the page's memory.
     Ugr(js_sys::Uint8Array),
+}
+
+/// How many calls in a row [`GraphView::order_edges`] waits for the GPU.
+const ORDER_WAITS: u32 = 32;
+
+/// A page's edge order: read in place, a run at a time.
+struct PageOrder(js_sys::Uint32Array);
+
+impl crate::order::EdgeOrder for PageOrder {
+    fn len(&self) -> usize {
+        self.0.length() as usize
+    }
+
+    fn read(&self, start: usize, out: &mut [u32]) {
+        let run = self.0.subarray(start as u32, (start + out.len()) as u32);
+        // Shorter only if the page let go of the array meanwhile: the
+        // edges are then drawn in the slots of their indexes.
+        if run.length() as usize == out.len() {
+            run.copy_to(out);
+        } else {
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = (start + i) as u32;
+            }
+        }
+    }
 }
 
 /// A page's bytes as a [`Source`]: read in place, a range at a time.
@@ -203,6 +233,8 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         backend,
         interact: Interact::new(),
         selection_edges: false,
+        partial: false,
+        order_waits: 0,
     })
 }
 
@@ -242,23 +274,170 @@ impl GraphView {
         self.view.step(&self.device, &self.queue, iterations);
     }
 
-    /// Draw a frame.
+    /// Draw a frame: everything, whether the view moves or not.
     pub fn render(&mut self) -> Result<(), JsValue> {
+        self.present(None).map(|_| ())
+    }
+
+    /// Draw a frame within the frame budget: while the view moves (the
+    /// camera or the positions changed since the last frame, or less than
+    /// [`GraphView::frame_rest_ms`] before `now`, the animation frame's
+    /// time),
+    /// only as many edges as the last frames' costs say fit in a frame,
+    /// the most important first ([`GraphView::set_edge_order`]), drawn
+    /// deeper to make up for the rest, and, where the nodes are too many
+    /// as well, the largest of them; at rest, everything, the same pixels
+    /// as [`GraphView::render`].
+    ///
+    /// Returns whether the view is moving. If it is, measure what the
+    /// frame cost, from this animation frame's time to the next's (whole
+    /// refreshes of the display, whenever in its frame each callback ran),
+    /// and say ([`GraphView::frame_cost`]): the budget follows it. And if
+    /// [`GraphView::frame_partial`] is then true, something was left out:
+    /// draw again once nothing has moved for `frameRestMs`.
+    ///
+    /// ```js
+    /// function draw(time) {  // an animation frame's
+    ///   if (view.renderFrame(time)) {
+    ///     requestAnimationFrame((next) => view.frameCost(next - time));
+    ///     clearTimeout(rest);
+    ///     if (view.framePartial) rest = setTimeout(() => requestAnimationFrame(draw), view.frameRestMs);
+    ///   }
+    /// }
+    /// ```
+    #[wasm_bindgen(js_name = renderFrame)]
+    pub fn render_frame(&mut self, now: f64) -> Result<bool, JsValue> {
+        self.present(Some(now))
+    }
+
+    /// Draw and present a frame: budgeted at `now`, or everything.
+    /// Returns whether the view is moving.
+    fn present(&mut self, now: Option<f64>) -> Result<bool, JsValue> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             other => return Err(js_err(format!("no frame to draw on: {other:?}"))),
         };
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.view.draw(&self.device, &self.queue, &target);
+        let moving = match now {
+            Some(now) => {
+                let drawn = self
+                    .view
+                    .draw_frame(&self.device, &self.queue, &target, now);
+                self.partial = drawn.partial;
+                drawn.moving
+            }
+            None => {
+                self.view.prepare(&self.device, &self.queue);
+                self.view.draw(&self.device, &self.queue, &target);
+                self.partial = false;
+                false
+            }
+        };
         frame.present();
-        Ok(())
+        Ok(moving)
+    }
+
+    /// The view is still moving, though nothing has changed since the last
+    /// frame: a layout is running, and its next positions are on their
+    /// way. The next [`GraphView::render_frame`] draws within the budget.
+    #[wasm_bindgen(js_name = keepMoving)]
+    pub fn keep_moving(&mut self) {
+        self.view.keep_moving();
+    }
+
+    /// Whether the last frame left anything out
+    /// ([`GraphView::render_frame`]).
+    #[wasm_bindgen(getter, js_name = framePartial)]
+    pub fn frame_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// How long after the last movement the view is at rest, in
+    /// milliseconds: a frame drawn then has every edge.
+    #[wasm_bindgen(getter, js_name = frameRestMs)]
+    pub fn frame_rest_ms(&self) -> f64 {
+        crate::budget::REST_MS
+    }
+
+    /// The last moving frame ([`GraphView::render_frame`]) cost `ms`: the
+    /// time from its start to when the next frame could start (the next
+    /// animation frame). With no GPU that is the time the browser took to
+    /// rasterise it; with one it is one refresh of the display, or more if
+    /// the frame was late.
+    #[wasm_bindgen(js_name = frameCost)]
+    pub fn frame_cost(&mut self, ms: f64) {
+        self.view.frame_cost(ms);
+    }
+
+    /// What the frame budget is doing:
+    ///
+    /// ```js
+    /// { k,        // the edges the last moving frame drew (0 before any)
+    ///   nodes,    // the nodes it drew: the largest
+    ///   edges,    // the edges a frame at rest draws
+    ///   ordered,  // how many of them are in importance order
+    ///   p95,      // of the last 120 moving frames' costs, ms; null before any
+    ///   frames,   // how many moving frames' costs were measured
+    ///   limit }   // the cost a moving frame is held to, ms
+    /// ```
+    #[wasm_bindgen(js_name = frameInfo)]
+    pub fn frame_info(&self) -> Result<JsValue, JsValue> {
+        let json = serde_json::to_string(&self.view.frame_info()).map_err(js_err)?;
+        js_sys::JSON::parse(&json)
+    }
+
+    /// Draw the edges in `order`, most important first, as
+    /// [`Layout::edge_order`] gives it: `order[i]` is the edge to draw
+    /// `i`-th, a permutation of the first `order.length` edges. Edges added
+    /// since stay after them. The frames that draw every edge do not
+    /// change; the ones that draw a prefix ([`GraphView::render_frame`])
+    /// draw the backbone. Nothing is written until
+    /// [`GraphView::order_edges`].
+    ///
+    /// `order` is a `Uint32Array`, and stays the page's until the order is
+    /// whole: the view reads it a run at a time and holds no copy of it
+    /// (#501). It must not change, or be transferred, until
+    /// [`GraphView::order_edges`] returns false.
+    #[wasm_bindgen(js_name = setEdgeOrder)]
+    pub fn set_edge_order(&mut self, order: js_sys::Uint32Array) -> Result<(), JsValue> {
+        self.order_waits = 0;
+        self.view
+            .set_edge_order_from(&self.device, Box::new(PageOrder(order)))
+            .map_err(js_err)
+    }
+
+    /// Write up to `max_edges` (65,536 unless given) more edges of the
+    /// order being set to the GPU, eight bytes each, and return whether
+    /// there is more to write. Call it a task at a time until it returns
+    /// false: the frames draw the old order until the new one is whole.
+    ///
+    /// What is written is staged in this module's memory until the GPU has
+    /// taken it (WebGL2), so a call made while the GPU still holds the
+    /// last one's writes nothing and returns true, up to 32 times in a row:
+    /// the order then costs the view a run of staging and not all of it.
+    #[wasm_bindgen(js_name = orderEdges)]
+    pub fn order_edges(&mut self, max_edges: Option<u32>) -> bool {
+        if !self.view.is_ordering() {
+            return false;
+        }
+        let taken = self
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_or(true, |status| status.is_queue_empty());
+        if !taken && self.order_waits < ORDER_WAITS {
+            self.order_waits += 1;
+            return true;
+        }
+        self.order_waits = 0;
+        let max = max_edges.unwrap_or(1 << 16) as usize;
+        self.view.order_edges(&self.device, &self.queue, max)
     }
 
     /// The canvas is now `width` x `height` pixels.
@@ -299,9 +478,49 @@ impl GraphView {
         pixels.map_err(js_err)
     }
 
-    /// The node under the pixel `(x, y)`, or `undefined`.
-    pub fn pick(&self, x: f32, y: f32) -> Option<u32> {
+    /// The node under the pixel `(x, y)`, or `undefined`. With the
+    /// positions at rest it reads only the nodes near the pixel
+    /// ([`GraphView::grid_ready`]).
+    pub fn pick(&mut self, x: f32, y: f32) -> Option<u32> {
         self.view.pick(x, y)
+    }
+
+    /// [`GraphView::pick`], testing every node: the same answer, for a
+    /// test to compare.
+    #[wasm_bindgen(js_name = pickLinear)]
+    pub fn pick_linear(&self, x: f32, y: f32) -> Option<u32> {
+        self.view.pick_linear(x, y)
+    }
+
+    /// Whether the grid over the nodes has every node where it is now. The
+    /// view builds it once the positions rest (three frames or picks with
+    /// none changed); until then, and while a layout runs, a pick tests
+    /// every node, and every node is drawn.
+    #[wasm_bindgen(getter, js_name = gridReady)]
+    pub fn grid_ready(&self) -> bool {
+        self.view.grid_ready()
+    }
+
+    /// Build the grid over the nodes now, without waiting for the
+    /// positions to rest: for timing it.
+    #[wasm_bindgen(js_name = rebuildGrid)]
+    pub fn rebuild_grid(&mut self) {
+        self.view.rebuild_grid();
+    }
+
+    /// Whether a zoomed-in frame may draw the nodes in view alone: on
+    /// unless turned off. The frame is the same either way.
+    #[wasm_bindgen(js_name = setCulling)]
+    pub fn set_culling(&mut self, on: bool) {
+        self.view.set_culling(on);
+    }
+
+    /// How many node instances the last frame's pass over the nodes drew:
+    /// every node, or, zoomed in with the positions at rest, the nodes in
+    /// view.
+    #[wasm_bindgen(getter, js_name = nodesDrawn)]
+    pub fn nodes_drawn(&self) -> u32 {
+        self.view.nodes_drawn() as u32
     }
 
     /// Node radii from a numeric column, one value per node.
@@ -514,22 +733,18 @@ impl GraphView {
     /// of it (4 CSS pixels, as a rule), or `undefined`: its index. For a
     /// click with no node under it ([`GraphView::pick`] first). An edge of
     /// a hidden node is not there to pick, nor is a removed edge. It reads
-    /// every edge once (`interact::nearest_edge`).
+    /// the edges near the pixel when the positions are at rest, and every
+    /// edge otherwise (`interact::nearest_edge`).
     #[wasm_bindgen(js_name = pickEdge)]
-    pub fn pick_edge(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
-        let camera = self.view.camera();
-        let (src, dst) = self.view.edges();
-        let (xs, ys) = self.view.positions();
-        let flags = self.view.highlight().flags();
-        let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
-        let result = self.view.result();
-        let skip = |e: u32| {
-            hidden(src[e as usize])
-                || hidden(dst[e as usize])
-                || result.is_some_and(|r| !r.edge_is_shown(e as usize))
-        };
-        let reach = tolerance / camera.pixels_per_unit;
-        nearest_edge(src, dst, xs, ys, skip, camera.to_world(x, y), reach)
+    pub fn pick_edge(&mut self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
+        self.view.pick_edge(x, y, tolerance)
+    }
+
+    /// [`GraphView::pick_edge`], testing every edge: the same answer, for
+    /// a test to compare.
+    #[wasm_bindgen(js_name = pickEdgeLinear)]
+    pub fn pick_edge_linear(&self, x: f32, y: f32, tolerance: f32) -> Option<u32> {
+        self.view.pick_edge_linear(x, y, tolerance)
     }
 
     /// Select the edge `edge` alone (as [`GraphView::pick_edge`] gave it):
@@ -775,7 +990,8 @@ impl GraphView {
     ///   hiddenNodes, hiddenEdges,    // removed, or at a removed node
     ///   nodeSlots, edgeSlots,        // the next node's and edge's index
     ///   size: { column, range },     // column null: by degree
-    ///   color: { column, entries: [{ category, label, color, count }], other, none } | null }
+    ///   color: { column, entries: [{ category, label, color, count }], other, none } | null,
+    ///   frame: { k, nodes, edges, ordered, p95, frames, limit } }  // the frame budget: frameInfo()
     /// ```
     ///
     /// It follows every [`GraphView::apply_delta`]. The node counts cost
@@ -784,9 +1000,16 @@ impl GraphView {
     /// proportional to the nodes) only when a column colours them, on the
     /// first call after a delta.
     pub fn info(&self) -> Result<JsValue, JsValue> {
+        #[derive(serde::Serialize)]
+        struct WithFrame {
+            #[serde(flatten)]
+            info: crate::live::Info,
+            frame: crate::view::FrameInfo,
+        }
         match self.view.info() {
             Some(info) => {
-                let json = serde_json::to_string(&info).map_err(js_err)?;
+                let frame = self.view.frame_info();
+                let json = serde_json::to_string(&WithFrame { info, frame }).map_err(js_err)?;
                 js_sys::JSON::parse(&json)
             }
             None => Ok(JsValue::UNDEFINED),
@@ -1058,6 +1281,15 @@ fn adjacency_from(
         .map_err(js_err)
 }
 
+impl From<LiveLayout> for Layout {
+    fn from(layout: LiveLayout) -> Self {
+        Layout {
+            layout,
+            order_room: Default::default(),
+        }
+    }
+}
+
 /// The graph of `n_nodes` nodes and the edges `(src[i], dst[i])`, or why it
 /// is not one.
 fn checked_graph(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Graph, JsValue> {
@@ -1077,6 +1309,12 @@ fn checked_graph(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Graph, Js
 #[wasm_bindgen]
 pub struct Layout {
     layout: LiveLayout,
+    /// Room for [`Layout::edge_order`]'s keys, eight bytes an edge, set
+    /// aside where the edge list was before the hierarchy is built: a
+    /// WebAssembly memory that has since filled has no block that large in
+    /// one piece, and would grow by it. Let go of by the order, or by the
+    /// first [`Layout::step`].
+    order_room: std::cell::Cell<Vec<u64>>,
 }
 
 #[wasm_bindgen]
@@ -1092,8 +1330,13 @@ impl Layout {
         multilevel: Option<bool>,
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
+        let edges = src.len();
         let adjacency = adjacency_of(n_nodes, src, dst)?;
-        Ok(Self::on(adjacency, multilevel))
+        // Where the edge list was: for the order of these edges.
+        let room = Vec::with_capacity(edges);
+        let mut layout = Self::on(adjacency, multilevel);
+        layout.order_room = std::cell::Cell::new(room);
+        Ok(layout)
     }
 
     fn on(adjacency: Arc<UndirectedCsr>, multilevel: Option<bool>) -> Layout {
@@ -1102,7 +1345,7 @@ impl Layout {
         } else {
             LiveLayout::new_on(adjacency, ursa_core::algo::Fa2Params::default())
         };
-        Layout { layout }
+        layout.into()
     }
 
     /// [`Layout::new`] for a caller that holds the graph's undirected
@@ -1134,12 +1377,12 @@ impl Layout {
             Some("rings") => {
                 let params = ursa_core::algo::RingsParams::default();
                 let layout = LiveLayout::rings_on(adjacency, level, params).map_err(js_err)?;
-                Ok(Layout { layout })
+                Ok(layout.into())
             }
             Some("layers") => {
                 let params = ursa_core::algo::LayersParams::default();
                 let layout = LiveLayout::layers_on(adjacency, level, params).map_err(js_err)?;
-                Ok(Layout { layout })
+                Ok(layout.into())
             }
             Some(other) => Err(js_err(format!("no layout called {other}"))),
         }
@@ -1163,7 +1406,7 @@ impl Layout {
         let params = ursa_core::algo::MultilevelParams::default().fa2;
         let layout = LiveLayout::from_positions_on(adjacency, params, x.to_vec(), y.to_vec())
             .map_err(js_err)?;
-        Ok(Layout { layout })
+        Ok(layout.into())
     }
 
     /// Concentric rings, for a neighbourhood (a `hop` result): `distance[i]`
@@ -1183,7 +1426,7 @@ impl Layout {
         let adjacency = adjacency_of(n_nodes, src, dst)?;
         let params = ursa_core::algo::RingsParams::default();
         let layout = LiveLayout::rings_on(adjacency, distance, params).map_err(js_err)?;
-        Ok(Layout { layout })
+        Ok(layout.into())
     }
 
     /// Layers left to right, for paths: `layer[i]` is node `i`'s position
@@ -1201,7 +1444,7 @@ impl Layout {
         let adjacency = adjacency_of(n_nodes, src, dst)?;
         let params = ursa_core::algo::LayersParams::default();
         let layout = LiveLayout::layers_on(adjacency, layer, params).map_err(js_err)?;
-        Ok(Layout { layout })
+        Ok(layout.into())
     }
 
     /// Which layout this is: `"force"`, `"rings"` or `"layers"`. Rings and
@@ -1250,6 +1493,7 @@ impl Layout {
     /// iterations of the whole graph. A grown layout runs no more than its
     /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
+        self.order_room.take();
         self.layout.step(iterations);
     }
 
@@ -1287,6 +1531,49 @@ impl Layout {
     #[wasm_bindgen(getter)]
     pub fn levels(&self) -> u32 {
         self.layout.levels() as u32
+    }
+
+    /// The order to draw the edges `(src[i], dst[i])` in, most important
+    /// first, for [`GraphView::set_edge_order`]: `order[i]` is the edge to
+    /// draw `i`-th. The edges are the layout's graph's, numbered as the
+    /// view numbers them. Coarse to fine, the edges between the drawing's
+    /// far groups come first (by the level of the hierarchy at which an
+    /// edge's two ends merge, then one edge of each merged edge a round,
+    /// the heaviest first, then a hash); otherwise the edges at the nodes
+    /// of highest degree do. The same input gives the same order.
+    ///
+    /// `src` and `dst` are `Uint32Array`s and stay the caller's: they are
+    /// read a run at a time, and the order is written into a new
+    /// `Uint32Array` from the keys it was sorted as, so that taking the
+    /// order costs this module's memory eight bytes an edge and no more
+    /// (#501). Take it before the layout is stepped down a level: after
+    /// that the hierarchy above is let go, and the order is by degree.
+    #[wasm_bindgen(js_name = edgeOrder)]
+    pub fn edge_order(
+        &self,
+        src: &js_sys::Uint32Array,
+        dst: &js_sys::Uint32Array,
+    ) -> Result<js_sys::Uint32Array, JsValue> {
+        if src.length() != dst.length() {
+            return Err(js_err(format!(
+                "src has {} edges but dst has {}",
+                src.length(),
+                dst.length()
+            )));
+        }
+        let edges = src.length() as usize;
+        let mut read = |start: usize, s: &mut [u32], d: &mut [u32]| {
+            let (from, to) = (start as u32, (start + s.len()) as u32);
+            src.subarray(from, to).copy_to(s);
+            dst.subarray(from, to).copy_to(d);
+        };
+        let room = self.order_room.take();
+        let packed = self.layout.edge_order_packed(edges, &mut read, room);
+        // wasm32 is little-endian: the packed halves are the order.
+        let order: &[u32] = &bytemuck::cast_slice(&packed)[..edges];
+        let out = js_sys::Uint32Array::new_with_length(edges as u32);
+        out.copy_from(order);
+        Ok(out)
     }
 
     /// The positions now: `x` then `y`, one per node each, in a new

@@ -97,8 +97,19 @@ load the wasm (`wasm-release`).
   task, one sync, per frame, which is the draw cost without the compositor's
   pacing.
 - **Pick**: `view.pick` at 200 pseudo-random pixels (a fixed sequence), with
-  the drawing fitted to the view. Pick is a linear scan of the nodes on the
-  CPU, so its cost is per node whether it hits or not.
+  the drawing fitted to the view and the positions at rest, so the picks
+  read the spatial grid (#500). In the tables below, run before the grid,
+  pick was a pass over every node, and its cost was per node whether it hit
+  or not.
+- **Grid** (from the next run on): the median of nine `view.rebuildGrid()`
+  calls, and `view.nodesDrawn` for a frame zoomed 10× into the middle of
+  the drawing (1% of its area).
+- **The frame budget**: the pan and the zoom again, as a page draws them:
+  `view.renderFrame(now)` each animation frame, and the time from that frame
+  to the next told to `view.frameCost`, with the edges in the layout's
+  importance order (computed on the page here, after the memory is read).
+  The time between frames, and the edges and nodes the last frame drew. No
+  sync point: the time between animation frames is the budget's own measure.
 - **Memory**: the page's and the worker's wasm memory (`memory.buffer`), and
   the page's JS heap (`performance.memory.usedJSHeapSize`, with
   `--enable-precise-memory-info`). The server sends COOP/COEP so the page is
@@ -117,6 +128,43 @@ load the wasm (`wasm-release`).
   cargo run -p ursa-core --release --example fa2_multilevel -- bench 1k,10k,100k,1m rmat,grid
   cargo run -p ursa-core --release --no-default-features --example fa2_multilevel -- bench
   ```
+
+## The spatial grid (#500)
+
+Measured 2026-11-22, apart from the tables below, on the same container
+(4 cores, shared with other builds at the time, so each time is given with
+the pass over every node measured beside it).
+
+Native, one core, 1,048,576 nodes (`cargo test -p ursa-viz
+--no-default-features --release --lib spatial -- --ignored --nocapture`);
+positions spread evenly, in six clusters with strays, and on a jittered
+lattice; 1.1M edges, a tenth of them between any two nodes:
+
+| positions | grid built | pick | pick, every node | edge grid built | edge pick | edge pick, every edge |
+|---|---|---|---|---|---|---|
+| random | 9.5 ms | 5.8 µs | 3.96 ms | 53 ms | 10.2 ms | 16.3 ms |
+| clustered | 11.7 ms | 22 µs | 3.66 ms | 49 ms | 0.44 ms | 6.1 ms |
+| lattice | 10.0 ms | 8.4 µs | 3.73 ms | 60 ms | 1.56 ms | 8.8 ms |
+
+On random positions every edge crosses the drawing, so most edges do pass
+near any point and the edge grid has little to leave out.
+
+In the browser (wasm, headless Chromium, WebGL2; `ONLY=grid bun
+tests/browser/view.ts`, which also checks every pick against the pass over
+every node and the culled frame against the whole one, byte for byte):
+
+| graph | nodes | edges | grid built | pick | pick, every node | edge pick | edge pick, every edge | node instances drawn, zoomed into 1% |
+|---|---|---|---|---|---|---|---|---|
+| clusters 8×500 | 4,000 | 24,391 | 0.2 ms | under 1 µs | 0.024 ms | 0.013 ms | 0.34 ms | 264 to 492 (6.6 to 12.3%: a cluster is dense) |
+| R-MAT | 131,072 | 1,000,000 | 2.1 ms | 1 µs | 0.77 ms | 12.6 ms | 37.6 ms | 1,031 to 3,178 (0.8 to 2.4%) |
+| R-MAT (`ONLY="grid nodes 1M"`) | 1,048,576 | 1,000,000 | 21.2 ms | 8 µs | 9.4 ms | 16.5 ms | 38.2 ms | 22,296 to 22,478 (2.1%) |
+
+The last row ran with the machine's load at 7.6 on 4 cores: its pass over
+every node took 9.4 ms, against the 4.9 ms of the run below, and the grid
+2.3 of those passes (the issue's 15 ms is 3.1). The test holds the ratios,
+not the times: a pick at most a 24th of the pass over every node, and the
+grid at most 4 of them. R-MAT here is three flat iterations from the seed:
+its edges cross the whole drawing, which is the edge grid's worst case.
 
 ## Results
 
@@ -205,8 +253,9 @@ What stands out, for setting targets:
   worker's positions 2 or 3 times in the whole layout (WebGPU, ~50), and the
   first frame came after 31 s. The worker kept its pace (9.9 s against
   7.8 s, sharing the CPU); the page just never showed it.
-- **Pick is a linear scan**: 0.55 ms at 131K nodes, 1.8 to 2.2 ms at 500K.
-  Fine for a click; too slow for hover at a few million nodes.
+- **Pick was a linear scan** in this run: 0.55 ms at 131K nodes, 1.8 to
+  2.2 ms at 500K. Fine for a click; too slow for hover at a few million
+  nodes. It reads a grid now: see [the spatial grid](#the-spatial-grid-500).
 - **Memory is the worker's**: at 1M edges the worker's wasm memory is 107
   to 116 MiB (the hierarchy, every level's adjacency) and the page's 54 to
   82 MiB (the view's copy of the graph and positions). wasm
@@ -489,6 +538,92 @@ and the size of the page's wasm memory when it is.
 - **These are a loaded machine's numbers.** With other builds running on
   its four cores a piece took up to 65 ms once; the harness holds the
   median of three pages to 60 ms.
+
+## The frame budget
+
+While the view moves it draws a prefix of the edges, in importance order,
+and the largest nodes: as much as the last frames' costs say fits (#495;
+[README](README.md#the-frame-budget)). Two measurements, both on this
+container (no GPU: SwiftShader on 4 shared cores), 2026-11-22.
+
+**In the shell**, `.graph rmat` (131,072 nodes, 1,000,000 edges) at
+1280 × 800, with `web/tests/graph-timing.ts`: from rest, a wheel event every
+animation frame for 5 s, zooming in and back out; the time from one frame's
+start to the next's (`graphTimings().frames.interval`), which with no GPU is
+the frame's cost.
+
+| | before (main at `f0d6ca7`, one run) | with the budget (three runs) |
+|---|---|---|
+| frames in the 5 s of wheel zoom | 2 | 231 to 241 |
+| frame interval, p50 | 3.3 s | 20 to 21 ms |
+| frame interval, **p95** | **3.3 s** | **26, 26 and 31 ms** |
+| frame interval, max | 3.3 s | 29 to 42 ms |
+| a moving frame draws | 1,000,000 edges, 131,072 nodes | 512 to 1,081 edges, 170 to 360 nodes |
+| first frame shown, from Enter | 6.0 s | 1.3 to 1.6 s |
+| layout done, from Enter | 10.6 s | 5.5 to 5.8 s |
+| a click on the view at rest, to its frame | 3.4 s | 2.5 to 4.1 s |
+| tasks over 50 ms on the page from Enter to done | 4.7 s, 4.6 s, 3.6 s | 5 to 11 of 50 to 260 ms |
+| ordering the edges, in the layout worker | – | 285 to 325 ms |
+| wasm heap: view / layout worker | 59 / 97 MiB | 59 to 61 / 104 MiB |
+
+The target is a p95 of 50 ms on this renderer, and `graph-timing.ts` fails
+a run over it. What the numbers say:
+
+- **This renderer's floor is the budget.** A frame with next to nothing on
+  it takes 17 to 30 ms here (the canvas is composited on the CPU), which is
+  already the 22 ms a frame is held to, so the budget stays at or just
+  above its least: 512 edges and 170 nodes. A frame is not held by drawing fewer edges
+  alone: the 131,072 nodes cost 1.4 s a frame by themselves (measured: 16,384
+  edges and every node, 1.5 s), which is why the nodes are budgeted too.
+- **Nothing is left to give when the machine is busy.** Those three runs
+  had the 4 cores mostly to themselves (a load of 3 to 5). Two other builds
+  share this container: at a load of about 8, four runs read a p95 of 25,
+  29, 30 and 46 ms, and at a load of 13, three read 44, 54 and 83 ms, all
+  with the same p50 (20 ms). The budget was at its least throughout, so the
+  late frames are the browser waiting for a core. The e2e's check allows
+  100 ms.
+- **The layout is faster** because the page's thread is no longer
+  rasterising a million edges after each set of positions: it draws the
+  positions as they come, and the worker's messages do not queue behind 4 s
+  frames.
+- **A frame at rest still draws everything**, in one go: 2.5 to 6 s of the
+  page's thread here, as every frame took before. There is one 200 ms
+  after the layout's end and one 200 ms after each movement's, and a click
+  or a hover on the view at rest draws another. A zoom begun under one
+  waits for it. Drawing it in slices is the design's next step (P3-2).
+- **The order costs the layout 0.3 s**, once, after its first positions,
+  and 8 MiB of the worker's heap while it sorts (eight bytes an edge, and
+  the copy of the edge list the call is given). The view holds nothing for
+  it once the edges are written.
+
+**In the bench** (`bun run bench`, `BACKENDS=webgl2 GRAPHS=rmat
+MODES=multilevel`, 1000 × 700): the same pan and zoom as the tables above,
+drawn with `renderFrame` and each frame's cost told to `frameCost`, after 20
+frames for the budget to find its level.
+
+| graph | pan, every edge: frame ms (median / p95) | pan, budgeted: rAF interval ms | pan drew (edges / nodes) | zoom, every edge: frame ms | zoom, budgeted: rAF interval ms | zoom drew | held to, ms | hierarchy + order, ms | order to the GPU, ms |
+|---|---|---|---|---|---|---|---|---|---|
+| rmat 10k | 78.5 / 117.0 | 16.7 / 50.0 | 512 / 170 | 69.6 / 84.2 | 16.7 / 33.3 | 512 / 170 | 21.7 | 9 + 5 | 1.1 |
+| rmat 100k | 441.9 / 520.9 | 16.7 / 33.3 | 512 / 170 | 540.2 / 620.8 | 33.3 / 33.3 | 512 / 170 | 21.7 | 52 + 29 | 3.2 |
+| rmat 1m | 4955.7 / 5961.3 | 16.7 / 33.3 | 512 / 170 | 7145.5 / 8418.4 | 16.7 / 33.3 | 512 / 170 | 21.7 | 598 + 272 | 21.2 |
+
+(This run was at a load of 11 to 14. The time between animation frames is
+whole refreshes: 16.7, 33.3 or 50 ms. "Hierarchy + order" is on the page
+here; in the shell the layout worker has the hierarchy already.)
+
+On a laptop, run the bench headed ([above](#on-a-laptop-with-a-real-gpu))
+and read these columns (`bun bench/report.ts` prints them under each
+backend's table): the target there is a p95 of 16 ms at 1M edges, which at
+60 Hz is every frame in its refresh (16.7 ms between animation frames), and
+"drew" says how much of the graph the GPU fits in a frame (all of it, on a
+discrete GPU). The 1M-edge case alone:
+
+```sh
+HEADED=1 CHROME=/path/to/chrome GRAPHS=rmat SIZES=1m MODES=multilevel NATIVE=0 bun run bench bench/results-laptop.json
+bun bench/report.ts bench/results-laptop.json
+```
+
+**It has not been measured on a GPU**: there is none here.
 
 ## Memory at a million edges
 

@@ -37,12 +37,23 @@
 //! slots that changed. Taking nodes or edges off the end is a shorter draw
 //! range. A removed edge keeps its slot as a line from its source to itself,
 //! which draws nothing.
+//!
+//! The edges are drawn in the order they are in the buffer, and a frame may
+//! draw only the first of them ([`Renderer::draw_prefix`]): what the view
+//! does while it moves, to keep to its frame budget ([`crate::budget`]).
+//! The caller puts the edges in importance order for that
+//! ([`Renderer::edge_buffer`], [`Renderer::replace_edges`]); every edge has
+//! the same ink, so the order does not change a frame that draws them all.
+//! Such a frame may draw only some of the nodes too: the caller gathers
+//! them into a buffer of their own ([`Renderer::set_some_nodes`]), as the
+//! nodes in front are, because an instance cannot be drawn by index.
 
 use std::borrow::Cow;
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::budget::prefix_alpha;
 use crate::highlight::{DIM_LEVEL, HIGHLIGHT_WIDTH, MARK_REACH, MIN_FRONT_RADIUS};
 use crate::pace::{ready, Pace};
 use crate::scene::{rgba, Camera, NodeStyle, Theme};
@@ -351,6 +362,8 @@ pub struct Renderer {
     /// The edges while a node is hidden: it reads the flags too.
     hiding_edges: wgpu::RenderPipeline,
     nodes: wgpu::RenderPipeline,
+    /// The nodes in view, from one buffer ([`Renderer::set_culled_nodes`]).
+    culled_nodes: wgpu::RenderPipeline,
     front_nodes: wgpu::RenderPipeline,
     wide_edges: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
@@ -366,6 +379,13 @@ pub struct Renderer {
     wide: Instances,
     /// The nodes in front, each a [`FrontNode`].
     front: Instances,
+    /// The nodes a frame that does not draw them all draws, most important
+    /// first, each a [`FrontNode`] ([`Renderer::set_some_nodes`]).
+    some: Instances,
+    /// The nodes in view, each a [`FrontNode`], in index order: drawn in
+    /// place of every node while `culling`.
+    culled: Instances,
+    culling: bool,
     n_nodes: u32,
     n_indices: u32,
     /// How many nodes and edges the buffers have room for.
@@ -398,7 +418,17 @@ pub struct Renderer {
 /// canvas, the nodes cover at most `coverage` of it: 1 for a small graph,
 /// down to `0.15` for a huge one (131K nodes on a laptop screen).
 pub fn node_radius_scale(radius: &[f32], width: f32, height: f32, coverage: f32) -> f32 {
-    let area: f32 = radius.iter().map(|r| std::f32::consts::PI * r * r).sum();
+    radius_scale_for(disc_area(radius), width, height, coverage)
+}
+
+/// The area of every node's disc at full size, in square pixels: what
+/// [`node_radius_scale`] reads of the radii, for a caller that keeps it.
+pub fn disc_area(radius: &[f32]) -> f32 {
+    radius.iter().map(|r| std::f32::consts::PI * r * r).sum()
+}
+
+/// [`node_radius_scale`], from the discs' area ([`disc_area`]).
+pub fn radius_scale_for(area: f32, width: f32, height: f32, coverage: f32) -> f32 {
     if area <= 0.0 {
         return 1.0;
     }
@@ -744,6 +774,16 @@ impl Renderer {
             &front_buffers,
         );
         pace.breathe().await;
+        // The pass over every node, reading one buffer: for the nodes in
+        // view alone.
+        let culled_nodes = pipeline(
+            "nodes in view",
+            "node_vs",
+            "node_fs",
+            triangles,
+            &front_buffers,
+        );
+        pace.breathe().await;
         let wide_attrs = [
             wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Float32x2,
@@ -794,6 +834,7 @@ impl Renderer {
             edges,
             hiding_edges,
             nodes,
+            culled_nodes,
             front_nodes,
             wide_edges,
             uniforms,
@@ -807,6 +848,9 @@ impl Renderer {
             lines,
             wide: Instances::new(device, "highlighted edges", WIDE_STRIDE),
             front: Instances::new(device, "nodes in front", FRONT_STRIDE),
+            some: Instances::new(device, "some nodes", FRONT_STRIDE),
+            culled: Instances::new(device, "nodes in view", FRONT_STRIDE),
+            culling: false,
             n_nodes: n_nodes as u32,
             n_indices: 2 * n_edges as u32,
             node_capacity: node_capacity as u32,
@@ -1003,6 +1047,48 @@ impl Renderer {
         bytes.len() as u64
     }
 
+    /// A new edge buffer with the room this one has, to fill
+    /// ([`Renderer::write_edges_to`]) and then draw from
+    /// ([`Renderer::replace_edges`]): the edges in another order, written
+    /// across several frames while the frames draw the old one.
+    pub fn edge_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
+        buffer(
+            device,
+            "edges",
+            &[],
+            u64::from(self.edge_capacity.max(1)) * EDGE_STRIDE,
+            EDGE_USAGE,
+        )
+    }
+
+    /// [`Renderer::write_edges`], into a buffer from
+    /// [`Renderer::edge_buffer`].
+    pub fn write_edges_to(
+        &self,
+        queue: &wgpu::Queue,
+        edges: &wgpu::Buffer,
+        first: usize,
+        line_indices: &[u32],
+    ) -> u64 {
+        debug_assert!(first + line_indices.len() / 2 <= self.edge_capacity as usize);
+        if line_indices.is_empty() {
+            return 0;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(line_indices);
+        queue.write_buffer(edges, first as u64 * EDGE_STRIDE, bytes);
+        bytes.len() as u64
+    }
+
+    /// Draw the edges from `edges`, a buffer from [`Renderer::edge_buffer`]
+    /// made since the buffers last grew, with every slot drawn written.
+    pub fn replace_edges(&mut self, edges: wgpu::Buffer) {
+        debug_assert_eq!(
+            edges.size(),
+            u64::from(self.edge_capacity.max(1)) * EDGE_STRIDE
+        );
+        self.lines = edges;
+    }
+
     /// How many nodes and edges are drawn.
     pub fn counts(&self) -> (usize, usize) {
         (self.n_nodes as usize, self.n_indices as usize / 2)
@@ -1065,6 +1151,63 @@ impl Renderer {
         self.front.set(device, queue, nodes);
     }
 
+    /// The nodes for a frame that does not draw them all
+    /// ([`Renderer::draw_prefix`]), most important first: such a frame draws
+    /// the first of these. 20 bytes each; call it again when their
+    /// positions, styles or flags change. A node in front is left out of
+    /// the pass by its flags, as it is of the pass over every node.
+    pub fn set_some_nodes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: &[FrontNode],
+    ) {
+        self.some.set(device, queue, nodes);
+    }
+
+    /// How many nodes [`Renderer::set_some_nodes`] holds.
+    pub fn some_nodes(&self) -> u32 {
+        self.some.len
+    }
+
+    /// Draw only these nodes in the pass over every node (`Some`: the nodes
+    /// in view, in index order, 20 bytes each), or every node again
+    /// (`None`, which uploads nothing). The nodes given must be every node
+    /// that pass would put a fragment on the canvas for, as they are in the
+    /// node buffers: the frame is then the same, bit for bit. Whoever
+    /// changes a position, a style, a flag or the camera says so again.
+    pub fn set_culled_nodes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: Option<&[FrontNode]>,
+    ) {
+        self.culling = nodes.is_some();
+        if let Some(nodes) = nodes {
+            self.culled.set(device, queue, nodes);
+        }
+    }
+
+    /// Draw every node again in the pass over every node.
+    pub fn set_culled_nodes_off(&mut self) {
+        self.culling = false;
+    }
+
+    /// How many instances the pass over every node draws: every node, or
+    /// the nodes in view ([`Renderer::set_culled_nodes`]).
+    pub fn nodes_drawn(&self) -> u32 {
+        if self.culling {
+            self.culled.len
+        } else {
+            self.n_nodes
+        }
+    }
+
+    /// Bytes of nodes in view written to the GPU so far.
+    pub fn culled_bytes_uploaded(&self) -> u64 {
+        self.culled.bytes_uploaded
+    }
+
     /// How many highlighted edges are drawn.
     pub fn highlight_edges(&self) -> u32 {
         self.wide.len
@@ -1100,13 +1243,47 @@ impl Renderer {
         draw_nodes: bool,
         radius_scale: f32,
     ) {
+        let all = self.n_indices as usize / 2;
+        self.draw_prefix(
+            device,
+            queue,
+            target,
+            camera,
+            draw_nodes,
+            radius_scale,
+            all,
+            None,
+        );
+    }
+
+    /// [`Renderer::draw`], with only the first `edges` edges of the buffer
+    /// (all of them, if there are fewer), drawn as much deeper as makes up
+    /// for the rest ([`prefix_alpha`]); and, if `some_nodes` is given, with
+    /// only the first that many of the nodes of
+    /// [`Renderer::set_some_nodes`] in place of every node. The highlighted
+    /// edges and the nodes in front are drawn as ever.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_prefix(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        camera: &Camera,
+        draw_nodes: bool,
+        radius_scale: f32,
+        edges: usize,
+        some_nodes: Option<usize>,
+    ) {
+        let all = self.n_indices as usize / 2;
+        let edges = edges.min(all);
+        let n_indices = 2 * edges as u32;
         let (w, h) = camera.viewport;
         let s = camera.pixels_per_unit;
         let u = Uniforms {
             center: [camera.center.0, camera.center.1],
             scale: [2.0 * s / w, 2.0 * s / h],
             pixel: [2.0 / w, 2.0 / h],
-            edge_alpha: self.edge_alpha,
+            edge_alpha: prefix_alpha(self.edge_alpha, edges, all),
             radius_scale,
             edge_color: rgba(self.edge_color),
             highlight_color: rgba(self.highlight_color),
@@ -1149,7 +1326,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
-            if self.n_indices > 0 {
+            if n_indices > 0 {
                 // Reading the flags costs a little on every edge: only
                 // while a node is hidden.
                 if self.any_hidden {
@@ -1161,9 +1338,26 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.x.slice(..));
                 pass.set_vertex_buffer(1, self.y.slice(..));
                 pass.set_index_buffer(self.lines.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.n_indices, 0, 0..1);
+                pass.draw_indexed(0..n_indices, 0, 0..1);
             }
-            if draw_nodes && self.n_nodes > 0 {
+            if let Some(some) = some_nodes {
+                // A moving frame: the largest nodes alone, never the
+                // nodes in view as well.
+                let some = (some as u32).min(self.some.len);
+                if draw_nodes && some > 0 {
+                    pass.set_pipeline(&self.culled_nodes);
+                    pass.set_vertex_buffer(0, self.some.slice());
+                    pass.draw(0..6, 0..some);
+                }
+            } else if draw_nodes && self.culling {
+                // The nodes in view alone, as the pass below would draw
+                // them.
+                if self.culled.len > 0 {
+                    pass.set_pipeline(&self.culled_nodes);
+                    pass.set_vertex_buffer(0, self.culled.slice());
+                    pass.draw(0..6, 0..self.culled.len);
+                }
+            } else if draw_nodes && self.n_nodes > 0 {
                 pass.set_pipeline(&self.nodes);
                 pass.set_vertex_buffer(0, self.x.slice(..));
                 pass.set_vertex_buffer(1, self.y.slice(..));

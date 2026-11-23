@@ -799,6 +799,59 @@ impl LiveLayout {
         }
     }
 
+    /// The order to draw the edges `(src[e], dst[e])` in, most important
+    /// first, so that any prefix is a backbone of the drawing
+    /// ([`crate::order`]): `order[i]` is the edge to draw `i`-th. The edges
+    /// are the graph's, in the order the caller numbers them.
+    ///
+    /// Coarse to fine, the order is the hierarchy's
+    /// ([`Fa2Multilevel::edge_order`]): the edges between the drawing's far
+    /// groups first, the local fill last. With no hierarchy (flat, rings,
+    /// layers, a grown layout, or a graph too small to coarsen) it is by
+    /// the larger degree of an edge's two ends
+    /// ([`ursa_core::algo::edge_order_by_degree`]): the edges at the
+    /// largest nodes first. The same input gives the same order every time.
+    ///
+    /// # Panics
+    ///
+    /// If `src` and `dst` differ in length.
+    pub fn edge_order(&self, src: &[u32], dst: &[u32]) -> Vec<u32> {
+        match &self.engine {
+            Engine::Multilevel(s) if s.coarse_levels() > 0 => {
+                s.edge_order(&self.adjacency, src, dst)
+            }
+            _ => ursa_core::algo::edge_order_by_degree(&self.adjacency, src, dst),
+        }
+    }
+
+    /// [`LiveLayout::edge_order`] for a caller whose edges are not slices
+    /// here and which has no room to spare (a browser's worker): the
+    /// `edges` edges are read a run at a time (`read(start, src, dst)`),
+    /// and the order comes back packed, two edges a `u64`, low half first
+    /// (`ursa_core::algo::pack_edges_of_keys`): on a little-endian machine,
+    /// the order's `u32`s as bytes. At its peak it holds eight bytes an
+    /// edge, where the slices and a vector of the order would be twenty.
+    ///
+    /// `room` is the vector the order is made in (emptied first): one with
+    /// room for `edges` values, set aside before the layout was made, where
+    /// a large block may not be there to ask for afterwards.
+    pub fn edge_order_packed(
+        &self,
+        edges: usize,
+        read: &mut dyn FnMut(usize, &mut [u32], &mut [u32]),
+        room: Vec<u64>,
+    ) -> Vec<u64> {
+        let adj = &self.adjacency;
+        let mut keys = match &self.engine {
+            Engine::Multilevel(s) if s.coarse_levels() > 0 => {
+                s.edge_order_keys(adj, edges, read, room)
+            }
+            _ => ursa_core::algo::edge_order_by_degree_keys(adj, edges, read, room),
+        };
+        ursa_core::algo::pack_edges_of_keys(&mut keys);
+        keys
+    }
+
     /// The positions now: `x` and `y`, one per node.
     pub fn positions(&self) -> (&[f32], &[f32]) {
         match &self.engine {

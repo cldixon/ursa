@@ -33,10 +33,31 @@
 // edges, a delta of 100 nodes and 300 edges uploads at most 64 KB and takes
 // at most 2 ms. ONLY=delta runs these alone (ONLY="delta karate" the first).
 //
+// Then the frame budget (#495), on WebGL2. On the karate club, a view made
+// from a result draws its edges in the order a layout gives them: the frame
+// read back is the frame before, byte for byte, also after a delta and its
+// inverse, with the order set or still on its way to the GPU; an order that
+// is not a permutation changes nothing; and removing an ordered edge draws
+// what it draws without an order. On R-MAT with 100K edges, the frame at
+// rest with the edges in importance order is the first frame, byte for
+// byte; a frame while the view moves draws a prefix of the edges and the
+// largest nodes, less ink than everything and never none; the budget follows
+// the costs it is told, down to its floor and up to everything; and a frame
+// after the rest is every edge again. ONLY=budget runs these alone.
+//
 // Then making a view (#426), on WebGL2: at 46K nodes and 1M edges no task
 // on the page's thread is over 60 ms, the page's wasm memory is at most
 // 20 MiB afterwards, and the view has no adjacency until a layout on its
 // own thread steps. ONLY=create runs these alone.
+//
+// Then the spatial grid (#500), on WebGL2: on the clusters and on R-MAT
+// with 1M edges, a pick and an edge pick with the grid are the picks that
+// test every node and edge, at pixels on nodes, beside them and anywhere,
+// fitted and zoomed in, with nodes hidden, selected and added by a delta;
+// while the positions move every pick tests every node; and zoomed into 1%
+// of the drawing the node pass draws at most 5% of the instances, in a
+// frame that is the frame with every node drawn, byte for byte. ONLY=grid
+// runs these alone.
 import { chromium, type Page } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -612,6 +633,182 @@ if (CREATE_CASES.length) {
   }
   await gl.close();
 }
+// The spatial grid.
+const GRID_CASES = [
+  { name: "grid clusters", query: "graph=clusters&k=8&size=500&result=1", edgeMs: 0 },
+  { name: "grid rmat 1M", query: "graph=rmat&scale=17&edges=1000000&result=1&multilevel=0&iterations=3", edgeMs: 1 },
+  // The issue's size, a million nodes: minutes with no GPU, so only when
+  // asked for by name (ONLY="grid nodes 1M").
+  { name: "grid nodes 1M", query: "graph=rmat&scale=20&edges=1000000&result=1&multilevel=0&iterations=1", edgeMs: 1, big: true },
+].filter((c) => (c.big ? ONLY === c.name : !ONLY || c.name.startsWith(ONLY)));
+if (GRID_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  for (const c of GRID_CASES) {
+    const name = c.name;
+    const fail = (what: string) => failures.push(`${name}: ${what}`);
+    const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+    page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+    page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+    await page.goto(`${base}?${c.query}`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    await page.waitForTimeout(500);
+    // The issue's 5% is R-MAT's; a cluster is denser, and half is what the
+    // view promises.
+    const r: any = await page.evaluate(async (share) => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph, n = g.n;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const [W, H] = [canvas.width, canvas.height];
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      const problems: string[] = [];
+      const out: any = { backend: view.backend, nodes: n, edges: g.src.length };
+      let seed = 500;
+      const rnd = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32);
+      // Pixels on nodes, beside them, on edges and anywhere.
+      const pixels = (count: number) => {
+        const at: number[][] = [];
+        for (let k = 0; k < count; k++) {
+          const i = Math.floor(rnd() * view.nodeCount), [x, y] = view.nodePixel(i);
+          if (k % 4 === 0) at.push([rnd() * W, rnd() * H]);
+          else if (k % 4 === 1) at.push([x, y]);
+          else if (k % 4 === 2) at.push([x + (rnd() - 0.5) * 12, y + (rnd() - 0.5) * 12]);
+          else {
+            const e = Math.floor(rnd() * g.src.length), [ax, ay] = view.nodePixel(g.src[e]), [bx, by] = view.nodePixel(g.dst[e]), t = rnd();
+            at.push([ax + (bx - ax) * t + rnd() * 3, ay + (by - ay) * t + rnd() * 3]);
+          }
+        }
+        return at;
+      };
+      // Every pick with the grid is the pick without it.
+      const same = (what: string, count: number, edges: number) => {
+        let hits = 0, edgeHits = 0, wrong = 0;
+        const at = pixels(count);
+        for (const [x, y] of at) {
+          const [a, b] = [view.pick(x, y), view.pickLinear(x, y)];
+          if (a !== b && wrong++ < 3) problems.push(`${what}: at ${x.toFixed(1)}, ${y.toFixed(1)} the grid picks node ${a}, every node tested picks ${b}`);
+          if (b !== undefined) hits++;
+        }
+        for (const [x, y] of at.slice(0, edges)) {
+          const [a, b] = [view.pickEdge(x, y, 4), view.pickEdgeLinear(x, y, 4)];
+          if (a !== b && wrong++ < 3) problems.push(`${what}: at ${x.toFixed(1)}, ${y.toFixed(1)} the grid picks edge ${a}, every edge tested picks ${b}`);
+          if (b !== undefined) edgeHits++;
+        }
+        if (hits < count / 8) problems.push(`${what}: only ${hits} of ${count} pixels are on a node`);
+        if (edges && !edgeHits) problems.push(`${what}: no pixel of ${edges} is on an edge`);
+        return [hits, edgeHits];
+      };
+      const many = n > 50_000 ? 400 : 2000, edgePicks = n > 50_000 ? 40 : 400;
+      // The positions rest: three frames or picks, and the grid is there.
+      view.setPositions(view.positions());
+      if (view.gridReady) problems.push("the grid is ready as the positions change");
+      view.render(); view.pick(1, 1);
+      if (view.gridReady) problems.push("the grid is built after two quiet calls, not three");
+      view.pick(1, 1);
+      if (!view.gridReady) problems.push("the grid is not built after three quiet calls");
+      out.fitted = same("fitted", many, edgePicks);
+      // With nodes hidden and selected.
+      const hub = g.src[0];
+      view.setHidden(Uint32Array.of(hub, 1, 2));
+      view.setSelection(Uint32Array.of(5, 6));
+      out.flagged = same("with nodes hidden and selected", many, edgePicks);
+      const [hx, hy] = view.nodePixel(hub);
+      if (view.pick(hx, hy) === hub) problems.push(`hidden node ${hub} can be picked`);
+      const [sx, sy] = view.nodePixel(5);
+      if (view.pick(sx, sy) === undefined) problems.push("nothing is picked on selected node 5");
+      view.setHidden(new Uint32Array()); view.setSelection(new Uint32Array());
+      // New nodes, before the grid has them and after; and after the undo.
+      // The view places them, around the node they hang off.
+      const delta = new viz.DeltaBuilder().addNodes(n, 20).addEdges(Uint32Array.from({ length: 20 }, (_, k) => n + k), new Uint32Array(20)).toBytes();
+      view.applyDelta(delta);
+      if (view.gridReady) problems.push("the grid is ready with nodes it has not seen");
+      const [nx, ny] = view.nodePixel(n + 7);
+      const fresh = [view.pick(nx, ny), view.pickLinear(nx, ny)];
+      if (fresh[0] !== fresh[1] || fresh[0] === undefined) problems.push(`on new node ${n + 7} the grid picks ${fresh[0]}, every node tested ${fresh[1]}`);
+      if (view.gridReady) problems.push("one pick after a delta built the grid");
+      out.grown = same("after a delta", many, edgePicks);
+      if (!view.gridReady) problems.push("the grid was not rebuilt after the delta");
+      view.applyDelta(viz.invertDelta(delta));
+      out.undone = same("after the undo", many, edgePicks);
+      // Zoomed in, where a pixel is a small part of a cell.
+      view.zoom(10, W * 0.4, H * 0.45);
+      out.zoomed = same("zoomed in 10x", many, edgePicks);
+      // A node's own pixel picks a node at least as near.
+      // The clock here ticks in tenths of a millisecond: each time is the
+      // mean of a run of calls.
+      const each = (at: number[][], f: (x: number, y: number) => any) => { const t = performance.now(); for (const [x, y] of at) f(x, y); return (performance.now() - t) / at.length; };
+      view.fit(); view.render(); view.render(); view.render();
+      const at = Array.from({ length: 2000 }, () => [rnd() * W, rnd() * H]);
+      out.pickMs = each(at, (x, y) => view.pick(x, y));
+      out.linearMs = each(at.slice(0, 50), (x, y) => view.pickLinear(x, y));
+      out.buildMs = each(at.slice(0, 20), () => view.rebuildGrid());
+      view.pickEdge(1, 1, 4); view.pickEdge(1, 1, 4);
+      out.edgeMs = each(at.slice(0, 200), (x, y) => view.pickEdge(x, y, 4));
+      out.edgeLinearMs = each(at.slice(0, 20), (x, y) => view.pickEdgeLinear(x, y, 4));
+      // Culling: every node while they all show, and fewer zoomed into 1%
+      // of the drawing (a tenth each way), in the same frame.
+      const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const inked = (a: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i += 4) if (a[i] < 235 || a[i + 1] < 235 || a[i + 2] < 235) d++; return d; };
+      view.render();
+      out.drawnFitted = view.nodesDrawn;
+      if (out.drawnFitted !== n) problems.push(`fitted, ${out.drawnFitted} of ${n} nodes are drawn`);
+      out.views = [];
+      // The middle of the drawing, and around two of its nodes.
+      for (const [zx, zy] of [[W / 2, H / 2], view.nodePixel(g.src[0]), view.nodePixel(g.dst[g.dst.length >> 1])]) {
+        view.fit(); view.zoom(10, zx, zy);
+        // A selected, a pinned and a hovered node in view, and a hidden one.
+        const inView = [];
+        for (let i = 0; i < n && inView.length < 4; i++) { const [x, y] = view.nodePixel(i); if (x > 50 && y > 50 && x < W - 50 && y < H - 50) inView.push(i); }
+        if (inView.length === 4) { view.setSelection(Uint32Array.of(inView[0])); view.setPinned(Uint32Array.of(inView[1])); view.setHovered(inView[2]); view.setHidden(Uint32Array.of(inView[3])); }
+        view.setCulling(true); view.render();
+        const drawn = view.nodesDrawn;
+        const culled: Uint8Array = await view.snapshot();
+        view.setCulling(false); view.render();
+        if (view.nodesDrawn !== n) problems.push(`with culling off, ${view.nodesDrawn} of ${n} nodes are drawn`);
+        const all: Uint8Array = await view.snapshot();
+        view.setCulling(true);
+        const d = differ(culled, all);
+        if (d) problems.push(`zoomed in at ${zx}, ${zy}, ${d} bytes of the frame with ${drawn} nodes drawn differ from the frame with all ${n}`);
+        if (!(drawn <= share * n)) problems.push(`zoomed into 1% of the drawing at ${zx}, ${zy}, ${drawn} of ${n} node instances are drawn: over ${100 * share}%`);
+        // Panning says which nodes are in view again.
+        view.pan(-40, 25); view.render();
+        const panned: Uint8Array = await view.snapshot();
+        view.setCulling(false); view.render();
+        const d2 = differ(panned, await view.snapshot());
+        view.setCulling(true);
+        if (d2) problems.push(`panned, ${d2} bytes of the culled frame differ`);
+        out.views.push({ drawn, inked: inked(all), marked: inView.length });
+        view.setSelection(new Uint32Array()); view.setPinned(new Uint32Array()); view.setHovered(undefined); view.setHidden(new Uint32Array());
+      }
+      // While the positions move, every node is drawn and tested.
+      view.setPositions(view.positions()); view.render();
+      if (view.nodesDrawn !== n) problems.push(`as the positions move, ${view.nodesDrawn} of ${n} nodes are drawn`);
+      for (let k = 0; k < 5; k++) { view.setPositions(view.positions()); view.render(); view.pick(10, 10); }
+      if (view.gridReady) problems.push("the grid was built while the positions changed every frame");
+      view.fit();
+      w.pauseFrames(false);
+      return { problems, ...out };
+    }, c.edgeMs ? 0.05 : 0.5).catch((e) => ({ problems: [String(e)] }));
+    for (const p of r.problems) fail(p);
+    if (r.backend && r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
+    const ms = (v: number) => `${v?.toFixed(v < 1 ? 3 : 1)} ms`;
+    if (c.edgeMs) {
+      // The issue's numbers are 0.2 ms a pick and 15 ms to build the grid
+      // at 1M nodes, where a pick that tests every node took 4.9 ms. This
+      // machine is shared and this graph may be smaller, so the times are
+      // held to the same ratios of that pick, measured in the same run
+      // (with some room for the grid: a run of 20 against a run of 50).
+      if (!(r.pickMs <= r.linearMs / 24.5)) fail(`a pick takes ${ms(r.pickMs)}, and ${ms(r.linearMs)} testing every node: not 24 times less`);
+      if (!(r.buildMs <= 4 * r.linearMs)) fail(`building the grid takes ${ms(r.buildMs)}: over 4 picks that test every node (${ms(r.linearMs)})`);
+    }
+    console.log(
+      `${name}: ${r.backend} · ${r.nodes?.toLocaleString()} nodes, ${r.edges?.toLocaleString()} edges · picks equal to the linear scan's (nodes hit, edges hit): fitted ${r.fitted}, flagged ${r.flagged}, after a delta ${r.grown}, undone ${r.undone}, zoomed ${r.zoomed} · ` +
+        `pick ${ms(r.pickMs)} (every node: ${ms(r.linearMs)}) · grid built in ${ms(r.buildMs)} · edge pick ${ms(r.edgeMs)} (every edge: ${ms(r.edgeLinearMs)}) · ` +
+        `zoomed into 1%: ${r.views?.map((v: any) => `${v.drawn} of ${r.nodes} instances (${(100 * v.drawn / r.nodes).toFixed(2)}%), ${v.inked} px inked, same frame`).join("; ")}`,
+    );
+    await page.close();
+  }
+  await gl.close();
+}
 // Scenes that change in place.
 const DELTA_CASES = ["delta karate", "delta rmat 1M"].filter((c) => !ONLY || c.startsWith(ONLY));
 if (DELTA_CASES.length) {
@@ -953,6 +1150,238 @@ if (DELTA_CASES.length) {
     console.log(`delta on ${backend}: buffers grown, slots written, nodes and edges removed and all undone with ${errors.length} errors`);
     await gpu.close();
   }
+}
+const BUDGET_CASES = ["budget karate", "budget rmat 100K"].filter((c) => !ONLY || c.startsWith(ONLY));
+if (BUDGET_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  const open = async (name: string, query: string) => {
+    const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+    page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+    page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+    await page.goto(`${base}?${query}`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    await page.waitForTimeout(500); // the last positions drawn
+    return page;
+  };
+  if (BUDGET_CASES.includes("budget karate")) {
+    const name = "budget karate";
+    const page = await open(name, "graph=karate&result=xy");
+    const r: any = await page.evaluate(async () => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+      const n = g.n, m = g.src.length;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 100));
+      const out: any = { backend: view.backend, problems: [] as string[] };
+      const problem = (what: string) => out.problems.push(what);
+      const frame = (): Promise<Uint8Array> => view.snapshot();
+      const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const undo = (delta: Uint8Array) => view.applyDelta(viz.invertDelta(delta));
+      const xy = view.positions();
+      const grow = () => new viz.DeltaBuilder()
+        .addNodes(n, 2, Float32Array.of((xy[0] + xy[33]) / 2, (xy[5] + xy[26]) / 2, (xy[n] + xy[n + 33]) / 2, (xy[n + 5] + xy[n + 26]) / 2))
+        .addEdges(Uint32Array.of(n, n + 1, n), Uint32Array.of(0, n, 11))
+        .toBytes();
+      const cut = () => new viz.DeltaBuilder().removeEdges(Uint32Array.of(3, 40)).toBytes();
+      const cutNew = () => new viz.DeltaBuilder().removeEdges(Uint32Array.of(m + 1)).toBytes();
+
+      // Without an order: the frames to compare with.
+      const first = await frame();
+      view.applyDelta(grow());
+      const grown = await frame();
+      view.applyDelta(cutNew());
+      const grownCut = await frame();
+      undo(cutNew());
+      undo(grow());
+      view.applyDelta(cut());
+      const cutFrame = await frame();
+      undo(cut());
+      if (differ(first, await frame())) problem("the deltas' inverses did not give the first frame back");
+      if (!differ(first, grown) || !differ(first, cutFrame) || !differ(grown, grownCut)) problem("a delta changed no pixel");
+      if (view.frameInfo().ordered !== 0) problem(`a new view has ${view.frameInfo().ordered} ordered edges`);
+
+      // An order from a layout of the graph: a permutation, and not the
+      // identity.
+      const layout = new viz.Layout(n, g.src, g.dst);
+      const order: Uint32Array = layout.edgeOrder(g.src, g.dst);
+      layout.free();
+      out.order = Array.from(order.subarray(0, 8));
+      if (order.length !== m || new Set(order).size !== m || Math.max(...order) !== m - 1) problem("the layout's order is not a permutation of the edges");
+      if (order.every((e, i) => e === i)) problem("the layout's order is the index order");
+
+      // What is not an order changes nothing.
+      const refused = (bad: number[], what: string) => {
+        try { view.setEdgeOrder(Uint32Array.from(bad)); problem(`${what} was taken as an order`); } catch (e) { out.refused = String(e); }
+      };
+      refused([0, 0], "an order that names an edge twice");
+      refused([0, 2], "an order that names an edge past its end");
+      refused(Array.from({ length: m + 1 }, (_, i) => i), "an order of more edges than there are");
+      if (view.orderEdges()) problem("a refused order left edges to write");
+      if (differ(first, await frame())) problem("a refused order changed the frame");
+
+      // Set, a few edges a call: the frame is the first until it is whole,
+      // and after.
+      view.setEdgeOrder(order);
+      let calls = 1;
+      if (differ(first, await frame())) problem("an order not yet written changed the frame");
+      while (view.orderEdges(16)) calls++;
+      out.calls = calls;
+      if (calls !== Math.ceil(m / 16)) problem(`${m} edges were written in ${calls} calls of 16`);
+      if (view.frameInfo().ordered !== m) problem(`${view.frameInfo().ordered} of ${m} edges are ordered`);
+      out.sameAtRest = differ(first, await frame());
+      if (out.sameAtRest) problem(`with the edges in order, ${out.sameAtRest} bytes of the frame at rest differ`);
+
+      // New edges go after the ordered ones; removing one of those keeps
+      // the order.
+      view.applyDelta(grow());
+      if (differ(grown, await frame())) problem("with an order, a growth drew another frame");
+      view.applyDelta(cutNew());
+      if (differ(grownCut, await frame())) problem("with an order, removing a new edge drew another frame");
+      if (view.frameInfo().ordered !== m) problem("removing an edge added since the order lost the order");
+      undo(cutNew());
+      undo(grow());
+      if (differ(first, await frame())) problem("with an order, a growth and its inverse did not give the first frame back");
+      if (view.frameInfo().ordered !== m) problem("a growth and its inverse lost the order");
+
+      // Removing ordered edges draws what it draws without an order, and
+      // the edges go back to index order.
+      view.applyDelta(cut());
+      if (differ(cutFrame, await frame())) problem("with an order, removing two edges drew another frame");
+      out.orderedAfterCut = view.frameInfo().ordered;
+      if (out.orderedAfterCut !== 0) problem(`${out.orderedAfterCut} edges are still ordered after an ordered edge was removed`);
+      undo(cut());
+      if (differ(first, await frame())) problem("restoring the edges did not give the first frame back");
+
+      // An order still on its way when a delta comes is written out first.
+      view.setEdgeOrder(order);
+      view.orderEdges(16);
+      view.applyDelta(grow());
+      if (view.orderEdges()) problem("a delta left an order half written");
+      if (differ(grown, await frame())) problem("a delta over a half-written order drew another frame");
+      if (view.frameInfo().ordered !== m) problem("a delta over a half-written order lost it");
+      undo(grow());
+      if (differ(first, await frame())) problem("after a half-written order and a delta, the first frame did not come back");
+
+      // A small graph moves whole: nothing is left out.
+      view.pan(4, 0);
+      const moving = view.renderFrame(1000);
+      const info = view.frameInfo();
+      out.info = view.info().frame;
+      if (!moving || view.framePartial) problem(`a moving frame of karate: moving ${moving}, partial ${view.framePartial}`);
+      if (info.k !== m || info.nodes !== n || info.edges !== m) problem(`a moving frame of karate drew ${JSON.stringify(info)}`);
+      if (JSON.stringify(out.info) !== JSON.stringify(info)) problem("info().frame is not frameInfo()");
+      w.pauseFrames(false);
+      return out;
+    }).catch((e) => ({ problems: [String(e)] }));
+    for (const what of r.problems) failures.push(`${name}: ${what}`);
+    console.log(`${name} on ${r.backend}: the order starts ${JSON.stringify(r.order)}, written in ${r.calls} calls; ${r.sameAtRest} bytes of the frame at rest differ; ${r.orderedAfterCut} ordered after an ordered edge went; refused: ${r.refused}; ${JSON.stringify(r.info)}`);
+    await page.close();
+  }
+  if (BUDGET_CASES.includes("budget rmat 100K")) {
+    const name = "budget rmat 100K";
+    const page = await open(name, "graph=rmat&scale=14&edges=100000");
+    const r: any = await page.evaluate(async () => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const n = g.n, m = g.src.length;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 100));
+      const out: any = { backend: view.backend, problems: [] as string[], n, m };
+      const problem = (what: string) => out.problems.push(what);
+      const differ = (a: Uint8Array | Uint8ClampedArray, b: Uint8Array | Uint8ClampedArray) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      // The canvas as just drawn, read in the task that drew it.
+      const copy = document.createElement("canvas");
+      copy.width = canvas.width; copy.height = canvas.height;
+      const ctx = copy.getContext("2d", { willReadFrequently: true })!;
+      const shown = () => { ctx.clearRect(0, 0, copy.width, copy.height); ctx.drawImage(canvas, 0, 0); return ctx.getImageData(0, 0, copy.width, copy.height).data; };
+      const ink = (px: Uint8ClampedArray) => { let c = 0; for (let i = 0; i < px.length; i += 4) if (px[i] < 235 || px[i + 1] < 235 || px[i + 2] < 235) c++; return c; };
+
+      const first: Uint8Array = await view.snapshot();
+      const t0 = performance.now();
+      const layout = new viz.Layout(n, g.src, g.dst);
+      out.levels = layout.levels;
+      const t1 = performance.now();
+      const order: Uint32Array = layout.edgeOrder(g.src, g.dst);
+      out.orderMs = performance.now() - t1;
+      out.hierarchyMs = t1 - t0;
+      layout.free();
+      const seen = new Uint8Array(m);
+      let repeats = 0;
+      for (const e of order) { if (e >= m || seen[e]) repeats++; else seen[e] = 1; }
+      if (order.length !== m || repeats) problem(`the order is not a permutation: ${order.length} of ${m}, ${repeats} bad`);
+      view.setEdgeOrder(order);
+      let calls = 1;
+      const t2 = performance.now();
+      while (view.orderEdges(30000)) calls++;
+      out.writeMs = performance.now() - t2;
+      out.calls = calls;
+      out.sameAtRest = differ(first, await view.snapshot());
+      if (out.sameAtRest) problem(`with the edges in importance order, ${out.sameAtRest} bytes of the frame at rest differ from the first`);
+
+      // Everything, on the canvas.
+      view.render();
+      const whole = shown();
+      out.inkWhole = ink(whole);
+
+      // The view moves: a prefix of the edges and the largest nodes.
+      let now = 100_000;
+      const move = () => { view.pan(2, 0); view.pan(-2, 0); return view.renderFrame((now += 16)); };
+      if (!move()) problem("a frame after a pan is not a moving one");
+      const moving = shown();
+      out.first = view.frameInfo();
+      out.inkMoving = ink(moving);
+      if (!view.framePartial) problem("the first moving frame of 100K edges left nothing out");
+      if (!(out.first.k > 0 && out.first.k < m && out.first.nodes > 0 && out.first.nodes < n)) problem(`the first moving frame drew ${JSON.stringify(out.first)}`);
+      if (!(out.inkMoving > 0 && out.inkMoving < out.inkWhole)) problem(`a moving frame inked ${out.inkMoving} pixels, everything ${out.inkWhole}`);
+      if (out.first.ordered !== m || out.first.edges !== m) problem(`frameInfo says ${JSON.stringify(out.first)}`);
+
+      // Frames that cost too much: less, down to the floor, never nothing.
+      let least = { k: m, nodes: n };
+      for (let i = 0; i < 60; i++) {
+        view.frameCost(400);
+        move();
+        const f = view.frameInfo();
+        least = { k: Math.min(least.k, f.k), nodes: Math.min(least.nodes, f.nodes) };
+      }
+      out.least = least;
+      out.inkLeast = ink(shown());
+      if (!(least.k >= 256 && least.k < out.first.k && least.nodes >= 64)) problem(`after 60 slow frames the least drawn was ${JSON.stringify(least)}`);
+      if (!(out.inkLeast > 0)) problem("the least budget drew nothing");
+      out.p95Slow = view.frameInfo().p95;
+      if (out.p95Slow !== 400) problem(`the p95 of 60 frames of 400 ms is ${out.p95Slow}`);
+
+      // Frames that fit: more, up to everything.
+      let frames = 0;
+      while (view.framePartial && frames < 400) { view.frameCost(8); move(); frames++; }
+      out.framesToAll = frames;
+      out.all = view.frameInfo();
+      if (view.framePartial || out.all.k !== m || out.all.nodes !== n) problem(`after ${frames} fast frames the view draws ${JSON.stringify(out.all)}`);
+      out.allDiffers = differ(whole, shown());
+      if (out.allDiffers) problem(`a moving frame with everything differs from render() in ${out.allDiffers} bytes`);
+
+      // Cut back, then at rest: everything, and not a moving frame.
+      for (let i = 0; i < 6; i++) { view.frameCost(400); move(); }
+      if (!view.framePartial) problem("slow frames after everything fitted left nothing out");
+      // A frame soon after, with nothing moved, is still a prefix.
+      if (!view.renderFrame((now += 50)) || !view.framePartial) problem("a frame 50 ms after a movement drew everything");
+      // A running layout keeps the view moving past the rest.
+      view.keepMoving();
+      if (!view.renderFrame((now += 1000)) || !view.framePartial) problem("keepMoving did not keep the view moving");
+      const rested = view.renderFrame((now += view.frameRestMs));
+      out.restDiffers = differ(whole, shown());
+      if (rested || view.framePartial) problem(`a frame after the rest: moving ${rested}, partial ${view.framePartial}`);
+      if (out.restDiffers) problem(`the frame at rest differs from render() in ${out.restDiffers} bytes`);
+      w.pauseFrames(false);
+      return out;
+    }).catch((e) => ({ problems: [String(e)] }));
+    for (const what of r.problems) failures.push(`${name}: ${what}`);
+    console.log(
+      `${name} on ${r.backend}: ${r.n} nodes, ${r.m} edges, ${r.levels} levels; hierarchy ${r.hierarchyMs?.toFixed(0)} ms, order ${r.orderMs?.toFixed(1)} ms, written in ${r.calls} calls, ${r.writeMs?.toFixed(1)} ms; ` +
+        `at rest ${r.sameAtRest} bytes differ; ink: everything ${r.inkWhole}, first moving frame ${r.inkMoving} (${JSON.stringify(r.first)}), least ${r.inkLeast} (${JSON.stringify(r.least)}); ` +
+        `everything again after ${r.framesToAll} fast frames`,
+    );
+    await page.close();
+  }
+  await gl.close();
 }
 server.stop();
 if (failures.length) {

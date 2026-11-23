@@ -14,7 +14,14 @@
 //   1-pixel `readPixels`; WebGPU: `queue.onSubmittedWorkDone`), one frame per
 //   animation frame, median and p95. Wall time, not GPU timestamps: the view
 //   requests no `timestamp-query` feature;
-// - pick latency (`view.pick` at random pixels);
+// - the frame budget (#495): the same pan and zoom drawn as a page draws
+//   them, `view.renderFrame` with each frame's cost (the time to the next
+//   animation frame) told to `view.frameCost`, the edges in the layout's
+//   importance order: the time between frames, median and p95, and how many
+//   edges and nodes the last frame drew. This is the interaction trace to
+//   read on a laptop: its p95 is what the budget holds;
+// - pick latency (`view.pick` at random pixels), the time to build the grid
+//   it reads, and how many nodes a frame zoomed into 1% of the drawing draws;
 // - memory: the page's and the layout worker's wasm memory, and
 //   `performance.measureUserAgentSpecificMemory` (the server sends
 //   COOP/COEP, so the page is cross-origin isolated) or `performance.memory`;
@@ -285,6 +292,18 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             pickMs.push(performance.now() - t);
             if (hit !== undefined) hits++;
           }
+          // The grid the picks read: building it, and what a frame zoomed
+          // into 1% of the drawing (a tenth each way) draws with it.
+          const gridBuildMs: number[] = [];
+          for (let i = 0; i < 9; i++) {
+            const t = performance.now();
+            view.rebuildGrid();
+            gridBuildMs.push(performance.now() - t);
+          }
+          view.zoom(10, canvas.width / 2, canvas.height / 2);
+          view.render();
+          const culledNodes = view.nodesDrawn;
+          view.fit();
           // Memory.
           const memory: any = { pageWasmBytes: w.wasm.memory.buffer.byteLength, workerWasmBytes: w.stats.workerMemoryBytes };
           const pm = (performance as any).memory;
@@ -301,8 +320,46 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
               memory.userAgentSpecificError = String(e);
             }
           }
+          // The frame budget (#495), after the memory is read: ordering the
+          // edges here builds a layout's hierarchy on the page, which a
+          // page that has a layout worker never does.
+          const budgetRun = async (move: (i: number) => void) => {
+            const interval: number[] = [];
+            let last = 0, started = 0, moving = false;
+            const start = performance.now();
+            for (let i = 0; i < frames + 20 && (i < 40 || performance.now() - start < budgetMs); i++) {
+              const ts = (await raf()) as number;
+              if (moving) view.frameCost(ts - started);
+              move(i);
+              started = ts;
+              moving = view.renderFrame(ts);
+              if (i >= 20) interval.push(ts - last); // 20 for the budget to find its level
+              last = ts;
+            }
+            const f = view.frameInfo();
+            return { interval, edges: f.k, nodes: f.nodes, p95: f.p95, limit: f.limit };
+          };
+          const tOrder = performance.now();
+          const layout = new w.viz.Layout(n, w.graph.src, w.graph.dst);
+          const tHierarchy = performance.now();
+          const order = layout.edgeOrder(w.graph.src, w.graph.dst);
+          const orderMs = performance.now() - tHierarchy;
+          layout.free();
+          view.setEdgeOrder(order);
+          const tWrite = performance.now();
+          let writes = 1;
+          while (view.orderEdges()) writes++;
+          const budget = {
+            hierarchyMs: tHierarchy - tOrder,
+            orderMs,
+            writeMs: performance.now() - tWrite,
+            writes,
+            pan: await budgetRun((i) => view.pan(i % 20 < 10 ? 6 : -6, i % 14 < 7 ? 4 : -4)),
+            zoom: (view.fit(), await budgetRun((i) => view.zoom(i % 30 < 15 ? 1.05 : 1 / 1.05, canvas.width / 2, canvas.height / 2))),
+          };
+          view.fit();
           w.pauseFrames(false);
-          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, memory };
+          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, gridBuildMs, culledNodes, memory, budget };
         },
         { frames: FRAMES, picks: PICKS, budgetMs: FRAME_BUDGET_MS },
       ),
@@ -311,7 +368,9 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
       const r = result[k];
       result[k] = { cpuMs: summary(r.cpu), frameMs: summary(r.total), rafIntervalMs: summary(r.interval) };
     }
+    for (const k of ["pan", "zoom"]) result.budget[k] = { ...result.budget[k], interval: undefined, rafIntervalMs: summary(result.budget[k].interval) };
     result.pickMs = summary(result.pickMs);
+    result.gridBuildMs = summary(result.gridBuildMs);
     result.burstMsPerFrame = summary(result.burstMs);
     delete result.burstMs;
     const h = result.highlight;

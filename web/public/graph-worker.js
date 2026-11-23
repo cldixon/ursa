@@ -7,12 +7,15 @@
 //   {type: "init", module}                 -> {type: "ready"}  (ursa-viz loaded,
 //                                             ahead of the graph: graph.js preload)
 //   {type: "start", module, n, src, dst, layout?}
-//   {type: "start", module, n, adjacency: {offsets, targets}, layout?}
+//   {type: "start", module, n, adjacency: {offsets, targets}, src, dst, layout?}
 //     -> {type: "positions", xy, iterations, level, levels, total} ..., then {type: "done", iterations}
 //     or {type: "error", message}
 //     The graph is its edges (src, dst), or, where the page was given it,
 //     its undirected adjacency (UGR's edges.adjacency.*), which the layout
 //     uses as it is, sorting nothing. The layout is the same either way.
+//     With an adjacency the edges still come, for the "order" below, which
+//     is of the page's edges as it numbers them; the layout does not read
+//     them.
 //   {type: "grow", epoch, n, src, dst}     the graph grew (an expansion, #443):
 //     the same nodes, new ones after them, and the edges shown now. The new
 //     nodes start beside their neighbours and the layout runs warm, the old
@@ -21,6 +24,12 @@
 //   {type: "place", epoch, n, src, dst, xy} the graph is at these positions
 //     (an undo restored them): the layout is there, with nothing to run,
 //     for the next "grow". -> "done"
+//
+// After the first "positions" of a "start" comes, once,
+//   {type: "order", order, ms}: the order to draw the edges in (#495), most
+//     important first, a Uint32Array of edge indexes (transferred) for
+//     GraphView.setEdgeOrder, and the ms it took to compute. The layout has
+//     the hierarchy the order comes from (Layout.edgeOrder).
 //
 // `layout` picks a fixed layout instead: {kind: "rings" | "layers", level},
 // `level` a Uint32Array of each node's distance from a seed (rings) or its
@@ -84,6 +93,7 @@ async function handle(data) {
       // Coarse to fine has a place for every node before any iteration, and a
       // fixed layout has its last: draw it.
       post();
+      postOrder(data);
       run();
     } else if (data.type === "grow") {
       if (!layout) throw new Error("no layout to grow");
@@ -125,6 +135,20 @@ function post() {
     times = null;
   }
   self.postMessage(message, [xy.buffer]);
+}
+
+/**
+ * The order to draw the edges `(src[i], dst[i])` in, most important first
+ * (#495): what the page draws a prefix of while the view moves. Once, after
+ * the first positions: the hierarchy it comes from never changes.
+ */
+function postOrder({ src, dst }) {
+  if (!src || !dst) return;
+  const t = performance.now();
+  // The edges stay here: the layout reads them a run at a time, and writes
+  // the order into an array of this worker's, to give away (#501).
+  const order = layout.edgeOrder(src, dst);
+  self.postMessage({ type: "order", order, ms: performance.now() - t }, [order.buffer]);
 }
 
 function done() {

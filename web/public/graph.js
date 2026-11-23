@@ -256,8 +256,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (graph.adjacency && !anyRemoved(graph)) {
       // The engine had the adjacency to send: the layout uses it as it is
       // (a copy of it: the result's buffer stays this page's).
+      // The edges go too, in this page's numbering: the order to draw them
+      // in (#495) is an order of these, which an adjacency does not have.
       const adjacency = { offsets: graph.adjacency.offsets.slice(), targets: graph.adjacency.targets.slice() };
-      worker.postMessage({ ...start, adjacency }, [adjacency.offsets.buffer, adjacency.targets.buffer]);
+      const { src, dst } = shownEdges(graph);
+      worker.postMessage({ ...start, adjacency, src, dst }, [adjacency.offsets.buffer, adjacency.targets.buffer, src.buffer, dst.buffer]);
     } else {
       const { src, dst } = shownEdges(graph);
       worker.postMessage({ ...start, src, dst }, [src.buffer, dst.buffer]);
@@ -383,6 +386,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     paused: false,
     pending: null,
     frame: 0,
+    // The timer for the frame that draws every edge once the view rests
+    // (#495), and whether the layout worker numbers the edges as the view
+    // does (it is sent only the edges shown), so that its order is the view's.
+    rest: 0,
+    orderable: !anyRemoved(graph),
+    // How long the worker took to order the edges, in ms, once it has.
+    orderMs: null,
     times,
     cleanup: [],
   };
@@ -461,7 +471,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
 
   // Frames: drawn when something changed (new positions, a pan or zoom), not
   // every animation frame, so an idle view costs nothing.
-  const draw = () => {
+  const draw = (frameTime) => {
     state.frame = 0;
     if (current !== state || state.paused || !state.positioned) return;
     if (state.pending) {
@@ -470,16 +480,61 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     }
     try {
       const start = performance.now();
-      view.render();
+      // Within the frame budget (#495): while the view moves, as many edges
+      // as fit in a frame; at rest, all of them.
+      // A layout that is running is movement, between its positions too.
+      if (!state.layoutDone) view.keepMoving();
+      const moving = view.renderFrame(frameTime);
       const end = performance.now();
       timings.frameDrawn(start, end);
       state.frames++;
       times.firstDraw ??= end;
+      if (moving) budgeted(frameTime);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
     }
     placeBusy();
+  };
+  // After a moving frame: what it cost, which the budget follows, is the
+  // time to the next animation frame (with no GPU the browser rasterises on
+  // this thread first; with one, a late frame misses a refresh), from one
+  // frame's time to the next's: whole refreshes, whenever in its frame each
+  // callback ran. And if it left anything out, a frame with everything once
+  // nothing has moved for a while.
+  const budgeted = (frameTime) => {
+    requestAnimationFrame((next) => current === state && !state.paused && view.frameCost(next - frameTime));
+    clearTimeout(state.rest);
+    state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
+  };
+  // Nothing has moved for a while: everything, unless the layout is still
+  // running (its next positions are on their way: look again later).
+  const rested = () => {
+    if (current !== state) return;
+    if (state.layoutDone) redraw(false);
+    else state.rest = setTimeout(rested, view.frameRestMs);
+  };
+  state.cleanup.push(() => clearTimeout(state.rest));
+  // The order the layout worker gives the edges, most important first: the
+  // view writes it to the GPU a piece a task, and draws the order it had
+  // until the new one is whole. A frame with every edge is the same either way.
+  const orderEdges = ({ order, ms }) => {
+    if (!state.orderable || current !== state) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void setTimeout(() => orderEdges({ order, ms }), 50);
+    state.orderMs = ms;
+    try {
+      view.setEdgeOrder(order);
+    } catch {
+      // Not an order of this view's edges: they stay as they are.
+      return;
+    }
+    const more = () => {
+      if (current !== state) return;
+      if (state.paused) return void setTimeout(more, 50);
+      if (view.orderEdges()) setTimeout(more);
+    };
+    more();
   };
   // `input` unless the layout or a test asked: graphTimings' frame intervals
   // are of frames the user's movement asked for.
@@ -499,6 +554,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (current !== state) return;
     if (data.times) for (const [k, v] of Object.entries(data.times)) times[k] ??= v - (performance.timeOrigin - data.origin);
     if (data.memory) state.layoutMemory = data.memory;
+    // The edges' drawing order (#495) is of the edges the layout started
+    // with, whatever was added since.
+    if (data.type === "order") return orderEdges(data);
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
     if (data.type === "positions") {
@@ -1329,6 +1387,10 @@ export function info() {
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,
+    // The frame budget (#495): {k, nodes, edges, ordered, p95, frames, limit}
+    // (GraphView.frameInfo), whether the last frame left anything out, and
+    // the ms the layout worker took to order the edges (null until it has).
+    frame: { ...current.view.frameInfo(), partial: current.view.framePartial, orderMs: current.orderMs },
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
