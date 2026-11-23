@@ -1,5 +1,5 @@
-//! Running `CREATE PROPERTY GRAPH`, `DROP PROPERTY GRAPH`, `SHOW GRAPHS` and
-//! `DESCRIBE GRAPH`.
+//! Running `CREATE PROPERTY GRAPH`, `DROP PROPERTY GRAPH`, `SHOW GRAPHS`,
+//! `DESCRIBE GRAPH` and DuckPGQ's `SUMMARIZE PROPERTY GRAPH`.
 //!
 //! Identifiers are normalized as DataFusion normalizes table names (unquoted
 //! names lower-cased, quoted names kept, unless
@@ -43,6 +43,26 @@ pub(crate) fn show(ctx: &SessionContext) -> Result<DataFrame> {
 pub(crate) async fn describe(ctx: &SessionContext, statement: DescribeGraph) -> Result<DataFrame> {
     let name = graph_name(statement.name, normalizes(ctx))?;
     ctx.read_batch(graph::describe_graph(&ctx.state(), &name).await?)
+}
+
+/// DuckPGQ's `SUMMARIZE PROPERTY GRAPH g`: `SELECT * FROM describe(g)`, for
+/// a graph of one edge table. For more, `describe` needs the pair to run on.
+pub(crate) async fn summarize(ctx: &SessionContext, statement: DescribeGraph) -> Result<DataFrame> {
+    let name = graph_name(statement.name, normalizes(ctx))?;
+    if let Some(g) = graph::registry_of(ctx).get(&name) {
+        if g.edge_tables.len() > 1 {
+            let names: Vec<&str> = g.edge_tables.iter().map(|e| e.name.as_str()).collect();
+            return Err(DataFusionError::Plan(format!(
+                "graph '{name}' has {} edge tables ({}), and SUMMARIZE PROPERTY GRAPH \
+                 summarizes a graph of one; name the pair to describe: SELECT * FROM \
+                 describe({name}, <vertex table>, <edge table>)",
+                names.len(),
+                names.join(", ")
+            )));
+        }
+    }
+    let quoted = Ident::with_quote('"', name.replace('"', "\"\""));
+    ctx.sql(&format!("SELECT * FROM describe({quoted})")).await
 }
 
 /// The definition `statement` makes, with its identifiers normalized. Vertex
