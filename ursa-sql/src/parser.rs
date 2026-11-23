@@ -244,7 +244,10 @@ impl<'a> UrsaParser<'a> {
         if self.word(0, "SUMMARIZE") {
             let at = if self.word(1, "PROPERTY") { 2 } else { 1 };
             if self.word(at, "GRAPH")
-                && matches!(self.df.parser.peek_nth_token_ref(at + 1).token, Token::Word(_))
+                && matches!(
+                    self.df.parser.peek_nth_token_ref(at + 1).token,
+                    Token::Word(_)
+                )
             {
                 for _ in 0..=at {
                     self.df.parser.next_token();

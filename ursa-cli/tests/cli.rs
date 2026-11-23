@@ -1947,7 +1947,9 @@ fn duckdb_habits() {
         "count\n78\n"
     );
     assert!(std::fs::read_to_string(&out).unwrap().starts_with("0|1\n"));
-    let e = fails(&format!("COPY (FROM '{edges}') TO '{out}' (FORMAT csv, PARTITION_BY (src))"));
+    let e = fails(&format!(
+        "COPY (FROM '{edges}') TO '{out}' (FORMAT csv, PARTITION_BY (src))"
+    ));
     assert!(
         e.starts_with("Error: the COPY option PARTITION_BY is not supported"),
         "{e}"
@@ -1960,16 +1962,15 @@ fn duckdb_habits() {
 
     // An unquoted file name.
     let e = fails("FROM karate_edges.csv");
-    assert!(
-        e.contains("quote its path: FROM 'karate_edges.csv'"),
-        "{e}"
-    );
+    assert!(e.contains("quote its path: FROM 'karate_edges.csv'"), "{e}");
 
     // Graph statements and functions.
     let graph = define_karate();
     assert!(csv(&format!("{graph} SHOW PROPERTY GRAPHS")).contains("karate"));
     assert_eq!(
-        csv(&format!("{graph} DROP GRAPH karate; SHOW GRAPHS")).lines().count(),
+        csv(&format!("{graph} DROP GRAPH karate; SHOW GRAPHS"))
+            .lines()
+            .count(),
         1
     );
     let e = fails(&format!("{graph} SELECT pagerank(karate)"));
@@ -1982,13 +1983,17 @@ fn duckdb_habits() {
         e.contains("join its rows on id, as in SELECT * FROM karate.nodes JOIN pagerank(karate) USING (id)"),
         "{e}"
     );
-    let e = fails(&format!("{graph} ALTER PROPERTY GRAPH karate ADD VERTEX TABLES (x)"));
+    let e = fails(&format!(
+        "{graph} ALTER PROPERTY GRAPH karate ADD VERTEX TABLES (x)"
+    ));
     assert!(e.contains("use CREATE OR REPLACE PROPERTY GRAPH"), "{e}");
     assert!(csv(&format!("{graph} SUMMARIZE PROPERTY GRAPH karate")).contains("\n34,78,"));
 
     // ORDER BY ALL, SHOW 'file', TEMP tables.
     assert_eq!(
-        csv(&format!("SELECT dst, src FROM '{edges}' ORDER BY ALL DESC LIMIT 1")),
+        csv(&format!(
+            "SELECT dst, src FROM '{edges}' ORDER BY ALL DESC LIMIT 1"
+        )),
         "dst,src\n33,32\n"
     );
     assert!(csv(&format!("SHOW '{edges}'")).contains("src,Int64,YES"));

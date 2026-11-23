@@ -69,7 +69,12 @@ async fn graphs() -> SessionContext {
 #[tokio::test]
 async fn from_first_under_describe_explain_view_and_copy() {
     let ctx = graphs().await;
-    same(&ctx, "DESCRIBE FROM Student", "DESCRIBE SELECT * FROM Student").await;
+    same(
+        &ctx,
+        "DESCRIBE FROM Student",
+        "DESCRIBE SELECT * FROM Student",
+    )
+    .await;
     same(
         &ctx,
         &format!("DESCRIBE FROM '{}'", karate()),
@@ -79,7 +84,12 @@ async fn from_first_under_describe_explain_view_and_copy() {
     let explain = ok(&ctx, "EXPLAIN FROM Student").await;
     assert!(explain.contains("projection=[id, name]"), "{explain}");
     ok(&ctx, "CREATE VIEW v AS FROM Student WHERE id < 2").await;
-    same(&ctx, "SELECT * FROM v", "SELECT * FROM Student WHERE id < 2").await;
+    same(
+        &ctx,
+        "SELECT * FROM v",
+        "SELECT * FROM Student WHERE id < 2",
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("s.csv").display().to_string();
     ok(&ctx, &format!("COPY (FROM Student) TO '{out}'")).await;
@@ -116,7 +126,11 @@ async fn copy_takes_duckdbs_options() {
 
     // HEADER false and DELIMITER '|'.
     let c = path("out.csv");
-    ok(&ctx, &format!("COPY Student TO '{c}' (HEADER false, DELIMITER '|')")).await;
+    ok(
+        &ctx,
+        &format!("COPY Student TO '{c}' (HEADER false, DELIMITER '|')"),
+    )
+    .await;
     let text = std::fs::read_to_string(&c).unwrap();
     assert!(text.lines().all(|l| l.contains('|')), "{text}");
     assert!(!text.contains("name"), "no header: {text}");
@@ -139,37 +153,64 @@ async fn copy_takes_duckdbs_options() {
     let d = path("df.parquet");
     ok(
         &ctx,
-        &format!("COPY Student TO '{d}' STORED AS PARQUET OPTIONS ('format.compression' 'zstd(1)')"),
+        &format!(
+            "COPY Student TO '{d}' STORED AS PARQUET OPTIONS ('format.compression' 'zstd(1)')"
+        ),
     )
     .await;
 
     // The rest are refused by name.
     let m = err(
         &ctx,
-        &format!("COPY Student TO '{}' (FORMAT parquet, ROW_GROUP_SIZE 1000)", path("x.parquet")),
+        &format!(
+            "COPY Student TO '{}' (FORMAT parquet, ROW_GROUP_SIZE 1000)",
+            path("x.parquet")
+        ),
     )
     .await;
     assert!(
-        m.starts_with("the COPY option ROW_GROUP_SIZE is not supported; Ursa maps DuckDB's FORMAT, HEADER"),
+        m.starts_with(
+            "the COPY option ROW_GROUP_SIZE is not supported; Ursa maps DuckDB's FORMAT, HEADER"
+        ),
         "{m}"
     );
     // An option whose value is a list is refused by name too.
     let m = err(
         &ctx,
-        &format!("COPY Student TO '{}' (FORMAT csv, PARTITION_BY (id, name))", path("x")),
+        &format!(
+            "COPY Student TO '{}' (FORMAT csv, PARTITION_BY (id, name))",
+            path("x")
+        ),
     )
     .await;
-    assert!(m.starts_with("the COPY option PARTITION_BY is not supported"), "{m}");
-    let m = err(&ctx, &format!("COPY Student TO '{}' (FORMAT)", path("x.parquet"))).await;
+    assert!(
+        m.starts_with("the COPY option PARTITION_BY is not supported"),
+        "{m}"
+    );
+    let m = err(
+        &ctx,
+        &format!("COPY Student TO '{}' (FORMAT)", path("x.parquet")),
+    )
+    .await;
     assert_eq!(m, "the COPY option FORMAT needs a value");
-    let m = err(&ctx, &format!("COPY Student TO '{}' (HEADER maybe)", path("x.csv"))).await;
+    let m = err(
+        &ctx,
+        &format!("COPY Student TO '{}' (HEADER maybe)", path("x.csv")),
+    )
+    .await;
     assert!(m.contains("HEADER is true or false"), "{m}");
     let m = err(
         &ctx,
-        &format!("COPY Student TO '{}' (FORMAT csv) STORED AS CSV", path("x.csv")),
+        &format!(
+            "COPY Student TO '{}' (FORMAT csv) STORED AS CSV",
+            path("x.csv")
+        ),
     )
     .await;
-    assert!(m.contains("Expected: end of statement or ;, found: STORED at Line: 1"), "{m}");
+    assert!(
+        m.contains("Expected: end of statement or ;, found: STORED at Line: 1"),
+        "{m}"
+    );
 }
 
 #[tokio::test]
@@ -204,7 +245,10 @@ async fn an_unquoted_file_name_says_to_quote_it() {
     let ctx = ursa_engine::new_session();
     for (sql, path) in [
         ("FROM karate_edges.csv", "karate_edges.csv"),
-        ("SELECT count(*) FROM data.edges.parquet", "data.edges.parquet"),
+        (
+            "SELECT count(*) FROM data.edges.parquet",
+            "data.edges.parquet",
+        ),
         ("COPY karate_edges.csv TO 'x.parquet'", "karate_edges.csv"),
     ] {
         let m = err(&ctx, sql).await;
@@ -279,7 +323,12 @@ async fn drop_show_summarize_and_alter_graph() {
     same(&ctx, "SHOW PROPERTY GRAPHS", "SHOW GRAPHS").await;
 
     // SUMMARIZE PROPERTY GRAPH: describe(g) for one edge table.
-    same(&ctx, "SUMMARIZE PROPERTY GRAPH k", "SELECT * FROM describe(k)").await;
+    same(
+        &ctx,
+        "SUMMARIZE PROPERTY GRAPH k",
+        "SELECT * FROM describe(k)",
+    )
+    .await;
     same(&ctx, "summarize graph k", "SELECT * FROM describe(k)").await;
     assert_eq!(
         err(&ctx, "SUMMARIZE PROPERTY GRAPH pg").await,
@@ -364,7 +413,12 @@ async fn create_temp_table_and_view() {
 #[tokio::test]
 async fn duckdb_function_names() {
     let ctx = graphs().await;
-    same(&ctx, "SELECT list_value(1, 2, 3) AS l", "SELECT make_array(1, 2, 3) AS l").await;
+    same(
+        &ctx,
+        "SELECT list_value(1, 2, 3) AS l",
+        "SELECT make_array(1, 2, 3) AS l",
+    )
+    .await;
     same(
         &ctx,
         "SELECT strftime(TIMESTAMP '2024-03-05 10:11:12', '%Y-%m-%d %H') AS a, \
@@ -396,7 +450,13 @@ async fn duckdb_function_names() {
     )
     .await;
     let m = err(&ctx, "SELECT strftime(1, '%Y')").await;
-    assert!(m.contains("strftime takes a date or timestamp and a format string"), "{m}");
+    assert!(
+        m.contains("strftime takes a date or timestamp and a format string"),
+        "{m}"
+    );
     let m = err(&ctx, "SELECT arg_max(src, dst) OVER () FROM e").await;
-    assert!(m.contains("arg_max(x, y) is an aggregate, not a window function"), "{m}");
+    assert!(
+        m.contains("arg_max(x, y) is an aggregate, not a window function"),
+        "{m}"
+    );
 }

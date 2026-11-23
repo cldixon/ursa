@@ -49,7 +49,9 @@ pub(crate) fn accept(statement: &mut DFStatement) -> datafusion::error::Result<(
         return Ok(());
     };
     match inner.as_mut() {
-        SqlStatement::Set(Set::SingleAssignment { variable, .. }) if is_word(variable, "threads") => {
+        SqlStatement::Set(Set::SingleAssignment { variable, .. })
+            if is_word(variable, "threads") =>
+        {
             if cfg!(target_arch = "wasm32") {
                 return Err(DataFusionError::NotImplemented(
                     "SET threads is not supported in the browser, which runs each query on one \
@@ -136,7 +138,12 @@ fn select_width(body: &SetExpr) -> Option<usize> {
             let Select { projection, .. } = select.as_ref();
             projection
                 .iter()
-                .all(|item| matches!(item, SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }))
+                .all(|item| {
+                    matches!(
+                        item,
+                        SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }
+                    )
+                })
                 .then_some(projection.len())
         }
         SetExpr::Query(query) => select_width(&query.body),
@@ -181,9 +188,11 @@ fn scalar_graph_call(statement: &DFStatement, message: &str) -> Option<String> {
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
             match expr {
                 Expr::Function(f)
-                    if f.name.0.last().and_then(|p| p.as_ident()).is_some_and(|i| {
-                        i.value.eq_ignore_ascii_case(self.0)
-                    }) =>
+                    if f.name
+                        .0
+                        .last()
+                        .and_then(|p| p.as_ident())
+                        .is_some_and(|i| i.value.eq_ignore_ascii_case(self.0)) =>
                 {
                     ControlFlow::Break(f.to_string())
                 }

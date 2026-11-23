@@ -196,7 +196,12 @@ FROM 'karate_edges.csv';
 ```
 
 ```text
-placeholder
+┌─────────────┬────────────┬─────────────────────┬──────────┐
+│      l      │    day     │          t          │ last_dst │
+│ List(Int64) │    Utf8    │    Timestamp(ms)    │  Int64   │
+├─────────────┼────────────┼─────────────────────┼──────────┤
+│ [1, 2]      │ 05/03/2024 │ 1970-01-02T00:00:00 │       33 │
+└─────────────┴────────────┴─────────────────────┴──────────┘
 ```
 
 `arg_max` and `arg_min` are aggregates, not window functions. DuckDB's lambdas (`list_transform(l, x -> x + 1)`) and reuse of a column alias in the same `SELECT` are not supported. The graph functions are table functions: `SELECT pagerank(g)` says to write `SELECT * FROM pagerank(g)`, and a graph function named as a column (`SELECT id, pagerank FROM g.nodes`) says to join its rows on `id`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.

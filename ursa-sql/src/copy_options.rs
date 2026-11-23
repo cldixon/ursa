@@ -158,11 +158,11 @@ fn option_value(value: Value) -> String {
     }
 }
 
+/// DataFusion's `STORED AS` format and its `OPTIONS` list.
+type StoredAsAndOptions = (Option<String>, Vec<(String, Value)>);
+
 /// DuckDB's options as DataFusion's `STORED AS` and `OPTIONS`.
-fn map_options(
-    target: &str,
-    written: Vec<(String, Option<String>)>,
-) -> Result<(Option<String>, Vec<(String, Value)>)> {
+fn map_options(target: &str, written: Vec<(String, Option<String>)>) -> Result<StoredAsAndOptions> {
     let mut stored_as = None;
     let mut options = Vec::new();
     let mut compression = None;
@@ -228,7 +228,10 @@ fn compression_option(codec: &str, parquet: bool) -> Option<String> {
 }
 
 fn option(key: &str, value: &str) -> (String, Value) {
-    (key.to_string(), Value::SingleQuotedString(value.to_string()))
+    (
+        key.to_string(),
+        Value::SingleQuotedString(value.to_string()),
+    )
 }
 
 #[cfg(test)]
@@ -239,9 +242,18 @@ mod tests {
     fn compression_names() {
         assert_eq!(compression_option("ZSTD", true).as_deref(), Some("zstd(3)"));
         assert_eq!(compression_option("zstd", false).as_deref(), Some("zstd"));
-        assert_eq!(compression_option("snappy", true).as_deref(), Some("snappy"));
-        assert_eq!(compression_option("zstd(9)", true).as_deref(), Some("zstd(9)"));
-        assert_eq!(compression_option("none", false).as_deref(), Some("uncompressed"));
+        assert_eq!(
+            compression_option("snappy", true).as_deref(),
+            Some("snappy")
+        );
+        assert_eq!(
+            compression_option("zstd(9)", true).as_deref(),
+            Some("zstd(9)")
+        );
+        assert_eq!(
+            compression_option("none", false).as_deref(),
+            Some("uncompressed")
+        );
         assert_eq!(compression_option("auto", true), None);
     }
 }

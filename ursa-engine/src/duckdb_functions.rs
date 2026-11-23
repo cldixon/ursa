@@ -168,10 +168,9 @@ impl ScalarUDFImpl for EpochMs {
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         match arg_types {
             [ty] if ty.is_integer() || ty.is_null() => Ok(vec![DataType::Int64]),
-            [DataType::Timestamp(_, tz)] => Ok(vec![DataType::Timestamp(
-                TimeUnit::Millisecond,
-                tz.clone(),
-            )]),
+            [DataType::Timestamp(_, tz)] => {
+                Ok(vec![DataType::Timestamp(TimeUnit::Millisecond, tz.clone())])
+            }
             [DataType::Date32 | DataType::Date64] => Ok(vec![MILLIS]),
             [ty] => plan_err!(
                 "epoch_ms takes milliseconds (an integer) or a date or timestamp; got {ty}"
@@ -267,8 +266,11 @@ impl AggregateUDFImpl for ArgBest {
             if !order_by.is_empty() {
                 return plan_err!("{name}(x, y) takes no ORDER BY: y is what it orders by");
             }
-            let [x, y] = <[Expr; 2]>::try_from(args)
-                .map_err(|_| datafusion::error::DataFusionError::Plan(format!("{name} takes two arguments, as in {name}(x, y)")))?;
+            let [x, y] = <[Expr; 2]>::try_from(args).map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "{name} takes two arguments, as in {name}(x, y)"
+                ))
+            })?;
             // As DuckDB's arg_max: rows where either is NULL are skipped.
             let present = x.clone().is_not_null().and(y.clone().is_not_null());
             let filter = match filter {

@@ -827,5 +827,8 @@ fn temp_tables_and_views_run_and_are_not_stored() {
     assert!(out.ends_with("y\n2\n"), "{out}");
     assert!(catalog(&dir.path().join("club.ursa")).is_empty());
     let e = err(ursa_in(dir.path(), &["club.ursa", "-c", "SELECT * FROM v"]));
-    assert!(e.contains("table 'datafusion.public.v' not found") || e.contains("'v'"), "{e}");
+    assert!(
+        e.contains("table 'datafusion.public.v' not found") || e.contains("'v'"),
+        "{e}"
+    );
 }
