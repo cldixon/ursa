@@ -192,9 +192,9 @@ async fn equals_the_edge_table_filtered_to_the_nodes() {
                     "SELECT id FROM degree(rmat) ORDER BY degree DESC, id LIMIT 300",
                 ),
                 (
-                    "(SELECT id FROM hop(rmat, seeds => [1], n => 2, direction => 'both') \
+                    "(SELECT id FROM hop(rmat, seeds => [1], steps => 2, direction => 'both') \
                      UNION SELECT 1)",
-                    "SELECT id FROM hop(rmat, seeds => [1], n => 2, direction => 'both') \
+                    "SELECT id FROM hop(rmat, seeds => [1], steps => 2, direction => 'both') \
                      UNION SELECT 1",
                 ),
             ],

@@ -967,7 +967,7 @@ fn traversals_match_getting_started() {
     // "Member 0 has 16 friends, so this returns 16 rows."
     let sql = format!(
         "{}
-         SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
+         SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');",
         define_karate()
     );
     let out = ok(ursa(&["--format", "csv", "-c", &sql]));
@@ -984,7 +984,7 @@ fn traversals_match_getting_started() {
         "{}
          SELECT * FROM hop(karate,
                            seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                           n => 2);",
+                           steps => 2);",
         define_karate()
     );
     assert_eq!(
@@ -1046,7 +1046,7 @@ fn traversals_match_getting_started() {
         ok(ursa(&["-c", &sql])),
         "\
 ┌───────┬───────┬───────┬─────────┐
-│  src  │  dst  │  hop  │  cost   │
+│  src  │  dst  │ step  │  cost   │
 │ Int64 │ Int64 │ Int64 │ Float64 │
 ├───────┼───────┼───────┼─────────┤
 │     0 │     8 │     0 │     1.0 │
@@ -1063,7 +1063,7 @@ fn traversals_match_getting_started() {
             )
         ])),
         "Error: algorithms(): hop() is a traversal, which returns rows of its own, not one per \
-         node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], n => 1, \
+         node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], steps => 1, \
          direction => 'out')\n"
     );
 }

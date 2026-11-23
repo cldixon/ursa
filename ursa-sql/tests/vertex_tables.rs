@@ -222,7 +222,7 @@ async fn a_node_on_no_edge_reaches_nothing() {
     assert_eq!(
         ok(
             &ctx,
-            "SELECT * FROM random_walk(g, start => [5], steps => 3, seed => 1)"
+            "SELECT * FROM random_walk(g, seeds => [5], steps => 3, random_seed => 1)"
         )
         .await,
         ["0,0,5"]

@@ -434,7 +434,7 @@ fn set_layout(drawing: &mut Drawing, layout: ursa_viz::model::Layout) -> Result<
         return plan_err(format!(
             "LAYOUT {name} places each node by its distance from a seed or its step along a path, \
              and {what} {} neither. Draw a hop result or paths (.graph SELECT * FROM hop(g, seeds \
-             => [1], n => 2) LAYOUT {name}), say which columns are one (AS hops(seed, id, \
+             => [1], steps => 2) LAYOUT {name}), say which columns are one (AS hops(seed, id, \
              distance)), or use LAYOUT force",
             if what == "this drawing" || what == "a property graph" {
                 "has"

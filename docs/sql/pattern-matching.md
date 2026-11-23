@@ -252,7 +252,7 @@ A match is fast when it starts from a few nodes. Name them by their key, in the 
 - `(a WHERE a.id IN (0, 33))`, a list;
 - `WHERE a.id IN (SELECT id FROM members WHERE club = 'Officer')`, a subquery. For now, a table that a subquery inside the pattern reads must also be named in the statement outside the `GRAPH_TABLE`, as in `… FROM GRAPH_TABLE (…) g JOIN members m ON m.id = g.id`; otherwise it is reported as not found.
 
-Such a node is *bound*. From a bound node, every edge of its path is followed on the graph index, outward from it, one edge at a time from the nodes the edge before reached: `MATCH (a WHERE a.id = 33)-[]-(b)-[]-(c)` reads only the edges at member 33 and at its neighbours, never the whole edge table. With the index stored in a database, that takes about as long as `hop(karate, seeds => [33], n => 2)`. The bound node can be anywhere in the path; the edges on its left are followed backward.
+Such a node is *bound*. From a bound node, every edge of its path is followed on the graph index, outward from it, one edge at a time from the nodes the edge before reached: `MATCH (a WHERE a.id = 33)-[]-(b)-[]-(c)` reads only the edges at member 33 and at its neighbours, never the whole edge table. With the index stored in a database, that takes about as long as `hop(karate, seeds => [33], steps => 2)`. The bound node can be anywhere in the path; the edges on its left are followed backward.
 
 A node whose key is all the query reads (in `COLUMNS` and the conditions) is not joined to its vertex table: its keys come from the index. The vertex table is read only for the properties the query asks for, such as `c.club`.
 

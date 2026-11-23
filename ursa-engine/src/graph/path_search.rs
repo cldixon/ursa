@@ -1293,7 +1293,7 @@ impl<'a, T: States> Walker<'a, T> {
 fn too_many_paths(limit: usize, search: &Search, bounded: bool) -> DataFusionError {
     const RAISE: &str = "or SET ursa.max_paths to a higher limit (0 for none)";
     const HOP: &str = "count the nodes at each distance with hop(…) \
-                       (SELECT distance, count(*) FROM hop(g, seeds => […], n => …) GROUP BY 1)";
+                       (SELECT distance, count(*) FROM hop(g, seeds => […], steps => …) GROUP BY 1)";
     let remedy = match search.selector {
         Selector::All => format!(
             "give the quantified edge a lower upper bound, keep fewer paths with ANY SHORTEST, \
@@ -2079,10 +2079,10 @@ mod tests {
             (3, None),
         ];
         let expected: &[(&str, u64, usize)] = &[
-            ("know", 11234326496623982603, 71739),
-            ("chain", 17288712035607911604, 234240),
-            ("uniform", 15178768632453315796, 385893),
-            ("rmat", 17019204663491492836, 276899),
+            ("know", 12579871203238691482, 71739),
+            ("chain", 1410182832036601776, 234240),
+            ("uniform", 5017031796771702360, 385893),
+            ("rmat", 9397029938903403620, 276899),
         ];
         let mut got = Vec::new();
         for threads in [1, 4] {

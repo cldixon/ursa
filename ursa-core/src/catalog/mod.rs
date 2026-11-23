@@ -55,5 +55,4 @@ pub use eval::{DispatchError, Evaluator, Inputs, OutputDtype};
 pub use spec::{
     direction_name, lookup, names, parse_direction, Bound, ColumnType, Family, FunctionSpec,
     OutputKind, OutputSpec, ParamSpec, ParamType, Range, Shape, Value, ALL_DIRECTIONS, FUNCTIONS,
-    OUT_OR_BOTH,
 };

@@ -143,7 +143,8 @@ pub enum Call {
         damping: f64,
         max_iter: u32,
         tol: f64,
-        /// `Out` (the stored rows) or `Both` (the undirected view).
+        /// `Out` (the stored rows), `In` (the reversed graph) or `Both` (the
+        /// undirected view).
         direction: Direction,
     },
     ConnectedComponents {
@@ -160,7 +161,8 @@ pub enum Call {
     Betweenness {
         sample: Option<f64>,
         seed: Option<u64>,
-        /// `Out` (directed) or `Both` (undirected view, halved).
+        /// `Out` (directed), `In` (the reversed graph) or `Both` (undirected
+        /// view, halved).
         direction: Direction,
     },
     LabelPropagation {

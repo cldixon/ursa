@@ -132,7 +132,7 @@ async fn hop_is_rings_at_distance_1_and_2_with_the_real_edges() {
     let ctx = karate().await;
     let view = after(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')",
     )
     .await;
     let r = &view.result;
@@ -414,7 +414,7 @@ async fn as_overrides_what_a_graph_query_says_it_is() {
     let ctx = karate().await;
     // A hop result is rings by rule 2; as edges it is the star it was before
     // #433, and as nodes the reached nodes with the ties among them.
-    let hop = "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    let hop = "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')";
     let rows: usize = Sql
         .run(&ctx, hop)
         .await

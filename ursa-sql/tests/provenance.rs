@@ -120,7 +120,7 @@ async fn traversals_say_what_their_columns_are() {
             ),
             // No vertex table, no label.
             (
-                "SELECT * FROM hop(karate_edges_only, seeds => [0], n => 2)",
+                "SELECT * FROM hop(karate_edges_only, seeds => [0], steps => 2)",
                 "seed: seed karate_edges_only\nid: node karate_edges_only\n\
                  distance: distance karate_edges_only",
             ),
@@ -129,7 +129,7 @@ async fn traversals_say_what_their_columns_are() {
                 "src: src karate members\ndst: dst karate members\nhop: step karate\ncost:",
             ),
             (
-                "SELECT * FROM random_walk(karate, start => [0], steps => 2)",
+                "SELECT * FROM random_walk(karate, seeds => [0], steps => 2)",
                 "walk_id: walk karate\nstep: step karate\nnode: node karate members",
             ),
             // No rows, the same schema.

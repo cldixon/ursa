@@ -230,7 +230,7 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 
 ```text
 ┌───────┬───────┬───────┬─────────┐
-│  src  │  dst  │  hop  │  cost   │
+│  src  │  dst  │ step  │  cost   │
 │ Int64 │ Int64 │ Int64 │ Float64 │
 ├───────┼───────┼───────┼─────────┤
 │     0 │     8 │     0 │     1.0 │
@@ -242,7 +242,7 @@ SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'bot
 SELECT count(*) AS reached
 FROM hop(karate,
          seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-         n => 2);
+         steps => 2);
 ```
 
 - `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row. Rows come in no particular order: add `ORDER BY` when it matters.
@@ -412,7 +412,7 @@ CREATE PROPERTY GRAPH lesmis_strong
   EDGE TABLES (strong_ties SOURCE KEY (src) DESTINATION KEY (dst));
 
 SELECT count(DISTINCT id) AS reached
-FROM hop(lesmis_strong, seeds => ['Valjean'], n => 2, direction => 'both');
+FROM hop(lesmis_strong, seeds => ['Valjean'], steps => 2, direction => 'both');
 ```
 
 ```text

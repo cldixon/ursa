@@ -10,9 +10,13 @@
 //! and output columns as the Python library's `ur.hop(edges, n,
 //! direction).from_(seeds)`, `ur.shortest_path(edges, source, target, weight,
 //! direction)` and `ur.random_walk(edges, start, steps, walks_per_node,
-//! seed)` (`python/ursa/_graph.py`, `ursa-plan`'s `result.rs`). The parity
-//! fixture records the Python signatures and outputs, and
-//! `tests/parity.rs` holds these specs to them.
+//! seed)` (`python/ursa/_graph.py`, `ursa-plan`'s `result.rs`), with SQL's
+//! own names where #415 gave every role one name ([`PYTHON_NAMES`]): SQL's
+//! `steps` and `seeds` are Python's `n` and `start`, SQL's `random_seed` is
+//! `random_walk`'s `seed`, and SQL's `id` and `step` columns are
+//! `random_walk`'s `node` and `shortest_path`'s `hop`. The parity fixture
+//! records the Python signatures and outputs, and `tests/parity.rs` holds
+//! these specs to them through that table.
 //!
 //! The literal parameters use the catalog's [`ParamType`]s and are checked by
 //! the catalog's rules (a count is a non-negative integer below 2^32, a seed a
@@ -27,6 +31,12 @@
 //! deliberate difference: SQL's `hop` names its columns `(seed, id,
 //! distance)`, where Python's `EdgeFrame` has `(src, dst)` and no distance
 //! (#328); the parity test compares `seed` and `id` with `src` and `dst`.
+//!
+//! A literal node id that names no node of the graph is an error (#416):
+//! `hop(seeds =>): 99 is not a node of graph 'pg'`. Ids from a subquery are
+//! the data's, so one that is not a node is skipped, and a notice says how
+//! many were ([`TraversalSpec::strict_ids`]; `induced_edges`, whose node set
+//! may name anything, skips them always).
 //!
 //! `induced_edges` (#432) is SQL's own: the Python library has no function
 //! for the edges among a node set ([`TraversalSpec::python`] is false), so
@@ -49,7 +59,9 @@ use ursa_core::catalog::{
 };
 use ursa_core::{Direction, IdMap, Topology};
 
-use super::functions::{did_you_mean, expected_text, plan, sql_value, Literal};
+use super::functions::{
+    direction_arg, expected_text, plan, sql_value, takes, unknown_param_text, Given, Literal,
+};
 use super::provenance;
 
 /// What a traversal parameter takes.
@@ -82,6 +94,16 @@ impl TraversalParam {
             self.ty,
             TraversalParamType::Nodes | TraversalParamType::Node
         )
+    }
+
+    /// Whether the parameter can take an argument shaped `given`: node ids
+    /// are a list (for several), a query, an id or an expression.
+    pub fn takes(&self, given: Given) -> bool {
+        match self.ty {
+            TraversalParamType::Nodes => given != Given::Number && given != Given::Boolean,
+            TraversalParamType::Node => !matches!(given, Given::Number | Given::Boolean | Given::List),
+            TraversalParamType::Param(ty) => takes(self.name, ty, given),
+        }
     }
 
     /// Whether the parameter is the weight expression.
@@ -144,7 +166,20 @@ pub struct TraversalSpec {
     /// Whether the Python library has the traversal, with the same
     /// parameters and rows: the parity test holds those to it.
     pub python: bool,
+    /// Whether a literal node id that is not a node of the graph is an error
+    /// (#416). Ids from a subquery are skipped either way, with a notice.
+    pub strict_ids: bool,
 }
+
+/// The names SQL gives a traversal's parameters and columns where the Python
+/// library's differ (#415): `(function, SQL name, Python name)`.
+pub const PYTHON_NAMES: &[(&str, &str, &str)] = &[
+    ("hop", "steps", "n"),
+    ("random_walk", "seeds", "start"),
+    ("random_walk", "random_seed", "seed"),
+    ("random_walk", "id", "node"),
+    ("shortest_path", "step", "hop"),
+];
 
 impl TraversalSpec {
     /// The parameter called `name`.
@@ -208,7 +243,7 @@ impl TraversalSpec {
         )
     }
 
-    /// `hop(<graph>, seeds => [<id>, ...], n => 1, direction => 'out')`: the
+    /// `hop(<graph>, seeds => [<id>, ...], steps => 1, direction => 'out')`: the
     /// call with every parameter at its default, for messages.
     pub fn signature(&self) -> String {
         let mut parts = vec!["<graph>".to_string()];
@@ -250,12 +285,12 @@ const DIRECTION: TraversalParam = param(
 pub static TRAVERSALS: &[TraversalSpec] = &[
     TraversalSpec {
         name: "hop",
-        summary: "The nodes within n steps of each seed: one (seed, id, distance) row per seed \
+        summary: "The nodes within steps of each seed: one (seed, id, distance) row per seed \
                   and node reached, distance the fewest steps from the seed to it. A seed is not \
                   its own row; a repeated seed repeats its rows. The rows come in no particular \
                   order; use ORDER BY for one.",
         networkx: Some(
-            "nx.single_source_shortest_path_length(G, seed, cutoff=n), the seed left out \
+            "nx.single_source_shortest_path_length(G, seed, cutoff=steps), the seed left out \
              (in: on G.reverse(); both: on U)",
         ),
         params: &[
@@ -266,7 +301,7 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
                 "The nodes to start from: a list, a query of one column, or one id.",
             ),
             param(
-                "n",
+                "steps",
                 TraversalParamType::Param(ParamType::Count),
                 Some(Value::UInt(1)),
                 "How many steps to take.",
@@ -283,11 +318,14 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             ),
         ],
         python: true,
+        strict_ids: true,
     },
     TraversalSpec {
         name: "shortest_path",
         summary: "One shortest path from source to target: one row per edge, in order, with its \
-                  0-based position (hop) and the cost from source to its end. No path, no rows.",
+                  0-based position (step) and the cost from source to its end. No path, no \
+                  rows; nor when source is target, as a path of no edges has no edge rows (to \
+                  ask whether a path exists, use GRAPH_TABLE and path_length(p)).",
         networkx: Some(
             "nx.shortest_path(G, source, target) (weighted: nx.dijkstra_path(G, source, target, \
              weight=...))",
@@ -317,19 +355,20 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
         outputs: &[
             out("src", OutputType::Id, Some(provenance::ROLE_SRC)),
             out("dst", OutputType::Id, Some(provenance::ROLE_DST)),
-            out("hop", OutputType::Int64, Some(provenance::ROLE_STEP)),
+            out("step", OutputType::Int64, Some(provenance::ROLE_STEP)),
             out("cost", OutputType::Float64, None),
         ],
         python: true,
+        strict_ids: true,
     },
     TraversalSpec {
         name: "random_walk",
-        summary: "Random walks along out-edges from each start node: one (walk_id, step, node) \
-                  row per step. A walk stops early at a node with no out-edges.",
+        summary: "Random walks along out-edges from each seed: one (walk_id, step, id) row per \
+                  step. A walk stops early at a node with no out-edges.",
         networkx: None,
         params: &[
             param(
-                "start",
+                "seeds",
                 TraversalParamType::Nodes,
                 None,
                 "The nodes to start walks at: a list, a query of one column, or one id.",
@@ -344,10 +383,10 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
                 "walks_per_node",
                 TraversalParamType::Param(ParamType::Count),
                 Some(Value::UInt(1)),
-                "How many walks start at each start node.",
+                "How many walks start at each seed.",
             ),
             param(
-                "seed",
+                "random_seed",
                 TraversalParamType::Param(ParamType::Seed),
                 Some(Value::Null),
                 "Seed for the deterministic random stream; null is a fixed default.",
@@ -356,9 +395,10 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
         outputs: &[
             out("walk_id", OutputType::Int64, Some(provenance::ROLE_WALK)),
             out("step", OutputType::Int64, Some(provenance::ROLE_STEP)),
-            out("node", OutputType::Id, Some(provenance::ROLE_NODE)),
+            out("id", OutputType::Id, Some(provenance::ROLE_NODE)),
         ],
         python: true,
+        strict_ids: true,
     },
     TraversalSpec {
         name: "induced_edges",
@@ -379,6 +419,7 @@ pub static TRAVERSALS: &[TraversalSpec] = &[
             out("edge", OutputType::Int64, Some(provenance::ROLE_EDGE)),
         ],
         python: false,
+        strict_ids: false,
     },
 ];
 
@@ -392,7 +433,7 @@ pub fn lookup(name: &str) -> Option<&'static TraversalSpec> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Traversal {
     Hop {
-        n: u32,
+        steps: u32,
         direction: Direction,
     },
     ShortestPath {
@@ -401,7 +442,7 @@ pub enum Traversal {
     RandomWalk {
         steps: u32,
         walks_per_node: u32,
-        seed: Option<u64>,
+        random_seed: Option<u64>,
     },
     InducedEdges,
 }
@@ -425,16 +466,16 @@ impl Traversal {
     fn value(&self, name: &str) -> Option<Value> {
         let seed = |s: Option<u64>| s.map_or(Value::Null, Value::UInt);
         Some(match (self, name) {
-            (Traversal::Hop { n, .. }, "n") => Value::UInt(u64::from(*n)),
+            (Traversal::Hop { steps, .. }, "steps")
+            | (Traversal::RandomWalk { steps, .. }, "steps") => Value::UInt(u64::from(*steps)),
             (Traversal::Hop { direction, .. }, "direction")
             | (Traversal::ShortestPath { direction }, "direction") => {
                 Value::Str(direction_name(*direction))
             }
-            (Traversal::RandomWalk { steps, .. }, "steps") => Value::UInt(u64::from(*steps)),
             (Traversal::RandomWalk { walks_per_node, .. }, "walks_per_node") => {
                 Value::UInt(u64::from(*walks_per_node))
             }
-            (Traversal::RandomWalk { seed: s, .. }, "seed") => seed(*s),
+            (Traversal::RandomWalk { random_seed, .. }, "random_seed") => seed(*random_seed),
             _ => return None,
         })
     }
@@ -462,17 +503,21 @@ impl Traversal {
     }
 }
 
-/// "hop() has no parameter 'm'; did you mean 'n'? ...".
-pub fn unknown_param(spec: &TraversalSpec, name: &str) -> DataFusionError {
-    let names: Vec<&str> = spec.params.iter().map(|p| p.name).collect();
-    let hint = did_you_mean(name, names.iter().copied())
-        .map(|s| format!("; did you mean '{s}'?"))
-        .unwrap_or_else(|| ".".to_string());
-    plan(format!(
-        "{}() has no parameter '{name}'{hint} Its parameters are: {}",
-        spec.name,
-        names.join(", ")
-    ))
+/// "hop() has no parameter 'n'; did you mean 'steps'? ...": `given` is the
+/// argument's shape, if known, so the suggestion can take it (#415).
+pub fn unknown_param(spec: &TraversalSpec, name: &str, given: Option<Given>) -> DataFusionError {
+    let takers: Vec<Box<dyn Fn(Given) -> bool>> = spec
+        .params
+        .iter()
+        .map(|p| Box::new(move |g| p.takes(g)) as Box<dyn Fn(Given) -> bool>)
+        .collect();
+    let entries: Vec<(&str, &dyn Fn(Given) -> bool)> = spec
+        .params
+        .iter()
+        .zip(&takers)
+        .map(|(p, t)| (p.name, t.as_ref()))
+        .collect();
+    plan(unknown_param_text(spec.name, name, given, &entries))
 }
 
 /// "random_walk() needs 'steps': random_walk(<graph>, ...)".
@@ -585,12 +630,22 @@ fn check(spec: &TraversalSpec, name: &str, ty: ParamType, literal: &Literal) -> 
             _ => Err(expected(Expected::Seed)),
         },
         ParamType::Direction(choices) => match literal {
-            Literal::String(s) if choices.contains(&s.as_str()) => Ok(Value::Str(
-                choices
-                    .iter()
-                    .find(|c| **c == s.as_str())
-                    .expect("checked above"),
-            )),
+            Literal::String(s) => {
+                // In any case (#415).
+                let s = direction_arg(spec.name, name, s)?;
+                match choices.iter().find(|c| **c == s.as_str()) {
+                    Some(c) => Ok(Value::Str(c)),
+                    None => {
+                        let options: Vec<String> =
+                            choices.iter().map(|o| format!("'{o}'")).collect();
+                        Err(plan(format!(
+                            "{}({name} => {literal}) is not supported; use one of {}",
+                            spec.name,
+                            options.join(", ")
+                        )))
+                    }
+                }
+            }
             _ => {
                 let options: Vec<String> = choices.iter().map(|o| format!("'{o}'")).collect();
                 Err(plan(format!(
@@ -646,7 +701,7 @@ pub fn resolve(spec: &'static TraversalSpec, literals: &[(String, Literal)]) -> 
     };
     Ok(match spec.name {
         "hop" => Traversal::Hop {
-            n: count("n"),
+            steps: count("steps"),
             direction: direction("direction"),
         },
         "shortest_path" => Traversal::ShortestPath {
@@ -655,7 +710,7 @@ pub fn resolve(spec: &'static TraversalSpec, literals: &[(String, Literal)]) -> 
         "random_walk" => Traversal::RandomWalk {
             steps: count("steps"),
             walks_per_node: count("walks_per_node"),
-            seed: seed("seed"),
+            random_seed: seed("random_seed"),
         },
         "induced_edges" => Traversal::InducedEdges,
         other => unreachable!("no traversal {other}"),
@@ -679,9 +734,9 @@ pub fn batch(
     // An id not in the graph reaches nothing (#225), as in ursa-plan.
     let known = |i: usize| -> Vec<u32> { nodes[i].iter().flatten().copied().collect() };
     let columns: Vec<ArrayRef> = match *traversal {
-        Traversal::Hop { n, direction } => {
+        Traversal::Hop { steps, direction } => {
             let (seed, reached, distance) =
-                k_hop_distances_masked(topology, None, &known(0), n, direction);
+                k_hop_distances_masked(topology, None, &known(0), steps, direction);
             let distance: Vec<i64> = distance.into_iter().map(i64::from).collect();
             vec![
                 ids.gather_user(&seed),
@@ -702,12 +757,12 @@ pub fn batch(
                 },
                 _ => None,
             };
-            let (mut src, mut dst, mut hop, mut cost) = (vec![], vec![], vec![], vec![]);
+            let (mut src, mut dst, mut step, mut cost) = (vec![], vec![], vec![], vec![]);
             if let Some((path, costs)) = route {
                 for (i, pair) in path.windows(2).enumerate() {
                     src.push(pair[0]);
                     dst.push(pair[1]);
-                    hop.push(i as i64);
+                    step.push(i as i64);
                     // The cost to this edge's end: the settled distance when
                     // weighted, the edge count otherwise.
                     cost.push(match &costs {
@@ -719,16 +774,23 @@ pub fn batch(
             vec![
                 ids.gather_user(&src),
                 ids.gather_user(&dst),
-                Arc::new(Int64Array::from(hop)),
+                Arc::new(Int64Array::from(step)),
                 Arc::new(Float64Array::from(cost)),
             ]
         }
         Traversal::RandomWalk {
             steps,
             walks_per_node,
-            seed,
+            random_seed,
         } => {
-            let walks = random_walk_masked(topology, None, &known(0), steps, walks_per_node, seed);
+            let walks = random_walk_masked(
+                topology,
+                None,
+                &known(0),
+                steps,
+                walks_per_node,
+                random_seed,
+            );
             vec![
                 Arc::new(Int64Array::from(walks.walk_id)),
                 Arc::new(Int64Array::from(walks.step)),
@@ -807,7 +869,7 @@ mod tests {
         assert_eq!(
             call("hop", &[]).unwrap(),
             Traversal::Hop {
-                n: 1,
+                steps: 1,
                 direction: Direction::Out
             }
         );
@@ -822,7 +884,7 @@ mod tests {
             Traversal::RandomWalk {
                 steps: 4,
                 walks_per_node: 1,
-                seed: None
+                random_seed: None
             }
         );
     }
@@ -830,12 +892,12 @@ mod tests {
     #[test]
     fn explains_bad_arguments() {
         assert_eq!(
-            message(call("hop", &[("n", num("-1"))])),
-            "hop(n =>) must be a non-negative integer below 2^32; got -1"
+            message(call("hop", &[("steps", num("-1"))])),
+            "hop(steps =>) must be a non-negative integer below 2^32; got -1"
         );
         assert_eq!(
-            message(call("hop", &[("n", num("1.5"))])),
-            "hop(n =>) must be a non-negative integer below 2^32; got 1.5"
+            message(call("hop", &[("steps", num("1.5"))])),
+            "hop(steps =>) must be a non-negative integer below 2^32; got 1.5"
         );
         assert_eq!(
             message(call("hop", &[("direction", Literal::String("up".into()))])),
@@ -843,28 +905,91 @@ mod tests {
         );
         assert_eq!(
             message(call("random_walk", &[])),
-            "random_walk() needs 'steps': random_walk(<graph>, start => [<id>, ...], steps => \
-             <integer>, walks_per_node => 1, seed => NULL)"
+            "random_walk() needs 'steps': random_walk(<graph>, seeds => [<id>, ...], steps => \
+             <integer>, walks_per_node => 1, random_seed => NULL)"
         );
         assert_eq!(
             message(call(
                 "random_walk",
-                &[("steps", num("2")), ("seed", Literal::String("x".into()))]
+                &[("steps", num("2")), ("random_seed", Literal::String("x".into()))]
             )),
-            "random_walk(seed =>) must be a non-negative integer or NULL; got 'x'"
+            "random_walk(random_seed =>) must be a non-negative integer or NULL; got 'x'"
         );
         assert_eq!(
-            crate::user_message(&unknown_param(lookup("hop").unwrap(), "m")),
-            "hop() has no parameter 'm'; did you mean 'n'? Its parameters are: seeds, n, \
-             direction"
+            message(call("hop", &[("direction", Literal::String("UNDIRECTED".into()))])),
+            "hop(direction => 'UNDIRECTED') is not supported; use 'both', which reads every \
+             edge both ways (the undirected view)"
         );
+        assert_eq!(
+            call("hop", &[("direction", Literal::String("Both".into()))]).unwrap(),
+            Traversal::Hop {
+                steps: 1,
+                direction: Direction::Both
+            }
+        );
+    }
+
+    /// #415: the names others use point to Ursa's, and a suggestion can take
+    /// the value given.
+    #[test]
+    fn suggests_the_name_to_use() {
+        let hint = |function: &str, name: &str, given: Given| {
+            crate::user_message(&unknown_param(lookup(function).unwrap(), name, Some(given)))
+        };
+        for (function, name, given, want) in [
+            ("hop", "n", Given::Integer, "steps"),
+            ("hop", "max_hops", Given::Integer, "steps"),
+            ("hop", "depth", Given::Integer, "steps"),
+            ("hop", "k", Given::Integer, "steps"),
+            ("hop", "start", Given::List, "seeds"),
+            ("hop", "stepz", Given::Integer, "steps"),
+            ("random_walk", "start", Given::List, "seeds"),
+            ("random_walk", "n", Given::Integer, "steps"),
+            ("random_walk", "seed", Given::Integer, "random_seed"),
+            // A list is node ids, never a random seed (the near miss #415
+            // found).
+            ("random_walk", "seed", Given::List, "seeds"),
+            ("random_walk", "sed", Given::List, "seeds"),
+            ("shortest_path", "src", Given::Integer, "source"),
+            ("shortest_path", "dst", Given::Integer, "target"),
+        ] {
+            let message = hint(function, name, given);
+            assert!(
+                message.contains(&format!("did you mean '{want}'?")),
+                "{function}({name}): {message}"
+            );
+        }
+        assert_eq!(
+            hint("hop", "n", Given::Integer),
+            "hop() has no parameter 'n'; did you mean 'steps'? Its parameters are: seeds, \
+             steps, direction"
+        );
+        // Nothing that can take a string is close to 'steps'.
+        assert_eq!(
+            hint("random_walk", "stepz", Given::String),
+            "random_walk() has no parameter 'stepz'. Its parameters are: seeds, steps, \
+             walks_per_node, random_seed"
+        );
+    }
+
+    /// Every SQL name that differs from the Python library's is listed, so
+    /// the parity test can map it.
+    #[test]
+    fn python_names_are_sql_names() {
+        for (function, sql, _) in PYTHON_NAMES {
+            let spec = lookup(function).unwrap();
+            assert!(
+                spec.param(sql).is_some() || spec.outputs.iter().any(|o| o.name == *sql),
+                "{function} has no {sql}"
+            );
+        }
     }
 
     #[test]
     fn signatures_show_defaults() {
         assert_eq!(
             lookup("hop").unwrap().signature(),
-            "hop(<graph>, seeds => [<id>, ...], n => 1, direction => 'out')"
+            "hop(<graph>, seeds => [<id>, ...], steps => 1, direction => 'out')"
         );
         assert_eq!(
             lookup("shortest_path").unwrap().signature(),
@@ -875,10 +1000,10 @@ mod tests {
 
     #[test]
     fn explain_spells_the_call() {
-        let hop = call("hop", &[("n", num("2"))]).unwrap();
+        let hop = call("hop", &[("steps", num("2"))]).unwrap();
         assert_eq!(
             hop.display(&["[0]".into()], None),
-            "hop(seeds => [0], n => 2, direction => 'out')"
+            "hop(seeds => [0], steps => 2, direction => 'out')"
         );
         let path = call("shortest_path", &[]).unwrap();
         assert_eq!(

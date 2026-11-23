@@ -52,8 +52,6 @@ pub enum Value {
 
 /// The directions every directed function accepts.
 pub const ALL_DIRECTIONS: &[&str] = &["out", "in", "both"];
-/// The directions of `pagerank` and `betweenness`, which reject `'in'`.
-pub const OUT_OR_BOTH: &[&str] = &["out", "both"];
 /// The output dtypes a float-valued function can emit.
 const DTYPES: &[&str] = &["f64", "f32"];
 /// The neighbour aggregations.
@@ -396,12 +394,6 @@ const DIRECTION_ALL: ParamSpec = param(
     Value::Str("out"),
     "Follow out-edges, in-edges, or both (the undirected view).",
 );
-const DIRECTION_OUT_OR_BOTH: ParamSpec = param(
-    "direction",
-    ParamType::Direction(OUT_OR_BOTH),
-    Value::Str("out"),
-    "Follow the rows as stored, or read the graph as undirected.",
-);
 const WEIGHT: ParamSpec = param(
     "weight",
     ParamType::Weight,
@@ -450,7 +442,9 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
         name: "pagerank",
         family: Family::Algorithm,
         summary: "PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.",
-        networkx: Some("nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))"),
+        networkx: Some(
+            "nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))",
+        ),
         params: &[
             param(
                 "damping",
@@ -475,7 +469,7 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
             .within(Range::at_least(0.0)),
             WEIGHT,
             DTYPE,
-            DIRECTION_OUT_OR_BOTH,
+            DIRECTION_ALL,
         ],
         outputs: &[out("pagerank", ColumnType::Float64)],
         shape: Shape::PerNode,
@@ -529,7 +523,8 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
         summary: "Betweenness centrality (Brandes), unnormalized.",
         networkx: Some(
             "nx.betweenness_centrality(G, normalized=False, endpoints=False) \
-             (both: nx.betweenness_centrality(U, normalized=False))",
+             (in: on G.reverse(), the same exact values; both: \
+             nx.betweenness_centrality(U, normalized=False))",
         ),
         params: &[
             param(
@@ -542,7 +537,7 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
             WEIGHT,
             SEED,
             DTYPE,
-            DIRECTION_OUT_OR_BOTH,
+            DIRECTION_ALL,
         ],
         outputs: &[out("betweenness", ColumnType::Float64)],
         shape: Shape::PerNode,
@@ -840,14 +835,18 @@ pub static FUNCTIONS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "diameter",
         family: Family::Statistic,
-        summary: "The longest shortest path over reachable ordered pairs.",
+        summary: "The longest shortest path over reachable ordered pairs. By default \
+                  (approximate => true) it is a lower bound from a bounded sample of sources, \
+                  which may be below the true diameter; approximate => false gives the exact \
+                  value, at the cost of a search from every node.",
         networkx: Some("nx.diameter(U) on a connected graph (both, approximate=False)"),
         params: &[
             param(
                 "approximate",
                 ParamType::Bool,
                 Value::Bool(true),
-                "A lower bound from a bounded sample of sources.",
+                "true (the default): a lower bound from a bounded sample of sources, which may \
+                 be below the true diameter; false: the exact diameter.",
             ),
             DIRECTION_ALL,
         ],

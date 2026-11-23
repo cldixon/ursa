@@ -127,7 +127,7 @@ async fn a_node_of_a_graph_shows_its_vertex_table_row() {
     );
     let part = draw(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [33], n => 1, direction => 'both') LIMIT 4",
+        "SELECT * FROM hop(karate, seeds => [33], steps => 1, direction => 'both') LIMIT 4",
     )
     .await;
     let at = node(&part, "33");
