@@ -18,6 +18,12 @@
 //     (an undo restored them): the layout is there, with nothing to run,
 //     for the next "grow". -> "done"
 //
+// After the first "positions" of a "start" comes, once,
+//   {type: "order", order, ms}: the order to draw the edges in (#495), most
+//     important first, a Uint32Array of edge indexes (transferred) for
+//     GraphView.setEdgeOrder, and the ms it took to compute. The layout has
+//     the hierarchy the order comes from (Layout.edgeOrder).
+//
 // `layout` picks a fixed layout instead: {kind: "rings" | "layers", level},
 // `level` a Uint32Array of each node's distance from a seed (rings) or its
 // layer (layers), 0xFFFFFFFF for none. A fixed layout is done as it is made:
@@ -76,6 +82,7 @@ async function handle(data) {
       // Coarse to fine has a place for every node before any iteration, and a
       // fixed layout has its last: draw it.
       post();
+      postOrder(data);
       run();
     } else if (data.type === "grow") {
       if (!layout) throw new Error("no layout to grow");
@@ -115,6 +122,17 @@ function post() {
     times = null;
   }
   self.postMessage(message, [xy.buffer]);
+}
+
+/**
+ * The order to draw the edges `(src[i], dst[i])` in, most important first
+ * (#495): what the page draws a prefix of while the view moves. Once, after
+ * the first positions: the hierarchy it comes from never changes.
+ */
+function postOrder({ src, dst }) {
+  const t = performance.now();
+  const order = layout.edgeOrder(src, dst);
+  self.postMessage({ type: "order", order, ms: performance.now() - t }, [order.buffer]);
 }
 
 function done() {

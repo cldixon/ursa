@@ -183,25 +183,52 @@ async fn text_after_a_columns_item_is_an_error() {
 }
 
 #[tokio::test]
-async fn keep_and_one_row_per_are_refused_not_ignored() {
+async fn keep_and_one_row_per_are_read_not_ignored() {
+    // Both used to be dropped after a WHERE condition. Now KEEP on one path
+    // is its prefix form, ONE ROW PER MATCH is the default, and what is not
+    // supported is refused (#414).
     let ctx = school().await;
     let columns = "COLUMNS (a.id AS a, b.id AS b)";
-    for clause in [
-        "WHERE a.id = 0 KEEP TRAIL",
-        "KEEP TRAIL",
-        "KEEP ANY SHORTEST WHERE a.id = 0",
+    let path = |prefix: &str, rest: &str| {
+        format!(
+            "SELECT * FROM GRAPH_TABLE (pg MATCH {prefix} (a:Person)-[k:knows]->{{1,2}}(b:Person) \
+             {rest} {columns}) ORDER BY a, b"
+        )
+    };
+    for (clause, prefix) in [
+        ("WHERE a.id = 0 KEEP TRAIL", "TRAIL"),
+        ("KEEP TRAIL", "TRAIL"),
+        ("KEEP ANY SHORTEST WHERE a.id = 0", "ANY SHORTEST"),
+        ("KEEP ANY SHORTEST TRAIL", "ANY SHORTEST TRAIL"),
     ] {
-        let message = err(&ctx, &knows(&format!("{clause} {columns}"))).await;
-        assert_contains(&message, "in GRAPH_TABLE: KEEP is not supported yet");
+        let rest = clause.replace(&format!("KEEP {prefix}"), "");
+        assert_eq!(
+            ok(&ctx, &path("", clause)).await,
+            ok(&ctx, &path(prefix, &rest)).await,
+            "{clause}"
+        );
     }
-    for clause in [
-        "WHERE a.id = 0 ONE ROW PER MATCH",
-        "ONE ROW PER MATCH",
-        "ONE ROW PER VERTEX (v)",
-    ] {
-        let message = err(&ctx, &knows(&format!("{clause} {columns}"))).await;
-        assert_contains(&message, "in GRAPH_TABLE: ONE ROW PER is not supported yet");
+    for clause in ["WHERE a.id = 0 ONE ROW PER MATCH", "ONE ROW PER MATCH"] {
+        let rest = clause.replace("ONE ROW PER MATCH", "");
+        assert_eq!(
+            ok(
+                &ctx,
+                &(knows(&format!("{clause} {columns}")) + " ORDER BY a, b")
+            )
+            .await,
+            ok(
+                &ctx,
+                &(knows(&format!("{rest} {columns}")) + " ORDER BY a, b")
+            )
+            .await,
+            "{clause}"
+        );
     }
+    let message = err(&ctx, &knows(&format!("ONE ROW PER VERTEX (v) {columns}"))).await;
+    assert_contains(
+        &message,
+        "in GRAPH_TABLE: ONE ROW PER VERTEX and ONE ROW PER STEP are not supported yet",
+    );
 }
 
 // ---- #410 ----------------------------------------------------------------
