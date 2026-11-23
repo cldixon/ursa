@@ -478,6 +478,28 @@ impl LiveResult {
         out
     }
 
+    /// [`LiveResult::line_indices`] for the edges `edges`, in that order:
+    /// what a renderer that draws them in an order of its own
+    /// ([`crate::order`]) writes.
+    pub fn lines_of(&self, edges: &[u32]) -> Vec<u32> {
+        let (src, dst, flags) = (
+            self.result.src(),
+            self.result.dst(),
+            self.result.edge_flags(),
+        );
+        let mut out = Vec::with_capacity(2 * edges.len());
+        for &e in edges {
+            let e = e as usize;
+            out.push(src[e]);
+            out.push(if flags[e] & REMOVED != 0 {
+                src[e]
+            } else {
+                dst[e]
+            });
+        }
+        out
+    }
+
     /// Apply `delta` to the result and to what is drawn of it, or, if the
     /// delta does not fit the result, change nothing and say why.
     ///

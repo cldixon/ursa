@@ -23,10 +23,12 @@ later, in a notebook widget or a native window through the same `View`.
 | `highlight` | each node's flags (selected, pinned, hidden, …) and the highlighted edges. No GPU. |
 | `spatial` | a grid over the node positions, and one over the edges: a pick reads what is near the pointer, and a zoomed-in frame draws the nodes in view. No GPU. |
 | `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
+| `budget` | the frame budget: how much a frame draws while the view moves, from what the last frames cost. No GPU. |
+| `order` | the edges' drawing order, most important first: what a prefix of them is. No GPU. |
 | `pace` (feature `render`) | making a view in pieces, with a turn of the event loop between them. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
-| `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`). |
+| `web` (feature) | the wasm-bindgen API: `createView` and `createViewFromResult` for a canvas (`applyDelta`), `Layout` for a worker (`step`, `grow`, `rings`, `layers`, `edgeOrder`). |
 
 With `default-features = false` the crate is `model`, `scene`, `highlight`, `interact`, `spatial` and `live`, with
 no wgpu in its dependencies: what an engine needs to produce a graph, and
@@ -117,6 +119,92 @@ edges in `tests/model_scale.rs`.
   never a storage buffer, because WebGL2 has none.
 - **Highlights** are a second layer (below): flags in a buffer of their own,
   and the highlighted edges as instanced quads over the line list.
+
+## The frame budget
+
+A frame has 16 ms. A million edges cost an integrated GPU more than that,
+and a software renderer seconds (4 s here; the 131K nodes alone, 1.4 s). So
+the view keeps to a budget by drawing less while it moves, and everything
+when it rests (#495, the design's §5).
+
+- **The edges are in importance order**, so that any prefix of the edge
+  buffer is a backbone of the drawing and not a corner of it. The layout
+  computes the order from its hierarchy (`LiveLayout::edge_order`,
+  `Layout.edgeOrder(src, dst)` in the worker; `Fa2Multilevel::edge_order` in
+  `ursa-core`), by:
+  1. the level at which the edge's two ends merge, coarsest first: an edge
+     whose ends are still apart at the coarsest level joins two of the
+     drawing's far groups, and one whose ends merge at the first level is
+     local fill;
+  2. a round: each merged edge (the tie between two groups, just below that
+     level) gives one of the input edges it stands for before any gives a
+     second, so a short prefix shows every tie, not all of the heaviest;
+  3. the merged edge's weight within a round, heaviest first;
+  4. a hash of the edge's index.
+
+  With no hierarchy (rings, layers, a flat or grown layout, a graph too
+  small to coarsen) it is by the larger degree of the edge's two ends, then
+  the hash. The order is a permutation, `order[i]` the edge to draw `i`-th;
+  the view takes it with `setEdgeOrder(order)` and writes the edges to a new
+  buffer a piece at a time (`orderEdges()`, until it returns `false`), the
+  frames drawing the old buffer until the new one is whole. Every edge has
+  the same ink, so a frame with all of them is the same pixels in any
+  order. Edges added later (a delta) go after the ordered ones.
+- **While the view moves** (the camera or the positions changed since the
+  last frame, or less than 200 ms ago), `renderFrame(now)` draws the first
+  `k` edges and, if the nodes are too many as well, the largest of them
+  (gathered into a small buffer of their own, 20 bytes each: instances
+  cannot be drawn by index). A budget is in units of one edge; a node is
+  three (six vertices to an edge's two), and half the budget goes to the
+  nodes until they are all drawn. The edges are drawn deeper to make up for
+  the ones left out (`1 - (1 - alpha)^(m / k)`, up to 0.6), so that where
+  edges pile up the ink is as deep as with all of them. Highlighted edges
+  and the nodes in front are always drawn.
+- **`k` follows what the last frames cost.** The page measures a frame from
+  its start to the next animation frame and says (`frameCost(ms)`). That is
+  a whole number of the display's refresh periods, so it says whether a
+  budget fits (12 ms, or 1.3 periods: 22 ms at 60 Hz), never by how much,
+  and the controller searches: a new view doubles its budget every frame
+  until one is late; then it holds the largest budget known to fit and now
+  and then tries 4% more (bolder if that holds, rarer if it does not); and
+  a budget that held and then is late twice running is cut in proportion.
+  One late frame is a hiccup and changes nothing. Under a steady load the
+  budget moves by 4%.
+- **At rest** (200 ms after the last movement; `frameRestMs`) a frame draws
+  everything, as `render()` always does. The page draws that frame when
+  `framePartial` says the last one left something out; a layout that is
+  still running counts as movement (`keepMoving()`).
+- `frameInfo()` (and `info().frame`) says what the budget is doing:
+  `{k, nodes, edges, ordered, p95, frames, limit}`: the edges and nodes the
+  last moving frame drew, the edges there are, how many are in importance
+  order, the p95 of the last 120 moving frames' costs, how many were
+  measured, and the cost a frame is held to.
+
+The view keeps no table of where each edge went (it would be four bytes an
+edge for as long as the view lives), only how many are ordered. So a delta
+that removes or restores an ordered edge, or takes ordered edges off the
+end, puts every edge back in index order: the frame at rest is unchanged,
+and the frames that move draw a prefix by index until an order is set again.
+Hiding a node does not: that is a flag, and the edges stay where they are.
+
+`tests/browser/view.ts` (`ONLY=budget`) reads frames back on WebGL2: with
+the edges in importance order the frame at rest is the frame before, byte
+for byte, on karate (through deltas and their inverses, with the order set
+or half written) and on R-MAT with 100K edges; a moving frame draws a
+prefix (8,192 edges and 2,730 nodes of 100,000 and 16,384 at first), less
+ink than everything and never none (512 edges and 170 nodes at the least);
+and the budget grows back to everything, the same pixels as `render()`. The
+controller's unit tests (`budget.rs`) run it against model devices (an
+integrated GPU at 60 Hz, 120 Hz, a software renderer): it converges on what
+fits, never draws nothing, moves by under a tenth under a steady load, and
+follows a load that changes.
+
+Measured in the shell on `.graph rmat` (1M edges, headless Chromium,
+software WebGL2: [`BENCH.md`](BENCH.md#the-frame-budget)): frames of a
+scripted wheel zoom are 26 to 31 ms apart at the 95th percentile over three
+runs, where they were 3.3 s; they draw 512 to 1,081 edges and 170 to 360
+nodes, which is all this renderer shows in a frame. Ordering the million edges takes the layout
+worker 0.3 s. It has not been measured on a GPU.
 
 ## Making a view
 
@@ -724,6 +812,21 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
 - **The view's own layout.** `View::step`, for a page that lays out on its
   own thread, is still flat ForceAtlas2; the worker's `Layout` is coarse to
   fine.
+- **GPU timestamps for the frame budget.** The budget follows the time
+  between animation frames, which is whole refresh periods. WebGPU's
+  `timestamp-query` would say what a frame cost the GPU to the microsecond,
+  so the budget could go straight to what fits instead of searching; the
+  view does not request the feature, and there was no GPU here to try it on.
+- **The frame budget on a 30 Hz display.** A frame "fits" within 1.3
+  refresh periods, with the period taken to be at most 60 Hz's: on a display
+  that refreshes slower every frame is late, and the view draws its least.
+- **Slices at rest.** The frame at rest draws everything in one go: seconds
+  in software, on the page's thread. Drawing it in slices into a texture,
+  and panning that texture, is the design's next step (P3-2).
+- **An order after the graph grows.** Edges added by a delta are drawn
+  after the ordered ones, least important, however central they are; and a
+  delta that removes an ordered edge drops the order. Nothing asks the
+  layout for a new one.
 - **Small components out past the ring.** A few nodes of R-MAT's small
   components end up far outside the ring of isolated nodes, as under flat
   ForceAtlas2, and fitting the view to them shrinks the drawing.

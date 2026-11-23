@@ -2,8 +2,8 @@
 //
 //   bun bench/report.ts [bench/results.json]
 //
-// Prints Markdown: the machine, then a table per backend, then the native
-// layout timings. Paste it into BENCH.md's "Results" section after a rerun.
+// Prints Markdown: the machine, then a table per backend (and, under it, the
+// frame budget's), then the native layout timings. Paste it into BENCH.md's "Results" section after a rerun.
 import { resolve } from "node:path";
 
 const path = Bun.argv[2] ?? resolve(import.meta.dir, "results.json");
@@ -45,6 +45,22 @@ for (const b of backends) {
     );
   }
   out.push("");
+  // The frame budget (#495): the same pan and zoom, drawn within it.
+  if (ml.some((c: any) => c.budget)) {
+    out.push("Within the frame budget (`renderFrame`): the time between frames, and what the last frame drew.");
+    out.push("");
+    out.push("| graph | pan, rAF interval ms (median / p95) | pan drew (edges / nodes) | zoom, rAF interval ms | zoom drew | held to, ms | hierarchy + order, ms | order to the GPU, ms |");
+    out.push("|---|---|---|---|---|---|---|---|");
+    const drew = (b: any) => `${b.edges.toLocaleString("en")} / ${b.nodes.toLocaleString("en")}`;
+    for (const c of ml) {
+      const b = c.budget;
+      if (!b) continue;
+      out.push(
+        `| ${label(c)} | ${pair(b.pan.rafIntervalMs)} | ${drew(b.pan)} | ${pair(b.zoom.rafIntervalMs)} | ${drew(b.zoom)} | ${ms(b.zoom.limit, 1)} | ${ms(b.hierarchyMs)} + ${ms(b.orderMs)} | ${ms(b.writeMs, 1)} |`,
+      );
+    }
+    out.push("");
+  }
 }
 
 for (const [label, n] of Object.entries(r.native ?? {}) as [string, any][]) {
