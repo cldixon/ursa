@@ -104,6 +104,12 @@ load the wasm (`wasm-release`).
 - **Grid** (from the next run on): the median of nine `view.rebuildGrid()`
   calls, and `view.nodesDrawn` for a frame zoomed 10× into the middle of
   the drawing (1% of its area).
+- **The frame budget**: the pan and the zoom again, as a page draws them:
+  `view.renderFrame(now)` each animation frame, and the time from that frame
+  to the next told to `view.frameCost`, with the edges in the layout's
+  importance order (computed on the page here, after the memory is read).
+  The time between frames, and the edges and nodes the last frame drew. No
+  sync point: the time between animation frames is the budget's own measure.
 - **Memory**: the page's and the worker's wasm memory (`memory.buffer`), and
   the page's JS heap (`performance.memory.usedJSHeapSize`, with
   `--enable-precise-memory-info`). The server sends COOP/COEP so the page is
@@ -523,6 +529,92 @@ and the size of the page's wasm memory when it is.
 - **These are a loaded machine's numbers.** With other builds running on
   its four cores a piece took up to 65 ms once; the harness holds the
   median of three pages to 60 ms.
+
+## The frame budget
+
+While the view moves it draws a prefix of the edges, in importance order,
+and the largest nodes: as much as the last frames' costs say fits (#495;
+[README](README.md#the-frame-budget)). Two measurements, both on this
+container (no GPU: SwiftShader on 4 shared cores), 2026-11-22.
+
+**In the shell**, `.graph rmat` (131,072 nodes, 1,000,000 edges) at
+1280 × 800, with `web/tests/graph-timing.ts`: from rest, a wheel event every
+animation frame for 5 s, zooming in and back out; the time from one frame's
+start to the next's (`graphTimings().frames.interval`), which with no GPU is
+the frame's cost.
+
+| | before (main at `f0d6ca7`, one run) | with the budget (three runs) |
+|---|---|---|
+| frames in the 5 s of wheel zoom | 2 | 231 to 241 |
+| frame interval, p50 | 3.3 s | 20 to 21 ms |
+| frame interval, **p95** | **3.3 s** | **26, 26 and 31 ms** |
+| frame interval, max | 3.3 s | 29 to 42 ms |
+| a moving frame draws | 1,000,000 edges, 131,072 nodes | 512 to 1,081 edges, 170 to 360 nodes |
+| first frame shown, from Enter | 6.0 s | 1.3 to 1.6 s |
+| layout done, from Enter | 10.6 s | 5.5 to 5.8 s |
+| a click on the view at rest, to its frame | 3.4 s | 2.5 to 4.1 s |
+| tasks over 50 ms on the page from Enter to done | 4.7 s, 4.6 s, 3.6 s | 5 to 11 of 50 to 260 ms |
+| ordering the edges, in the layout worker | – | 285 to 325 ms |
+| wasm heap: view / layout worker | 59 / 97 MiB | 59 to 61 / 104 MiB |
+
+The target is a p95 of 50 ms on this renderer, and `graph-timing.ts` fails
+a run over it. What the numbers say:
+
+- **This renderer's floor is the budget.** A frame with next to nothing on
+  it takes 17 to 30 ms here (the canvas is composited on the CPU), which is
+  already the 22 ms a frame is held to, so the budget stays at or just
+  above its least: 512 edges and 170 nodes. A frame is not held by drawing fewer edges
+  alone: the 131,072 nodes cost 1.4 s a frame by themselves (measured: 16,384
+  edges and every node, 1.5 s), which is why the nodes are budgeted too.
+- **Nothing is left to give when the machine is busy.** Those three runs
+  had the 4 cores mostly to themselves (a load of 3 to 5). Two other builds
+  share this container: at a load of about 8, four runs read a p95 of 25,
+  29, 30 and 46 ms, and at a load of 13, three read 44, 54 and 83 ms, all
+  with the same p50 (20 ms). The budget was at its least throughout, so the
+  late frames are the browser waiting for a core. The e2e's check allows
+  100 ms.
+- **The layout is faster** because the page's thread is no longer
+  rasterising a million edges after each set of positions: it draws the
+  positions as they come, and the worker's messages do not queue behind 4 s
+  frames.
+- **A frame at rest still draws everything**, in one go: 2.5 to 6 s of the
+  page's thread here, as every frame took before. There is one 200 ms
+  after the layout's end and one 200 ms after each movement's, and a click
+  or a hover on the view at rest draws another. A zoom begun under one
+  waits for it. Drawing it in slices is the design's next step (P3-2).
+- **The order costs the layout 0.3 s**, once, after its first positions,
+  and 8 MiB of the worker's heap while it sorts (eight bytes an edge, and
+  the copy of the edge list the call is given). The view holds nothing for
+  it once the edges are written.
+
+**In the bench** (`bun run bench`, `BACKENDS=webgl2 GRAPHS=rmat
+MODES=multilevel`, 1000 × 700): the same pan and zoom as the tables above,
+drawn with `renderFrame` and each frame's cost told to `frameCost`, after 20
+frames for the budget to find its level.
+
+| graph | pan, every edge: frame ms (median / p95) | pan, budgeted: rAF interval ms | pan drew (edges / nodes) | zoom, every edge: frame ms | zoom, budgeted: rAF interval ms | zoom drew | held to, ms | hierarchy + order, ms | order to the GPU, ms |
+|---|---|---|---|---|---|---|---|---|---|
+| rmat 10k | 78.5 / 117.0 | 16.7 / 50.0 | 512 / 170 | 69.6 / 84.2 | 16.7 / 33.3 | 512 / 170 | 21.7 | 9 + 5 | 1.1 |
+| rmat 100k | 441.9 / 520.9 | 16.7 / 33.3 | 512 / 170 | 540.2 / 620.8 | 33.3 / 33.3 | 512 / 170 | 21.7 | 52 + 29 | 3.2 |
+| rmat 1m | 4955.7 / 5961.3 | 16.7 / 33.3 | 512 / 170 | 7145.5 / 8418.4 | 16.7 / 33.3 | 512 / 170 | 21.7 | 598 + 272 | 21.2 |
+
+(This run was at a load of 11 to 14. The time between animation frames is
+whole refreshes: 16.7, 33.3 or 50 ms. "Hierarchy + order" is on the page
+here; in the shell the layout worker has the hierarchy already.)
+
+On a laptop, run the bench headed ([above](#on-a-laptop-with-a-real-gpu))
+and read these columns (`bun bench/report.ts` prints them under each
+backend's table): the target there is a p95 of 16 ms at 1M edges, which at
+60 Hz is every frame in its refresh (16.7 ms between animation frames), and
+"drew" says how much of the graph the GPU fits in a frame (all of it, on a
+discrete GPU). The 1M-edge case alone:
+
+```sh
+HEADED=1 CHROME=/path/to/chrome GRAPHS=rmat SIZES=1m MODES=multilevel NATIVE=0 bun run bench bench/results-laptop.json
+bun bench/report.ts bench/results-laptop.json
+```
+
+**It has not been measured on a GPU**: there is none here.
 
 ## Caveats
 

@@ -44,6 +44,8 @@ pub struct GraphView {
     /// Draw the selection's incident edges wide
     /// ([`GraphView::set_selection_edges`]).
     selection_edges: bool,
+    /// The last frame left edges out ([`GraphView::render_frame`]).
+    partial: bool,
 }
 
 /// A view of the graph of `n_nodes` nodes and the edges `(src[i], dst[i])`
@@ -168,6 +170,7 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         backend,
         interact: Interact::new(),
         selection_edges: false,
+        partial: false,
     })
 }
 
@@ -207,24 +210,147 @@ impl GraphView {
         self.view.step(&self.device, &self.queue, iterations);
     }
 
-    /// Draw a frame.
+    /// Draw a frame: everything, whether the view moves or not.
     pub fn render(&mut self) -> Result<(), JsValue> {
+        self.present(None).map(|_| ())
+    }
+
+    /// Draw a frame within the frame budget: while the view moves (the
+    /// camera or the positions changed since the last frame, or less than
+    /// [`GraphView::frame_rest_ms`] before `now`, the animation frame's
+    /// time),
+    /// only as many edges as the last frames' costs say fit in a frame,
+    /// the most important first ([`GraphView::set_edge_order`]), drawn
+    /// deeper to make up for the rest, and, where the nodes are too many
+    /// as well, the largest of them; at rest, everything, the same pixels
+    /// as [`GraphView::render`].
+    ///
+    /// Returns whether the view is moving. If it is, measure what the
+    /// frame cost, from this animation frame's time to the next's (whole
+    /// refreshes of the display, whenever in its frame each callback ran),
+    /// and say ([`GraphView::frame_cost`]): the budget follows it. And if
+    /// [`GraphView::frame_partial`] is then true, something was left out:
+    /// draw again once nothing has moved for `frameRestMs`.
+    ///
+    /// ```js
+    /// function draw(time) {  // an animation frame's
+    ///   if (view.renderFrame(time)) {
+    ///     requestAnimationFrame((next) => view.frameCost(next - time));
+    ///     clearTimeout(rest);
+    ///     if (view.framePartial) rest = setTimeout(() => requestAnimationFrame(draw), view.frameRestMs);
+    ///   }
+    /// }
+    /// ```
+    #[wasm_bindgen(js_name = renderFrame)]
+    pub fn render_frame(&mut self, now: f64) -> Result<bool, JsValue> {
+        self.present(Some(now))
+    }
+
+    /// Draw and present a frame: budgeted at `now`, or everything.
+    /// Returns whether the view is moving.
+    fn present(&mut self, now: Option<f64>) -> Result<bool, JsValue> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             other => return Err(js_err(format!("no frame to draw on: {other:?}"))),
         };
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.view.prepare(&self.device, &self.queue);
-        self.view.draw(&self.device, &self.queue, &target);
+        let moving = match now {
+            Some(now) => {
+                let drawn = self
+                    .view
+                    .draw_frame(&self.device, &self.queue, &target, now);
+                self.partial = drawn.partial;
+                drawn.moving
+            }
+            None => {
+                self.view.prepare(&self.device, &self.queue);
+                self.view.draw(&self.device, &self.queue, &target);
+                self.partial = false;
+                false
+            }
+        };
         frame.present();
-        Ok(())
+        Ok(moving)
+    }
+
+    /// The view is still moving, though nothing has changed since the last
+    /// frame: a layout is running, and its next positions are on their
+    /// way. The next [`GraphView::render_frame`] draws within the budget.
+    #[wasm_bindgen(js_name = keepMoving)]
+    pub fn keep_moving(&mut self) {
+        self.view.keep_moving();
+    }
+
+    /// Whether the last frame left anything out
+    /// ([`GraphView::render_frame`]).
+    #[wasm_bindgen(getter, js_name = framePartial)]
+    pub fn frame_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// How long after the last movement the view is at rest, in
+    /// milliseconds: a frame drawn then has every edge.
+    #[wasm_bindgen(getter, js_name = frameRestMs)]
+    pub fn frame_rest_ms(&self) -> f64 {
+        crate::budget::REST_MS
+    }
+
+    /// The last moving frame ([`GraphView::render_frame`]) cost `ms`: the
+    /// time from its start to when the next frame could start (the next
+    /// animation frame). With no GPU that is the time the browser took to
+    /// rasterise it; with one it is one refresh of the display, or more if
+    /// the frame was late.
+    #[wasm_bindgen(js_name = frameCost)]
+    pub fn frame_cost(&mut self, ms: f64) {
+        self.view.frame_cost(ms);
+    }
+
+    /// What the frame budget is doing:
+    ///
+    /// ```js
+    /// { k,        // the edges the last moving frame drew (0 before any)
+    ///   nodes,    // the nodes it drew: the largest
+    ///   edges,    // the edges a frame at rest draws
+    ///   ordered,  // how many of them are in importance order
+    ///   p95,      // of the last 120 moving frames' costs, ms; null before any
+    ///   frames,   // how many moving frames' costs were measured
+    ///   limit }   // the cost a moving frame is held to, ms
+    /// ```
+    #[wasm_bindgen(js_name = frameInfo)]
+    pub fn frame_info(&self) -> Result<JsValue, JsValue> {
+        let json = serde_json::to_string(&self.view.frame_info()).map_err(js_err)?;
+        js_sys::JSON::parse(&json)
+    }
+
+    /// Draw the edges in `order`, most important first, as
+    /// [`Layout::edge_order`] gives it: `order[i]` is the edge to draw
+    /// `i`-th, a permutation of the first `order.length` edges. Edges added
+    /// since stay after them. The frames that draw every edge do not
+    /// change; the ones that draw a prefix ([`GraphView::render_frame`])
+    /// draw the backbone. Nothing is written until
+    /// [`GraphView::order_edges`].
+    #[wasm_bindgen(js_name = setEdgeOrder)]
+    pub fn set_edge_order(&mut self, order: Vec<u32>) -> Result<(), JsValue> {
+        self.view
+            .set_edge_order(&self.device, order)
+            .map_err(js_err)
+    }
+
+    /// Write up to `max_edges` (262,144 unless given) more edges of the
+    /// order being set to the GPU, eight bytes each, and return whether
+    /// there is more to write. Call it a task at a time until it returns
+    /// false: the frames draw the old order until the new one is whole.
+    #[wasm_bindgen(js_name = orderEdges)]
+    pub fn order_edges(&mut self, max_edges: Option<u32>) -> bool {
+        let max = max_edges.unwrap_or(1 << 18) as usize;
+        self.view.order_edges(&self.device, &self.queue, max)
     }
 
     /// The canvas is now `width` x `height` pixels.
@@ -777,7 +903,8 @@ impl GraphView {
     ///   hiddenNodes, hiddenEdges,    // removed, or at a removed node
     ///   nodeSlots, edgeSlots,        // the next node's and edge's index
     ///   size: { column, range },     // column null: by degree
-    ///   color: { column, entries: [{ category, label, color, count }], other, none } | null }
+    ///   color: { column, entries: [{ category, label, color, count }], other, none } | null,
+    ///   frame: { k, nodes, edges, ordered, p95, frames, limit } }  // the frame budget: frameInfo()
     /// ```
     ///
     /// It follows every [`GraphView::apply_delta`]. The node counts cost
@@ -786,9 +913,16 @@ impl GraphView {
     /// proportional to the nodes) only when a column colours them, on the
     /// first call after a delta.
     pub fn info(&self) -> Result<JsValue, JsValue> {
+        #[derive(serde::Serialize)]
+        struct WithFrame {
+            #[serde(flatten)]
+            info: crate::live::Info,
+            frame: crate::view::FrameInfo,
+        }
         match self.view.info() {
             Some(info) => {
-                let json = serde_json::to_string(&info).map_err(js_err)?;
+                let frame = self.view.frame_info();
+                let json = serde_json::to_string(&WithFrame { info, frame }).map_err(js_err)?;
                 js_sys::JSON::parse(&json)
             }
             None => Ok(JsValue::UNDEFINED),
@@ -1196,6 +1330,26 @@ impl Layout {
     #[wasm_bindgen(getter)]
     pub fn levels(&self) -> u32 {
         self.layout.levels() as u32
+    }
+
+    /// The order to draw the edges `(src[i], dst[i])` in, most important
+    /// first, for [`GraphView::set_edge_order`]: `order[i]` is the edge to
+    /// draw `i`-th. The edges are the layout's graph's, numbered as the
+    /// view numbers them. Coarse to fine, the edges between the drawing's
+    /// far groups come first (by the level of the hierarchy at which an
+    /// edge's two ends merge, then one edge of each merged edge a round,
+    /// the heaviest first, then a hash); otherwise the edges at the nodes
+    /// of highest degree do. The same input gives the same order.
+    #[wasm_bindgen(js_name = edgeOrder)]
+    pub fn edge_order(&self, src: &[u32], dst: &[u32]) -> Result<Vec<u32>, JsValue> {
+        if src.len() != dst.len() {
+            return Err(js_err(format!(
+                "src has {} edges but dst has {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        Ok(self.layout.edge_order(src, dst))
     }
 
     /// The positions now: `x` then `y`, one per node each.

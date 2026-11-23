@@ -1,0 +1,89 @@
+# The reviewed list of the conformance cases where Ursa differs from the
+# reference (#299). Each entry names a case by its id (`# id:` in the .slt
+# files), says why, and records how Ursa differs: `error` is a regex its error
+# must match. A case on this list that starts to pass fails the suite until
+# its entry is removed.
+#
+# kind: unsupported (not built yet), deliberate (Ursa differs on purpose),
+#       numeric-reference (a different reference result), bug (needs an open issue)
+
+[[difference]]
+id     = "ddl/3"
+kind   = "unsupported"
+reason = "Keys of more than one column."
+error  = "multi-column keys are not supported yet"
+
+[[difference]]
+id     = "match/8"
+kind   = "deliberate"
+reason = "The standard matches nothing; Ursa refuses the pattern, as DuckPGQ does, because it is almost always a typo (#410)."
+error  = "no edge of 'know' connects them"
+
+[[difference]]
+id     = "match/11"
+kind   = "unsupported"
+issue  = 412
+reason = "A variable over several element tables."
+error  = "cannot be told from the pattern"
+
+[[difference]]
+id     = "match/11b"
+kind   = "unsupported"
+issue  = 412
+reason = "Label expressions."
+error  = "label expressions .* are not supported yet; use one label \\(#412\\)"
+
+[[difference]]
+id     = "edges/3"
+kind   = "deliberate"
+reason = "Every edge of an Ursa graph is directed, so ~[e]~ is refused with a pointer to -[e]-."
+error  = "Ursa's edges are directed; use -\\[e\\]- to follow them either way"
+
+[[difference]]
+id     = "path/7"
+kind   = "unsupported"
+issue  = 414
+reason = "A selector, path mode or path variable on a path of several edges (#414, B3)."
+error  = "must be one edge between two nodes for now"
+
+[[difference]]
+id     = "keep/4"
+kind   = "unsupported"
+issue  = 414
+reason = "KEEP over a pattern of several paths; write the selector before each path."
+error  = "KEEP over several path patterns is not supported yet"
+
+[[difference]]
+id     = "element_id/3"
+kind   = "unsupported"
+issue  = 413
+reason = "element_id of an edge is its row in the edge table, which only a path search reads; an edge read by a join has none yet."
+error  = "only a path search reads for now"
+
+[[difference]]
+id     = "rows/2"
+kind   = "unsupported"
+issue  = 414
+reason = "ONE ROW PER VERTEX and ONE ROW PER STEP (#414, B6)."
+error  = "ONE ROW PER VERTEX and ONE ROW PER STEP are not supported yet"
+
+[[difference]]
+id     = "errors/2"
+kind   = "unsupported"
+issue  = 414
+reason = "A subquery inside the pattern sees only the tables the statement names (#414, B4)."
+error  = "a subquery inside the pattern reads table 'student', which the statement does not name"
+
+[[difference]]
+id     = "errors/3"
+kind   = "unsupported"
+issue  = 414
+reason = "A GRAPH_TABLE that refers to tables outside it."
+error  = "GRAPH_TABLE cannot refer to tables outside it yet"
+
+[[difference]]
+id     = "errors/4"
+kind   = "unsupported"
+issue  = 414
+reason = "A GRAPH_TABLE that refers to tables outside it."
+error  = "GRAPH_TABLE cannot refer to tables outside it yet"

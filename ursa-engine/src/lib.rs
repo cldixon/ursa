@@ -17,6 +17,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 mod blocking;
 pub mod database;
+mod duckdb_functions;
 pub mod error;
 mod file_table;
 pub mod graph;
@@ -103,6 +104,8 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     }
     let ctx: SessionContext = state.into();
     graph::register_functions(&ctx).expect("registering a relation planner cannot fail");
+    // DuckDB's names for DataFusion's functions: list_value, strftime, … (#417).
+    duckdb_functions::register(&ctx);
     let reads = read_functions::ReadFunctions::new(ctx.state().config())
         .expect("the session config has a place for read_* tables");
     ctx.register_relation_planner(Arc::new(reads))

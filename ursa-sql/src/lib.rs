@@ -27,7 +27,9 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 
+mod copy_options;
 pub mod database;
+mod duckdb;
 mod from_first;
 mod graph_ddl;
 pub mod graph_table;
@@ -135,7 +137,7 @@ impl ursa_engine::graph::view::RunSql for Sql {
 /// Run one statement, leaving the database's catalog alone.
 pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Result<DataFrame> {
     match statement {
-        UrsaStatement::DataFusion(statement) => {
+        UrsaStatement::DataFusion(mut statement) => {
             let state = ctx.state();
             // A COPY target or external table location in object storage needs
             // its store registered before DataFusion plans the write or read.
@@ -175,25 +177,44 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
                         .await;
                 }
             }
-            // `read_csv(...)` and its siblings open their files first: the
-            // planner that plans them cannot wait on a listing.
-            let reads = ursa_engine::read_functions::open_reads(&state, &statement).await?;
-            let plan = state.statement_to_plan(*statement).await?;
-            drop(reads);
-            // A column an inner join equates with a node key is one (#431).
-            let plan = ursa_engine::graph::provenance::carry_through_joins(plan)?;
-            ursa_engine::graph::check_ddl(&state, &plan).await?;
-            ctx.execute_logical_plan(plan).await
+            // DuckDB's `SET threads` and `CREATE TEMP TABLE` (#417).
+            duckdb::accept(&mut statement)?;
+            let written = statement.as_ref().clone();
+            match plan_and_run(ctx, *statement).await {
+                Ok(frame) => Ok(frame),
+                // DuckDB's `ORDER BY ALL`, planned again as positions.
+                Err(e) => match duckdb::retry(&written, &e) {
+                    Some(rewritten) => plan_and_run(ctx, rewritten)
+                        .await
+                        .map_err(|e| duckdb::explain(&written, e)),
+                    None => Err(duckdb::explain(&written, e)),
+                },
+            }
         }
         UrsaStatement::CreatePropertyGraph(statement) => graph_ddl::create(ctx, *statement).await,
         UrsaStatement::DropPropertyGraph(statement) => graph_ddl::drop(ctx, statement),
         UrsaStatement::ShowGraphs => graph_ddl::show(ctx),
         UrsaStatement::DescribeGraph(statement) => graph_ddl::describe(ctx, statement).await,
+        UrsaStatement::SummarizeGraph(statement) => graph_ddl::summarize(ctx, statement).await,
         // `execute` handles ATTACH before it gets here.
         UrsaStatement::Attach(_) => Err(DataFusionError::Plan(
             "ATTACH cannot run while replaying a database's catalog".into(),
         )),
     }
+}
+
+/// Plan `statement` and run it.
+async fn plan_and_run(ctx: &SessionContext, statement: DFStatement) -> Result<DataFrame> {
+    let state = ctx.state();
+    // `read_csv(...)` and its siblings open their files first: the
+    // planner that plans them cannot wait on a listing.
+    let reads = ursa_engine::read_functions::open_reads(&state, &statement).await?;
+    let plan = state.statement_to_plan(statement).await?;
+    drop(reads);
+    // A column an inner join equates with a node key is one (#431).
+    let plan = ursa_engine::graph::provenance::carry_through_joins(plan)?;
+    ursa_engine::graph::check_ddl(&state, &plan).await?;
+    ctx.execute_logical_plan(plan).await
 }
 
 /// Whether `statement` is `SHOW TABLES`, with no option DataFusion would

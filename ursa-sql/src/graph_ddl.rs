@@ -1,5 +1,5 @@
-//! Running `CREATE PROPERTY GRAPH`, `DROP PROPERTY GRAPH`, `SHOW GRAPHS` and
-//! `DESCRIBE GRAPH`.
+//! Running `CREATE PROPERTY GRAPH`, `DROP PROPERTY GRAPH`, `SHOW GRAPHS`,
+//! `DESCRIBE GRAPH` and DuckPGQ's `SUMMARIZE PROPERTY GRAPH`.
 //!
 //! Identifiers are normalized as DataFusion normalizes table names (unquoted
 //! names lower-cased, quoted names kept, unless
@@ -43,6 +43,26 @@ pub(crate) fn show(ctx: &SessionContext) -> Result<DataFrame> {
 pub(crate) async fn describe(ctx: &SessionContext, statement: DescribeGraph) -> Result<DataFrame> {
     let name = graph_name(statement.name, normalizes(ctx))?;
     ctx.read_batch(graph::describe_graph(&ctx.state(), &name).await?)
+}
+
+/// DuckPGQ's `SUMMARIZE PROPERTY GRAPH g`: `SELECT * FROM describe(g)`, for
+/// a graph of one edge table. For more, `describe` needs the pair to run on.
+pub(crate) async fn summarize(ctx: &SessionContext, statement: DescribeGraph) -> Result<DataFrame> {
+    let name = graph_name(statement.name, normalizes(ctx))?;
+    if let Some(g) = graph::registry_of(ctx).get(&name) {
+        if g.edge_tables.len() > 1 {
+            let names: Vec<&str> = g.edge_tables.iter().map(|e| e.name.as_str()).collect();
+            return Err(DataFusionError::Plan(format!(
+                "graph '{name}' has {} edge tables ({}), and SUMMARIZE PROPERTY GRAPH \
+                 summarizes a graph of one; name the pair to describe: SELECT * FROM \
+                 describe({name}, <vertex table>, <edge table>)",
+                names.len(),
+                names.join(", ")
+            )));
+        }
+    }
+    let quoted = Ident::with_quote('"', name.replace('"', "\"\""));
+    ctx.sql(&format!("SELECT * FROM describe({quoted})")).await
 }
 
 /// The definition `statement` makes, with its identifiers normalized. Vertex
@@ -139,7 +159,8 @@ fn labels(labels: Vec<LabelDef>, element: &str, normalizer: &IdentNormalizer) ->
 }
 
 /// The endpoint column, the vertex table (element name) its `REFERENCES`
-/// names, and the column it references.
+/// names, and the column it references, if it names one (`REFERENCES v`
+/// without a column references `v`'s key, which the engine resolves).
 fn endpoint(
     endpoint: EndpointDef,
     vertices: &[VertexSpec],
@@ -151,7 +172,7 @@ fn endpoint(
         return Ok((key, None, None));
     };
     let referenced = object_name_to_table_reference(table, normalize)?;
-    let column = normalizer.normalize(column);
+    let column = column.map(|c| normalizer.normalize(c));
     // A vertex table by its element name, else by its table's name.
     let vertex = vertices
         .iter()
@@ -159,7 +180,7 @@ fn endpoint(
         .or_else(|| vertices.iter().find(|v| same_table(&referenced, &v.table)))
         .map(|v| v.name.clone())
         .unwrap_or_else(|| referenced.table().to_string());
-    Ok((key, Some(vertex), Some(column)))
+    Ok((key, Some(vertex), column))
 }
 
 /// Whether two references name the same table: equal, or one is the other

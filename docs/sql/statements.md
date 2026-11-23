@@ -54,7 +54,7 @@ SELECT count(*) AS ties FROM 'ties.jsonl';
 └───────┘
 ```
 
-`STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not.
+`STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not, and `OPTIONS (...)` takes DataFusion's writer options. DuckDB's option list works too: `COPY … TO 'ties.txt' (FORMAT csv, HEADER false, DELIMITER '|')`, with `FORMAT`, `HEADER`, `DELIMITER` (or `DELIM`, `SEP`) and `COMPRESSION`; see [Differences from DuckDB](duckdb.md#what-is-different).
 
 !!! tip "Convert large CSV files to Parquet once"
 
@@ -128,8 +128,8 @@ CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name
 
 vertex_table := table [AS name] [KEY (column)] [labels]
 edge_table   := table [AS name] [KEY (column)]
-                SOURCE KEY (column) [REFERENCES vertex_table (column)]
-                DESTINATION KEY (column) [REFERENCES vertex_table (column)]
+                SOURCE KEY (column) [REFERENCES vertex_table [(column)]]
+                DESTINATION KEY (column) [REFERENCES vertex_table [(column)]]
                 [labels]
 labels       := DEFAULT LABEL [properties] | LABEL name [properties] [LABEL name [properties] …] | properties
               | properties LABEL name [LABEL name …]
@@ -154,7 +154,7 @@ CREATE PROPERTY GRAPH karate
 - **The node set** (new in 0.7; in 0.6.0 the algorithms see only the edges' endpoints). With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`.
 - **A key identifies one row** (behaviour change in 0.12). A vertex table's key must be unique and not NULL, as SQL/PGQ requires. A vertex table with a duplicate or a NULL key is refused with an error that counts the rows and names a duplicate, by whatever reads it as the graph's nodes: the algorithms and traversals, `g.nodes`, and `GRAPH_TABLE`. The table is read when a query runs, so `CREATE PROPERTY GRAPH` still accepts it. Deduplicate it in a view and define the graph over the view: `CREATE VIEW people_nodes AS SELECT DISTINCT ON (id) * FROM people WHERE id IS NOT NULL ORDER BY id`. Before 0.12 the algorithms counted a duplicated key once and skipped a NULL key, while `g.nodes` and `GRAPH_TABLE` returned every row, so they did not agree on the nodes.
 - **Keys with no edges** (new in 0.8) cost the algorithms next to nothing: they run on the nodes with at least one edge and fill in each isolated node's result, which is the same every time. It is degree 0, its own component and its own community (a label of its own), 0 triangles and a clustering coefficient of 0. Its PageRank is its share of the teleport and of the dangling nodes' score, since a node with no edges is dangling too. The results are those of running on every node, bit for bit, but two of them depend on how many keys there are. PageRank's scores sum to 1 over every node, so a vertex table with more keys gives every node a lower score. And every isolated node is a community: `count(DISTINCT louvain)` counts each one, so count the communities with more than one member with `GROUP BY louvain HAVING count(*) > 1`.
-- **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
+- **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. The key's column can be left out (`REFERENCES members`) when the vertex table's key is known: its `KEY`, its primary key, or the column another `REFERENCES` names. With several vertex tables, every endpoint needs one, to say which table it refers to.
 - **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
 
@@ -250,7 +250,7 @@ DROP PROPERTY GRAPH first;
 DROP PROPERTY GRAPH IF EXISTS first;
 ```
 
-Dropping a graph leaves its tables and views alone.
+Dropping a graph leaves its tables and views alone. `PROPERTY` may be left out: `DROP GRAPH first`. There is no `ALTER PROPERTY GRAPH`; to change a graph, write its whole new definition with `CREATE OR REPLACE PROPERTY GRAPH`.
 
 ## SHOW GRAPHS
 
@@ -328,7 +328,7 @@ SHOW ursa.index_storage_limit;
 | `ursa.max_paths` | `10000000` | The most paths one `GRAPH_TABLE` path search holds before it stops with an error; `0` for no limit. Under `ANY SHORTEST` and `SHORTEST k` it counts the paths kept, never fewer than one (`k`) per node of the graph; otherwise every path and partial path held. See [pattern matching](pattern-matching.md#how-many-paths). |
 | `ursa.build_read_ahead` | `auto` | The most memory an index build holds in decoded rows read ahead of the ones it is numbering, so that the partitions of its source (and of a vertex table) decode on all cores at once. Bytes, or a number with `KiB`, `MiB`, `GiB` or `TiB`. `auto`: 256 MiB per partition of the source (one per core, as a rule), at most 1 GiB and at most an eighth of the memory available; less than 1 GiB slows a build of many partitions. `0` reads the source one partition at a time, holding nothing ahead: the least memory, the slowest build. The index is the same under any value. |
 
-`SHOW ursa.index_storage_limit VERBOSE` adds a description; for the storage limit, it starts with where the limit comes from (`SET for this session`, or the default and the free space it is a share of). `SHOW ALL` lists every setting, DataFusion's and Ursa's. DataFusion's settings, such as `datafusion.execution.target_partitions`, work as in DataFusion.
+`SHOW ursa.index_storage_limit VERBOSE` adds a description; for the storage limit, it starts with where the limit comes from (`SET for this session`, or the default and the free space it is a share of). `SHOW ALL` lists every setting, DataFusion's and Ursa's. DataFusion's settings, such as `datafusion.execution.target_partitions`, work as in DataFusion. DuckDB's `SET threads = 4` sets `datafusion.execution.target_partitions`; any other name without an `ursa.` or `datafusion.` prefix is refused with a message that says so.
 
 A setting lasts for the session, as in DuckDB and Postgres, in any database: `SET` and `RESET` write nothing to the database file. To keep a setting, put the `SET` in `~/.ursarc`, which the interactive shell runs at startup, or in a file you pass with `-init`, which scripts run too.
 

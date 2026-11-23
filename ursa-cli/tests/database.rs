@@ -807,3 +807,28 @@ fn a_database_with_a_view_over_a_missing_file_opens() {
     assert_eq!(String::from_utf8(out.stderr.clone()).unwrap(), "");
     assert_eq!(ok(out), "x\n1\n");
 }
+
+/// DuckDB's `CREATE TEMP TABLE` and `CREATE TEMP VIEW` run in a database
+/// file, for the process that made them, and are not stored (#417).
+#[test]
+fn temp_tables_and_views_run_and_are_not_stored() {
+    let dir = karate_dir();
+    let out = ok(ursa_in(
+        dir.path(),
+        &[
+            "club.ursa",
+            "--format",
+            "csv",
+            "-c",
+            "CREATE TEMP TABLE t AS SELECT 1 AS x; CREATE TEMP VIEW v AS SELECT x + 1 AS y FROM t; \
+             SELECT y FROM v",
+        ],
+    ));
+    assert!(out.ends_with("y\n2\n"), "{out}");
+    assert!(catalog(&dir.path().join("club.ursa")).is_empty());
+    let e = err(ursa_in(dir.path(), &["club.ursa", "-c", "SELECT * FROM v"]));
+    assert!(
+        e.contains("table 'datafusion.public.v' not found") || e.contains("'v'"),
+        "{e}"
+    );
+}

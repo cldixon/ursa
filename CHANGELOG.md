@@ -80,6 +80,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `SHOW TABLES` leaves out `information_schema`'s own views.
   - Docs: a "Differences from DuckDB" page, the file formats and `read_*`
     functions in the statements page, and `COPY`'s row count.
+- **Ursa SQL: more DuckDB and DuckPGQ habits** (#417). Each of these failed
+  with a parser error or a message that did not name the fix.
+  - `COPY … TO 'f' (FORMAT parquet, HEADER, DELIMITER '|', COMPRESSION
+    zstd)`, and `WITH (…)`: DuckDB's option list maps onto `STORED AS` and
+    `OPTIONS`. `DELIM` and `SEP` are `DELIMITER`'s other names; any other
+    option is refused by name.
+  - `SET threads = n` sets `datafusion.execution.target_partitions`. `SET`
+    of another name without an `ursa.` or `datafusion.` prefix says that
+    Ursa's settings start with one, and that `SHOW ALL` lists them.
+  - `DROP GRAPH g` and `SHOW PROPERTY GRAPHS`. DuckPGQ's `SUMMARIZE
+    PROPERTY GRAPH g` returns `describe(g)` for a graph of one edge table
+    and says to name the pair for more. `ALTER PROPERTY GRAPH` says to use
+    `CREATE OR REPLACE PROPERTY GRAPH`.
+  - `ORDER BY ALL` orders by every column of the `SELECT` list; after
+    `SELECT *`, the error says to name the columns or their positions.
+  - `SHOW 'file.csv'` is `DESCRIBE 'file.csv'`. `CREATE TEMP TABLE` and
+    `CREATE TEMP VIEW` run; a database file does not store them.
+  - Hints: `SELECT pagerank(g)`, for every graph function, says it is a
+    table function (`SELECT * FROM pagerank(g)`); `SELECT id, pagerank FROM
+    g.nodes` says to join the function's rows on `id` (#300); an unquoted
+    file name, `FROM karate_edges.csv`, says to quote the path.
+  - DuckDB's names for DataFusion's functions: `list_value` (`make_array`),
+    `strftime` (`to_char`, either argument order), `epoch_ms` (milliseconds
+    to a timestamp and back), and the aggregates `arg_max` and `arg_min`
+    (`first_value … ORDER BY`, skipping NULLs).
+  - Tests: `DESCRIBE FROM`, `EXPLAIN FROM`, `CREATE VIEW v AS FROM` and
+    `COPY (FROM t) TO` together, on DuckPGQ's graph.
 - **`ursa` for agents and scripts** (#312):
   - `-f` files, `-c` and SQL on stdin take dot-commands, as `-init` files
     and `.read` do, and as in DuckDB: `.timer on`, `.mode csv`, `.read`. In
@@ -228,6 +255,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **A frame budget for the graph view: pan and zoom no longer wait for the
+  graph's size** (#495). While the camera or the positions change, a frame
+  draws a prefix of the edges and, where the nodes are too many as well,
+  the largest of them: as much as the last frames' costs say fits in a
+  frame (12 ms, or 1.3 of the display's refresh periods). At rest, 200 ms
+  after the last movement, it draws everything, the same pixels as before.
+  The edges are in importance order, so a prefix is a backbone of the
+  drawing: by the level of the layout's hierarchy at which an edge's two
+  ends merge, coarsest first, then one edge of each merged edge a round, the
+  heaviest first, then a hash (`Fa2Multilevel::edge_order` in `ursa-core`;
+  by the larger degree of the two ends where there is no hierarchy:
+  `edge_order_by_degree`). The layout worker computes the order once
+  (0.3 s at 1M edges) and the view writes it to the GPU a piece at a time.
+  `ursa-viz` gains `budget` (the controller: it searches for the largest
+  budget that fits, since a browser's frame cost is whole refresh periods)
+  and `order`; `View::draw_frame`, `set_edge_order` and `frame_info`; and
+  in the wasm API `renderFrame`, `frameCost`, `framePartial`, `keepMoving`,
+  `setEdgeOrder`, `orderEdges`, `frameInfo` (also `info().frame`) and
+  `Layout.edgeOrder`. On `.graph rmat` (1M edges) in headless Chromium's
+  software WebGL2, frames of a scripted wheel zoom are 26 to 31 ms apart at
+  the 95th percentile over three runs (3.3 s before; 25 to 46 ms on a
+  busier machine), the first frame is shown 1.3 s after Enter (6.0 s) and
+  the layout is done at 5.6 s (10.6 s),
+  the page no longer rasterising a million edges for each set of positions;
+  that renderer fits 512 to 1,081 edges and 170 to 360 nodes in a frame,
+  and a frame at rest still takes it seconds. Not measured on a GPU
+  (`ursa-viz/BENCH.md`).
 - **Ursa Web Shell: the Graph view times itself** (#430).
   `window.ursaShell.graphTimings()` gains `frames` (the count, and the p50,
   p95 and max of the time in `render()` and of the time between frames
@@ -932,6 +986,39 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WHERE`, and `COLUMNS`. `KEEP …` and `ONE ROW PER …`, which were ignored
   the same way, are refused as not supported yet. Only queries that were
   already wrong are affected.
+- **SQL: more of SQL/PGQ's and DuckPGQ's `GRAPH_TABLE` forms run**
+  (#413, #414). Each was an error before, so no query that ran changes.
+  - `COLUMNS` may be left out, or written `COLUMNS (*)`: every property of
+    each named node and edge, in pattern order (`a.*, k.*, b.*`), as DuckPGQ
+    returns them. A repeated name gets a suffix (`id`, `id:1`).
+  - `<-[e]->` and `<->`, the standard's "left or right", mean `-[e]-` and
+    `-`, since every edge of an Ursa graph is directed. The undirected `~`
+    forms are refused: "Ursa's edges are directed; use -[e]- to follow them
+    either way".
+  - `element_id(a)` of a node is its key; `element_id(e)` of an edge is its
+    row in the edge table, the number `edges(p)` lists (for the edge of a
+    path with a variable; an edge read by a join is refused for now).
+  - Graph predicates in `WHERE` and `COLUMNS`: `SAME(a, b, …)`,
+    `ALL_DIFFERENT(a, b, …)`, `x IS [NOT] LABELED l`, and `a IS [NOT]
+    SOURCE OF e` / `IS [NOT] DESTINATION OF e`.
+  - `KEEP <selector or path mode>` after a pattern of one path is its prefix
+    form: `MATCH p = (a)-[e]->*(b) KEEP ANY SHORTEST` is `MATCH p = ANY
+    SHORTEST (a)-[e]->*(b)`. `ONE ROW PER MATCH`, the default, is accepted.
+  - `CREATE PROPERTY GRAPH`: `REFERENCES t` without a column list names
+    `t`'s key, when it is known (its `KEY`, its primary key, or another
+    `REFERENCES`).
+  - Clearer errors for what is not supported yet, in place of parser
+    errors, debug dumps or a wrong variable: `KEEP` over several paths,
+    `ONE ROW PER VERTEX` / `STEP`, aggregates in `COLUMNS`, a subquery in
+    the pattern that reads a table the statement does not name, `LATERAL
+    GRAPH_TABLE` and other references to tables outside the `GRAPH_TABLE`,
+    the properties of a quantified edge variable ("stands for several
+    edges"), and Cypher's property maps (`{name: 'x'}`) and ranges
+    (`*1..3`), each with the SQL/PGQ to write. The label-expression error
+    now points at #412.
+  - A SQL/PGQ and DuckPGQ conformance suite (#299), `tests/conformance/`,
+    in sqllogictest's format, with a reviewed list of known differences;
+    `cargo test -p ursa-sql --test conformance` runs it.
 
 - **Triangle counting uses about a third of the CPU, with the same counts**
   (#420). `triangle_count`, and so `clustering_coefficient` and the SQL

@@ -11,7 +11,7 @@ Ursa's SQL works like DuckDB's in the ways you use most: you name a file in `FRO
 
 ## What works the same
 
-**Files are tables.** Name a file, a glob, a directory or a URL in `FROM`:
+**Files are tables.** Name a file, a glob, a directory or a URL in `FROM`, in quotes:
 
 ```sql
 SELECT count(*) AS ties FROM 'karate_edges.csv';
@@ -25,6 +25,8 @@ SELECT count(*) AS ties FROM 'karate_edges.csv';
 │    78 │
 └───────┘
 ```
+
+Without the quotes, `FROM karate_edges.csv` names a table `csv` in a schema `karate_edges`; the error that it is not found says to quote the path. `SHOW 'karate_edges.csv'` is `DESCRIBE 'karate_edges.csv'`, as in DuckDB.
 
 **`read_parquet`, `read_csv` and `read_json`** read the same files, with a few of DuckDB's options. DuckDB's `name = value` form works, as does Ursa's `name => value`:
 
@@ -44,7 +46,7 @@ SELECT * FROM read_csv('karate_edges.csv', header = true, delim = ',') LIMIT 2;
 
 [Reading and writing files](/docs/import-export/files/) lists the options. `read_csv_auto`, `read_json_auto` and `read_ndjson` are other names for the same functions.
 
-**FROM-first queries**, `EXCLUDE`, `REPLACE`, `GROUP BY ALL` and `QUALIFY`:
+**FROM-first queries**, `EXCLUDE`, `REPLACE`, `GROUP BY ALL`, `ORDER BY ALL` and `QUALIFY`:
 
 ```sql
 FROM 'karate_edges.csv' LIMIT 1;
@@ -52,7 +54,7 @@ SELECT * EXCLUDE (dst) FROM 'karate_edges.csv' LIMIT 1;
 SELECT src, count(*) AS friends FROM 'karate_edges.csv' GROUP BY ALL ORDER BY friends DESC LIMIT 1;
 ```
 
-A FROM-first query works wherever a query does: in a subquery, in `CREATE VIEW v AS FROM t`, in `COPY (FROM t) TO …`, and after `EXPLAIN` and `DESCRIBE` (`DESCRIBE FROM 'karate_edges.csv'` lists the file's columns).
+A FROM-first query works wherever a query does: in a subquery, in `CREATE VIEW v AS FROM t`, in `COPY (FROM t) TO …`, and after `EXPLAIN` and `DESCRIBE` (`DESCRIBE FROM 'karate_edges.csv'` lists the file's columns). `ORDER BY ALL` orders by every column of the `SELECT` list, left to right, where the list names its columns; after `SELECT *`, name the columns or their positions (`ORDER BY 1, 2`).
 
 ```text
 ┌───────┬───────┐
@@ -93,7 +95,9 @@ DESCRIBE 'karate_edges.csv';
 
 **The shell.** `ursa club.ursa` opens or creates a database file, as `duckdb club.duckdb` does. `-c` runs SQL and exits, and `-f` runs a file. The dot-commands include `.tables`, `.schema`, `.mode` (with DuckDB's `duckbox`, `markdown`, `line` and `jsonlines`), `.headers`, `.output`, `.once`, `.read`, `.timer` and `.help`; `.nullvalue`, `.separator`, `.databases` and `.shell` are not there. See [the shell](/docs/cli/shell/).
 
-**Graphs.** `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` follow SQL/PGQ, as DuckDB's DuckPGQ extension does, and DuckPGQ's examples run as written. See [pattern matching](/docs/graphs/pattern-matching/). Graph functions such as `pagerank(g, damping => 0.9)` take their parameters by name, written `name => value`, `name = value` or `name := value`.
+**Graphs.** `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` follow SQL/PGQ, as DuckDB's DuckPGQ extension does, and DuckPGQ's examples run as written. See [pattern matching](/docs/graphs/pattern-matching/). DuckPGQ's `DROP PROPERTY GRAPH` and `SHOW PROPERTY GRAPHS` work, and may leave out `PROPERTY` (`DROP GRAPH g`, `SHOW GRAPHS`). `SUMMARIZE PROPERTY GRAPH g` returns `describe(g)`'s row for a graph of one edge table; for more, call `describe(g, vertex, edge)` with the pair. `ALTER PROPERTY GRAPH` is not supported: write the whole new definition with `CREATE OR REPLACE PROPERTY GRAPH`. Graph functions such as `pagerank(g, damping => 0.9)` take their parameters by name, written `name => value`, `name = value` or `name := value`.
+
+**Settings and temporary tables.** `SET threads = 4` sets `datafusion.execution.target_partitions`, the number of partitions a query runs in. Ursa's other settings start with `ursa.` or `datafusion.`, and `SHOW ALL` lists them; DuckDB's `memory_limit` is `datafusion.runtime.memory_limit`. `CREATE TEMP TABLE` and `CREATE TEMP VIEW` work. In a database file they are not stored.
 
 ## What is different
 
@@ -133,7 +137,29 @@ COPY (SELECT * FROM 'karate_edges.csv') TO 'ties.parquet';
 └────────┘
 ```
 
-The format comes from the extension, or from `STORED AS PARQUET`. Options go in `OPTIONS (...)`, not DuckDB's `(FORMAT parquet, ...)`.
+The format comes from the extension, or from `FORMAT` in DuckDB's option list, which Ursa maps onto DataFusion's `STORED AS` and `OPTIONS (...)`:
+
+```sql
+COPY (FROM 'karate_edges.csv') TO 'ties.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+```
+
+```text
+┌────────┐
+│ count  │
+│ UInt64 │
+├────────┤
+│     78 │
+└────────┘
+```
+
+| DuckDB | DataFusion |
+| --- | --- |
+| `FORMAT parquet` | `STORED AS PARQUET` |
+| `HEADER`, `HEADER false` | `OPTIONS ('format.has_header' 'true')` |
+| `DELIMITER '\|'`, `DELIM`, `SEP` | `OPTIONS ('format.delimiter' '\|')` |
+| `COMPRESSION zstd` | `OPTIONS ('format.compression' 'zstd(3)')` for Parquet; `zstd`, `gzip` and `brotli` get a level |
+
+`WITH (...)` works too. Any other option, such as `ROW_GROUP_SIZE` or `PARTITION_BY`, is refused by name; DataFusion's own options go in `OPTIONS (...)`.
 
 **Division.** In DataFusion, `/` between two integers is integer division, rounded toward zero, as in PostgreSQL: `7 / 2` is `3`, and `count(*) / 3` is an integer. DuckDB's `/` returns a `DOUBLE` (3.5), and DuckDB's `//` (integer division) is not supported. With a `DECIMAL` (`NUMERIC`) on either side, the result is a `DECIMAL`. For a float, make one side a float, with `CAST(a AS DOUBLE)` or `* 1.0`; for an integer from a float or a decimal, `CAST(… AS BIGINT)` rounds toward zero:
 
@@ -154,12 +180,38 @@ SELECT 7 / 2 AS integers,
 └──────────┴─────────┴──────────────┴───────────────────┴───────────┘
 ```
 
-**Functions.** Scalar and aggregate functions are DataFusion's. Most common ones share DuckDB's names, but some do not: `to_char` formats a date where DuckDB has `strftime`, and `make_array` builds a list where DuckDB also has `list_value`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.
+**Functions.** Scalar and aggregate functions are DataFusion's. Most common ones share DuckDB's names, and Ursa adds DuckDB's names for a few that DataFusion calls something else:
+
+| DuckDB | Runs as |
+| --- | --- |
+| `list_value(a, b, …)` | `make_array(a, b, …)` |
+| `strftime(t, format)` | `to_char(t, format)`; `strftime(format, t)` works too |
+| `epoch_ms(n)` | the timestamp `n` milliseconds after 1970-01-01 |
+| `epoch_ms(t)` | the milliseconds from 1970-01-01 to `t`, a `BIGINT` |
+| `arg_max(x, y)`, `arg_min(x, y)` | `first_value(x ORDER BY y DESC)` (`ASC`), skipping rows where `x` or `y` is NULL |
+
+```sql
+SELECT list_value(1, 2) AS l,
+       strftime(DATE '2024-03-05', '%d/%m/%Y') AS day,
+       epoch_ms(86400000) AS t,
+       arg_max(dst, src) AS last_dst
+FROM 'karate_edges.csv';
+```
+
+```text
+┌─────────────┬────────────┬─────────────────────┬──────────┐
+│      l      │    day     │          t          │ last_dst │
+│ List(Int64) │    Utf8    │    Timestamp(ms)    │  Int64   │
+├─────────────┼────────────┼─────────────────────┼──────────┤
+│ [1, 2]      │ 05/03/2024 │ 1970-01-02T00:00:00 │       33 │
+└─────────────┴────────────┴─────────────────────┴──────────┘
+```
+
+`arg_max` and `arg_min` are aggregates, not window functions. DuckDB's lambdas (`list_transform(l, x -> x + 1)`) and reuse of a column alias in the same `SELECT` are not supported. The graph functions are table functions: `SELECT pagerank(g)` says to write `SELECT * FROM pagerank(g)`, and a graph function named as a column (`SELECT id, pagerank FROM g.nodes`) says to join its rows on `id`. `SELECT * FROM ursa_functions()` lists the graph functions, and `SHOW FUNCTIONS` lists the rest.
 
 **Not supported:**
 
-- `SUMMARIZE`;
+- `SUMMARIZE` of a table or query;
 - `USING SAMPLE` and `TABLESAMPLE`. Both are refused with an error; for a sample of n rows, use `ORDER BY random() LIMIT n`;
-- `ORDER BY ALL`;
 - `PRAGMA`, `INSTALL` and `LOAD`. Ursa has no extensions: object storage, Parquet, CSV and JSON are built in;
 - `ATTACH … AS`. A session has one database.

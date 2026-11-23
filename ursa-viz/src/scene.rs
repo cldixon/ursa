@@ -735,6 +735,29 @@ impl LiveLayout {
         }
     }
 
+    /// The order to draw the edges `(src[e], dst[e])` in, most important
+    /// first, so that any prefix is a backbone of the drawing
+    /// ([`crate::order`]): `order[i]` is the edge to draw `i`-th. The edges
+    /// are the graph's, in the order the caller numbers them.
+    ///
+    /// Coarse to fine, the order is the hierarchy's
+    /// ([`Fa2Multilevel::edge_order`]): the edges between the drawing's far
+    /// groups first, the local fill last. With no hierarchy (flat, rings,
+    /// layers, a grown layout, or a graph too small to coarsen) it is by
+    /// the larger degree of an edge's two ends
+    /// ([`ursa_core::algo::edge_order_by_degree`]): the edges at the
+    /// largest nodes first. The same input gives the same order every time.
+    ///
+    /// # Panics
+    ///
+    /// If `src` and `dst` differ in length.
+    pub fn edge_order(&self, src: &[u32], dst: &[u32]) -> Vec<u32> {
+        match &self.engine {
+            Engine::Multilevel(s) if s.coarse_levels() > 0 => s.edge_order(src, dst),
+            _ => ursa_core::algo::edge_order_by_degree(self.topology.undirected(), src, dst),
+        }
+    }
+
     /// The positions now: `x` and `y`, one per node.
     pub fn positions(&self) -> (&[f32], &[f32]) {
         match &self.engine {
