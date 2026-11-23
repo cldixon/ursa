@@ -28,9 +28,10 @@
 //   the page's memory as the browser measures it; and, from
 //   graphTimings().memory, what the two ursa-viz instances hold in bytes an
 //   edge. On rmat (a million edges) the run fails if the view's is over
-//   20 MiB or the layout worker's over 60 MB (#501): they are 17.9 MiB and
-//   55.7 MB, the same every run, since a WebAssembly memory grows by what
-//   is asked of it and not by the machine's load.
+//   20 MiB or the layout worker's over 60 MB (#501): they are 17.9 to
+//   18.3 MiB and 55.7 MB, the edge order of #495 included, and vary little
+//   with the machine's load, since a WebAssembly memory grows by what is
+//   asked of it.
 //
 // Then the medians over the runs.
 import { chromium } from "playwright";

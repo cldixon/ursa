@@ -437,18 +437,21 @@ impl GraphView {
     /// false: the frames draw the old order until the new one is whole.
     ///
     /// What is written is staged in this module's memory until the GPU has
-    /// taken it (WebGL2), so a call made while the GPU still holds the
-    /// last one's writes nothing and returns true, up to 32 times in a row:
-    /// the order then costs the view a run of staging and not all of it.
+    /// taken it (WebGL2). With `wait` true, a call made while the GPU
+    /// still holds the last one's writes nothing and returns true, up to
+    /// 32 times in a row: the order then costs the view a run of staging
+    /// and not all of it. A page that calls this a task at a time passes
+    /// it.
     #[wasm_bindgen(js_name = orderEdges)]
-    pub fn order_edges(&mut self, max_edges: Option<u32>) -> bool {
+    pub fn order_edges(&mut self, max_edges: Option<u32>, wait: Option<bool>) -> bool {
         if !self.view.is_ordering() {
             return false;
         }
-        let taken = self
-            .device
-            .poll(wgpu::PollType::Poll)
-            .map_or(true, |status| status.is_queue_empty());
+        let taken = !wait.unwrap_or(false)
+            || self
+                .device
+                .poll(wgpu::PollType::Poll)
+                .map_or(true, |status| status.is_queue_empty());
         if !taken && self.order_waits < ORDER_WAITS {
             self.order_waits += 1;
             return true;

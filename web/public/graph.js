@@ -532,7 +532,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const more = () => {
       if (current !== state) return;
       if (state.paused) return void setTimeout(more, 50);
-      if (view.orderEdges()) setTimeout(more);
+      // A run a task, each once the GPU has taken the last (#501).
+      if (view.orderEdges(undefined, true)) setTimeout(more);
     };
     more();
   };

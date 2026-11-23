@@ -636,7 +636,7 @@ every run: it follows what is allocated, not the machine's load.
 
 | | before | now | budget |
 |---|---|---|---|
-| the page's view | 59.6 MiB (62.5 MB), 62 bytes an edge | 17.9 MiB (18.7 MB), 19 bytes an edge | 20 MiB |
+| the page's view | 59.6 MiB (62.5 MB), 62 bytes an edge | 17.9 MiB (18.7 MB), 19 bytes an edge; 18.3 MiB in some runs once the edge order is written | 20 MiB |
 | the layout worker | 96.7 MiB (101.4 MB), 101 bytes an edge | 53.1 MiB (55.7 MB), 56 bytes an edge | 60 MB |
 | both | 164 MB | 74.4 MB | 76 MB |
 
