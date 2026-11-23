@@ -448,7 +448,7 @@ pub(super) fn degree_mass(adj: &UndirectedCsr) -> Vec<f32> {
 /// out, if the level has more than this share of the input graph's
 /// adjacency entries: a dense core that grouping does not thin. Levels that
 /// shrink, as most graphs' do, keep theirs.
-const LEAN_SHARE: f64 = 0.6;
+const LEAN_SHARE: f64 = 0.75;
 
 /// The coarsened levels of `adj`, finest first: `coarsen(adj)[0]` groups the
 /// nodes of `adj` itself. `lean` lets go of the weights of the levels that
@@ -945,17 +945,21 @@ impl Fa2Multilevel {
             s.copy_from_slice(&src[start..start + s.len()]);
             d.copy_from_slice(&dst[start..start + d.len()]);
         };
-        edges_of_keys(self.edge_order_keys(adj, src.len(), &mut read, Vec::new()))
+        let mut keys = vec![0u64; src.len()];
+        self.edge_order_keys(adj, src.len(), &mut read, &mut keys);
+        edges_of_keys(keys)
     }
 
     /// [`Self::edge_order`] for a caller that holds neither the edges nor
-    /// room for the order as slices of its own (a browser's worker, whose
-    /// edges are the page's): the `edges` edges are read a run at a time
-    /// (`read(start, src, dst)` fills the two runs, of equal length, with
-    /// the edges from `start` on), and what comes back is the sorted keys,
-    /// eight bytes an edge, which [`pack_edges_of_keys`] turns into the
-    /// order in place. So the order costs eight bytes an edge at its peak, and two
-    /// bytes for each adjacency entry of one level.
+    /// the order's keys in memory of its own (a browser's worker, whose
+    /// memory is small and whose edges are the page's): the `edges` edges
+    /// are read a run at a time (`read(start, src, dst)` fills the two
+    /// runs, of equal length, with the edges from `start` on), and each
+    /// edge's sort key is left in `keys`, which is read and written a run
+    /// at a time too ([`OrderKeys`]). The caller sorts the keys, ascending,
+    /// and [`edge_of_key`] of each is then the order. Here it holds two
+    /// runs of edges, one of keys, and two bytes for each adjacency entry
+    /// of the largest level.
     ///
     /// `adj` is the input graph's adjacency, the one given to
     /// [`Self::new`]. A lean hierarchy ([`Self::new_lean`]) does not hold
@@ -963,39 +967,36 @@ impl Fa2Multilevel {
     /// `adj`, a level at a time, and the order is the same. Once the layout
     /// has come down a level the hierarchy above it is let go, and the
     /// order is [`edge_order_by_degree`]'s.
-    ///
-    /// `room` is where the keys go: any vector, emptied first. One with room
-    /// for `edges` keys, set aside before the hierarchy was built, means the
-    /// order asks for no large block afterwards, when a small memory may
-    /// have none left in one piece.
     pub fn edge_order_keys(
         &self,
         adj: &UndirectedCsr,
         edges: usize,
-        read: &mut dyn FnMut(usize, &mut [u32], &mut [u32]),
-        room: Vec<u64>,
-    ) -> Vec<u64> {
+        read: &mut ReadEdges<'_>,
+        keys: &mut dyn OrderKeys,
+    ) {
         let levels = self.coarse.len();
         if self.level < levels {
-            return degree_keys(adj, edges, read, room);
+            return edge_order_by_degree_keys(adj, edges, read, keys);
         }
         let n0 = self.x.len();
         // Each level's nodes to their groups in the level above.
         let parents: Vec<Vec<u32>> = self.coarse.iter().map(Coarse::groups).collect();
         // First, for each edge, the level its ends merge at (0: it joins
-        // nothing) and, at the level below that, the merged edge it is part
-        // of (its adjacency entry there): `level << 32 | entry`. Eight
-        // bytes an edge is all this holds besides the hierarchy.
-        let mut keys = room;
-        keys.clear();
-        keys.resize(edges, 0);
-        let run = EDGE_RUN.min(edges);
+        // nothing) in bits 32 to 37 and, at the level below that, the
+        // merged edge it is part of (its adjacency entry there) below; and
+        // how many edges there are to rank at each level.
+        let level_of = |key: u64| (key >> 32) as usize & 63;
+        let ranked = |key: u64, l: usize| level_of(key) == l + 1 && key as u32 != NONE;
+        let mut to_rank = [0usize; 64];
+        let run = ORDER_RUN.min(edges);
         let (mut src, mut dst) = (vec![0u32; run], vec![0u32; run]);
+        let mut chunk = vec![0u64; run];
         let mut start = 0;
         while start < edges {
             let len = run.min(edges - start);
             read(start, &mut src[..len], &mut dst[..len]);
             for i in 0..len {
+                chunk[i] = 0;
                 let (mut a, mut b) = (src[i], dst[i]);
                 if a as usize >= n0 || b as usize >= n0 || a == b {
                     continue;
@@ -1020,105 +1021,112 @@ impl Fa2Multilevel {
                         entry = (base + at) as u32;
                     }
                 }
-                keys[start + i] = ((l + 1).min(63) as u64) << 32 | u64::from(entry);
+                let level = (l + 1).min(63);
+                chunk[i] = (level as u64) << 32 | u64::from(entry);
+                if entry != NONE {
+                    to_rank[level] += 1;
+                }
             }
+            keys.write(start, &chunk[..len]);
             start += len;
         }
         drop((src, dst));
-        // Each key now holds its level in bits 32 to 37 and its entry below.
-        // The round and the weight join them (bits 38 to 51, and 52 up),
-        // a level at a time, in one buffer of two bytes an entry that every
+        // The round and the weight join them (bits 38 to 51, and 52 up), a
+        // level at a time, in one buffer of two bytes an entry that every
         // level uses in turn: first as the count of the edges seen so far
         // of each merged edge, then, for a level whose weights a lean
         // hierarchy let go of, as those weights counted again.
-        let level_of = |key: u64| (key >> 32) as usize & 63;
-        let ranked = |key: u64, l: usize| level_of(key) == l + 1 && key as u32 != NONE;
         let most = self.coarse.iter().map(|c| c.entries).max().unwrap_or(0);
         let mut scratch = vec![0u16; most];
-        for l in 1..=levels {
+        // Every run of the keys, through `change`, and back.
+        let mut each_run = |keys: &mut dyn OrderKeys, change: &mut dyn FnMut(&mut [u64])| {
+            let mut start = 0;
+            while start < edges {
+                let len = run.min(edges - start);
+                keys.read(start, &mut chunk[..len]);
+                change(&mut chunk[..len]);
+                keys.write(start, &chunk[..len]);
+                start += len;
+            }
+        };
+        // Each input node's group at the level in hand (`NONE` once it has
+        // left the hierarchy), for the weights counted again.
+        let mut ancestor: Vec<u32> = (0..n0 as u32).collect();
+        for l in 1..=levels.min(62) {
             let coarse = &self.coarse[l - 1];
+            for a in &mut ancestor {
+                if *a != NONE {
+                    *a = parents[l - 1][*a as usize];
+                }
+            }
             // No edge's ends merge just above this level: nothing to rank.
-            if !keys.iter().any(|&key| ranked(key, l)) {
+            if to_rank[l + 1] == 0 {
                 continue;
             }
-            // Its round: how many edges before it, in index order, are
-            // part of the same merged edge.
             let seen = &mut scratch[..coarse.entries];
             seen.fill(0);
-            for key in keys.iter_mut().filter(|key| ranked(**key, l)) {
-                let count = &mut seen[*key as u32 as usize];
-                *key |= u64::from(*count).min(KEY_ROUNDS) << 38;
-                *count = count.saturating_add(1);
-            }
-            // Its merged edge's weight, as far as a key tells them apart.
             let lean = coarse.lacks_weights();
+            // Its round: how many edges before it, in index order, are
+            // part of the same merged edge. And its merged edge's weight,
+            // as far as a key tells them apart: with the round, where the
+            // level holds its weights.
+            each_run(keys, &mut |chunk| {
+                for key in chunk.iter_mut().filter(|key| ranked(**key, l)) {
+                    let entry = *key as u32 as usize;
+                    let count = &mut seen[entry];
+                    *key |= u64::from(*count).min(KEY_ROUNDS) << 38;
+                    *count = count.saturating_add(1);
+                    if !lean {
+                        let weight = (coarse.weights[entry].max(0.0) as u64).min(KEY_WEIGHTS);
+                        *key |= weight << 52;
+                    }
+                }
+            });
             if lean {
-                self.entry_counts(adj, &parents, l, seen);
-            }
-            for key in keys.iter_mut().filter(|key| ranked(**key, l)) {
-                let entry = *key as u32 as usize;
-                let weight = if lean {
-                    u64::from(seen[entry])
-                } else {
-                    (coarse.weights[entry].max(0.0) as u64).min(KEY_WEIGHTS)
-                };
-                *key |= weight << 52;
+                self.entry_counts(adj, &ancestor, l, seen);
+                each_run(keys, &mut |chunk| {
+                    for key in chunk.iter_mut().filter(|key| ranked(**key, l)) {
+                        *key |= u64::from(seen[*key as u32 as usize]) << 52;
+                    }
+                });
             }
         }
-        drop((scratch, parents));
+        drop(parents);
         // And with those, its key. An edge whose ends merge at the first
         // level stands for itself, and one that joins nothing comes last.
-        for (e, key) in keys.iter_mut().enumerate() {
-            let (level, entry) = (level_of(*key), *key as u32);
-            *key = if level <= 1 || entry == NONE {
-                order_key(level, 0, 1, e)
-            } else {
-                order_key(level, (*key >> 38) & KEY_ROUNDS, *key >> 52, e)
-            };
-        }
-        keys.sort_unstable();
-        keys
+        let mut e = 0;
+        each_run(keys, &mut |chunk| {
+            for key in chunk.iter_mut() {
+                let (level, entry) = (level_of(*key), *key as u32);
+                *key = if level <= 1 || entry == NONE {
+                    order_key(level, 0, 1, e)
+                } else {
+                    order_key(level, (*key >> 38) & KEY_ROUNDS, *key >> 52, e)
+                };
+                e += 1;
+            }
+        });
     }
 
     /// The weight of each adjacency entry of level `l`, into `counts` (one
     /// an entry), as far as an edge's key tells weights apart
     /// ([`KEY_WEIGHTS`]): how many of the input graph's entries it stands
-    /// for, counted from `adj` through the groups (`parents[i]` takes level
-    /// `i`'s nodes to level `i + 1`'s). A weight is a sum of ones, so this
-    /// is the weight the level was built with, capped; it is for a level
-    /// whose weights a lean hierarchy let go of, and takes two bytes an
-    /// entry where they took four.
-    fn entry_counts(
-        &self,
-        adj: &UndirectedCsr,
-        parents: &[Vec<u32>],
-        l: usize,
-        counts: &mut [u16],
-    ) {
+    /// for, counted from `adj` (`ancestor[v]` is input node `v`'s group at
+    /// level `l`, or [`NONE`]). A weight is a sum of ones, so this is the
+    /// weight the level was built with, capped; it is for a level whose
+    /// weights a lean hierarchy let go of, and takes two bytes an entry
+    /// where they took four.
+    fn entry_counts(&self, adj: &UndirectedCsr, ancestor: &[u32], l: usize, counts: &mut [u16]) {
         let level = &self.coarse[l - 1].adj;
         counts.fill(0);
-        let up = |mut v: u32| {
-            for parent in &parents[..l] {
-                v = parent[v as usize];
-                if v == NONE {
-                    break;
-                }
-            }
-            v
-        };
-        for u in 0..self.x.len() as u32 {
-            let neighbours = adj.neighbors(u);
-            if neighbours.is_empty() {
-                continue;
-            }
-            let a = up(u);
+        for (u, &a) in ancestor.iter().enumerate() {
             if a == NONE {
                 continue;
             }
             let base = level.offsets[a as usize] as usize;
             let row = level.neighbors(a);
-            for &v in neighbours {
-                let b = up(v);
+            for &v in adj.neighbors(u as u32) {
+                let b = ancestor[v as usize];
                 if b == NONE || b == a {
                     continue;
                 }
@@ -1131,40 +1139,51 @@ impl Fa2Multilevel {
     }
 }
 
-/// How many edges [`Fa2Multilevel::edge_order_keys`] reads at a time.
-const EDGE_RUN: usize = 1 << 16;
+/// How many edges, and how many keys, an order reads and writes at a time.
+const ORDER_RUN: usize = 1 << 15;
 
 /// The greatest weight an edge's key tells apart, and the greatest round:
 /// heavier and later ones tie.
 const KEY_WEIGHTS: u64 = (1 << 12) - 1;
 const KEY_ROUNDS: u64 = (1 << 14) - 1;
 
-/// The order of the edges whose sorted keys are `keys`
-/// ([`Fa2Multilevel::edge_order_keys`], [`edge_order_by_degree_keys`]),
-/// packed over them, two edges a key: the edge to draw `i`-th is the low
-/// half of `keys[i / 2]` for an even `i`, the high half for an odd one. The
-/// keys are cut to the half that holds them, and nothing is allocated. On a
-/// little-endian machine their bytes are then the order as `u32`s.
-pub fn pack_edges_of_keys(keys: &mut Vec<u64>) {
-    let edges = keys.len();
-    for j in 0..edges.div_ceil(2) {
-        let low = u64::from(unmix32(keys[2 * j] as u32));
-        let high = match keys.get(2 * j + 1) {
-            Some(&key) => u64::from(unmix32(key as u32)),
-            None => 0,
-        };
-        keys[j] = low | high << 32;
-    }
-    keys.truncate(edges.div_ceil(2));
+/// What gives an edge order its edges, a run at a time: `read(start, src,
+/// dst)` fills the two runs, of equal length, with the ends of the edges
+/// from `start` on.
+pub type ReadEdges<'a> = dyn FnMut(usize, &mut [u32], &mut [u32]) + 'a;
+
+/// Where an edge order's keys are kept while it is made, one `u64` an edge:
+/// a slice, or memory that is not this program's (a browser worker's
+/// `BigUint64Array`, outside its small WebAssembly memory), read and
+/// written a run at a time. See [`Fa2Multilevel::edge_order_keys`].
+pub trait OrderKeys {
+    /// Copy the keys from `start` on into `out`, all of it.
+    fn read(&mut self, start: usize, out: &mut [u64]);
+    /// Set the keys from `start` on to `keys`.
+    fn write(&mut self, start: usize, keys: &[u64]);
 }
 
-/// The order as a vector of its own.
+impl OrderKeys for Vec<u64> {
+    fn read(&mut self, start: usize, out: &mut [u64]) {
+        out.copy_from_slice(&self[start..start + out.len()]);
+    }
+
+    fn write(&mut self, start: usize, keys: &[u64]) {
+        self[start..start + keys.len()].copy_from_slice(keys);
+    }
+}
+
+/// The edge a sort key is of ([`Fa2Multilevel::edge_order_keys`],
+/// [`edge_order_by_degree_keys`]): with the keys sorted ascending, the
+/// order.
+pub fn edge_of_key(key: u64) -> u32 {
+    unmix32(key as u32)
+}
+
+/// The order of the edges with these keys.
 fn edges_of_keys(mut keys: Vec<u64>) -> Vec<u32> {
-    let edges = keys.len();
-    pack_edges_of_keys(&mut keys);
-    (0..edges)
-        .map(|i| (keys[i / 2] >> (32 * (i % 2))) as u32)
-        .collect()
+    keys.sort_unstable();
+    keys.into_iter().map(edge_of_key).collect()
 }
 
 /// The sort key of edge `e`: `level` (up to 63) highest first, then `round`
@@ -1213,32 +1232,24 @@ pub fn edge_order_by_degree(adj: &UndirectedCsr, src: &[u32], dst: &[u32]) -> Ve
         s.copy_from_slice(&src[start..start + s.len()]);
         d.copy_from_slice(&dst[start..start + d.len()]);
     };
-    edges_of_keys(degree_keys(adj, src.len(), &mut read, Vec::new()))
+    let mut keys = vec![0u64; src.len()];
+    edge_order_by_degree_keys(adj, src.len(), &mut read, &mut keys);
+    edges_of_keys(keys)
 }
 
-/// [`edge_order_by_degree`], with the edges read a run at a time and the
-/// sorted keys given back, as [`Fa2Multilevel::edge_order_keys`] does.
+/// [`edge_order_by_degree`], with the edges read a run at a time and each
+/// edge's sort key left in `keys`, as [`Fa2Multilevel::edge_order_keys`]
+/// does.
 pub fn edge_order_by_degree_keys(
     adj: &UndirectedCsr,
     edges: usize,
-    read: &mut dyn FnMut(usize, &mut [u32], &mut [u32]),
-    room: Vec<u64>,
-) -> Vec<u64> {
-    degree_keys(adj, edges, read, room)
-}
-
-fn degree_keys(
-    adj: &UndirectedCsr,
-    edges: usize,
-    read: &mut dyn FnMut(usize, &mut [u32], &mut [u32]),
-    room: Vec<u64>,
-) -> Vec<u64> {
+    read: &mut ReadEdges<'_>,
+    keys: &mut dyn OrderKeys,
+) {
     let n = adj.offsets.len().saturating_sub(1);
-    let mut keys = room;
-    keys.clear();
-    keys.resize(edges, 0);
-    let run = EDGE_RUN.min(edges);
+    let run = ORDER_RUN.min(edges);
     let (mut src, mut dst) = (vec![0u32; run], vec![0u32; run]);
+    let mut chunk = vec![0u64; run];
     let mut start = 0;
     while start < edges {
         let len = run.min(edges - start);
@@ -1251,12 +1262,11 @@ fn degree_keys(
                 0
             };
             let rank = u64::from(u32::MAX) - degree.min(u64::from(u32::MAX));
-            keys[start + i] = rank << 32 | u64::from(mix32((start + i) as u32));
+            chunk[i] = rank << 32 | u64::from(mix32((start + i) as u32));
         }
+        keys.write(start, &chunk[..len]);
         start += len;
     }
-    keys.sort_unstable();
-    keys
 }
 
 /// Coarse-to-fine ForceAtlas2 in one call: [`Fa2Multilevel`] run to the end of
@@ -1634,10 +1644,14 @@ mod tests {
         let mut lean = Fa2Multilevel::new_lean(adj, params);
         assert!(lean.coarse[0].lacks_weights() && lean.coarse[1].lacks_weights());
         // The weights counted again are the ones the level was built with.
-        let parents: Vec<Vec<u32>> = lean.coarse.iter().map(Coarse::groups).collect();
+        let mut ancestor: Vec<u32> = (0..n as u32).collect();
         for l in 1..=full.coarse.len() {
+            let parent = lean.coarse[l - 1].groups();
+            for a in ancestor.iter_mut().filter(|a| **a != NONE) {
+                *a = parent[*a as usize];
+            }
             let mut counts = vec![9u16; lean.coarse[l - 1].entries];
-            lean.entry_counts(adj, &parents, l, &mut counts);
+            lean.entry_counts(adj, &ancestor, l, &mut counts);
             let built: Vec<u16> = full.coarse[l - 1]
                 .weights
                 .iter()
@@ -1648,19 +1662,17 @@ mod tests {
         let order = full.edge_order(adj, &src, &dst);
         assert!(is_permutation(&order, src.len()));
         assert_eq!(lean.edge_order(adj, &src, &dst), order);
-        // Read a run at a time, and packed in place, it is the same order.
+        // Read a run at a time, its keys sorted by the caller: the same.
         let mut read = |start: usize, s: &mut [u32], d: &mut [u32]| {
             s.copy_from_slice(&src[start..start + s.len()]);
             d.copy_from_slice(&dst[start..start + d.len()]);
         };
-        let mut keys = lean.edge_order_keys(adj, src.len(), &mut read, vec![7; 3]);
+        let mut keys = vec![7u64; src.len()];
+        lean.edge_order_keys(adj, src.len(), &mut read, &mut keys);
+        keys.sort_unstable();
         assert!(keys.windows(2).all(|w| w[0] < w[1]));
-        pack_edges_of_keys(&mut keys);
-        assert_eq!(keys.len(), src.len().div_ceil(2));
-        let unpacked: Vec<u32> = (0..src.len())
-            .map(|i| (keys[i / 2] >> (32 * (i % 2))) as u32)
-            .collect();
-        assert_eq!(unpacked, order);
+        let sorted: Vec<u32> = keys.into_iter().map(edge_of_key).collect();
+        assert_eq!(sorted, order);
         // Taking the order changes nothing the layout reads.
         full.step(adj, 40.0);
         lean.step(adj, 40.0);

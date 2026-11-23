@@ -705,6 +705,37 @@ random graph of that size, in CI):
   by side and compare every position after every step; the golden layouts
   and the thread-count tests pass unchanged.
 
+**The edge order** (#495, [The frame budget](#the-frame-budget)) is taken
+in the worker right after its first positions, when the hierarchy is whole
+and the memory is as full as it gets. As first merged, on this branch:
+
+| | the view | the layout worker |
+|---|---|---|
+| the order sorted in the worker's memory, given to the view as a vector | 24.0 MiB | 67.1 MB |
+| the keys read and written a run at a time, one buffer for rounds and weights | 17.9 MiB | 63.8 MB |
+| the keys in a `BigUint64Array` outside the WebAssembly memory, sorted there (now) | 17.9–18.3 MiB | 55.7 MB |
+
+- **In the worker** the order needed eight bytes an edge for its keys in
+  one block, which a memory that has just built a hierarchy does not have
+  free in one piece: it grew by all of it. Setting the block aside before
+  the hierarchy was built moved the growth, and did not remove it. The keys
+  now live outside the WebAssembly memory (`OrderKeys`), are written and
+  read back a run of 32,768 at a time, and are sorted by the typed array's
+  own sort (80 ms for a million).
+- **On a lean hierarchy** the three dense levels' weights are not there to
+  rank by: they are counted again from the input adjacency, capped at the
+  4,095 a key tells apart, into the same two bytes an entry that count the
+  rounds. `ursa-core` checks that the counts are the weights and the order
+  the same, edge for edge.
+- **In the view** the order is read from the page's array a run at a time
+  as it is written to the GPU, 65,536 edges a task, each waiting for the
+  GPU to take the last: neither the order (4 MB) nor more than a run of
+  staging is held.
+- **It costs time:** ordering takes the worker 510 to 620 ms here, where
+  #495 measured 285 to 325 ms: the weights counted again, and the keys
+  crossing to the typed array and back at each level. The layout's first
+  iteration starts that much later; the first positions are already drawn.
+
 **Positions** go from the layout to the GPU in two copies: the layout's
 state into a `Float32Array` (`Layout.positions()`), which the worker
 transfers, and that array into the positions the view keeps

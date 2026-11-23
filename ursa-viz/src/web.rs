@@ -105,6 +105,24 @@ enum Scene {
     Ugr(js_sys::Uint8Array),
 }
 
+/// How many keys of an edge order are read back at a time.
+const ORDER_RUN: u32 = 1 << 15;
+
+/// An edge order's keys in the page's (or the worker's) own memory.
+struct PageKeys(js_sys::BigUint64Array);
+
+impl ursa_core::algo::OrderKeys for PageKeys {
+    fn read(&mut self, start: usize, out: &mut [u64]) {
+        let run = self.0.subarray(start as u32, (start + out.len()) as u32);
+        run.copy_to(out);
+    }
+
+    fn write(&mut self, start: usize, keys: &[u64]) {
+        let run = self.0.subarray(start as u32, (start + keys.len()) as u32);
+        run.copy_from(keys);
+    }
+}
+
 /// How many calls in a row [`GraphView::order_edges`] waits for the GPU.
 const ORDER_WAITS: u32 = 32;
 
@@ -1283,10 +1301,7 @@ fn adjacency_from(
 
 impl From<LiveLayout> for Layout {
     fn from(layout: LiveLayout) -> Self {
-        Layout {
-            layout,
-            order_room: Default::default(),
-        }
+        Layout { layout }
     }
 }
 
@@ -1309,12 +1324,6 @@ fn checked_graph(n_nodes: u32, src: Vec<u32>, dst: Vec<u32>) -> Result<Graph, Js
 #[wasm_bindgen]
 pub struct Layout {
     layout: LiveLayout,
-    /// Room for [`Layout::edge_order`]'s keys, eight bytes an edge, set
-    /// aside where the edge list was before the hierarchy is built: a
-    /// WebAssembly memory that has since filled has no block that large in
-    /// one piece, and would grow by it. Let go of by the order, or by the
-    /// first [`Layout::step`].
-    order_room: std::cell::Cell<Vec<u64>>,
 }
 
 #[wasm_bindgen]
@@ -1330,13 +1339,8 @@ impl Layout {
         multilevel: Option<bool>,
     ) -> Result<Layout, JsValue> {
         console_error_panic_hook::set_once();
-        let edges = src.len();
         let adjacency = adjacency_of(n_nodes, src, dst)?;
-        // Where the edge list was: for the order of these edges.
-        let room = Vec::with_capacity(edges);
-        let mut layout = Self::on(adjacency, multilevel);
-        layout.order_room = std::cell::Cell::new(room);
-        Ok(layout)
+        Ok(Self::on(adjacency, multilevel))
     }
 
     fn on(adjacency: Arc<UndirectedCsr>, multilevel: Option<bool>) -> Layout {
@@ -1493,7 +1497,6 @@ impl Layout {
     /// iterations of the whole graph. A grown layout runs no more than its
     /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
-        self.order_room.take();
         self.layout.step(iterations);
     }
 
@@ -1543,11 +1546,15 @@ impl Layout {
     /// of highest degree do. The same input gives the same order.
     ///
     /// `src` and `dst` are `Uint32Array`s and stay the caller's: they are
-    /// read a run at a time, and the order is written into a new
-    /// `Uint32Array` from the keys it was sorted as, so that taking the
-    /// order costs this module's memory eight bytes an edge and no more
-    /// (#501). Take it before the layout is stepped down a level: after
-    /// that the hierarchy above is let go, and the order is by degree.
+    /// read a run at a time. The keys the edges are sorted by (eight bytes
+    /// an edge) are kept in a `BigUint64Array` of the caller's realm, not
+    /// in this module's memory, sorted there, and read back a run at a
+    /// time into the `Uint32Array` returned. So taking the order costs
+    /// this module two bytes for each adjacency entry of the layout's
+    /// largest level and a few runs (#501): a worker's WebAssembly memory
+    /// does not grow by the order. Take it before the layout is stepped
+    /// down a level: after that the hierarchy above is let go, and the
+    /// order is by degree.
     #[wasm_bindgen(js_name = edgeOrder)]
     pub fn edge_order(
         &self,
@@ -1561,18 +1568,33 @@ impl Layout {
                 dst.length()
             )));
         }
-        let edges = src.length() as usize;
+        let edges = src.length();
         let mut read = |start: usize, s: &mut [u32], d: &mut [u32]| {
             let (from, to) = (start as u32, (start + s.len()) as u32);
             src.subarray(from, to).copy_to(s);
             dst.subarray(from, to).copy_to(d);
         };
-        let room = self.order_room.take();
-        let packed = self.layout.edge_order_packed(edges, &mut read, room);
-        // wasm32 is little-endian: the packed halves are the order.
-        let order: &[u32] = &bytemuck::cast_slice(&packed)[..edges];
-        let out = js_sys::Uint32Array::new_with_length(edges as u32);
-        out.copy_from(order);
+        let mut keys = PageKeys(js_sys::BigUint64Array::new_with_length(edges));
+        self.layout
+            .edge_order_keys(edges as usize, &mut read, &mut keys);
+        // Ascending, as unsigned 64-bit integers: a typed array's own sort.
+        let sort: js_sys::Function = js_sys::Reflect::get(&keys.0, &"sort".into())?.dyn_into()?;
+        sort.call0(&keys.0)?;
+        let out = js_sys::Uint32Array::new_with_length(edges);
+        let run = ORDER_RUN.min(edges);
+        let mut sorted = vec![0u64; run as usize];
+        let mut order = vec![0u32; run as usize];
+        let mut start = 0;
+        while start < edges {
+            let len = run.min(edges - start);
+            let (sorted, order) = (&mut sorted[..len as usize], &mut order[..len as usize]);
+            keys.0.subarray(start, start + len).copy_to(sorted);
+            for (edge, key) in order.iter_mut().zip(sorted.iter()) {
+                *edge = ursa_core::algo::edge_of_key(*key);
+            }
+            out.subarray(start, start + len).copy_from(order);
+            start += len;
+        }
         Ok(out)
     }
 

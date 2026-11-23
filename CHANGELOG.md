@@ -690,6 +690,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     a `Float32Array` filled straight from the layout's or the view's
     memory, and `setPositions` takes one and copies it once, into the
     positions the view keeps and uploads.
+  - **The edge order of #495, within the same memory.** `Layout.edgeOrder`
+    reads `src` and `dst` from the caller's `Uint32Array`s a run at a time,
+    keeps the sort keys in a `BigUint64Array` outside its WebAssembly
+    memory and sorts them there (`Fa2Multilevel::edge_order_keys` over an
+    `OrderKeys`), so the worker's memory does not grow by the order (it
+    grew by 11 MiB). On a lean hierarchy the weights it ranks by are
+    counted again from the adjacency, two bytes an entry, and the order is
+    the same; `edge_order` takes the input adjacency for that, and after
+    the layout has come down a level gives the order by degree.
+    `GraphView.setEdgeOrder` takes the `Uint32Array` and reads it a run at
+    a time (`order::EdgeOrder`), and `orderEdges` writes 65,536 edges a
+    call and waits for the GPU to take them, so the view does not hold the
+    order or its staging (6 MiB). Ordering a million edges takes the worker
+    510 to 620 ms where it took 285 to 325.
   - **Measured.** `graphTimings().memory` gives `{edges, view, layout}`,
     each instance's bytes and bytes an edge, and `tests/graph-timing.ts`
     fails over 20 MiB for the view or 60 MB for the worker on rmat.
