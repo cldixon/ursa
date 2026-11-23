@@ -47,6 +47,20 @@ reason = "A selector, path mode or path variable on a path of several edges (#41
 error  = "must be one edge between two nodes for now"
 
 [[difference]]
+id     = "keep/4"
+kind   = "unsupported"
+issue  = 414
+reason = "KEEP over a pattern of several paths; write the selector before each path."
+error  = "KEEP over several path patterns is not supported yet"
+
+[[difference]]
+id     = "element_id/3"
+kind   = "unsupported"
+issue  = 413
+reason = "element_id of an edge is its row in the edge table, which only a path search reads; an edge read by a join has none yet."
+error  = "only a path search reads for now"
+
+[[difference]]
 id     = "rows/2"
 kind   = "unsupported"
 issue  = 414

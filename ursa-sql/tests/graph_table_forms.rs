@@ -123,9 +123,17 @@ async fn columns_left_out_or_star_return_every_named_variable() {
 #[tokio::test]
 async fn left_or_right_edges_are_either_way_and_tilde_edges_are_refused() {
     let ctx = school().await;
-    let either = ok(&ctx, &pg("(a:Person)-[k:knows]-(b:Person) COLUMNS (a.id, b.id)")).await;
+    let either = ok(
+        &ctx,
+        &pg("(a:Person)-[k:knows]-(b:Person) COLUMNS (a.id, b.id)"),
+    )
+    .await;
     assert_eq!(
-        ok(&ctx, &pg("(a:Person)<-[k:knows]->(b:Person) COLUMNS (a.id, b.id)")).await,
+        ok(
+            &ctx,
+            &pg("(a:Person)<-[k:knows]->(b:Person) COLUMNS (a.id, b.id)")
+        )
+        .await,
         either
     );
     assert_eq!(
@@ -315,8 +323,10 @@ async fn a_quantified_edge_variable_says_it_stands_for_several_edges() {
     assert_contains(
         &err(
             &ctx,
-            &pg("p = ANY SHORTEST (a:Person WHERE a.id = 0)-[k:knows]->(b:Person) \
-                 COLUMNS (k.createDate)"),
+            &pg(
+                "p = ANY SHORTEST (a:Person WHERE a.id = 0)-[k:knows]->(b:Person) \
+                 COLUMNS (k.createDate)",
+            ),
         )
         .await,
         "edge 'k' is the edge of a searched path",

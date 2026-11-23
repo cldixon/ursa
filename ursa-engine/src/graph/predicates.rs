@@ -33,9 +33,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
 use super::functions::plan;
-use super::pattern::{
-    Lowered, Quantifier, VariableKind, IS_DESTINATION, IS_LABELED, IS_SOURCE,
-};
+use super::pattern::{Lowered, Quantifier, VariableKind, IS_DESTINATION, IS_LABELED, IS_SOURCE};
 use super::{EdgeTable, PropertyGraph};
 
 /// What a variable of the pattern is, as the rewrites need it.

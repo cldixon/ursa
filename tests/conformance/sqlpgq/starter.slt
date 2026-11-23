@@ -166,6 +166,13 @@ SELECT * FROM GRAPH_TABLE (pg MATCH p = (a:Person WHERE a.id = 1)-[k:knows]->(b:
 2 4
 3 5
 
+# id: element_id/3  element_id of an edge read by a join
+query II rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id = 1)-[k:knows]->(b:Person) COLUMNS (b.id, element_id(k)));
+----
+2 4
+3 5
+
 # id: predicates/1  ALL_DIFFERENT
 query I
 SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a:Person)-[:knows]->(b:Person)-[:knows]->(c:Person) WHERE all_different(a, b, c) COLUMNS (a.id));
@@ -275,6 +282,16 @@ SELECT array_to_string(v, ',') FROM GRAPH_TABLE (pg MATCH p = (a:Person WHERE a.
 0,3
 0,1,3
 
+# id: keep/3  KEEP after WHERE is read, not ignored (#409): the walk 0->3->0->3 repeats an edge
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:knows]->{1,3}(b:Person) WHERE a.id = 0 KEEP TRAIL COLUMNS (b.id));
+----
+12
+
+# id: keep/4  KEEP over a pattern of two paths
+statement ok
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id = 0)-[k:knows]->*(b:Person), (b)-[s:studyAt]->(c:School) KEEP ANY SHORTEST COLUMNS (b.id, c.school_name));
+
 # id: rows/1  ONE ROW PER MATCH is the default
 query I rowsort
 SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:knows]->(b:Person) WHERE a.id = 0 ONE ROW PER MATCH COLUMNS (b.id));
@@ -290,6 +307,10 @@ SELECT * FROM GRAPH_TABLE (pg MATCH p = (a:Person WHERE a.id = 0)-[k:knows]->{1,
 # id: errors/1  an aggregate in COLUMNS needs a group variable
 statement error aggregates in COLUMNS need a quantified edge variable
 SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:knows]->(b:Person) COLUMNS (count(*) AS n));
+
+# id: errors/1b  an aggregate beside a property
+statement error aggregates in COLUMNS need a quantified edge variable
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:knows]->(b:Person) COLUMNS (a.id, sum(k.createDate)));
 
 # id: errors/2  a subquery inside the pattern, on a table the statement does not name (#414)
 query I rowsort

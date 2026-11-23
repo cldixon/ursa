@@ -223,7 +223,8 @@ impl<'a> Tokens<'a> {
     /// word, not a property of that name (`a.keep`).
     fn starts_clause(&self) -> bool {
         let after_period = self.at > 0 && self.tokens[self.at - 1].0 == Token::Period;
-        !after_period && (self.is_word(0, "KEEP") || (self.is_word(0, "ONE") && self.is_word(1, "ROW")))
+        !after_period
+            && (self.is_word(0, "KEEP") || (self.is_word(0, "ONE") && self.is_word(1, "ROW")))
     }
 
     /// The text of token `i`, as written.
@@ -317,7 +318,10 @@ impl<'a> Tokens<'a> {
         stop: impl Fn(&Self, usize) -> bool,
     ) -> Result<Option<String>> {
         let from = self.tokens.get(self.at).map(|(_, start, _)| *start);
-        let text = self.text_until(stop).map(|t| graph_predicates(&t)).transpose()?;
+        let text = self
+            .text_until(stop)
+            .map(|t| graph_predicates(&t))
+            .transpose()?;
         if let (Some(text), Some(from)) = (&text, from) {
             check_sql(text, from, sql)?;
         }
@@ -370,7 +374,9 @@ fn graph_predicates(text: &str) -> Result<String> {
         }
         let call = if word(j, "LABELED") {
             let Some((label, _)) = name(j + 1) else {
-                return pattern_err(format!("{var} IS LABELED needs a label, as {var} IS LABELED person"));
+                return pattern_err(format!(
+                    "{var} IS LABELED needs a label, as {var} IS LABELED person"
+                ));
             };
             if matches!(
                 tokens.get(j + 2).map(|t| &t.0),
@@ -550,10 +556,7 @@ pub fn parse(body: &str) -> Result<Pattern> {
             t.next();
             t.next();
             if !t.is_word(0, "PER") {
-                return pattern_err(format!(
-                    "expected PER after ONE ROW, found {}",
-                    t.found()
-                ));
+                return pattern_err(format!("expected PER after ONE ROW, found {}", t.found()));
             }
             t.next();
             if t.is_word(0, "VERTEX") || t.is_word(0, "STEP") {
@@ -2423,7 +2426,11 @@ mod tests {
         );
         assert_eq!(
             path("g MATCH (a)-[e]->*(b) KEEP SHORTEST 2 TRAIL PATHS WHERE a.id = 1 COLUMNS (a.id)"),
-            (Selector::Shortest(2), Mode::Trail, Some("a.id = 1".to_string()))
+            (
+                Selector::Shortest(2),
+                Mode::Trail,
+                Some("a.id = 1".to_string())
+            )
         );
         // After WHERE too, as #409 found it written.
         assert_eq!(

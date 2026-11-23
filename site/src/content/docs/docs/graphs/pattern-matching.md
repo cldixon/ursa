@@ -132,6 +132,12 @@ FROM GRAPH_TABLE (karate
 ```
 
 ```text
+┌───────────┐
+│ triangles │
+│   Int64   │
+├───────────┤
+│        45 │
+└───────────┘
 ```
 
 Member 16's friends, and which way each tie is stored:
@@ -146,6 +152,13 @@ ORDER BY friend;
 ```
 
 ```text
+┌────────┬─────────┐
+│ friend │ from_16 │
+│ Int64  │ Boolean │
+├────────┼─────────┤
+│      5 │ false   │
+│      6 │ false   │
+└────────┴─────────┘
 ```
 
 `SAME` and `ALL_DIFFERENT` compare nodes for now. `element_id(e)` of an edge is its row in the edge table, the number `edges(p)` lists, so the edge must be the one edge of a path with a variable: `MATCH p = (a)-[e]->(b) COLUMNS (element_id(e))`.

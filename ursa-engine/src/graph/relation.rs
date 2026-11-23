@@ -150,9 +150,10 @@ impl RelationPlanner for GraphFunctions {
         // `LATERAL GRAPH_TABLE (…)` (#414).
         if let TableFactor::Function { name, .. } = &relation {
             if let [part] = name.0.as_slice() {
-                if part.as_ident().is_some_and(|i| {
-                    context.normalize_ident(i.clone()) == super::pattern::FUNCTION
-                }) {
+                if part
+                    .as_ident()
+                    .is_some_and(|i| context.normalize_ident(i.clone()) == super::pattern::FUNCTION)
+                {
                     return Err(plan(
                         "in GRAPH_TABLE: a GRAPH_TABLE cannot refer to tables outside it yet, so LATERAL is not supported; join on its output columns instead"
                             .to_string(),

@@ -152,7 +152,10 @@ fn parse_differences(path: &Path) -> Vec<Difference> {
                 .and_then(|v| v.rsplit_once('"'))
                 .map(|(v, _)| v)
                 .unwrap_or_else(|| panic!("known_differences.toml:{}: a string", n + 1));
-            inner.replace("\\\\", "\u{0}").replace("\\\"", "\"").replace('\u{0}', "\\")
+            inner
+                .replace("\\\\", "\u{0}")
+                .replace("\\\"", "\"")
+                .replace('\u{0}', "\\")
         };
         let entry = out
             .last_mut()
@@ -311,7 +314,11 @@ async fn conformance() {
                 (Some(outcome), None) => failures.push(format!(
                     "{}{}: differs from the reference:\n{}\ngot {outcome}",
                     record.at,
-                    record.id.as_deref().map(|i| format!(" ({i})")).unwrap_or_default(),
+                    record
+                        .id
+                        .as_deref()
+                        .map(|i| format!(" ({i})"))
+                        .unwrap_or_default(),
                     record.sql
                 )),
                 (Some(outcome), Some(d)) => {
@@ -339,7 +346,10 @@ async fn conformance() {
             failures.push(format!("known_differences.toml: no case has id '{}'", d.id));
         }
         if !["unsupported", "deliberate", "numeric-reference", "bug"].contains(&d.kind.as_str()) {
-            failures.push(format!("known_differences.toml: '{}' has kind '{}'", d.id, d.kind));
+            failures.push(format!(
+                "known_differences.toml: '{}' has kind '{}'",
+                d.id, d.kind
+            ));
         }
         if d.reason.is_empty() {
             failures.push(format!("known_differences.toml: '{}' needs a reason", d.id));
@@ -352,7 +362,8 @@ async fn conformance() {
         }
     }
 
-    let mut summary = String::from("| directory | cases | pass | known differences |\n|---|---|---|---|\n");
+    let mut summary =
+        String::from("| directory | cases | pass | known differences |\n|---|---|---|---|\n");
     for (group, (cases, pass, known)) in &report {
         writeln!(summary, "| {group} | {cases} | {pass} | {known} |").unwrap();
     }

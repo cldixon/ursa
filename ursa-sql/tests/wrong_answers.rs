@@ -211,8 +211,16 @@ async fn keep_and_one_row_per_are_read_not_ignored() {
     for clause in ["WHERE a.id = 0 ONE ROW PER MATCH", "ONE ROW PER MATCH"] {
         let rest = clause.replace("ONE ROW PER MATCH", "");
         assert_eq!(
-            ok(&ctx, &(knows(&format!("{clause} {columns}")) + " ORDER BY a, b")).await,
-            ok(&ctx, &(knows(&format!("{rest} {columns}")) + " ORDER BY a, b")).await,
+            ok(
+                &ctx,
+                &(knows(&format!("{clause} {columns}")) + " ORDER BY a, b")
+            )
+            .await,
+            ok(
+                &ctx,
+                &(knows(&format!("{rest} {columns}")) + " ORDER BY a, b")
+            )
+            .await,
             "{clause}"
         );
     }
