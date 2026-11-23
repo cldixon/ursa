@@ -46,6 +46,7 @@ pub mod model;
 pub mod order;
 #[cfg(feature = "render")]
 pub mod pace;
+pub mod refine;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod scene;

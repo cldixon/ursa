@@ -215,6 +215,58 @@ impl GraphView {
         self.present(None).map(|_| ())
     }
 
+    /// Whether slices of the frame at rest remain to be drawn: the frame
+    /// with everything does not fit in a frame, so
+    /// [`GraphView::render_frame`] left the canvas as it was, and
+    /// [`GraphView::refine`] draws it a slice a call.
+    #[wasm_bindgen(getter)]
+    pub fn refining(&self) -> bool {
+        self.view.refining()
+    }
+
+    /// Draw the next slice of the frame at rest, offscreen, if the GPU has
+    /// finished the last; `now` is `performance.now()`. Returns whether
+    /// slices remain. Call it a task at a time while it returns true, and
+    /// then draw a frame ([`GraphView::render_frame`]): the frame with
+    /// everything if the slices are done, and if the view moved or changed
+    /// meanwhile the frame that shows it, which begins them again once the
+    /// view rests.
+    ///
+    /// ```js
+    /// const refine = () => {
+    ///   if (view.refine(performance.now())) setTimeout(refine);
+    ///   else requestAnimationFrame(draw);
+    /// };
+    /// ```
+    pub fn refine(&mut self, now: f64) -> bool {
+        self.view.refine(&self.device, &self.queue, now)
+    }
+
+    /// Whether a frame at rest that does not fit in a frame is drawn in
+    /// slices: on unless turned off, when [`GraphView::render_frame`]
+    /// draws it at once, as [`GraphView::render`] does.
+    #[wasm_bindgen(js_name = setRefining)]
+    pub fn set_refining(&mut self, on: bool) {
+        self.view.set_refining(on);
+    }
+
+    /// [`GraphView::snapshot`], of the frame a refined view at rest shows:
+    /// the texture the slices were drawn into, under the highlighted edges
+    /// and the nodes in front. `undefined` unless the view is refined
+    /// (`frameInfo().refined`). Call no other method until it resolves.
+    #[wasm_bindgen(js_name = snapshotRefined)]
+    pub async fn snapshot_refined(&self) -> Result<Option<Vec<u8>>, JsValue> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pixels = self
+            .view
+            .snapshot_refined(&self.device, &self.queue, self.config.format)
+            .await;
+        if let Some(e) = scope.pop().await {
+            return Err(js_err(format!("snapshot: {e}")));
+        }
+        pixels.transpose().map_err(js_err)
+    }
+
     /// Draw a frame within the frame budget: while the view moves (the
     /// camera or the positions changed since the last frame, or less than
     /// [`GraphView::frame_rest_ms`] before `now`, the animation frame's
@@ -224,6 +276,15 @@ impl GraphView {
     /// deeper to make up for the rest, and, where the nodes are too many
     /// as well, the largest of them; at rest, everything, the same pixels
     /// as [`GraphView::render`].
+    ///
+    /// Everything at rest is drawn at once if that fits in a frame. If it
+    /// does not, this frame leaves the canvas as it is (or, if something
+    /// changed that it must show, draws what fits), and
+    /// [`GraphView::refining`] is true: draw the rest a slice a task with
+    /// [`GraphView::refine`], and then draw again. That frame, and the
+    /// frames at rest after it, are a texture with everything in it; the
+    /// frames of the next pan or zoom draw it under their own edges and
+    /// nodes, moved and scaled as the camera is.
     ///
     /// Returns whether the view is moving. If it is, measure what the
     /// frame cost, from this animation frame's time to the next's (whole
@@ -238,6 +299,8 @@ impl GraphView {
     ///     requestAnimationFrame((next) => view.frameCost(next - time));
     ///     clearTimeout(rest);
     ///     if (view.framePartial) rest = setTimeout(() => requestAnimationFrame(draw), view.frameRestMs);
+    ///   } else if (view.refining) {
+    ///     refine();  // above
     ///   }
     /// }
     /// ```
@@ -249,6 +312,12 @@ impl GraphView {
     /// Draw and present a frame: budgeted at `now`, or everything.
     /// Returns whether the view is moving.
     fn present(&mut self, now: Option<f64>) -> Result<bool, JsValue> {
+        let planned = now.map(|now| self.view.plan_frame(&self.device, &self.queue, now));
+        if let Some(planned) = planned.filter(|p| !p.draws()) {
+            // The canvas keeps its frame while the slices are drawn.
+            self.partial = planned.frame.partial;
+            return Ok(planned.frame.moving);
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -261,17 +330,17 @@ impl GraphView {
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let moving = match now {
-            Some(now) => {
-                let drawn = self
-                    .view
-                    .draw_frame(&self.device, &self.queue, &target, now);
-                self.partial = drawn.partial;
-                drawn.moving
+        let moving = match planned {
+            Some(planned) => {
+                self.view
+                    .draw_planned(&self.device, &self.queue, &target, &planned);
+                self.partial = planned.frame.partial;
+                planned.frame.moving
             }
             None => {
                 self.view.prepare(&self.device, &self.queue);
                 self.view.draw(&self.device, &self.queue, &target);
+                self.view.shown();
                 self.partial = false;
                 false
             }
@@ -288,8 +357,9 @@ impl GraphView {
         self.view.keep_moving();
     }
 
-    /// Whether the last frame left anything out
-    /// ([`GraphView::render_frame`]).
+    /// Whether the canvas lacks anything after the last frame
+    /// ([`GraphView::render_frame`]): a moving frame left edges or nodes
+    /// out, or the frame at rest is still being drawn in slices.
     #[wasm_bindgen(getter, js_name = framePartial)]
     pub fn frame_partial(&self) -> bool {
         self.partial
@@ -321,7 +391,11 @@ impl GraphView {
     ///   ordered,  // how many of them are in importance order
     ///   p95,      // of the last 120 moving frames' costs, ms; null before any
     ///   frames,   // how many moving frames' costs were measured
-    ///   limit }   // the cost a moving frame is held to, ms
+    ///   limit,    // the cost a moving frame is held to, ms
+    ///   refining, // whether slices of the frame at rest remain
+    ///   refined,  // whether the frame at rest is a texture with everything
+    ///   refinement } // the last one finished: { ms, slices, longestSliceMs,
+    ///                // sliceEdges, sliceNodes }; null before any
     /// ```
     #[wasm_bindgen(js_name = frameInfo)]
     pub fn frame_info(&self) -> Result<JsValue, JsValue> {
@@ -531,7 +605,7 @@ impl GraphView {
     /// Draw nodes as well as edges (on by default).
     #[wasm_bindgen(setter, js_name = drawNodes)]
     pub fn set_draw_nodes(&mut self, on: bool) {
-        self.view.draw_nodes = on;
+        self.view.set_draw_nodes(on);
     }
 
     /// Edge opacity, 0 to 1.
