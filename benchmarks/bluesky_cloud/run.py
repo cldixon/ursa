@@ -145,14 +145,14 @@ def steps(before: str | None) -> list[Step]:
     s += [
         Step(
             "hop_1",
-            f"SELECT count(*) FROM hop(g, seeds => [{MID}], steps => 1)",
+            f"SELECT count(*) FROM hop(g, seeds => [{MID}], n => 1)",
             "traversal",
             "g",
             exp(3216),
         ),
         Step(
             "hop_2",
-            f"SELECT count(*) FROM hop(g, seeds => [{MID}], steps => 2)",
+            f"SELECT count(*) FROM hop(g, seeds => [{MID}], n => 2)",
             "traversal",
             "g",
             exp(166664),
@@ -263,7 +263,7 @@ def steps(before: str | None) -> list[Step]:
         ),
         Step(
             "check_hop_in",
-            f"SELECT count(*) FROM hop(g, seeds => [{HUB}], steps => 1, direction => 'in')",
+            f"SELECT count(*) FROM hop(g, seeds => [{HUB}], n => 1, direction => 'in')",
             "check",
             "g",
             exp(562584),

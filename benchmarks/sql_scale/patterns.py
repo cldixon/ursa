@@ -82,7 +82,7 @@ def pick(edges: Path) -> tuple[int, int]:
 def steps(seed: int, target: int) -> list[tuple[str, str]]:
     s, t = seed, target
     return [
-        ("hop n=1", f"SELECT count(*) FROM hop(g, seeds => [{s}], steps => 1)"),
+        ("hop n=1", f"SELECT count(*) FROM hop(g, seeds => [{s}], n => 1)"),
         (
             "match 1 edge",
             f"SELECT count(*) FROM GRAPH_TABLE (g MATCH (a WHERE a.id = {s})-[]->(b) "
@@ -93,7 +93,7 @@ def steps(seed: int, target: int) -> list[tuple[str, str]]:
             f"SELECT count(*) FROM GRAPH_TABLE (g MATCH (a WHERE a.id = {s} OR false)-[]->(b) "
             "COLUMNS (b.id))",
         ),
-        ("hop n=2 (vertex table)", f"SELECT count(*) FROM hop(gv, seeds => [{s}], steps => 2)"),
+        ("hop n=2 (vertex table)", f"SELECT count(*) FROM hop(gv, seeds => [{s}], n => 2)"),
         (
             "match 2 edges (vertex table)",
             f"SELECT count(*) FROM GRAPH_TABLE (gv MATCH (a WHERE a.id = {s})-[]->(b)-[]->(c) "
@@ -176,9 +176,9 @@ def main(argv: list[str] | None = None) -> int:
         CREATE PROPERTY GRAPH gz VERTEX TABLES (vgz KEY (id))
           EDGE TABLES (e SOURCE KEY (src) REFERENCES vgz (id)
                          DESTINATION KEY (dst) REFERENCES vgz (id));
-        SELECT count(*) FROM hop(g, seeds => [{seed}], steps => 1);
-        SELECT count(*) FROM hop(gv, seeds => [{seed}], steps => 1);
-        SELECT count(*) FROM hop(gz, seeds => [{seed}], steps => 1);
+        SELECT count(*) FROM hop(g, seeds => [{seed}], n => 1);
+        SELECT count(*) FROM hop(gv, seeds => [{seed}], n => 1);
+        SELECT count(*) FROM hop(gz, seeds => [{seed}], n => 1);
     """
     run(args.ursa, db, define)
     print(f"{edges.name}: seed {seed}, target {target}", file=sys.stderr)

@@ -15,7 +15,7 @@ Per dataset (an ``rmat-<size>-<int|str>.parquet`` from ``gen.py``), in a fresh
 ``components``      ``connected_components(g)``
 ``louvain``         ``louvain(g, seed => 1)``
 ``degree``          ``degree(g)``
-``hop``             ``hop(g, seeds => [three ids], steps => 2)``
+``hop``             ``hop(g, seeds => [three ids], n => 2)``
 ``weighted``        ``pagerank(gw, weight => weight)`` over the ``-w`` variant
                     (its first query builds that graph's index)
 ``weighted_again``  the same, in a new process
@@ -196,7 +196,7 @@ def sql_steps(edges: Path, weighted: Path | None, seeds: list) -> dict[str, str]
             "SELECT count(*) AS n, count(DISTINCT louvain) AS c FROM louvain(g, seed => 1)"
         ),
         "degree": "SELECT count(*) AS n, sum(degree) AS s FROM degree(g)",
-        "hop": f"SELECT count(*) AS n FROM hop(g, seeds => {sql_literal(seeds)}, steps => 2)",
+        "hop": f"SELECT count(*) AS n FROM hop(g, seeds => {sql_literal(seeds)}, n => 2)",
         "algorithms": (
             "SELECT count(*) AS n, sum(degree) AS d, sum(pagerank) AS p, "
             "count(DISTINCT louvain) AS c "
