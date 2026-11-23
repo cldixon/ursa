@@ -128,8 +128,8 @@ CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name
 
 vertex_table := table [AS name] [KEY (column)] [labels]
 edge_table   := table [AS name] [KEY (column)]
-                SOURCE KEY (column) [REFERENCES vertex_table (column)]
-                DESTINATION KEY (column) [REFERENCES vertex_table (column)]
+                SOURCE KEY (column) [REFERENCES vertex_table [(column)]]
+                DESTINATION KEY (column) [REFERENCES vertex_table [(column)]]
                 [labels]
 labels       := DEFAULT LABEL [properties] | LABEL name [properties] [LABEL name [properties] …] | properties
               | properties LABEL name [LABEL name …]
@@ -154,7 +154,7 @@ CREATE PROPERTY GRAPH karate
 - **The node set** (new in 0.7; in 0.6.0 the algorithms see only the edges' endpoints). With a vertex table, every key is a node, one with no edges included, and every algorithm, traversal and pattern runs on those nodes, in the table's order. An edge whose source or destination is not a key is left out, as DuckPGQ leaves it out; `describe` counts such edges in `n_dropped_edges`.
 - **A key identifies one row** (behaviour change in 0.12). A vertex table's key must be unique and not NULL, as SQL/PGQ requires. A vertex table with a duplicate or a NULL key is refused with an error that counts the rows and names a duplicate, by whatever reads it as the graph's nodes: the algorithms and traversals, `g.nodes`, and `GRAPH_TABLE`. The table is read when a query runs, so `CREATE PROPERTY GRAPH` still accepts it. Deduplicate it in a view and define the graph over the view: `CREATE VIEW people_nodes AS SELECT DISTINCT ON (id) * FROM people WHERE id IS NOT NULL ORDER BY id`. Before 0.12 the algorithms counted a duplicated key once and skipped a NULL key, while `g.nodes` and `GRAPH_TABLE` returned every row, so they did not agree on the nodes.
 - **Keys with no edges** (new in 0.8) cost the algorithms next to nothing: they run on the nodes with at least one edge and fill in each isolated node's result, which is the same every time. It is degree 0, its own component and its own community (a label of its own), 0 triangles and a clustering coefficient of 0. Its PageRank is its share of the teleport and of the dangling nodes' score, since a node with no edges is dangling too. The results are those of running on every node, bit for bit, but two of them depend on how many keys there are. PageRank's scores sum to 1 over every node, so a vertex table with more keys gives every node a lower score. And every isolated node is a community: `count(DISTINCT louvain)` counts each one, so count the communities with more than one member with `GROUP BY louvain HAVING count(*) > 1`.
-- **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. With several vertex tables, every endpoint needs one, to say which table it refers to.
+- **`REFERENCES`** names a vertex table, by its `AS` name or its table name, and its key. The key's column can be left out (`REFERENCES members`) when the vertex table's key is known: its `KEY`, its primary key, or the column another `REFERENCES` names. With several vertex tables, every endpoint needs one, to say which table it refers to.
 - **Labels and properties.** Each table has a label, its name unless `LABEL` gives others, and exposes its columns as properties, all of them unless a `PROPERTIES` clause says otherwise. DuckPGQ's order, `Student PROPERTIES (id, name) LABEL Person`, gives `Person` those properties.
 - `NODE TABLES` and `RELATIONSHIP TABLES`, the standard's synonyms, work too.
 

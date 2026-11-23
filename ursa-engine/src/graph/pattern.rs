@@ -219,6 +219,22 @@ impl<'a> Tokens<'a> {
         matches!(self.peek(n), Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word))
     }
 
+    /// Whether a `KEEP` or `ONE ROW PER` clause starts at the next token: the
+    /// word, not a property of that name (`a.keep`).
+    fn starts_clause(&self) -> bool {
+        let after_period = self.at > 0 && self.tokens[self.at - 1].0 == Token::Period;
+        !after_period
+            && (self.is_word(0, "KEEP") || (self.is_word(0, "ONE") && self.is_word(1, "ROW")))
+    }
+
+    /// The text of token `i`, as written.
+    fn raw(&self, i: usize) -> &'a str {
+        match self.tokens.get(i) {
+            Some((_, start, end)) => &self.text[*start..*end],
+            None => "",
+        }
+    }
+
     fn eat(&mut self, token: &Token) -> bool {
         if self.peek(0) == Some(token) {
             self.at += 1;
@@ -302,13 +318,109 @@ impl<'a> Tokens<'a> {
         stop: impl Fn(&Self, usize) -> bool,
     ) -> Result<Option<String>> {
         let from = self.tokens.get(self.at).map(|(_, start, _)| *start);
-        let text = self.text_until(stop);
+        let text = self
+            .text_until(stop)
+            .map(|t| graph_predicates(&t))
+            .transpose()?;
         if let (Some(text), Some(from)) = (&text, from) {
             check_sql(text, from, sql)?;
         }
         Ok(text)
     }
 }
+
+/// The function `x IS [NOT] LABELED l` is rewritten to, as
+/// `__ursa_is_labeled(x, 'l')`; the planner replaces it with `TRUE` or
+/// `FALSE` once it knows `x`'s table.
+pub const IS_LABELED: &str = "__ursa_is_labeled";
+/// The function `a IS [NOT] SOURCE OF e` is rewritten to.
+pub const IS_SOURCE: &str = "__ursa_is_source";
+/// The function `a IS [NOT] DESTINATION OF e` is rewritten to.
+pub const IS_DESTINATION: &str = "__ursa_is_destination";
+
+/// `text`, a condition or `COLUMNS` list, with SQL/PGQ's predicates that SQL
+/// cannot parse rewritten to function calls: `x IS [NOT] LABELED l`, `a IS
+/// [NOT] SOURCE OF e` and `a IS [NOT] DESTINATION OF e`. The planner
+/// replaces the calls, as it does `SAME` and `ALL_DIFFERENT`.
+fn graph_predicates(text: &str) -> Result<String> {
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, text).tokenize_with_location() else {
+        return Ok(text.to_string());
+    };
+    let tokens: Vec<(Token, usize, usize)> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_) | Token::EOF))
+        .filter_map(|TokenWithSpan { token, span }| {
+            Some((token, offset(text, span.start)?, offset(text, span.end)?))
+        })
+        .collect();
+    let word = |i: usize, w: &str| matches!(tokens.get(i), Some((Token::Word(x), _, _)) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    let name = |i: usize| match tokens.get(i) {
+        Some((Token::Word(w), start, end)) => Some((w, &text[*start..*end])),
+        _ => None,
+    };
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        let variable = name(i).filter(|_| i == 0 || tokens[i - 1].0 != Token::Period);
+        let (Some((_, var)), true) = (variable, word(i + 1, "IS")) else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 2;
+        let negated = word(j, "NOT");
+        if negated {
+            j += 1;
+        }
+        let call = if word(j, "LABELED") {
+            let Some((label, _)) = name(j + 1) else {
+                return pattern_err(format!(
+                    "{var} IS LABELED needs a label, as {var} IS LABELED person"
+                ));
+            };
+            if matches!(
+                tokens.get(j + 2).map(|t| &t.0),
+                Some(Token::Pipe | Token::Ampersand | Token::ExclamationMark | Token::Mod)
+            ) {
+                return pattern_err(LABEL_EXPRESSIONS);
+            }
+            let label = match label.quote_style {
+                Some(_) => label.value.clone(),
+                None => label.value.to_lowercase(),
+            };
+            j += 2;
+            format!("{IS_LABELED}({var}, '{}')", label.replace('\'', "''"))
+        } else if (word(j, "SOURCE") || word(j, "DESTINATION")) && word(j + 1, "OF") {
+            let function = match word(j, "SOURCE") {
+                true => IS_SOURCE,
+                false => IS_DESTINATION,
+            };
+            let Some((_, edge)) = name(j + 2) else {
+                return pattern_err(format!(
+                    "IS SOURCE OF and IS DESTINATION OF take an edge variable, as {var} IS SOURCE OF e"
+                ));
+            };
+            j += 3;
+            format!("{function}({var}, {edge})")
+        } else {
+            i += 1;
+            continue;
+        };
+        out.push_str(&text[copied..tokens[i].1]);
+        match negated {
+            true => out.push_str(&format!("(NOT {call})")),
+            false => out.push_str(&call),
+        }
+        copied = tokens[j - 1].2;
+        i = j;
+    }
+    out.push_str(&text[copied..]);
+    Ok(out)
+}
+
+/// The refusal of a label expression (#412).
+const LABEL_EXPRESSIONS: &str =
+    "label expressions (|, &, !, %) are not supported yet; use one label (#412)";
 
 /// What a piece of a pattern's text is, as SQL.
 #[derive(Clone, Copy)]
@@ -355,17 +467,18 @@ fn check_sql(text: &str, from: usize, sql: Sql) -> Result<()> {
     ))
 }
 
-/// The refusal of a SQL/PGQ clause Ursa does not have, if `token` (and the
-/// token after it, `next`) starts one: `KEEP …` or `ONE ROW PER …`.
+/// The refusal of a pattern clause written where it does not go, if `token`
+/// (and the token after it, `next`) starts one: `KEEP …` or `ONE ROW PER …`
+/// inside a node or an edge, or in `COLUMNS`.
 fn unsupported_clause(token: &Token, next: &Token) -> Option<&'static str> {
     let is = |token: &Token, word: &str| matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word));
     if is(token, "KEEP") {
         Some(
-            "KEEP is not supported yet; write the selector or path mode before each path, as MATCH ANY SHORTEST (a)-[e]->*(b) or MATCH TRAIL (a)-[e]->*(b)",
+            "KEEP goes after the whole pattern, before WHERE and COLUMNS, as MATCH (a)-[e]->*(b) KEEP ANY SHORTEST WHERE a.id = 0",
         )
     } else if is(token, "ONE") && is(next, "ROW") {
         Some(
-            "ONE ROW PER is not supported yet; a GRAPH_TABLE returns one row per match, as ONE ROW PER MATCH does",
+            "ONE ROW PER goes after the pattern and its WHERE, before COLUMNS, as MATCH (a)-[e]->(b) ONE ROW PER MATCH COLUMNS (a.id)",
         )
     } else {
         None
@@ -405,22 +518,99 @@ pub fn parse(body: &str) -> Result<Pattern> {
     while t.eat(&Token::Comma) {
         paths.push(parse_path(&mut t)?);
     }
-    let condition = if t.is_word(0, "WHERE") {
-        t.next();
-        let condition = t.sql_until(Sql::Condition, |t, n| t.is_word(n, "COLUMNS"))?;
-        if condition.is_none() {
-            return pattern_err("WHERE needs a condition");
+    // KEEP, WHERE and ONE ROW PER, each at most once. The standard puts them
+    // in that order; another order is read the same.
+    let mut condition = None;
+    let mut keep: Option<(Selector, Mode)> = None;
+    let mut rows = false;
+    loop {
+        if t.is_word(0, "WHERE") {
+            if condition.is_some() {
+                return pattern_err("a pattern takes one WHERE; join its conditions with AND");
+            }
+            t.next();
+            condition = t.sql_until(Sql::Condition, |t, _| {
+                t.is_word(0, "COLUMNS") || t.starts_clause()
+            })?;
+            if condition.is_none() {
+                return pattern_err("WHERE needs a condition");
+            }
+        } else if t.is_word(0, "KEEP") {
+            if keep.is_some() {
+                return pattern_err("a pattern takes one KEEP");
+            }
+            t.next();
+            let before = t.at;
+            let prefix = parse_prefix(&mut t)?;
+            if t.at == before {
+                return pattern_err(format!(
+                    "KEEP takes a path selector or path mode, as KEEP ANY SHORTEST or KEEP TRAIL; found {}",
+                    t.found()
+                ));
+            }
+            keep = Some(prefix);
+        } else if t.is_word(0, "ONE") && t.is_word(1, "ROW") {
+            if rows {
+                return pattern_err("a pattern takes one ONE ROW PER clause");
+            }
+            t.next();
+            t.next();
+            if !t.is_word(0, "PER") {
+                return pattern_err(format!("expected PER after ONE ROW, found {}", t.found()));
+            }
+            t.next();
+            if t.is_word(0, "VERTEX") || t.is_word(0, "STEP") {
+                return pattern_err(ONE_ROW_PER_VERTEX);
+            }
+            if !t.is_word(0, "MATCH") {
+                return pattern_err(format!(
+                    "expected MATCH, VERTEX or STEP after ONE ROW PER, found {}",
+                    t.found()
+                ));
+            }
+            t.next();
+            rows = true;
+        } else {
+            break;
         }
-        condition
-    } else {
-        None
-    };
-    if !t.is_word(0, "COLUMNS") {
-        if t.peek(0).is_none() {
+    }
+    if let Some((selector, mode)) = keep {
+        let [path] = paths.as_mut_slice() else {
             return pattern_err(
-                "a GRAPH_TABLE needs COLUMNS (…), listing what to return, such as COLUMNS (a.id AS a, b.id AS b)",
+                "KEEP over several path patterns is not supported yet; put the selector or path mode before each path, as MATCH ANY SHORTEST (a)-[e]->*(b), TRAIL (c)-[f]->*(d)",
+            );
+        };
+        if (selector != Selector::All && path.selector != Selector::All)
+            || (mode != Mode::Walk && path.mode != Mode::Walk)
+        {
+            return pattern_err(
+                "the path has a selector or path mode both before it and in KEEP; write it once",
             );
         }
+        if selector != Selector::All {
+            path.selector = selector;
+        }
+        if mode != Mode::Walk {
+            path.mode = mode;
+        }
+    }
+    let columns = if t.is_word(0, "COLUMNS") {
+        t.next();
+        t.expect(&Token::LParen, "'(' after COLUMNS")?;
+        let Some(columns) = t.sql_until(Sql::Columns, |_, _| false)? else {
+            return pattern_err("COLUMNS (…) lists nothing");
+        };
+        t.expect(&Token::RParen, "')' to close COLUMNS")?;
+        if t.peek(0).is_some() {
+            return pattern_err(format!("unexpected {} after COLUMNS (…)", t.found()));
+        }
+        match columns.as_str() {
+            "*" => all_properties(&paths, "COLUMNS (*)")?,
+            _ => columns,
+        }
+    } else if t.peek(0).is_none() {
+        all_properties(&paths, "a GRAPH_TABLE without COLUMNS")?
+    } else {
         if let Some(token) = t.peek(0) {
             if let Some(clause) = unsupported_clause(token, t.peek(1).unwrap_or(&Token::EOF)) {
                 return pattern_err(clause);
@@ -430,22 +620,52 @@ pub fn parse(body: &str) -> Result<Pattern> {
             "expected ',', WHERE or COLUMNS after the pattern, found {}",
             t.found()
         ));
-    }
-    t.next();
-    t.expect(&Token::LParen, "'(' after COLUMNS")?;
-    let Some(columns) = t.sql_until(Sql::Columns, |_, _| false)? else {
-        return pattern_err("COLUMNS (…) lists nothing");
     };
-    t.expect(&Token::RParen, "')' to close COLUMNS")?;
-    if t.peek(0).is_some() {
-        return pattern_err(format!("unexpected {} after COLUMNS (…)", t.found()));
-    }
     Ok(Pattern {
         graph,
         paths,
         condition,
         columns,
     })
+}
+
+/// The refusal of `ONE ROW PER VERTEX` and `ONE ROW PER STEP`.
+const ONE_ROW_PER_VERTEX: &str = "ONE ROW PER VERTEX and ONE ROW PER STEP are not supported yet; return vertices(p) or edges(p) in COLUMNS and unnest them";
+
+/// `COLUMNS (*)`, and `COLUMNS` left out: every property of each named node
+/// and edge, in the order they first appear (`a.*, k.*, b.*`). An edge that
+/// stands for several edges (quantified, or in a path searched as a whole)
+/// has no properties to return, so it is left out. `what` names the form,
+/// for the error when nothing is named.
+fn all_properties(paths: &[PathPattern], what: &str) -> Result<String> {
+    let mut vars: Vec<&str> = Vec::new();
+    for path in paths {
+        let whole = path.var.is_some() || path.selector != Selector::All || path.mode != Mode::Walk;
+        for element in &path.elements {
+            let var = match element {
+                Element::Node(spec) => spec.var.as_deref(),
+                Element::Edge(spec, _, quantifier) => match whole || quantifier.is_some() {
+                    true => None,
+                    false => spec.var.as_deref(),
+                },
+            };
+            if let Some(var) = var {
+                if !vars.contains(&var) {
+                    vars.push(var);
+                }
+            }
+        }
+    }
+    if vars.is_empty() {
+        return pattern_err(format!(
+            "{what} returns the properties of the pattern's named nodes and edges, and it names none; name one, as (a:person), or list what to return, as COLUMNS (a.id)"
+        ));
+    }
+    Ok(vars
+        .iter()
+        .map(|v| format!("\"{}\".*", v.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 /// A path: `[p =] [selector] [mode [PATH | PATHS]]`, then a node, then edges
@@ -458,6 +678,28 @@ fn parse_path(t: &mut Tokens) -> Result<PathPattern> {
     } else {
         None
     };
+    let (selector, mode) = parse_prefix(t)?;
+    if t.peek(0) == Some(&Token::LParen) && t.peek(1) == Some(&Token::LParen) {
+        return pattern_err(
+            "parenthesized path patterns, as ((a)-[e]->(b))*, are not supported yet; quantify an edge instead, as (a)-[e]->*(b)",
+        );
+    }
+    let mut elements = vec![Element::Node(parse_node(t)?)];
+    while let Some((spec, direction, quantifier)) = parse_edge(t)? {
+        elements.push(Element::Edge(spec, direction, quantifier));
+        elements.push(Element::Node(parse_node(t)?));
+    }
+    Ok(PathPattern {
+        var,
+        selector,
+        mode,
+        elements,
+    })
+}
+
+/// A path's prefix, `[selector] [mode] [PATH | PATHS]`, every part optional;
+/// also what `KEEP` takes.
+fn parse_prefix(t: &mut Tokens) -> Result<(Selector, Mode)> {
     let selector = parse_selector(t)?;
     let mode = if t.is_word(0, "WALK") {
         Some(Mode::Walk)
@@ -476,22 +718,7 @@ fn parse_path(t: &mut Tokens) -> Result<PathPattern> {
     if t.is_word(0, "PATH") || t.is_word(0, "PATHS") {
         t.next();
     }
-    if t.peek(0) == Some(&Token::LParen) && t.peek(1) == Some(&Token::LParen) {
-        return pattern_err(
-            "parenthesized path patterns, as ((a)-[e]->(b))*, are not supported yet; quantify an edge instead, as (a)-[e]->*(b)",
-        );
-    }
-    let mut elements = vec![Element::Node(parse_node(t)?)];
-    while let Some((spec, direction, quantifier)) = parse_edge(t)? {
-        elements.push(Element::Edge(spec, direction, quantifier));
-        elements.push(Element::Node(parse_node(t)?));
-    }
-    Ok(PathPattern {
-        var,
-        selector,
-        mode: mode.unwrap_or(Mode::Walk),
-        elements,
-    })
+    Ok((selector, mode.unwrap_or(Mode::Walk)))
 }
 
 /// `ANY SHORTEST`, `ALL SHORTEST`, `ANY [k]`, `SHORTEST k`, `ALL`, or none.
@@ -550,13 +777,20 @@ fn parse_selector(t: &mut Tokens) -> Result<Selector> {
 
 fn parse_node(t: &mut Tokens) -> Result<Spec> {
     t.expect(&Token::LParen, "'(' to start a node")?;
-    let spec = parse_spec(t, &Token::RParen)?;
+    let spec = parse_spec(t, None)?;
     t.expect(&Token::RParen, "')' to close the node")?;
     Ok(spec)
 }
 
 /// `[var] [:label | IS label] [WHERE condition]`, up to `close`.
-fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
+/// `edge` is the edge's opening, `-` or `<-`, for an edge (closed by `]`);
+/// `None` for a node (closed by `)`).
+fn parse_spec(t: &mut Tokens, edge: Option<&str>) -> Result<Spec> {
+    let close = &match edge {
+        Some(_) => Token::RBracket,
+        None => Token::RParen,
+    };
+    let start = t.at;
     let mut spec = Spec::default();
     if matches!(t.peek(0), Some(Token::Word(_))) && !t.is_word(0, "WHERE") && !t.is_word(0, "IS") {
         spec.var = Some(t.identifier("a variable")?);
@@ -567,10 +801,22 @@ fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
             t.peek(0),
             Some(Token::Pipe | Token::Ampersand | Token::ExclamationMark | Token::Mod)
         ) {
-            return pattern_err(
-                "label expressions (|, &, !, %) are not supported yet; use one label (#297)",
-            );
+            return pattern_err(LABEL_EXPRESSIONS);
         }
+    }
+    // Cypher habits: a property map, and a range inside an edge's brackets.
+    let written = |t: &Tokens| {
+        let last = t.at.checked_sub(1).and_then(|i| t.tokens.get(i));
+        match (start < t.at, t.tokens.get(start), last) {
+            (true, Some((_, from, _)), Some((_, _, to))) => t.text[*from..*to].to_string(),
+            _ => String::new(),
+        }
+    };
+    if t.peek(0) == Some(&Token::LBrace) {
+        return pattern_err(property_map(t, &spec, &written(t), edge));
+    }
+    if let (Some(open), Some(Token::Mul)) = (edge, t.peek(0)) {
+        return pattern_err(cypher_range(t, &written(t), open));
     }
     if t.is_word(0, "WHERE") {
         t.next();
@@ -589,8 +835,122 @@ fn parse_spec(t: &mut Tokens, close: &Token) -> Result<Spec> {
     Ok(spec)
 }
 
-/// An edge, if one is next: `-[…]->`, `<-[…]-`, `-[…]-`, `->`, `<-` or `-`,
-/// and its quantifier, if it has one.
+/// The refusal of a Cypher property map, `(a:Person {name: 'Daniel'})`, at
+/// the `{`: with the condition to write instead, when the map is simple.
+/// `written` is the spec's text before the map; `edge`, the edge's opening.
+fn property_map(t: &Tokens, spec: &Spec, written: &str, edge: Option<&str>) -> String {
+    let var = spec
+        .var
+        .clone()
+        .unwrap_or_else(|| if edge.is_some() { "e" } else { "a" }.to_string());
+    let head = match spec.var {
+        Some(_) => written.trim().to_string(),
+        None => format!("{var}{}", written.trim()),
+    };
+    // The entries, `key: value`, up to the `}` that closes the map.
+    let mut conditions = Vec::new();
+    let mut i = t.at + 1;
+    let simple = loop {
+        let (Some(Token::Word(_)), Some(Token::Colon)) = (
+            t.tokens.get(i).map(|x| &x.0),
+            t.tokens.get(i + 1).map(|x| &x.0),
+        ) else {
+            break false;
+        };
+        let key = t.raw(i);
+        let from = i + 2;
+        let mut depth = 0i32;
+        let mut j = from;
+        while let Some((token, _, _)) = t.tokens.get(j) {
+            match token {
+                Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::RBrace if depth > 0 => depth -= 1,
+                Token::RBrace | Token::Comma if depth == 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j == from || j >= t.tokens.len() {
+            break false;
+        }
+        let value = &t.text[t.tokens[from].1..t.tokens[j - 1].2];
+        conditions.push(format!("{var}.{key} = {value}"));
+        if t.tokens[j].0 == Token::RBrace {
+            break true;
+        }
+        i = j + 1;
+    };
+    let (open, close) = match edge {
+        Some(_) => ("[", "]"),
+        None => ("(", ")"),
+    };
+    let example = match simple && !conditions.is_empty() {
+        true => format!("{open}{head} WHERE {}{close}", conditions.join(" AND ")),
+        false => format!("{open}{head} WHERE {var}.name = 'Daniel'{close}"),
+    };
+    format!("property maps ({{…}}) are Cypher; write the condition with WHERE, as {example}")
+}
+
+/// The refusal of a Cypher range inside an edge's brackets,
+/// `-[k:knows*1..3]->`, at the `*`: with the quantifier to write after the
+/// edge instead. `written` is the spec's text before the `*`; `open`, the
+/// edge's opening.
+fn cypher_range(t: &Tokens, written: &str, open: &str) -> String {
+    // The range's text, up to the `]`.
+    let mut j = t.at;
+    while j < t.tokens.len() && t.tokens[j].0 != Token::RBracket {
+        j += 1;
+    }
+    let close = match t.tokens.get(j + 1).map(|x| &x.0) {
+        Some(Token::Arrow) => "->",
+        _ if open == "<-" => "-",
+        _ => "-",
+    };
+    let range: String = match j > t.at {
+        true => t.text[t.tokens[t.at].1..t.tokens[j - 1].2]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect(),
+        false => "*".to_string(),
+    };
+    let bounds = range.trim_start_matches('*');
+    // Cypher's `*` is one or more edges; `*n` exactly n; `*m..n` m to n.
+    let quantifier = match bounds.split_once("..") {
+        None if bounds.is_empty() => Some("+".to_string()),
+        None => bounds.parse::<u32>().ok().map(|n| format!("{{{n}}}")),
+        Some((m, n)) => {
+            let m = match m {
+                "" => Some(1),
+                m => m.parse::<u32>().ok(),
+            };
+            let n = match n {
+                "" => Some(None),
+                n => n.parse::<u32>().ok().map(Some),
+            };
+            match (m, n) {
+                (Some(m), Some(Some(n))) => Some(format!("{{{m},{n}}}")),
+                (Some(m), Some(None)) => Some(format!("{{{m},}}")),
+                _ => None,
+            }
+        }
+    };
+    let quantifier = quantifier.unwrap_or_else(|| "{1,3}".to_string());
+    format!(
+        "{range} inside an edge's brackets is Cypher's range; in SQL/PGQ the quantifier follows the edge: write {open}[{}]{close}{quantifier}",
+        written.trim()
+    )
+}
+
+/// The refusal of an undirected edge written with `~`.
+const TILDE_EDGES: &str =
+    "Ursa's edges are directed; use -[e]- to follow them either way (~[e]~, <~[e]~, ~[e]~> and ~ are for undirected edges)";
+
+/// An edge, if one is next: `-[…]->`, `<-[…]-`, `-[…]-`, `<-[…]->`, `->`,
+/// `<-`, `-` or `<->`, and its quantifier, if it has one. `<-[…]->` and
+/// `<->` are "left or right": every edge of an Ursa graph is directed, so
+/// they mean `-[…]-` and `-`. Edges written with `~` (undirected) are
+/// refused.
 fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction, Option<Quantifier>)>> {
     let edge = match (t.peek(0), t.peek(1)) {
         // Abbreviated edges.
@@ -598,15 +958,31 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction, Option<Quantifi
             t.next();
             (Spec::default(), Direction::Right)
         }
+        (Some(Token::TwoWayArrow), _) => {
+            t.next();
+            (Spec::default(), Direction::Any)
+        }
+        (Some(Token::Lt), Some(Token::Arrow)) => {
+            t.next();
+            t.next();
+            (Spec::default(), Direction::Any)
+        }
         (Some(Token::Lt), Some(Token::Minus)) if t.peek(2) != Some(&Token::LBracket) => {
             t.next();
             t.next();
-            (Spec::default(), Direction::Left)
+            if t.eat(&Token::Gt) {
+                (Spec::default(), Direction::Any)
+            } else {
+                (Spec::default(), Direction::Left)
+            }
+        }
+        (Some(Token::Tilde), _) | (Some(Token::Lt), Some(Token::Tilde)) => {
+            return pattern_err(TILDE_EDGES)
         }
         (Some(Token::Minus), Some(Token::LBracket)) => {
             t.next();
             t.next();
-            let spec = parse_spec(t, &Token::RBracket)?;
+            let spec = parse_spec(t, Some("-"))?;
             t.expect(&Token::RBracket, "']' to close the edge")?;
             let direction = match t.next() {
                 Some(Token::Arrow) => Direction::Right,
@@ -619,6 +995,7 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction, Option<Quantifi
                 Some(Token::LongArrow) => {
                     return pattern_err("expected '->' or '-' after ']', found '->>'")
                 }
+                Some(Token::Tilde) => return pattern_err(TILDE_EDGES),
                 _ => {
                     t.at -= 1;
                     return pattern_err(format!(
@@ -633,10 +1010,23 @@ fn parse_edge(t: &mut Tokens) -> Result<Option<(Spec, Direction, Option<Quantifi
             t.next();
             t.next();
             t.expect(&Token::LBracket, "'[' after '<-'")?;
-            let spec = parse_spec(t, &Token::RBracket)?;
+            let spec = parse_spec(t, Some("<-"))?;
             t.expect(&Token::RBracket, "']' to close the edge")?;
-            t.expect(&Token::Minus, "'-' after ']'")?;
-            (spec, Direction::Left)
+            let direction = match t.next() {
+                // `<-[e]->`: left or right.
+                Some(Token::Arrow) => Direction::Any,
+                Some(Token::Minus) if t.eat(&Token::Gt) => Direction::Any,
+                Some(Token::Minus) => Direction::Left,
+                Some(Token::Tilde) => return pattern_err(TILDE_EDGES),
+                _ => {
+                    t.at -= 1;
+                    return pattern_err(format!(
+                        "expected '-' or '->' after ']', found {}",
+                        t.found()
+                    ));
+                }
+            };
+            (spec, direction)
         }
         (Some(Token::Minus), _) => {
             t.next();
@@ -775,6 +1165,8 @@ pub struct Segment {
     pub var: String,
     /// The path variable, if the path has one.
     pub path: Option<String>,
+    /// The edge variable it searches (an unnamed edge's is `__ursa_…`).
+    pub edge: String,
     /// The edge table, and its source and destination columns.
     pub edges: TableReference,
     pub source: String,
@@ -1402,6 +1794,7 @@ pub fn lower(
         segments.push(Segment {
             var,
             path,
+            edge: step.edge.clone(),
             edges: e.table.clone(),
             source: e.source.clone(),
             destination: e.destination.clone(),
@@ -1930,7 +2323,14 @@ mod tests {
                 "parenthesized path patterns",
             ),
             ("g MATCH (a:x|y) COLUMNS (a.id)", "label expressions"),
-            ("g MATCH (a)-[e]->(b)", "a GRAPH_TABLE needs COLUMNS (…)"),
+            (
+                "g MATCH ()-[]->()",
+                "a GRAPH_TABLE without COLUMNS returns the properties of the pattern's named nodes and edges",
+            ),
+            (
+                "g MATCH ()-[]->() COLUMNS (*)",
+                "COLUMNS (*) returns the properties of the pattern's named nodes and edges, and it names none",
+            ),
             (
                 "g (a) COLUMNS (a.id)",
                 "expected MATCH after the graph's name, found '('",
@@ -1945,6 +2345,189 @@ mod tests {
             ),
             ("g MATCH (a) COLUMNS (a.id) extra", "unexpected 'extra'"),
             ("g MATCH (a) COLUMNS ()", "COLUMNS (…) lists nothing"),
+        ] {
+            let message = parse(body).unwrap_err().to_string();
+            assert!(message.contains(expected), "{body}\n{message}");
+        }
+    }
+
+    #[test]
+    fn columns_left_out_or_star_are_every_named_element() {
+        for body in [
+            "g MATCH (a:x)-[k:y]->(b), (b)-[]->(\"C\")",
+            "g MATCH (a:x)-[k:y]->(b), (b)-[]->(\"C\") COLUMNS (*)",
+            "g MATCH (a:x)-[k:y]->(b), (b)-[]->(\"C\") COLUMNS ( * )",
+        ] {
+            assert_eq!(
+                parse(body).unwrap().columns,
+                r#""a".*, "k".*, "b".*, "C".*"#,
+                "{body}"
+            );
+        }
+        // An edge that stands for several edges has no properties to return.
+        assert_eq!(
+            parse("g MATCH (a)-[k]->{1,2}(b), p = (b)-[f]->(c)")
+                .unwrap()
+                .columns,
+            r#""a".*, "b".*, "c".*"#
+        );
+        // Other uses of * are left to the planner.
+        assert_eq!(
+            parse("g MATCH (a) COLUMNS (*, a.id)").unwrap().columns,
+            "*, a.id"
+        );
+    }
+
+    #[test]
+    fn either_direction_edges_and_tilde_edges() {
+        for path in ["(a)<-[e]->(b)", "(a)<-[e]- >(b)", "(a)<->(b)", "(a)<- >(b)"] {
+            let p = parse(&format!("g MATCH {path} COLUMNS (a.id)")).unwrap();
+            assert_eq!(edges(&p.paths[0]), vec![(Direction::Any, None)], "{path}");
+        }
+        let p = parse("g MATCH (a)<-[e]->{1,3}(b) COLUMNS (a.id)").unwrap();
+        assert_eq!(
+            edges(&p.paths[0]),
+            vec![(
+                Direction::Any,
+                Some(Quantifier {
+                    min: 1,
+                    max: Some(3)
+                })
+            )]
+        );
+        for path in [
+            "(a)~[e]~(b)",
+            "(a)<~[e]~(b)",
+            "(a)~[e]~>(b)",
+            "(a)~(b)",
+            "(a)<~(b)",
+            "(a)-[e]~(b)",
+            "(a)<-[e]~(b)",
+        ] {
+            let message = parse(&format!("g MATCH {path} COLUMNS (a.id)"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("Ursa's edges are directed; use -[e]- to follow them either way"),
+                "{path}\n{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_and_one_row_per_match() {
+        let path = |body: &str| {
+            let p = parse(body).unwrap();
+            (p.paths[0].selector, p.paths[0].mode, p.condition)
+        };
+        assert_eq!(
+            path("g MATCH (a)-[e]->*(b) KEEP ANY SHORTEST COLUMNS (a.id)"),
+            (Selector::Shortest(1), Mode::Walk, None)
+        );
+        assert_eq!(
+            path("g MATCH (a)-[e]->*(b) KEEP SHORTEST 2 TRAIL PATHS WHERE a.id = 1 COLUMNS (a.id)"),
+            (
+                Selector::Shortest(2),
+                Mode::Trail,
+                Some("a.id = 1".to_string())
+            )
+        );
+        // After WHERE too, as #409 found it written.
+        assert_eq!(
+            path("g MATCH (a)-[e]->*(b) WHERE a.id = 1 KEEP ACYCLIC COLUMNS (a.id)"),
+            (Selector::All, Mode::Acyclic, Some("a.id = 1".to_string()))
+        );
+        // A mode before the path and a selector in KEEP.
+        assert_eq!(
+            path("g MATCH TRAIL (a)-[e]->*(b) KEEP ALL SHORTEST COLUMNS (a.id)"),
+            (Selector::AllShortest, Mode::Trail, None)
+        );
+        // ONE ROW PER MATCH is the default; a property named keep is not KEEP.
+        assert_eq!(
+            path("g MATCH (a)-[e]->(b) WHERE a.keep = 1 ONE ROW PER MATCH COLUMNS (a.id)"),
+            (Selector::All, Mode::Walk, Some("a.keep = 1".to_string()))
+        );
+        assert_eq!(
+            path("g MATCH (a)-[e]->(b) ONE ROW PER MATCH"),
+            (Selector::All, Mode::Walk, None)
+        );
+        for (body, expected) in [
+            (
+                "g MATCH (a)-[e]->*(b), (b)-[f]->*(c) KEEP ANY SHORTEST COLUMNS (a.id)",
+                "KEEP over several path patterns is not supported yet",
+            ),
+            (
+                "g MATCH ANY SHORTEST (a)-[e]->*(b) KEEP ANY SHORTEST COLUMNS (a.id)",
+                "both before it and in KEEP",
+            ),
+            (
+                "g MATCH (a)-[e]->*(b) KEEP COLUMNS (a.id)",
+                "KEEP takes a path selector or path mode",
+            ),
+            (
+                "g MATCH (a)-[e]->*(b) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id)",
+                "ONE ROW PER VERTEX and ONE ROW PER STEP are not supported yet; return vertices(p) or edges(p)",
+            ),
+            (
+                "g MATCH (a)-[e]->*(b) ONE ROW PER VERTEX (v) COLUMNS (a.id)",
+                "ONE ROW PER VERTEX and ONE ROW PER STEP are not supported yet",
+            ),
+            (
+                "g MATCH (a WHERE a.id = 1 KEEP TRAIL)-[e]->*(b) COLUMNS (a.id)",
+                "KEEP goes after the whole pattern",
+            ),
+        ] {
+            let message = parse(body).unwrap_err().to_string();
+            assert!(message.contains(expected), "{body}\n{message}");
+        }
+    }
+
+    #[test]
+    fn graph_predicates_are_rewritten_to_calls() {
+        let p = parse(
+            "g MATCH (a)-[k]->(b) WHERE k IS LABELED \"studyAt\" AND a IS NOT LABELED Person \
+             AND a IS SOURCE OF k AND NOT b IS NOT DESTINATION OF k AND a.name IS NOT NULL \
+             COLUMNS (a IS LABELED x AS l)",
+        )
+        .unwrap();
+        assert_eq!(
+            p.condition.as_deref(),
+            Some(
+                "__ursa_is_labeled(k, 'studyAt') AND (NOT __ursa_is_labeled(a, 'person')) \
+                 AND __ursa_is_source(a, k) AND NOT (NOT __ursa_is_destination(b, k)) \
+                 AND a.name IS NOT NULL"
+            )
+        );
+        assert_eq!(p.columns, "__ursa_is_labeled(a, 'x') AS l");
+        let message = parse("g MATCH (a) WHERE a IS LABELED x|y COLUMNS (a.id)")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("(#412)"), "{message}");
+    }
+
+    #[test]
+    fn cypher_habits_are_refused_with_the_sql_pgq_form() {
+        for (body, expected) in [
+            (
+                "g MATCH (a:Person {name: 'Daniel'}) COLUMNS (a.id)",
+                "property maps ({…}) are Cypher; write the condition with WHERE, as (a:Person WHERE a.name = 'Daniel')",
+            ),
+            (
+                "g MATCH (:Person {name: 'Daniel', age: f(1, 2)}) COLUMNS (a.id)",
+                "as (a:Person WHERE a.name = 'Daniel' AND a.age = f(1, 2))",
+            ),
+            (
+                "g MATCH (a)-[k:knows {since: 2020}]->(b) COLUMNS (a.id)",
+                "as [k:knows WHERE k.since = 2020]",
+            ),
+            (
+                "g MATCH (a)-[k:knows*1..3]->(b) COLUMNS (a.id)",
+                "*1..3 inside an edge's brackets is Cypher's range; in SQL/PGQ the quantifier follows the edge: write -[k:knows]->{1,3}",
+            ),
+            ("g MATCH (a)-[k*]->(b) COLUMNS (a.id)", "write -[k]->+"),
+            ("g MATCH (a)-[:knows*2]-(b) COLUMNS (a.id)", "write -[:knows]-{2}"),
+            ("g MATCH (a)<-[k*..4]-(b) COLUMNS (a.id)", "write <-[k]-{1,4}"),
+            ("g MATCH (a)-[k * 2..]->(b) COLUMNS (a.id)", "write -[k]->{2,}"),
         ] {
             let message = parse(body).unwrap_err().to_string();
             assert!(message.contains(expected), "{body}\n{message}");
