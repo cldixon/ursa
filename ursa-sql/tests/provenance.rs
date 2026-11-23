@@ -126,15 +126,15 @@ async fn traversals_say_what_their_columns_are() {
             ),
             (
                 "SELECT * FROM shortest_path(karate, source => 0, target => 33)",
-                "src: src karate members\ndst: dst karate members\nhop: step karate\ncost:",
+                "src: src karate members\ndst: dst karate members\nstep: step karate\ncost:",
             ),
             (
                 "SELECT * FROM random_walk(karate, seeds => [0], steps => 2)",
-                "walk_id: walk karate\nstep: step karate\nnode: node karate members",
+                "walk_id: walk karate\nstep: step karate\nid: node karate members",
             ),
             // No rows, the same schema.
             (
-                "SELECT * FROM hop(karate, seeds => [99])",
+                "SELECT * FROM hop(karate, seeds => (SELECT 99))",
                 "seed: seed karate members\nid: node karate members\ndistance: distance karate",
             ),
         ],

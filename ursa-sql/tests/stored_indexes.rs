@@ -1186,7 +1186,7 @@ async fn an_index_stored_by_0_11_loads_and_is_rewritten_with_its_lookup_table() 
     use ursa_engine::database::index_file::{read_file, Encoded, VERSION, VERSION_3};
     let fixture = Fixture::new(20_000).await;
     let hop =
-        "SELECT seed, id, distance FROM hop(g, seeds => [0, 1, 2, -5], steps => 2) ORDER BY seed, id";
+        "SELECT seed, id, distance FROM hop(g, seeds => [0, 1, 2], steps => 2) ORDER BY seed, id";
     let first = open(&fixture.db()).await;
     let expected = ok(&first, QUERY).await;
     let hops = ok(&first, hop).await;
@@ -1250,7 +1250,7 @@ async fn a_later_process_finds_string_ids_through_the_stored_lookup_table() {
     let fixture = Fixture::new(20_000).await;
     let dir = fixture.dir.path();
     let queries = [
-        "SELECT seed, id, distance FROM hop(s, seeds => ['node-0', 'node-17', 'nobody'], steps => 2) ORDER BY seed, id",
+        "SELECT seed, id, distance FROM hop(s, seeds => (SELECT unnest(['node-0', 'node-17', 'nobody'])), steps => 2) ORDER BY seed, id",
         "SELECT count(*) FROM hop(s, seeds => (SELECT id FROM degree(s) WHERE id LIKE '%7'), steps => 1)",
         "SELECT id, round(pagerank, 8) FROM pagerank(s) ORDER BY pagerank DESC, id LIMIT 10",
         "SELECT count(*), sum(length(id)) FROM degree(s)",

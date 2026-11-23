@@ -505,8 +505,20 @@ async fn a_long_list_is_the_same_set() {
         let sql = format!("SELECT * FROM induced_edges(rmat, nodes => {nodes})");
         assert_eq!(rows(&ctx, &sql).await, from_query, "{what}");
     }
-    // `hop`'s seeds are planned the same way.
-    let seeds = list(&|i| i.to_string());
+    // `hop`'s seeds are planned the same way. A literal seed must be a node
+    // (#416), so the list keeps the ids that are; the query's others are
+    // skipped.
+    let nodes: std::collections::HashSet<String> = rows(&ctx, "SELECT id FROM rmat.nodes")
+        .await
+        .into_iter()
+        .collect();
+    let cells: Vec<String> = ids
+        .iter()
+        .map(|i| i.to_string())
+        .filter(|i| nodes.contains(i))
+        .collect();
+    assert!(cells.len() < ids.len());
+    let seeds = format!("[{}]", cells.join(", "));
     assert_eq!(
         rows(
             &ctx,
@@ -519,6 +531,17 @@ async fn a_long_list_is_the_same_set() {
              (SELECT (i * 7919 + 13) % 4096 FROM generate_series(0, 4999) AS t(i)))"
         )
         .await
+    );
+    let all = list(&|i| i.to_string());
+    let message = err(
+        &ctx,
+        &format!("SELECT count(*) FROM hop(rmat, seeds => {all})"),
+    )
+    .await;
+    assert!(
+        message.starts_with("hop(seeds =>): ")
+            && message.contains(" are not nodes of graph 'rmat': "),
+        "{message}"
     );
     // String ids, and integers read as their strings.
     let names = rows(&ctx, "SELECT id FROM degree(lesmis) ORDER BY id").await;

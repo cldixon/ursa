@@ -2365,7 +2365,7 @@ mod tests {
             direction.contains("string") && direction.contains("default 'out'"),
             "{direction}"
         );
-        assert!(direction.ends_with("One of: out, both."), "{direction}");
+        assert!(direction.ends_with("One of: out, in, both."), "{direction}");
         // A numeric parameter with a range says it (#416).
         let damping = lines
             .iter()

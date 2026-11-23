@@ -798,7 +798,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **SQL: graph functions accept more argument forms** (#415). `direction`
   values are read in any case (`'BOTH'`, `'Out'`). `'undirected'` is
   refused with a hint to use `'both'`. `pagerank` and `betweenness` take
-  `direction => 'in'`, which runs the same kernel on the reversed graph.
+  `direction => 'in'`, which runs the same kernel on the reversed graph
+  (SQL only: the Python verbs still take `'out'` and `'both'`).
   `connected_components(g, direction => …)` says to use `mode => 'weak'`
   or `'strong'`. Named arguments may be written `name = value` or
   `name := value` as well as `name => value`, as in `read_csv`, also inside
