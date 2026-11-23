@@ -950,6 +950,39 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `WHERE`, and `COLUMNS`. `KEEP …` and `ONE ROW PER …`, which were ignored
   the same way, are refused as not supported yet. Only queries that were
   already wrong are affected.
+- **SQL: more of SQL/PGQ's and DuckPGQ's `GRAPH_TABLE` forms run**
+  (#413, #414). Each was an error before, so no query that ran changes.
+  - `COLUMNS` may be left out, or written `COLUMNS (*)`: every property of
+    each named node and edge, in pattern order (`a.*, k.*, b.*`), as DuckPGQ
+    returns them. A repeated name gets a suffix (`id`, `id:1`).
+  - `<-[e]->` and `<->`, the standard's "left or right", mean `-[e]-` and
+    `-`, since every edge of an Ursa graph is directed. The undirected `~`
+    forms are refused: "Ursa's edges are directed; use -[e]- to follow them
+    either way".
+  - `element_id(a)` of a node is its key; `element_id(e)` of an edge is its
+    row in the edge table, the number `edges(p)` lists (for the edge of a
+    path with a variable; an edge read by a join is refused for now).
+  - Graph predicates in `WHERE` and `COLUMNS`: `SAME(a, b, …)`,
+    `ALL_DIFFERENT(a, b, …)`, `x IS [NOT] LABELED l`, and `a IS [NOT]
+    SOURCE OF e` / `IS [NOT] DESTINATION OF e`.
+  - `KEEP <selector or path mode>` after a pattern of one path is its prefix
+    form: `MATCH p = (a)-[e]->*(b) KEEP ANY SHORTEST` is `MATCH p = ANY
+    SHORTEST (a)-[e]->*(b)`. `ONE ROW PER MATCH`, the default, is accepted.
+  - `CREATE PROPERTY GRAPH`: `REFERENCES t` without a column list names
+    `t`'s key, when it is known (its `KEY`, its primary key, or another
+    `REFERENCES`).
+  - Clearer errors for what is not supported yet, in place of parser
+    errors, debug dumps or a wrong variable: `KEEP` over several paths,
+    `ONE ROW PER VERTEX` / `STEP`, aggregates in `COLUMNS`, a subquery in
+    the pattern that reads a table the statement does not name, `LATERAL
+    GRAPH_TABLE` and other references to tables outside the `GRAPH_TABLE`,
+    the properties of a quantified edge variable ("stands for several
+    edges"), and Cypher's property maps (`{name: 'x'}`) and ranges
+    (`*1..3`), each with the SQL/PGQ to write. The label-expression error
+    now points at #412.
+  - A SQL/PGQ and DuckPGQ conformance suite (#299), `tests/conformance/`,
+    in sqllogictest's format, with a reviewed list of known differences;
+    `cargo test -p ursa-sql --test conformance` runs it.
 
 - **Triangle counting uses about a third of the CPU, with the same counts**
   (#420). `triangle_count`, and so `clustering_coefficient` and the SQL

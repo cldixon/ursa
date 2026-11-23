@@ -139,7 +139,8 @@ fn labels(labels: Vec<LabelDef>, element: &str, normalizer: &IdentNormalizer) ->
 }
 
 /// The endpoint column, the vertex table (element name) its `REFERENCES`
-/// names, and the column it references.
+/// names, and the column it references, if it names one (`REFERENCES v`
+/// without a column references `v`'s key, which the engine resolves).
 fn endpoint(
     endpoint: EndpointDef,
     vertices: &[VertexSpec],
@@ -151,7 +152,7 @@ fn endpoint(
         return Ok((key, None, None));
     };
     let referenced = object_name_to_table_reference(table, normalize)?;
-    let column = normalizer.normalize(column);
+    let column = column.map(|c| normalizer.normalize(c));
     // A vertex table by its element name, else by its table's name.
     let vertex = vertices
         .iter()
@@ -159,7 +160,7 @@ fn endpoint(
         .or_else(|| vertices.iter().find(|v| same_table(&referenced, &v.table)))
         .map(|v| v.name.clone())
         .unwrap_or_else(|| referenced.table().to_string());
-    Ok((key, Some(vertex), Some(column)))
+    Ok((key, Some(vertex), column))
 }
 
 /// Whether two references name the same table: equal, or one is the other

@@ -502,6 +502,17 @@ async fn the_pattern_matching_page_examples() {
              {{\"directed\":false,\"edge\":null,\"from\":\"b\",\"label\":\"ties\",\"to\":\"c\"}}]",
             undirected("null")
         ),
+        // The graph predicates: a count, then element_id(b) (b's key) and a
+        // computed boolean.
+        "triangles:\nursa.pattern = [\
+         {\"directed\":true,\"edge\":null,\"from\":\"a\",\"label\":\"ties\",\"to\":\"b\"},\
+         {\"directed\":true,\"edge\":null,\"from\":\"b\",\"label\":\"ties\",\"to\":\"c\"},\
+         {\"directed\":true,\"edge\":null,\"from\":\"a\",\"label\":\"ties\",\"to\":\"c\"}]"
+            .to_string(),
+        format!(
+            "friend: node karate members b\nfrom_16:\nursa.pattern = [{}]",
+            undirected("\"e\"")
+        ),
         // `round(pagerank, 4)` is a new value.
         format!(
             "id: node karate members b\npagerank:\nursa.pattern = [{}]",

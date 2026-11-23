@@ -211,20 +211,27 @@ fn check_element_names(spec: &GraphSpec) -> Result<()> {
     }
     for e in &spec.edge_tables {
         for (side, key, vertex, column) in endpoints(e) {
-            let (Some(vertex), Some(column)) = (vertex, column) else {
+            let Some(vertex) = vertex else {
                 continue;
             };
             if spec.vertex_tables.iter().any(|v| &v.name == vertex) {
                 continue;
             }
+            // `REFERENCES v (column)`, or `REFERENCES v` when the column is
+            // left out.
+            let referenced = match column {
+                Some(column) => format!("{vertex} ({column})"),
+                None => vertex.to_string(),
+            };
             return plan_err(match spec.vertex_tables.as_slice() {
                 [] => format!(
                     "{side} KEY ({key}) REFERENCES {vertex}, but the graph has no VERTEX \
-                     TABLES; add VERTEX TABLES ({vertex} KEY ({column})) or drop the \
-                     REFERENCES clause"
+                     TABLES; add VERTEX TABLES ({vertex} KEY ({})) or drop the \
+                     REFERENCES clause",
+                    column.map(String::as_str).unwrap_or("…")
                 ),
                 [only] => format!(
-                    "{side} KEY ({key}) REFERENCES {vertex} ({column}), but the vertex table is \
+                    "{side} KEY ({key}) REFERENCES {referenced}, but the vertex table is \
                      {} KEY ({}); REFERENCES must name the vertex table and its key",
                     only.table,
                     only.key.as_deref().unwrap_or("…")
@@ -284,11 +291,27 @@ fn resolve_keys(spec: &GraphSpec, providers: &[Arc<dyn TableProvider>]) -> Resul
                 None => match referenced.first() {
                     Some((_, _, column)) => column.to_string(),
                     None => {
+                        // `REFERENCES v` without a column names v's key,
+                        // which must then be known some other way.
+                        let bare = spec.edge_tables.iter().flat_map(endpoints).find(
+                            |(_, _, vertex, column)| {
+                                vertex.is_some_and(|x| x == &v.name) && column.is_none()
+                            },
+                        );
+                        if let Some((side, endpoint, _, _)) = bare {
+                            return plan_err(format!(
+                                "{side} KEY ({endpoint}) REFERENCES {} names no column, so it \
+                                 references the vertex table's key, and vertex table '{}' has \
+                                 none declared: write KEY (column) on the vertex table, declare \
+                                 a primary key, or name the column, as REFERENCES {} (column)",
+                                v.name, v.name, v.name
+                            ));
+                        }
                         return plan_err(format!(
                             "vertex table '{}' needs a key: write KEY (column), declare a \
                              primary key, or have an edge table REFERENCES it",
                             v.name
-                        ))
+                        ));
                     }
                 },
             },
