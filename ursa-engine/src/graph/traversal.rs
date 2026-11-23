@@ -101,7 +101,9 @@ impl TraversalParam {
     pub fn takes(&self, given: Given) -> bool {
         match self.ty {
             TraversalParamType::Nodes => given != Given::Number && given != Given::Boolean,
-            TraversalParamType::Node => !matches!(given, Given::Number | Given::Boolean | Given::List),
+            TraversalParamType::Node => {
+                !matches!(given, Given::Number | Given::Boolean | Given::List)
+            }
             TraversalParamType::Param(ty) => takes(self.name, ty, given),
         }
     }
@@ -911,12 +913,18 @@ mod tests {
         assert_eq!(
             message(call(
                 "random_walk",
-                &[("steps", num("2")), ("random_seed", Literal::String("x".into()))]
+                &[
+                    ("steps", num("2")),
+                    ("random_seed", Literal::String("x".into()))
+                ]
             )),
             "random_walk(random_seed =>) must be a non-negative integer or NULL; got 'x'"
         );
         assert_eq!(
-            message(call("hop", &[("direction", Literal::String("UNDIRECTED".into()))])),
+            message(call(
+                "hop",
+                &[("direction", Literal::String("UNDIRECTED".into()))]
+            )),
             "hop(direction => 'UNDIRECTED') is not supported; use 'both', which reads every \
              edge both ways (the undirected view)"
         );

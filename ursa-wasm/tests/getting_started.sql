@@ -107,7 +107,7 @@ FROM connected_components(lesmis_strong);
 
 -- @step Traversals
 -- Traversals return rows of their own. hop returns (seed, id, distance): each
--- node within n steps of a seed; the seeds can be a list or a query.
+-- node within `steps` steps of a seed; the seeds can be a list or a query.
 SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both') ORDER BY seed, id;
 SELECT * FROM hop(karate,
                   seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),

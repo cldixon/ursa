@@ -107,8 +107,9 @@ LIMIT 3;
 
 - An algorithm returns one row per node: `id` plus a column named after the function (`pagerank`, `degree`, `louvain`, ...). Rows have no order: always `ORDER BY`.
 - A statistic (`density`, `diameter`, `avg_path_length`, `describe`) returns one row.
-- `direction` is `'out'` (the default), `'in'` or `'both'`. For an undirected edge list stored once per edge, use `'both'`. `triangle_count`, `clustering_coefficient`, `louvain` and `label_propagation` take no direction: they read the graph as undirected.
-- Stochastic functions take `seed => n`. Set it to get the same result twice.
+- `direction` is `'out'` (the default), `'in'` or `'both'`, in any case. For an undirected edge list stored once per edge, use `'both'` (`'undirected'` is refused). `triangle_count`, `clustering_coefficient`, `louvain` and `label_propagation` take no direction: they read the graph as undirected. `connected_components` takes `mode => 'weak'` or `'strong'` instead.
+- Stochastic algorithms take `seed => n` (`random_walk` takes `random_seed => n`). Set it to get the same result twice.
+- Named arguments are written `name => value`; `name = value` and `name := value` work too.
 - Join results to node attributes on `id`: `FROM karate.nodes JOIN degree(karate) USING (id)`.
 - For a top-k with attributes, take the top k first, then join: `WITH top AS (SELECT * FROM pagerank(g) ORDER BY pagerank DESC LIMIT 5) SELECT ... FROM top JOIN g.nodes USING (id) ORDER BY pagerank DESC`. The `ORDER BY ... LIMIT` is not moved below a join, so joining first carries every node's attributes through the sort: on a large graph, about twice the memory. This holds when the join keeps every row, as a join to the graph's node table does; a join that filters (a `WHERE` on an attribute, a `GRAPH_TABLE`) must come before the `LIMIT`.
 
@@ -245,9 +246,10 @@ FROM hop(karate,
          steps => 2);
 ```
 
-- `hop(g, seeds =>, n =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `n` steps; `distance` is the fewest steps from the seed. The seed itself is not a row. Rows come in no particular order: add `ORDER BY` when it matters.
-- `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `hop` and `cost`. Exactly one source and one target.
-- `random_walk(g, start =>, steps =>, walks_per_node =>, seed =>)`: one row per step.
+- `hop(g, seeds =>, steps =>, direction =>)`: one `(seed, id, distance)` row per seed and node reached within `steps` steps; `distance` is the fewest steps from the seed. The seed itself is not a row. Rows come in no particular order: add `ORDER BY` when it matters.
+- `shortest_path(g, source =>, target =>, weight =>, direction =>)`: one edge per row with `step` (its 0-based position) and `cost`. Exactly one source and one target. No path, or `source` equal to `target`, gives no rows.
+- `random_walk(g, seeds =>, steps =>, walks_per_node =>, random_seed =>)`: one `(walk_id, step, id)` row per step.
+- A literal id that is not a node of the graph is an error (`hop(seeds =>): 99 is not a node of graph 'karate'`). Ids from a subquery that are not nodes are skipped, with a notice of how many.
 - `induced_edges(g, nodes =>)`: the graph's edges whose two ends are both in `nodes` (a list or a query, as seeds), one `(src, dst, edge)` row per edge; `edge` is its row in the edge table. Read from the index: use it instead of `WHERE src IN (…) AND dst IN (…)` on the edge table.
 
 ## Pattern matching: GRAPH_TABLE
@@ -374,7 +376,7 @@ Error: hop(seeds =>) must be node ids of graph 'karate', which are integers; got
 
 **Other mistakes:**
 
-- A misspelled parameter or graph gets a "did you mean" suggestion. A wrong `direction` lists the accepted values.
+- A misspelled parameter or graph gets a "did you mean" suggestion. So does another system's name for a parameter: `n`, `k`, `max_hops` or `depth` points to `steps`, `start` to `seeds`. A wrong `direction` lists the accepted values.
 - A list for `shortest_path`'s `source` or `target` is refused: it takes exactly one of each.
 
 ## Worked examples

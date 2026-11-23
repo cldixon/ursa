@@ -93,7 +93,7 @@ DESCRIBE 'karate_edges.csv';
 
 **The shell.** `ursa club.ursa` opens or creates a database file, as `duckdb club.duckdb` does. `-c` runs SQL and exits, and `-f` runs a file. The dot-commands include `.tables`, `.schema`, `.mode` (with DuckDB's `duckbox`, `markdown`, `line` and `jsonlines`), `.headers`, `.output`, `.once`, `.read`, `.timer` and `.help`; `.nullvalue`, `.separator`, `.databases` and `.shell` are not there. See [the shell](/docs/cli/shell/).
 
-**Graphs.** `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` follow SQL/PGQ, as DuckDB's DuckPGQ extension does, and DuckPGQ's examples run as written. See [pattern matching](/docs/graphs/pattern-matching/).
+**Graphs.** `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` follow SQL/PGQ, as DuckDB's DuckPGQ extension does, and DuckPGQ's examples run as written. See [pattern matching](/docs/graphs/pattern-matching/). Graph functions such as `pagerank(g, damping => 0.9)` take their parameters by name, written `name => value`, `name = value` or `name := value`.
 
 ## What is different
 

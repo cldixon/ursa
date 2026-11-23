@@ -20,7 +20,7 @@ The Web Shell's `.graph` reads it to draw a result as what it is: a `hop` result
 
 | Role | The column is | Where |
 |---|---|---|
-| `node` | a node's key | an algorithm's `id`, `hop`'s `id`, `random_walk`'s `node`, a node variable's key in `GRAPH_TABLE` |
+| `node` | a node's key | an algorithm's `id`, `hop`'s `id`, `random_walk`'s `id`, a node variable's key in `GRAPH_TABLE` |
 | `metric` | a number per node | `pagerank`, `degree`, `betweenness`, `closeness`, `triangle_count`, `clustering_coefficient`, and `neighbors_agg` when it returns a number |
 | `category` | a group per node | `louvain`, `label_propagation`, `connected_components` |
 | `seed` | the node a row started from | `hop`'s `seed` |

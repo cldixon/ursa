@@ -686,8 +686,51 @@ async fn errors_are_for_people() {
         ),
         (
             "SELECT * FROM random_walk(karate, seeds => [0], steps => 2, direction => 'both')",
-            "random_walk() has no parameter 'direction'. Its parameters are: start, steps, \
-             walks_per_node, seed",
+            "random_walk() has no parameter 'direction'. Its parameters are: seeds, steps, \
+             walks_per_node, random_seed",
+        ),
+        // #415: the old names and other systems' are refused, pointing to
+        // Ursa's one name for the role, and only to a parameter that can take
+        // the value given.
+        (
+            "SELECT * FROM hop(karate, seeds => [0], n => 2)",
+            "hop() has no parameter 'n'; did you mean 'steps'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0], max_hops => 2)",
+            "hop() has no parameter 'max_hops'; did you mean 'steps'? Its parameters are: \
+             seeds, steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0], depth := 2)",
+            "hop() has no parameter 'depth'; did you mean 'steps'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, start => [0], k => 2)",
+            "hop() has no parameter 'start'; did you mean 'seeds'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, start => [0], steps => 2)",
+            "random_walk() has no parameter 'start'; did you mean 'seeds'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seeds => [0], steps => 2, seed => 7)",
+            "random_walk() has no parameter 'seed'; did you mean 'random_seed'? Its parameters \
+             are: seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seed => [0], steps => 2)",
+            "random_walk() has no parameter 'seed'; did you mean 'seeds'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seeds => [0], n = 2)",
+            "random_walk() has no parameter 'n'; did you mean 'steps'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
         ),
         (
             "SELECT * FROM algorithms(karate, hop(seeds => [0]))",
@@ -891,7 +934,10 @@ async fn node_id_type_errors_name_the_parameter() {
         ("SELECT * FROM hop(karate, seeds => [0, '0'])", 32),
         ("SELECT * FROM hop(karate, seeds => [NULL, 0])", 16),
         ("SELECT * FROM hop(karate, seeds => [-1 + 1])", 16),
-        ("SELECT * FROM hop(lesmis, seeds => (SELECT unnest([1])))", 0),
+        (
+            "SELECT * FROM hop(lesmis, seeds => (SELECT unnest([1])))",
+            0,
+        ),
         ("SELECT * FROM hop(lesmis, seeds => (SELECT 1))", 0),
         (
             "SELECT * FROM hop(karate, seeds => [CAST(0 AS TINYINT)])",

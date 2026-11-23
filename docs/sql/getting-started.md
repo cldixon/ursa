@@ -448,7 +448,7 @@ SELECT n_nodes, n_edges FROM describe(karate_late, nodes => 'touched');
 
 ## Traversals
 
-Traversals are table functions too, and they return rows of their own. `hop` returns the nodes within `n` steps of a set of seed nodes, one `(seed, id, distance)` row per seed and node reached: `id` is the node and `distance` the fewest steps from the seed to it. The seeds can be a list or a query. Member 0 has 16 friends, so this returns 16 rows:
+Traversals are table functions too, and they return rows of their own. `hop` returns the nodes within `steps` steps of a set of seed nodes, one `(seed, id, distance)` row per seed and node reached: `id` is the node and `distance` the fewest steps from the seed to it. The seeds can be a list or a query. Member 0 has 16 friends, so this returns 16 rows:
 
 ```sql
 SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');
@@ -458,7 +458,7 @@ SELECT * FROM hop(karate,
                   steps => 2);
 ```
 
-The second query returns 39 rows: each node within two steps of an Officer member, following edges in their stored direction, once for each member that reaches it. The seeds query runs as part of the same plan, so a filter in it is pushed into the scan of `karate_nodes.csv`. A seed that is not in the graph reaches nothing. The rows come back in no particular order, which can differ from one run to another; add `ORDER BY` (for example `ORDER BY seed, distance, id`) when the order matters.
+The second query returns 39 rows: each node within two steps of an Officer member, following edges in their stored direction, once for each member that reaches it. The seeds query runs as part of the same plan, so a filter in it is pushed into the scan of `karate_nodes.csv`. A seed from a query that is not a node of the graph is skipped, and a notice says how many were; a literal one, as in `seeds => [99]`, is an error that names it. The rows come back in no particular order, which can differ from one run to another; add `ORDER BY` (for example `ORDER BY seed, distance, id`) when the order matters.
 
 `random_walk` returns walks as rows: one per step, with the walk's number and position. Give it a `seed` for walks you can reproduce:
 

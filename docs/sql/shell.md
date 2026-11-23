@@ -186,7 +186,7 @@ SELECT name, family, networkx FROM ursa_functions() WHERE name = 'pagerank';
 ```text
     name = pagerank
   family = algorithm
-networkx = nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))
+networkx = nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))
 ```
 
 `.headers off` leaves out the header row of `csv` and `tsv`, as in DuckDB; `.headers on` puts it back. The other modes always name their columns.

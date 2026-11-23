@@ -1105,7 +1105,9 @@ impl ExecutionPlan for GraphTraversalExec {
                 let batches = drain(plan, &[0], &context).await?;
                 let from_query = shape.from_query.get(i).copied().unwrap_or(true);
                 let notifier = Notifier::of(context.session_config());
-                nodes.push(node_ids(&shape, param, &index, batches, from_query, &notifier)?);
+                nodes.push(node_ids(
+                    &shape, param, &index, batches, from_query, &notifier,
+                )?);
             }
             crate::run_blocking(move || {
                 let weights = weights.as_ref().map(|w| w[0].as_slice());

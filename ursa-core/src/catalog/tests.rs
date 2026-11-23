@@ -846,7 +846,11 @@ fn in_reads_the_reversed_graph() {
                 let (got, want) = (f64s(&got[0]), f64s(&want[0]));
                 assert_eq!(got.len(), want.len());
                 for (g, w) in got.iter().zip(&want) {
-                    assert!((g - w).abs() < 1e-12, "{:?}: {got:?} {want:?}", call(Direction::In));
+                    assert!(
+                        (g - w).abs() < 1e-12,
+                        "{:?}: {got:?} {want:?}",
+                        call(Direction::In)
+                    );
                 }
             }
         }

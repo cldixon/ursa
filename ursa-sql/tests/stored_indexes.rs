@@ -1369,7 +1369,11 @@ async fn an_index_in_use_survives_another_process_replacing_its_file() {
 
     // A reader loads g, for a traversal.
     let reader = open_read_only(&fixture.db()).await;
-    ok(&reader, "SELECT count(*) FROM hop(g, seeds => [0], steps => 1)").await;
+    ok(
+        &reader,
+        "SELECT count(*) FROM hop(g, seeds => [0], steps => 1)",
+    )
+    .await;
     assert_eq!(counts(&reader), (0, 1));
 
     // A writer with room for one index stores b, evicting g, then g again,

@@ -80,8 +80,8 @@ use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
 
 use super::functions::{
-    self, did_you_mean, is_per_node, nested_signature, plan, signature, Given, Literal,
-    ALGORITHMS, VALUES_QUERY,
+    self, did_you_mean, is_per_node, nested_signature, plan, signature, Given, Literal, ALGORITHMS,
+    VALUES_QUERY,
 };
 use super::kernels;
 use super::node::{
