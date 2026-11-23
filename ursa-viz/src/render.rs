@@ -47,6 +47,14 @@
 //! Such a frame may draw only some of the nodes too: the caller gathers
 //! them into a buffer of their own ([`Renderer::set_some_nodes`]), as the
 //! nodes in front are, because an instance cannot be drawn by index.
+//!
+//! Everything under the highlighted edges (the background, the edges and
+//! the nodes not in front) can also be drawn in slices into a texture the
+//! size of the canvas ([`Renderer::draw_slice`]), which a frame then draws
+//! in their place ([`Under`]): texel for texel at the camera it was drawn
+//! for, and moved and scaled at another ([`crate::refine`]). It is the one
+//! render target besides the canvas, made when first needed and destroyed
+//! with the renderer or by [`Renderer::release_detail`].
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -86,6 +94,9 @@ struct Uniforms {
     highlight_width: f32,
     /// The least radius of a node in front, in pixels.
     min_front_radius: f32,
+    /// Where the detail texture is drawn: its half-size in clip units, x
+    /// and y, then its centre. `1, 1, 0, 0` covers the canvas.
+    detail: [f32; 4],
 }
 
 /// The flag bits and mark sizes, as WGSL constants: the shader's copy of
@@ -127,6 +138,7 @@ struct Uniforms {
     dim_level: f32,
     highlight_width: f32,
     min_front_radius: f32,
+    detail: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -354,6 +366,41 @@ fn wide_fs(in: WideOut) -> @location(0) vec4<f32> {
     let a = u.highlight_color.a * coverage;
     return vec4<f32>(u.highlight_color.rgb * a, a);
 }
+
+// The detail texture: everything under the highlighted edges, drawn
+// before, as a quad where the camera now puts what it shows.
+@group(1) @binding(0) var detail_texture: texture_2d<f32>;
+@group(1) @binding(1) var detail_sampler: sampler;
+
+struct DetailOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn detail_vs(@builtin(vertex_index) corner: u32) -> DetailOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0),
+    );
+    let c = corners[corner];
+    var out: DetailOut;
+    out.position = vec4<f32>(c * u.detail.xy + u.detail.zw, 0.0, 1.0);
+    out.uv = vec2<f32>(0.5 + 0.5 * c.x, 0.5 - 0.5 * c.y);
+    return out;
+}
+
+// Texel for texel: the camera is the one the texture was drawn for.
+@fragment
+fn detail_copy_fs(in: DetailOut) -> @location(0) vec4<f32> {
+    return textureLoad(detail_texture, vec2<i32>(in.position.xy), 0);
+}
+
+// Moved and scaled: the camera has changed since.
+@fragment
+fn detail_fs(in: DetailOut) -> @location(0) vec4<f32> {
+    return textureSample(detail_texture, detail_sampler, in.uv);
+}
 "#;
 
 /// The GPU side of a scene: its pipelines and buffers.
@@ -366,6 +413,16 @@ pub struct Renderer {
     culled_nodes: wgpu::RenderPipeline,
     front_nodes: wgpu::RenderPipeline,
     wide_edges: wgpu::RenderPipeline,
+    /// The detail texture onto a frame: texel for texel, and moved and
+    /// scaled.
+    detail_copy: wgpu::RenderPipeline,
+    detail_scaled: wgpu::RenderPipeline,
+    detail_layout: wgpu::BindGroupLayout,
+    detail_sampler: wgpu::Sampler,
+    /// The detail texture, once a refinement has needed it.
+    detail: Option<Detail>,
+    /// The format of the textures drawn into.
+    format: wgpu::TextureFormat,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     x: wgpu::Buffer,
@@ -386,6 +443,9 @@ pub struct Renderer {
     /// place of every node while `culling`.
     culled: Instances,
     culling: bool,
+    /// The nodes drawn over the detail texture, which has no copy of
+    /// them ([`Renderer::set_patch_nodes`]), each a [`FrontNode`].
+    patch: Instances,
     n_nodes: u32,
     n_indices: u32,
     /// How many nodes and edges the buffers have room for.
@@ -581,6 +641,59 @@ impl Instances {
     fn slice(&self) -> wgpu::BufferSlice<'_> {
         self.buffer.slice(..u64::from(self.len) * self.stride)
     }
+}
+
+/// The detail texture: the size of the canvas, in the format of the
+/// frames, drawn into a slice at a time and read by the frames.
+struct Detail {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+impl Drop for Detail {
+    fn drop(&mut self) {
+        // Now, not when the last reference to it goes.
+        self.texture.destroy();
+    }
+}
+
+/// A run of the draw that fills the detail texture
+/// ([`Renderer::draw_slice`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slice {
+    /// These edges of the buffer.
+    Edges(Range<usize>),
+    /// These instances of the pass over every node: of every node, or of
+    /// the nodes in view while those are drawn alone
+    /// ([`Renderer::nodes_drawn`] of them either way).
+    Nodes(Range<usize>),
+    /// Nothing: the background alone, with `clear`.
+    Nothing,
+}
+
+/// What a frame draws under its highlighted edges ([`Renderer::draw_over`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Under {
+    /// The first `edges` edges of the buffer, and every node, or the first
+    /// `some_nodes` of [`Renderer::set_some_nodes`]: what
+    /// [`Renderer::draw_prefix`] draws.
+    Live {
+        edges: usize,
+        some_nodes: Option<usize>,
+    },
+    /// The detail texture, drawn for the frame's own camera and holding
+    /// everything: texel for texel, and then the nodes it has no copy of
+    /// ([`Renderer::set_patch_nodes`]).
+    Detail,
+    /// The detail texture as drawn for the camera `from`, moved and scaled
+    /// to where this frame's camera puts it, and over it what `Live` draws.
+    Both {
+        from: Camera,
+        edges: usize,
+        some_nodes: Option<usize>,
+    },
 }
 
 impl Renderer {
@@ -809,6 +922,72 @@ impl Renderer {
             &wide_buffers,
         );
         pace.breathe().await;
+        // The detail texture onto a frame: no vertex buffer, and no
+        // blending (it replaces the background it was cleared with).
+        let detail_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("detail"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let over_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ursa-viz, over the detail"),
+            bind_group_layouts: &[Some(&bind_layout), Some(&detail_layout)],
+            immediate_size: 0,
+        });
+        let replace = [Some(wgpu::ColorTargetState {
+            format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let detail_pipeline = |label: &str, fs: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&over_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("detail_vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &replace,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let detail_copy = detail_pipeline("detail", "detail_copy_fs");
+        pace.breathe().await;
+        let detail_scaled = detail_pipeline("detail, moved", "detail_fs");
+        pace.breathe().await;
+        let detail_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("detail"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let theme = Theme::light();
         // An empty graph's buffers hold room for one node and one edge: a
         // zero-sized buffer cannot be bound.
@@ -837,6 +1016,12 @@ impl Renderer {
             culled_nodes,
             front_nodes,
             wide_edges,
+            detail_copy,
+            detail_scaled,
+            detail_layout,
+            detail_sampler,
+            detail: None,
+            format,
             uniforms,
             bind_group,
             x: node("x", bytemuck::cast_slice(x)),
@@ -851,6 +1036,7 @@ impl Renderer {
             some: Instances::new(device, "some nodes", FRONT_STRIDE),
             culled: Instances::new(device, "nodes in view", FRONT_STRIDE),
             culling: false,
+            patch: Instances::new(device, "nodes over the detail", FRONT_STRIDE),
             n_nodes: n_nodes as u32,
             n_indices: 2 * n_edges as u32,
             node_capacity: node_capacity as u32,
@@ -1274,12 +1460,31 @@ impl Renderer {
         edges: usize,
         some_nodes: Option<usize>,
     ) {
+        let under = Under::Live { edges, some_nodes };
+        self.draw_over(
+            device,
+            queue,
+            target,
+            camera,
+            draw_nodes,
+            radius_scale,
+            under,
+        );
+    }
+
+    /// What the shaders read to draw as `camera` sees, with `edges` of the
+    /// edges drawn and the detail texture at `detail`.
+    fn uniforms_for(
+        &self,
+        camera: &Camera,
+        radius_scale: f32,
+        edges: usize,
+        detail: [f32; 4],
+    ) -> Uniforms {
         let all = self.n_indices as usize / 2;
-        let edges = edges.min(all);
-        let n_indices = 2 * edges as u32;
         let (w, h) = camera.viewport;
         let s = camera.pixels_per_unit;
-        let u = Uniforms {
+        Uniforms {
             center: [camera.center.0, camera.center.1],
             scale: [2.0 * s / w, 2.0 * s / h],
             pixel: [2.0 / w, 2.0 / h],
@@ -1303,68 +1508,173 @@ impl Renderer {
             dim_level: self.dim_level,
             highlight_width: self.highlight_width,
             min_front_radius: MIN_FRONT_RADIUS,
+            detail,
+        }
+    }
+
+    /// The first `edges` edges of the buffer, into `pass`.
+    fn pass_edges(&self, pass: &mut wgpu::RenderPass<'_>, edges: Range<usize>) {
+        if edges.is_empty() {
+            return;
+        }
+        // Reading the flags costs a little on every edge: only while a
+        // node is hidden.
+        if self.any_hidden {
+            pass.set_pipeline(&self.hiding_edges);
+            pass.set_vertex_buffer(2, self.flags.slice(..));
+        } else {
+            pass.set_pipeline(&self.edges);
+        }
+        pass.set_vertex_buffer(0, self.x.slice(..));
+        pass.set_vertex_buffer(1, self.y.slice(..));
+        pass.set_index_buffer(self.lines.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(2 * edges.start as u32..2 * edges.end as u32, 0, 0..1);
+    }
+
+    /// These instances of the pass over every node, into `pass`: of the
+    /// nodes in view while those are drawn alone, else of every node. The
+    /// run starts where the buffers are bound from, not at a first
+    /// instance, which WebGL2 does not have.
+    fn pass_nodes(&self, pass: &mut wgpu::RenderPass<'_>, nodes: Range<usize>) {
+        let total = self.nodes_drawn() as usize;
+        let nodes = nodes.start.min(total)..nodes.end.min(total);
+        if nodes.is_empty() {
+            return;
+        }
+        let count = (nodes.end - nodes.start) as u32;
+        if self.culling {
+            let bytes = nodes.start as u64 * FRONT_STRIDE..nodes.end as u64 * FRONT_STRIDE;
+            pass.set_pipeline(&self.culled_nodes);
+            pass.set_vertex_buffer(0, self.culled.buffer.slice(bytes));
+        } else {
+            let from = nodes.start as u64 * NODE_STRIDE;
+            pass.set_pipeline(&self.nodes);
+            pass.set_vertex_buffer(0, self.x.slice(from..));
+            pass.set_vertex_buffer(1, self.y.slice(from..));
+            pass.set_vertex_buffer(2, self.radius.slice(from..));
+            pass.set_vertex_buffer(3, self.color.slice(from..));
+            pass.set_vertex_buffer(4, self.flags.slice(from..));
+        }
+        pass.draw(0..6, 0..count);
+    }
+
+    /// A render pass into `target`, over what it holds or over the
+    /// background.
+    fn pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clear: bool,
+    ) -> wgpu::RenderPass<'e> {
+        let load = match clear {
+            true => wgpu::LoadOp::Clear(self.background),
+            false => wgpu::LoadOp::Load,
         };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("frame"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass
+    }
+
+    /// Draw a frame into `target` as `camera` sees it: `under`, and over it
+    /// the highlighted edges and the nodes in front. Without a detail
+    /// texture ([`Renderer::make_detail`]), what `under` asks of it is
+    /// drawn from the buffers instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_over(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        camera: &Camera,
+        draw_nodes: bool,
+        radius_scale: f32,
+        under: Under,
+    ) {
+        let all = self.n_indices as usize / 2;
+        let everything = Under::Live {
+            edges: all,
+            some_nodes: None,
+        };
+        let under = match (under, &self.detail) {
+            (Under::Detail, None) => everything,
+            (
+                Under::Both {
+                    edges, some_nodes, ..
+                },
+                None,
+            ) => Under::Live { edges, some_nodes },
+            (under, _) => under,
+        };
+        // Where the texture goes, and what is drawn from the buffers.
+        let (detail, live) = match under {
+            Under::Live { edges, some_nodes } => (None, Some((edges, some_nodes))),
+            Under::Detail => (Some([1.0, 1.0, 0.0, 0.0]), None),
+            Under::Both {
+                from,
+                edges,
+                some_nodes,
+            } => (Some(detail_place(&from, camera)), Some((edges, some_nodes))),
+        };
+        let edges = live.map_or(all, |(edges, _)| edges.min(all));
+        let u = self.uniforms_for(
+            camera,
+            radius_scale,
+            edges,
+            detail.unwrap_or([1.0, 1.0, 0.0, 0.0]),
+        );
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.background),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            if n_indices > 0 {
-                // Reading the flags costs a little on every edge: only
-                // while a node is hidden.
-                if self.any_hidden {
-                    pass.set_pipeline(&self.hiding_edges);
-                    pass.set_vertex_buffer(2, self.flags.slice(..));
-                } else {
-                    pass.set_pipeline(&self.edges);
-                }
-                pass.set_vertex_buffer(0, self.x.slice(..));
-                pass.set_vertex_buffer(1, self.y.slice(..));
-                pass.set_index_buffer(self.lines.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..n_indices, 0, 0..1);
+            let mut pass = self.pass(&mut encoder, target, true);
+            if let (Some(_), Some(texture)) = (detail, &self.detail) {
+                pass.set_pipeline(match under {
+                    Under::Detail => &self.detail_copy,
+                    _ => &self.detail_scaled,
+                });
+                pass.set_bind_group(1, &texture.bind_group, &[]);
+                pass.draw(0..6, 0..1);
             }
-            if let Some(some) = some_nodes {
-                // A moving frame: the largest nodes alone, never the
-                // nodes in view as well.
-                let some = (some as u32).min(self.some.len);
-                if draw_nodes && some > 0 {
-                    pass.set_pipeline(&self.culled_nodes);
-                    pass.set_vertex_buffer(0, self.some.slice());
-                    pass.draw(0..6, 0..some);
+            match live {
+                Some((_, some_nodes)) => {
+                    self.pass_edges(&mut pass, 0..edges);
+                    if let Some(some) = some_nodes {
+                        // A moving frame: the largest nodes alone, never
+                        // the nodes in view as well.
+                        let some = (some as u32).min(self.some.len);
+                        if draw_nodes && some > 0 {
+                            pass.set_pipeline(&self.culled_nodes);
+                            pass.set_vertex_buffer(0, self.some.slice());
+                            pass.draw(0..6, 0..some);
+                        }
+                    } else if draw_nodes {
+                        // Every node, or the nodes in view alone.
+                        self.pass_nodes(&mut pass, 0..self.nodes_drawn() as usize);
+                    }
                 }
-            } else if draw_nodes && self.culling {
-                // The nodes in view alone, as the pass below would draw
-                // them.
-                if self.culled.len > 0 {
+                // The nodes the texture has no copy of.
+                None if draw_nodes && self.patch.len > 0 => {
                     pass.set_pipeline(&self.culled_nodes);
-                    pass.set_vertex_buffer(0, self.culled.slice());
-                    pass.draw(0..6, 0..self.culled.len);
+                    pass.set_vertex_buffer(0, self.patch.slice());
+                    pass.draw(0..6, 0..self.patch.len);
                 }
-            } else if draw_nodes && self.n_nodes > 0 {
-                pass.set_pipeline(&self.nodes);
-                pass.set_vertex_buffer(0, self.x.slice(..));
-                pass.set_vertex_buffer(1, self.y.slice(..));
-                pass.set_vertex_buffer(2, self.radius.slice(..));
-                pass.set_vertex_buffer(3, self.color.slice(..));
-                pass.set_vertex_buffer(4, self.flags.slice(..));
-                pass.draw(0..6, 0..self.n_nodes);
+                None => {}
             }
             if self.wide.len > 0 {
                 pass.set_pipeline(&self.wide_edges);
@@ -1379,6 +1689,138 @@ impl Renderer {
         }
         queue.submit([encoder.finish()]);
     }
+
+    /// Have a detail texture of `width` x `height` pixels: a new one, with
+    /// nothing drawn in it, unless there is one of that size. Returns
+    /// whether it is new.
+    pub fn make_detail(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+        let size = (width.max(1), height.max(1));
+        if self.detail.as_ref().is_some_and(|d| d.size == size) {
+            return false;
+        }
+        // The old one first: never two at once.
+        self.detail = None;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("detail"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("detail"),
+            layout: &self.detail_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.detail_sampler),
+                },
+            ],
+        });
+        self.detail = Some(Detail {
+            texture,
+            view,
+            bind_group,
+            size,
+        });
+        true
+    }
+
+    /// Destroy the detail texture, if there is one: its memory is the
+    /// GPU's again at once.
+    pub fn release_detail(&mut self) {
+        self.detail = None;
+    }
+
+    /// The detail texture's size in pixels, if there is one.
+    pub fn detail_size(&self) -> Option<(u32, u32)> {
+        self.detail.as_ref().map(|d| d.size)
+    }
+
+    /// Draw `slice` into the detail texture as `camera` sees it, over what
+    /// the texture holds, or over the background if `clear`: one run of
+    /// what [`Renderer::draw`] puts under the highlighted edges. Every
+    /// edge and then every instance of the node pass, a slice after
+    /// another with the first clearing, leave the pixels one
+    /// [`Renderer::draw`] leaves there. Nothing is drawn without a
+    /// texture ([`Renderer::make_detail`]).
+    pub fn draw_slice(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        radius_scale: f32,
+        clear: bool,
+        slice: &Slice,
+    ) {
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        let all = self.n_indices as usize / 2;
+        let u = self.uniforms_for(camera, radius_scale, all, [1.0, 1.0, 0.0, 0.0]);
+        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("slice"),
+        });
+        {
+            let mut pass = self.pass(&mut encoder, &detail.view, clear);
+            match slice {
+                Slice::Edges(edges) => {
+                    self.pass_edges(&mut pass, edges.start.min(all)..edges.end.min(all))
+                }
+                Slice::Nodes(nodes) => self.pass_nodes(&mut pass, nodes.clone()),
+                Slice::Nothing => {}
+            }
+        }
+        queue.submit([encoder.finish()]);
+    }
+
+    /// Draw these nodes over the detail texture ([`Under::Detail`]), by
+    /// the pass over every node's rules: the nodes that pass draws now and
+    /// the texture has no copy of, 20 bytes each.
+    pub fn set_patch_nodes(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: &[FrontNode],
+    ) {
+        self.patch.set(device, queue, nodes);
+    }
+
+    /// How many nodes are drawn over the detail texture.
+    pub fn patch_nodes(&self) -> u32 {
+        self.patch.len
+    }
+}
+
+/// Where a texture drawn for the camera `from` goes in a frame of `to`:
+/// its half-size in clip units, x and y, then its centre. A world point
+/// `p` is at `(p - from.center) * from_scale` in the texture and at
+/// `(p - to.center) * to_scale` in the frame.
+fn detail_place(from: &Camera, to: &Camera) -> [f32; 4] {
+    let scale = |c: &Camera| {
+        let s = c.pixels_per_unit;
+        (2.0 * s / c.viewport.0, 2.0 * s / c.viewport.1)
+    };
+    let (from_scale, to_scale) = (scale(from), scale(to));
+    [
+        to_scale.0 / from_scale.0,
+        to_scale.1 / from_scale.1,
+        (from.center.0 - to.center.0) * to_scale.0,
+        (from.center.1 - to.center.1) * to_scale.1,
+    ]
 }
 
 /// Flags as the GPU holds them: four bytes a node, the flags byte first.
@@ -1410,7 +1852,8 @@ mod tests {
     fn the_uniforms_are_laid_out_as_wgsl_lays_them_out() {
         // vec4 aligns to 16 bytes: edge_color follows radius_scale at 32,
         // and the four scalars after the colours fill the last 16.
-        assert_eq!(std::mem::size_of::<Uniforms>(), 128);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
+        assert_eq!(std::mem::offset_of!(Uniforms, detail), 128);
         assert_eq!(std::mem::offset_of!(Uniforms, edge_color), 32);
         assert_eq!(std::mem::offset_of!(Uniforms, highlight_color), 48);
         assert_eq!(std::mem::offset_of!(Uniforms, selection_color), 64);
@@ -1475,6 +1918,38 @@ mod tests {
             capacity = next;
         }
         assert_eq!((capacity, grows), (1 << 21, 2));
+    }
+
+    #[test]
+    fn the_detail_texture_follows_the_camera() {
+        let from = Camera {
+            center: (10.0, -4.0),
+            pixels_per_unit: 2.0,
+            viewport: (800.0, 600.0),
+        };
+        // The same camera: over the whole canvas, exactly.
+        assert_eq!(detail_place(&from, &from), [1.0, 1.0, 0.0, 0.0]);
+        // Panned 80 pixels right and 30 down (the drawing follows the
+        // drag): a fifth of the clip's width right, a tenth of its height
+        // down.
+        let mut to = from;
+        to.pan(80.0, 30.0);
+        let [sx, sy, ox, oy] = detail_place(&from, &to);
+        assert_eq!((sx, sy), (1.0, 1.0));
+        assert!(
+            (ox - 0.2).abs() < 1e-6 && (oy + 0.1).abs() < 1e-6,
+            "{ox} {oy}"
+        );
+        // Zoomed in twice about the canvas's middle: twice the size, still
+        // centred. About a corner: the corner stays put.
+        let mut to = from;
+        to.zoom(2.0, 400.0, 300.0);
+        assert_eq!(detail_place(&from, &to), [2.0, 2.0, 0.0, 0.0]);
+        let mut to = from;
+        to.zoom(2.0, 0.0, 0.0);
+        let [sx, sy, ox, oy] = detail_place(&from, &to);
+        // The texture's top left corner, at clip (-1, 1), is the frame's.
+        assert!((-sx + ox + 1.0).abs() < 1e-5 && (sy + oy - 1.0).abs() < 1e-5);
     }
 
     #[test]

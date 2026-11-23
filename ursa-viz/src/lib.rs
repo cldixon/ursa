@@ -27,13 +27,16 @@
 //!   or WebGL2 in the browser, Vulkan, Metal or DX12 natively. Edges are a
 //!   line list over the node positions, so a layout step uploads 8 bytes a
 //!   node and never the edges.
+//! - [`refine`]: the frame at rest, where it does not fit in a frame: how
+//!   large the slices are that draw it into a texture, and what a change
+//!   of flags asks of that texture. No GPU.
 //! - `view` (feature `render`): a scene and its renderer, for a platform
 //!   binding to drive.
 //! - `web` (feature `web`): the wasm-bindgen API for an HTML canvas.
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
-//! [`highlight`], [`interact`], [`spatial`], [`live`], [`budget`] and
-//! [`order`] alone: no GPU and no browser, which is how the engine depends
+//! [`highlight`], [`interact`], [`spatial`], [`live`], [`budget`],
+//! [`order`] and [`refine`] alone: no GPU and no browser, which is how the engine depends
 //! on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
@@ -48,6 +51,7 @@ pub mod live;
 pub mod model;
 pub mod order;
 pub mod pace;
+pub mod refine;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod scene;

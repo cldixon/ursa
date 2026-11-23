@@ -32,7 +32,7 @@ impl View {
         format: wgpu::TextureFormat,
         scene: LevelScene,
     ) {
-        self.budget.moved();
+        self.moved();
         match &mut self.level {
             Some(level) => level.scene = scene,
             None => {
@@ -54,7 +54,7 @@ impl View {
         };
         let (x, y) = level.scene.positions_mut();
         fill(x, y);
-        self.budget.moved();
+        self.moved();
         if self.follow {
             self.fit_camera();
         }
@@ -65,7 +65,7 @@ impl View {
     /// them, or will.
     pub fn clear_level(&mut self) {
         if self.level.take().is_some() {
-            self.budget.moved();
+            self.moved();
             self.fitted = None;
         }
     }
@@ -121,13 +121,14 @@ impl View {
         self.gather_level(device, queue, usize::MAX, usize::MAX);
     }
 
-    /// [`View::draw_frame`] of the level: within the frame budget while
-    /// the view moves, the heaviest discs and the heaviest edges.
-    pub(super) fn draw_level_frame(
+    /// [`View::plan_frame`] of the level: within the frame budget while
+    /// the view moves, the heaviest discs and the heaviest edges, given to
+    /// the GPU for [`View::draw_level`]. A level is never refined in
+    /// slices: at rest a frame has all of it.
+    pub(super) fn plan_level_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        target: &wgpu::TextureView,
         now_ms: f64,
     ) -> Frame {
         let (n, m) = self
@@ -143,7 +144,6 @@ impl View {
             (units / NODE_UNITS).max(1).min(m)
         };
         self.gather_level(device, queue, discs, links);
-        self.draw_level(device, queue, target);
         frame
     }
 

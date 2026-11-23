@@ -20,6 +20,9 @@
 //   importance order: the time between frames, median and p95, and how many
 //   edges and nodes the last frame drew. This is the interaction trace to
 //   read on a laptop: its p95 is what the budget holds;
+// - refinement at rest (#496): the frame with everything, drawn in slices
+//   after that movement: how long it takes, in how many slices, and the
+//   page's tasks over 50 ms meanwhile;
 // - pick latency (`view.pick` at random pixels), the time to build the grid
 //   it reads, and how many nodes a frame zoomed into 1% of the drawing draws;
 // - memory: the page's and the layout worker's wasm memory, and
@@ -358,8 +361,46 @@ async function runCase(browser: Browser, backend: string, graph: string, size: s
             zoom: (view.fit(), await budgetRun((i) => view.zoom(i % 30 < 15 ? 1.05 : 1 / 1.05, canvas.width / 2, canvas.height / 2))),
           };
           view.fit();
+          // Refinement at rest (#496): after that movement, the frame with
+          // everything, drawn in slices as a page draws it (a call of
+          // `view.refine` a task until it says it is done, then a frame):
+          // how long from the first slice to the frame, in how many slices,
+          // and the page's tasks over 50 ms meanwhile (a long-task observer;
+          // it reports a task a little after its end). `null` where
+          // everything fits in a frame and nothing is drawn in slices.
+          let refine: any = null;
+          {
+            // The fit's frame, which is a moving one, and the frame at rest.
+            const moved = (await raf()) as number;
+            view.renderFrame(moved);
+            view.renderFrame(moved + 1000);
+            if (view.refining) {
+              const tasks: number[][] = [];
+              const seen = new PerformanceObserver((list) => {
+                for (const e of list.getEntries()) tasks.push([e.startTime, e.duration]);
+              });
+              seen.observe({ type: "longtask" });
+              const t0 = performance.now();
+              let calls = 0, longestCall = 0;
+              for (;;) {
+                const t = performance.now();
+                const more = view.refine(t);
+                longestCall = Math.max(longestCall, performance.now() - t);
+                calls++;
+                if (!more) break;
+                await new Promise((r) => setTimeout(r));
+              }
+              view.renderFrame(moved + 2000);
+              await raf();
+              const ms = performance.now() - t0;
+              await new Promise((r) => setTimeout(r, 300));
+              seen.disconnect();
+              const f = view.frameInfo();
+              refine = { ms, calls, longestCall, refined: f.refined, ...f.refinement, longTasks: tasks.filter(([start]) => start >= t0 && start <= t0 + ms).map(([, d]) => Math.round(d)) };
+            }
+          }
           w.pauseFrames(false);
-          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, gridBuildMs, culledNodes, memory, budget };
+          return { syncKind, pan, zoom, burstMs: burst, highlight, pickMs, pickHits: hits, gridBuildMs, culledNodes, memory, budget, refine };
         },
         { frames: FRAMES, picks: PICKS, budgetMs: FRAME_BUDGET_MS },
       ),
