@@ -647,6 +647,10 @@ pub struct Fa2Multilevel {
     /// The positions of the input graph's nodes now.
     x: Vec<f32>,
     y: Vec<f32>,
+    /// `x` and `y` are behind the level being laid out
+    /// ([`Self::step_level`] leaves them so): [`Self::prolong`] brings
+    /// them up to date.
+    stale: bool,
 }
 
 impl Fa2Multilevel {
@@ -709,6 +713,7 @@ impl Fa2Multilevel {
             work: 0.0,
             x: Vec::new(),
             y: Vec::new(),
+            stale: false,
         };
         this.sync();
         this
@@ -875,6 +880,7 @@ impl Fa2Multilevel {
     /// Bring the input graph's positions up to date: the current level's,
     /// prolonged level by level, as [`Self::descend`] will.
     fn sync(&mut self) {
+        self.stale = false;
         let (x, y) = self.state.positions();
         if self.level == 0 {
             self.x.clear();
@@ -893,17 +899,218 @@ impl Fa2Multilevel {
         self.y = y;
     }
 
-    /// A position for every input node now, uncentered.
+    /// A position for every input node now, uncentered: as of the last
+    /// [`Self::step`] or [`Self::prolong`] ([`Self::step_level`] moves a
+    /// coarse level without bringing these along).
     pub fn positions(&self) -> (&[f32], &[f32]) {
         (&self.x, &self.y)
     }
 
     /// The positions, centered on the origin, as [`layout_fa2_multilevel`]
     /// returns them.
-    pub fn into_positions(self) -> Positions {
+    pub fn into_positions(mut self) -> Positions {
+        self.prolong();
         let (mut x, mut y) = (self.x, self.y);
         center(&mut x, &mut y);
         (x, y)
+    }
+}
+
+/// The heaviest merged edges of one level of the hierarchy
+/// ([`Fa2Multilevel::level_edges`]): edge `i` joins the level's nodes
+/// `src[i] < dst[i]` and stands for `weight[i]` edges of the input graph.
+/// Heaviest first, then by `src`, then by `dst`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LevelEdges {
+    pub src: Vec<u32>,
+    pub dst: Vec<u32>,
+    pub weight: Vec<f32>,
+    /// How many merged edges the level has: these are the heaviest of them.
+    pub total: usize,
+}
+
+/// # The level being laid out, as a graph of its own
+///
+/// For a view that draws the layout a level at a time, as an aggregated
+/// graph (a disc for each node of the level, sized by its mass, and its
+/// heaviest merged edges), and not as the input graph with every node at
+/// its group's place. [`Self::step_level`] is [`Self::step`] one level at a
+/// time; between two calls the level's nodes, masses, merged edges and the
+/// groups its nodes will split into can be read. None of it changes the
+/// layout: the positions are the same, bit for bit, however it is stepped
+/// and whatever is read.
+impl Fa2Multilevel {
+    /// Whether the level being laid out has had all its iterations, and is
+    /// not the input graph: the next [`Self::step_level`] comes down from
+    /// it, and then the level is let go. Read what is wanted of it first.
+    pub fn level_finished(&self) -> bool {
+        self.level > 0 && self.state.iterations() >= self.schedule[self.level]
+    }
+
+    /// [`Self::step`], within one level: comes down a level first if the
+    /// one being laid out is finished ([`Self::level_finished`]), then
+    /// spends the budget on iterations of the level it is at, and stops
+    /// there when that level is finished. So a caller sees every level, at
+    /// its last iteration, before the hierarchy lets it go. What is left
+    /// of the budget when a level finishes is dropped, not carried over
+    /// (within a level it is, as [`Self::step`] carries it): the next call
+    /// runs no longer than its own budget buys, though the levels above
+    /// were cheap.
+    ///
+    /// While a coarse level is laid out, the input graph's positions
+    /// ([`Self::positions`]) are not brought up to date: prolonging every
+    /// level after every step is work a caller that draws the level itself
+    /// ([`Self::level_positions`]) has no use for. [`Self::prolong`] does
+    /// it when asked.
+    pub fn step_level(&mut self, adj: &UndirectedCsr, budget: f64) {
+        self.credit += budget.max(0.0);
+        if self.level_finished() {
+            self.descend(adj);
+        }
+        while !self.is_done() {
+            let remaining = self.schedule[self.level] - self.state.iterations();
+            let cost = self.cost[self.level];
+            let affordable = (self.credit / cost).floor().min(f64::from(remaining));
+            if affordable < 1.0 {
+                break;
+            }
+            let iterations = affordable as u32;
+            if self.level == 0 {
+                self.state.step(adj, iterations);
+            } else {
+                self.ensure_weights(adj);
+                let c = &self.coarse[self.level - 1];
+                self.state
+                    .step_weighted(&c.adj, Some(&c.weights), iterations);
+            }
+            let spent = f64::from(iterations) * cost;
+            self.credit -= spent;
+            self.work += spent;
+        }
+        if self.is_done() || self.level_finished() {
+            self.credit = 0.0;
+        }
+        if self.level == 0 {
+            self.sync();
+        } else {
+            self.stale = true;
+        }
+    }
+
+    /// Bring the input graph's positions ([`Self::positions`]) up to date
+    /// with the level being laid out, after [`Self::step_level`].
+    pub fn prolong(&mut self) {
+        if self.stale {
+            self.sync();
+        }
+    }
+
+    /// The positions of the nodes of the level being laid out
+    /// ([`Self::level`]), uncentered: at level 0, the input graph's.
+    pub fn level_positions(&self) -> (&[f32], &[f32]) {
+        self.state.positions()
+    }
+
+    /// How many nodes the level being laid out has.
+    pub fn level_nodes(&self) -> usize {
+        self.state.positions().0.len()
+    }
+
+    /// The mass of each node of the level being laid out: the summed
+    /// ForceAtlas2 masses (`degree + 1`) of the input nodes it stands for.
+    /// `adj` is the input graph's adjacency.
+    pub fn level_mass(&self, adj: &UndirectedCsr) -> Vec<f32> {
+        match self.level {
+            0 => degree_mass(adj),
+            l => self.coarse[l - 1].mass.clone(),
+        }
+    }
+
+    /// For each node of the level below the one being laid out, the node
+    /// of this level it is part of: where it will start from when the
+    /// layout comes down. `u32::MAX` for a node that has no group (an
+    /// isolated node, or at a coarse level a whole component merged into
+    /// one node: they start on a ring around the drawing). `None` at level
+    /// 0, which has no level below.
+    pub fn parents_below(&self) -> Option<Vec<u32>> {
+        (self.level > 0).then(|| self.coarse[self.level - 1].groups())
+    }
+
+    /// The merged edges of the level being laid out, the heaviest `most` of
+    /// them ([`LevelEdges`]). `adj` is the input graph's adjacency. At
+    /// level 0 there are none to give: the input graph's edges are the
+    /// caller's already, each of weight 1 (`total` says how many).
+    ///
+    /// A lean hierarchy ([`Self::new_lean`]) makes the level's weights
+    /// again here if it let go of them, as the level's first iteration
+    /// would have. Beyond the edges returned this holds a quarter of a
+    /// megabyte while it runs, whatever the level's size: the heaviest are
+    /// found by counting, not by sorting them all.
+    pub fn level_edges(&mut self, adj: &UndirectedCsr, most: usize) -> LevelEdges {
+        if self.level == 0 {
+            return LevelEdges {
+                total: adj.targets.len() / 2,
+                ..LevelEdges::default()
+            };
+        }
+        self.ensure_weights(adj);
+        let c = &self.coarse[self.level - 1];
+        let total = c.entries / 2;
+        let take = most.min(total);
+        // Each edge once, from its lower end: `(node, entry)`.
+        let entries = || {
+            (0..c.n as u32).flat_map(move |u| {
+                let base = c.adj.offsets[u as usize] as usize;
+                c.adj
+                    .neighbors(u)
+                    .iter()
+                    .enumerate()
+                    .filter(move |&(_, &v)| v > u)
+                    .map(move |(e, &v)| (u, v, c.weights[base + e]))
+            })
+        };
+        // The weight the last edge taken has, as far as a bucket tells
+        // weights apart (they are whole numbers), and how many heavier
+        // edges there are than that.
+        const BUCKETS: usize = 1 << 16;
+        let bucket = |w: f32| (w.max(0.0) as usize).min(BUCKETS - 1);
+        let (mut least, mut above) = (0, 0);
+        if take < total {
+            let mut count = vec![0u32; BUCKETS];
+            for (_, _, w) in entries() {
+                count[bucket(w)] += 1;
+            }
+            least = BUCKETS - 1;
+            while above + count[least] as usize <= take && least > 0 {
+                above += count[least] as usize;
+                least -= 1;
+            }
+        }
+        // Every heavier edge, and the first in index order of those as
+        // heavy as the last.
+        let mut ties = take - above.min(take);
+        let mut picked: Vec<(u32, u32, f32)> = Vec::with_capacity(take);
+        if take > 0 {
+            for (u, v, w) in entries() {
+                let b = bucket(w);
+                if take == total || b > least {
+                    picked.push((u, v, w));
+                } else if b == least && ties > 0 {
+                    picked.push((u, v, w));
+                    ties -= 1;
+                }
+                if picked.len() == take {
+                    break;
+                }
+            }
+        }
+        picked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        LevelEdges {
+            src: picked.iter().map(|e| e.0).collect(),
+            dst: picked.iter().map(|e| e.1).collect(),
+            weight: picked.iter().map(|e| e.2).collect(),
+            total,
+        }
     }
 }
 
@@ -1389,6 +1596,151 @@ mod tests {
         }
         assert_eq!(a.positions(), b.positions());
         assert_eq!(a.into_positions(), layout_fa2_multilevel(&t, None, params));
+    }
+
+    /// A random graph of `n` nodes and `m` edges (some repeated, some
+    /// loops), the same every time.
+    fn random_edges(n: u64, m: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        (0..m).map(|_| (next() as u32, next() as u32)).unzip()
+    }
+
+    #[test]
+    fn a_level_at_a_time_gives_the_same_bits_and_shows_every_level() {
+        // Dense enough that a lean hierarchy lets go of weights, with a few
+        // isolated nodes (the last 40) to be dropped.
+        let (src, dst) = random_edges(2960, 45_000);
+        let t = Topology::build(3000, src, dst);
+        let adj = t.undirected();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let want = layout_fa2_multilevel(&t, None, params);
+        for lean in [false, true] {
+            let mut whole = Fa2Multilevel::build(adj, params, lean);
+            let mut ml = Fa2Multilevel::build(adj, params, lean);
+            let levels = ml.coarse_levels();
+            assert!(levels >= 3);
+            let sizes = ml.level_sizes();
+            let entries = ml.level_entries(adj);
+            let mut seen = Vec::new();
+            let mut budgets = [0.3, 1.0, 7.0, 0.01, 25.0].iter().cycle();
+            // The level above's masses and positions, and this level's
+            // nodes' groups in it.
+            let mut above: Option<(Vec<f32>, Vec<u32>)> = None;
+            while !ml.is_done() {
+                let before = ml.level();
+                let parents = ml.level_finished().then(|| ml.parents_below().unwrap());
+                let budget = *budgets.next().unwrap();
+                ml.step_level(adj, budget);
+                // Never more than one level down a call, and only from a
+                // finished one.
+                assert!(before - ml.level() <= 1);
+                assert_eq!(before != ml.level(), parents.is_some());
+                let l = ml.level();
+                let (x, y) = ml.level_positions();
+                assert_eq!((x.len(), y.len()), (sizes[l], sizes[l]));
+                assert_eq!(ml.level_nodes(), sizes[l]);
+                if seen.last() != Some(&l) {
+                    seen.push(l);
+                    let mass = ml.level_mass(adj);
+                    assert_eq!(mass.len(), sizes[l]);
+                    if let (Some(parents), Some((mass_above, _))) = (&parents, &above) {
+                        // A node's mass is its members', and every node
+                        // with a neighbour has a group.
+                        let mut sum = vec![0.0f32; mass_above.len()];
+                        for (i, &p) in parents.iter().enumerate() {
+                            if p != NONE {
+                                sum[p as usize] += mass[i];
+                            }
+                        }
+                        assert_eq!(&sum, mass_above);
+                    }
+                    let all = ml.level_edges(adj, usize::MAX);
+                    assert_eq!(all.total, entries[l] / 2);
+                    if l == 0 {
+                        assert!(all.src.is_empty());
+                    } else {
+                        assert_eq!(all.src.len(), all.total);
+                        // Every merged edge once, lower end first, heaviest
+                        // first; and together they stand for the input
+                        // edges whose ends are apart here.
+                        for i in 0..all.total {
+                            assert!(all.src[i] < all.dst[i] && (all.dst[i] as usize) < sizes[l]);
+                            if i > 0 {
+                                let (a, b) = (i - 1, i);
+                                let key = |i: usize| (all.src[i], all.dst[i]);
+                                assert!(
+                                    all.weight[a] > all.weight[b]
+                                        || (all.weight[a] == all.weight[b] && key(a) < key(b))
+                                );
+                            }
+                        }
+                        // The heaviest few are the first of them all.
+                        for most in [0, 1, 7, all.total / 2, all.total - 1, all.total] {
+                            let some = ml.level_edges(adj, most);
+                            assert_eq!(some.total, all.total);
+                            assert_eq!(some.src, &all.src[..most], "level {l}, most {most}");
+                            assert_eq!(some.dst, &all.dst[..most]);
+                            assert_eq!(some.weight, &all.weight[..most]);
+                        }
+                    }
+                    above = Some((mass, Vec::new()));
+                }
+            }
+            // Every level, coarsest first.
+            assert_eq!(seen, (0..=levels).rev().collect::<Vec<_>>());
+            whole.step(adj, f64::INFINITY);
+            assert_eq!(ml.positions(), whole.positions());
+            assert_eq!(ml.work_done().round(), whole.work_done().round());
+            assert_eq!(ml.into_positions(), want);
+        }
+    }
+
+    #[test]
+    fn a_level_at_a_time_prolongs_only_when_asked() {
+        let t = grid(30, 30);
+        let adj = t.undirected();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let mut whole = Fa2Multilevel::new(adj, params);
+        let mut ml = Fa2Multilevel::new(adj, params);
+        // The coarsest level, to its last iteration and no further.
+        ml.step_level(adj, f64::INFINITY);
+        assert!(ml.level_finished());
+        assert_eq!(ml.level(), ml.coarse_levels());
+        // As far as a whole step with exactly that work gets.
+        whole.step(adj, ml.work_done());
+        assert_eq!(whole.work_done(), ml.work_done());
+        assert_ne!(ml.positions(), whole.positions());
+        ml.prolong();
+        assert_eq!(ml.positions(), whole.positions());
+        // The next call comes a level down, and what the last one had left
+        // over is not spent there.
+        let work = ml.work_done();
+        ml.step_level(adj, 0.0);
+        assert_eq!(ml.level(), ml.coarse_levels() - 1);
+        assert_eq!(ml.work_done(), work);
+        assert!(!ml.level_finished());
+        // An edge order asked for after a level was read is the order
+        // asked for before.
+        let (src, dst) = random_edges(900, 2000);
+        let (src, dst) = (&src[..], &dst[..]);
+        let mut fresh = Fa2Multilevel::new_lean(adj, params);
+        let order = fresh.edge_order(adj, src, dst);
+        fresh.step_level(adj, f64::INFINITY);
+        let _ = fresh.level_edges(adj, 100);
+        let _ = fresh.parents_below();
+        assert_eq!(fresh.edge_order(adj, src, dst), order);
     }
 
     #[test]

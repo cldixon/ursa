@@ -369,6 +369,10 @@ pub struct LiveLayout {
     /// The graph's undirected adjacency: all a layout reads of it.
     adjacency: Arc<UndirectedCsr>,
     engine: Engine,
+    /// For each node of the level being laid out, the node of the level
+    /// above it came from: kept by [`LiveLayout::step_level`] as it comes
+    /// down a level, for [`LiveLayout::level_graph`] to give away.
+    parents: Option<Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -501,6 +505,7 @@ impl LiveLayout {
         Self {
             adjacency,
             engine: Engine::Flat(state),
+            parents: None,
         }
     }
 
@@ -520,6 +525,7 @@ impl LiveLayout {
         Self {
             adjacency,
             engine: Engine::Multilevel(Box::new(state)),
+            parents: None,
         }
     }
 
@@ -559,6 +565,7 @@ impl LiveLayout {
                 run: 0,
                 total: 0,
             },
+            parents: None,
         })
     }
 
@@ -623,6 +630,7 @@ impl LiveLayout {
         Ok(Self {
             adjacency,
             engine: Engine::Fixed { kind, x, y },
+            parents: None,
         })
     }
 
@@ -684,7 +692,9 @@ impl LiveLayout {
         };
         let mut state = match std::mem::replace(&mut self.engine, placeholder) {
             Engine::Flat(s) | Engine::Warm { state: s, .. } => s,
-            Engine::Multilevel(m) => {
+            Engine::Multilevel(mut m) => {
+                // Wherever its level is now, for every node.
+                m.prolong();
                 let (x, y) = m.positions();
                 // The masses are the grown graph's, set below.
                 Fa2State::from_positions(m.params().fa2, x.to_vec(), y.to_vec(), vec![1.0; had])
@@ -694,6 +704,7 @@ impl LiveLayout {
             }
         };
         self.adjacency = adjacency;
+        self.parents = None;
         let total = fa2_grow(
             &mut state,
             &self.adjacency,
@@ -746,6 +757,91 @@ impl LiveLayout {
             }
             Engine::Fixed { .. } => {}
         }
+    }
+
+    /// [`LiveLayout::step`], a level at a time, for a view that draws the
+    /// level being laid out as a graph of its own ([`crate::levels`]) and
+    /// not every node at its group's place. Coarse to fine, it comes down a
+    /// level only at the start, from a level that has had all its
+    /// iterations, and stops when the level it is at has had its own: every
+    /// level can be read at its last iteration, with
+    /// [`LiveLayout::level_positions`], and at its first, with
+    /// [`LiveLayout::level_graph`], before the hierarchy lets it go. The
+    /// final positions are the same bits as [`LiveLayout::step`]'s.
+    ///
+    /// While a coarse level is laid out, [`LiveLayout::positions`] is not
+    /// brought up to date: [`LiveLayout::prolong`] does that. Any other
+    /// layout steps as [`LiveLayout::step`] does.
+    pub fn step_level(&mut self, iterations: u32) {
+        match &mut self.engine {
+            Engine::Multilevel(s) => {
+                if s.level_finished() {
+                    self.parents = s.parents_below();
+                }
+                s.step_level(&self.adjacency, f64::from(iterations));
+            }
+            _ => self.step(iterations),
+        }
+    }
+
+    /// Whether the level being laid out is a coarse one that has had all
+    /// its iterations: the next [`LiveLayout::step_level`] comes down from
+    /// it.
+    pub fn level_finished(&self) -> bool {
+        matches!(&self.engine, Engine::Multilevel(s) if s.level_finished())
+    }
+
+    /// The work done so far, in iterations of the whole graph, not
+    /// rounded as [`LiveLayout::iterations`] is: what a caller pacing
+    /// [`LiveLayout::step_level`] measures a step by.
+    pub fn work(&self) -> f64 {
+        match &self.engine {
+            Engine::Multilevel(s) => s.work_done(),
+            _ => f64::from(self.iterations()),
+        }
+    }
+
+    /// Bring [`LiveLayout::positions`] up to date with the level being
+    /// laid out, after [`LiveLayout::step_level`].
+    pub fn prolong(&mut self) {
+        if let Engine::Multilevel(s) = &mut self.engine {
+            s.prolong();
+        }
+    }
+
+    /// The positions of the nodes of the level being laid out: `x` and
+    /// `y`, one per node of that level. At level 0, and for any layout
+    /// that is not coarse to fine, they are [`LiveLayout::positions`].
+    pub fn level_positions(&self) -> (&[f32], &[f32]) {
+        match &self.engine {
+            Engine::Multilevel(s) => s.level_positions(),
+            _ => self.positions(),
+        }
+    }
+
+    /// The level being laid out as a graph of its own
+    /// ([`crate::levels::LevelGraph`]): each node's mass, the node of the
+    /// level above it came from (if [`LiveLayout::step_level`] brought the
+    /// layout down to this level; given once, then forgotten), and its
+    /// heaviest `most_edges` merged edges. At level 0 the nodes are the
+    /// graph's, and neither masses (each is its degree plus one) nor
+    /// edges are given: the caller has them. `None` for a layout that is
+    /// not coarse to fine.
+    pub fn level_graph(&mut self, most_edges: usize) -> Option<crate::levels::LevelGraph> {
+        let Engine::Multilevel(s) = &mut self.engine else {
+            return None;
+        };
+        let adj = &*self.adjacency;
+        Some(crate::levels::LevelGraph {
+            level: s.level(),
+            levels: s.coarse_levels() + 1,
+            mass: match s.level() {
+                0 => Vec::new(),
+                _ => s.level_mass(adj),
+            },
+            parents: self.parents.take(),
+            edges: s.level_edges(adj, most_edges),
+        })
     }
 
     /// Iterations run so far: for coarse to fine, the work done, in
@@ -1411,6 +1507,78 @@ mod tests {
         let (x, y) = layers.positions();
         assert_eq!(x.len(), 5);
         assert!(x.iter().chain(y).all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_layout_stepped_a_level_at_a_time_ends_on_the_same_bits() {
+        // A ring of 600 with chords: several levels.
+        let n = 600u32;
+        let src: Vec<u32> = (0..n).chain((0..n).step_by(7)).collect();
+        let dst: Vec<u32> = (0..n)
+            .map(|i| (i + 1) % n)
+            .chain((0..n).step_by(7).map(|i| (i * 13 + 5) % n))
+            .collect();
+        let g = Graph::new(n as usize, src, dst).unwrap();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let mut whole = LiveLayout::multilevel(&g, params);
+        while !whole.is_done() {
+            whole.step(3);
+        }
+        let mut live = LiveLayout::multilevel(&g, params);
+        let levels = live.levels();
+        assert!(levels >= 4);
+        // The coarsest level has no parents; every level below gets its
+        // own, once, when the layout comes down to it.
+        let top = live.level_graph(10).unwrap();
+        assert_eq!((top.level, top.levels), (levels - 1, levels));
+        assert!(top.parents.is_none());
+        assert_eq!(top.mass.len(), live.level_positions().0.len());
+        assert!(top.edges.src.len() <= 10 && top.edges.total >= top.edges.src.len());
+        let mut above = top.mass.len();
+        let mut seen = vec![top.level];
+        while !live.is_done() {
+            let before = live.level();
+            live.step_level(3);
+            if live.level() != before {
+                let level = live.level_graph(10).unwrap();
+                seen.push(level.level);
+                let parents = level.parents.expect("the level's parents");
+                let nodes = live.level_positions().0.len();
+                assert_eq!(parents.len(), nodes);
+                assert!(parents
+                    .iter()
+                    .all(|&p| p == u32::MAX || (p as usize) < above));
+                // The graph's own masses and edges are the caller's.
+                assert_eq!(level.mass.len(), if level.level == 0 { 0 } else { nodes });
+                assert_eq!(level.edges.src.is_empty(), level.level == 0);
+                // Given once.
+                assert!(live.level_graph(10).unwrap().parents.is_none());
+                above = nodes;
+            }
+        }
+        assert_eq!(seen, (0..levels).rev().collect::<Vec<_>>());
+        assert_eq!(live.positions(), whole.positions());
+        assert_eq!(live.level_positions(), whole.positions());
+        assert_eq!(live.iterations(), whole.iterations());
+
+        // Grown from a coarse level, the layout starts from that level
+        // prolonged: where stepping it whole would have had every node.
+        let mut a = LiveLayout::multilevel(&g, params);
+        let mut b = LiveLayout::multilevel(&g, params);
+        a.step_level(1);
+        b.step(1);
+        assert_eq!(a.iterations(), b.iterations());
+        a.prolong();
+        assert_eq!(a.positions(), b.positions());
+        // A layout that is not coarse to fine has no levels to give.
+        let mut flat = LiveLayout::new(&g, Fa2Params::default());
+        assert!(flat.level_graph(10).is_none());
+        flat.step_level(2);
+        assert_eq!(flat.iterations(), 2);
+        assert_eq!(flat.level_positions(), flat.positions());
     }
 
     #[test]

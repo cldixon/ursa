@@ -22,6 +22,8 @@ use crate::render::{disc_area, radius_scale_for, starting_capacity, FrontNode, R
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
 use crate::spatial::{Discs, EdgeGrid, NodeGrid};
 
+mod level;
+
 pub struct View {
     /// The graph, for a view made of one ([`View::new`]). A view made from
     /// a result ([`View::from_result`]) has none: the result (`live`) is
@@ -79,6 +81,9 @@ pub struct View {
     moving_drew: (usize, usize),
     /// Where the nodes are, for picking and culling ([`Spatial`]).
     spatial: Spatial,
+    /// A level of the layout's hierarchy, drawn in place of the graph
+    /// until the layout reaches the graph itself ([`View::set_level`]).
+    level: Option<level::Level>,
 }
 
 /// The nodes for a frame that does not draw them all: the largest first.
@@ -472,6 +477,7 @@ impl View {
             some: SomeNodes::default(),
             moving_drew: (0, 0),
             spatial: Spatial::default(),
+            level: None,
         };
         view.spatial.max_radius = max_radius(&view.style.radius);
         if view.live.is_some() {
@@ -1019,6 +1025,10 @@ impl View {
     }
 
     fn fit_camera(&mut self) {
+        // A level's nodes, while one is drawn: the graph's have no place yet.
+        if let Some(b) = self.level_bounds() {
+            return self.fit_to(b);
+        }
         let b = bounds(&self.x, &self.y);
         self.fit_to(b);
         self.fitted = Some(Fitted {
@@ -1135,6 +1145,10 @@ impl View {
     /// while a layout runs. The answer is the same either way
     /// ([`View::pick_linear`]).
     pub fn pick(&mut self, px: f32, py: f32) -> Option<u32> {
+        // A level's discs are not the graph's nodes: nothing to pick.
+        if self.level.is_some() {
+            return None;
+        }
         self.rested();
         let discs = self.discs();
         match &self.spatial.grid {
@@ -1145,6 +1159,9 @@ impl View {
 
     /// [`View::pick`], testing every node: what the grid must agree with.
     pub fn pick_linear(&self, px: f32, py: f32) -> Option<u32> {
+        if self.level.is_some() {
+            return None;
+        }
         self.discs().pick_linear(px, py)
     }
 
@@ -1168,6 +1185,9 @@ impl View {
     /// otherwise every edge. The answer is the same either way
     /// ([`View::pick_edge_linear`]).
     pub fn pick_edge(&mut self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
+        if self.level.is_some() {
+            return None;
+        }
         self.rested();
         let at_rest = self.grid_is_fresh() && self.n_edges() <= EDGE_GRID_MAX;
         if at_rest && self.spatial.edges.is_none() {
@@ -1190,6 +1210,9 @@ impl View {
 
     /// [`View::pick_edge`], testing every edge.
     pub fn pick_edge_linear(&self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
+        if self.level.is_some() {
+            return None;
+        }
         let (src, dst) = self.edges();
         let at = self.camera.to_world(px, py);
         let reach = tolerance / self.camera.pixels_per_unit;
@@ -1211,6 +1234,9 @@ impl View {
     /// The frame is the same, bit for bit: only nodes that put nothing on
     /// the canvas are left out, and the rest are drawn in the same order.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.level.is_some() {
+            return self.prepare_level(device, queue);
+        }
         self.rested();
         if std::mem::replace(&mut self.spatial.culled, true) {
             return;
@@ -1536,6 +1562,10 @@ impl View {
         target: &wgpu::TextureView,
         now_ms: f64,
     ) -> Frame {
+        // A level of the hierarchy, while one is set, in place of the graph.
+        if self.level.is_some() {
+            return self.draw_level_frame(device, queue, target, now_ms);
+        }
         // The grid once the positions rest, and the nodes in view: what a
         // frame that draws every node draws of them ([`View::prepare`]).
         self.prepare(device, queue);
@@ -1619,6 +1649,9 @@ impl View {
     /// Draw a frame into `target`: everything, whether the view moves or
     /// not.
     pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
+        if self.level.is_some() {
+            return self.draw_level(device, queue, target);
+        }
         self.renderer.draw(
             device,
             queue,
