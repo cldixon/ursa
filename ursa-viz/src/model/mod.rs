@@ -78,10 +78,11 @@ pub mod ugr;
 pub use delta::{BatchColumn, BatchValues, EdgeBatch, GraphDelta, NodeBatch, Op};
 pub use result::{
     Column, ColumnRole, Encodings, GraphResult, Highlights, Key, KeyType, Layout, ModelError,
-    NodeLabel, Path, Positions, Provenance, Role, Strings, Target, Values, NO_ROW, NULL, REMOVED,
+    NodeLabel, Path, Positions, Provenance, Role, Sparse, Strings, Target, Values, NO_ROW, NULL,
+    REMOVED,
 };
 pub use select::Selection;
-pub use ugr::UgrError;
+pub use ugr::{Room, Source, UgrError};
 
 #[cfg(test)]
 mod tests;

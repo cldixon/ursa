@@ -47,7 +47,6 @@ pub mod interact;
 pub mod live;
 pub mod model;
 pub mod order;
-#[cfg(feature = "render")]
 pub mod pace;
 pub mod refine;
 #[cfg(feature = "render")]

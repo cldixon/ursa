@@ -301,14 +301,20 @@ been measured on a GPU.
 Making a view costs an upload, not a graph build (#426). At 46K nodes and
 1M edges `createView` holds the page's thread for no task over 50 ms and
 leaves the page's wasm memory at 16 MiB; it was one task of 190 to 350 ms
-and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)).
+and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)). A view made from a result
+(`createViewFromResult`) is made the same way and holds 18 MiB (#501).
 
 - **No adjacency.** A `Graph` is the node count and the edge list. Its
-  topology, which a layout needs and a frame does not, is built when first
-  asked for (`Graph::topology`), so the page's view never builds one: its
-  layout runs in a worker. `View::step`, a layout on the view's own thread,
-  builds it on its first call. `GraphView.hasTopology` says whether it is
-  there.
+  undirected adjacency, which a layout needs and a frame does not, is built
+  when first asked for (`Graph::adjacency`), so the page's view never builds
+  one: its layout runs in a worker. `View::step`, a layout on the view's own
+  thread, builds it on its first call. `GraphView.hasTopology` says whether
+  it is there.
+- **The edges once.** A view made from a result reads its nodes and edges
+  from the result (`View::edges`), and keeps no graph of its own beside it.
+  The result is read from the page's buffer a section at a time
+  (`View::from_ugr_paced`, [`UGR.md`](UGR.md#reading-a-large-result)), so
+  the buffer is never in the view's memory as well.
 - **Degrees from the edge list.** A node's degree is its distinct
   neighbours, as the adjacency counts them. `Graph::degrees` counts them in
   three passes over the edges, with no sort: each pair of nodes is put in
@@ -320,7 +326,9 @@ and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)).
   (`ursa_core::algo::fa2_seed_positions`).
 - **Edges a run at a time.** The edges go to the GPU 65,536 at a time, each
   run submitted before the next is made, so a million edges are never held
-  again as one list of indexes.
+  again as one list of indexes. On a page the view waits for the GPU to
+  take each run (a few turns of the event loop): until it has, WebGL2 keeps
+  the run's bytes in the view's memory.
 - **In pieces.** What is left is compiling the shader, linking five
   pipelines and the uploads: 150 to 200 ms on software WebGL2. On a page
   (`createView`, `createViewFromResult`; `View::new_paced` and
@@ -673,6 +681,36 @@ slow iteration never holds up a frame: the page draws at the display's rate
 whatever the layout costs. `Layout`'s `level` and `levels` say how far it
 is: coarse to fine counts `level` down from `levels - 1` to 0, the graph
 itself.
+
+What the worker holds (#501), 56 MB at 1M edges where it was 101:
+
+- **An adjacency, not a topology.** A layout reads the graph's undirected
+  adjacency and nothing else, so that is all that is built
+  (`UndirectedCsr::from_edges`: two slots an edge, sorted and merged in
+  place), or it is handed over: `Layout.fromAdjacency(n, offsets, targets)`
+  takes the adjacency a result carries
+  ([`UGR.md`](UGR.md), `edges.adjacency.*`), checks it in one pass and
+  sorts nothing (`LiveLayout::multilevel_on` and the other `_on`
+  constructors). Either way it is the adjacency `Topology::undirected`
+  gives, so the layout has the same bits.
+- **A lean hierarchy** (`Fa2Multilevel::new_lean`). R-MAT's coarse levels
+  do not thin: at 1M edges the first four have 68 to 95% of the graph's
+  adjacency entries each, and with a weight for every entry the hierarchy
+  was 53 MiB. A
+  level with more than three quarters of the graph's entries lets go of its
+  weights once the level above is built from them, and they are made again
+  (one more contraction for each level between it and the graph) when the
+  layout comes down to it; and every level is released once the layout is
+  past it. The positions are the same at every step. It costs a 1M-edge
+  R-MAT layout six contractions, which is within the spread of the runs
+  here (5.2 to 5.6 s from the hierarchy to the end lean, 5.3 to 5.9 s
+  with every weight held; [`BENCH.md`](BENCH.md#memory-at-a-million-edges));
+  a graph whose levels shrink pays nothing.
+- **Positions in two copies.** `Layout.positions()` fills a new
+  `Float32Array` from the layout's state, which the worker transfers;
+  `GraphView.setPositions` copies it into the positions the view keeps
+  (for picking, and the nodes in front) and writes those to the GPU. They
+  used to be copied six times on the way.
 
 ## Growing a layout
 

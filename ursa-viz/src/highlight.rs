@@ -126,8 +126,8 @@ impl HighlightState {
 
     /// Make room for `nodes` more nodes.
     pub fn reserve(&mut self, nodes: usize) {
-        self.flags.reserve(nodes);
-        self.drawn.reserve(nodes);
+        self.flags.reserve_exact(nodes);
+        self.drawn.reserve_exact(nodes);
     }
 
     /// As many nodes as `n_nodes`: new ones at the end, unflagged, or the

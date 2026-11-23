@@ -1922,3 +1922,92 @@ fn a_truncated_parquet_file_is_an_error_not_a_panic() {
         }
     }
 }
+
+/// DuckDB and DuckPGQ habits, through the binary (#417).
+#[test]
+fn duckdb_habits() {
+    let csv = |sql: &str| ok(ursa(&["--format", "csv", "-c", sql]));
+    let fails = |sql: &str| err(ursa(&["-c", sql]));
+    let edges = karate_edges();
+
+    // DESCRIBE and EXPLAIN of a FROM-first query.
+    assert_eq!(
+        csv(&format!("DESCRIBE FROM '{edges}'")),
+        "column_name,data_type,is_nullable\nsrc,Int64,YES\ndst,Int64,YES\n"
+    );
+    assert!(csv(&format!("EXPLAIN FROM '{edges}'")).contains("TableScan"));
+
+    // COPY with DuckDB's options.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("ties.txt").display().to_string();
+    assert_eq!(
+        csv(&format!(
+            "COPY (FROM '{edges}') TO '{out}' (FORMAT csv, HEADER false, DELIMITER '|')"
+        )),
+        "count\n78\n"
+    );
+    assert!(std::fs::read_to_string(&out).unwrap().starts_with("0|1\n"));
+    let e = fails(&format!(
+        "COPY (FROM '{edges}') TO '{out}' (FORMAT csv, PARTITION_BY (src))"
+    ));
+    assert!(
+        e.starts_with("Error: the COPY option PARTITION_BY is not supported"),
+        "{e}"
+    );
+
+    // Settings.
+    assert!(csv("SET threads = 2; SHOW datafusion.execution.target_partitions").ends_with(",2\n"));
+    let e = fails("SET memory_limit = '1GB'");
+    assert!(e.starts_with("Error: memory_limit is not a setting"), "{e}");
+
+    // An unquoted file name.
+    let e = fails("FROM karate_edges.csv");
+    assert!(e.contains("quote its path: FROM 'karate_edges.csv'"), "{e}");
+
+    // Graph statements and functions.
+    let graph = define_karate();
+    assert!(csv(&format!("{graph} SHOW PROPERTY GRAPHS")).contains("karate"));
+    assert_eq!(
+        csv(&format!("{graph} DROP GRAPH karate; SHOW GRAPHS"))
+            .lines()
+            .count(),
+        1
+    );
+    let e = fails(&format!("{graph} SELECT pagerank(karate)"));
+    assert!(
+        e.contains("pagerank is a table function, not a scalar one: call it in FROM, as in SELECT * FROM pagerank(karate)"),
+        "{e}"
+    );
+    let e = fails(&format!("{graph} SELECT id, pagerank FROM karate.nodes"));
+    assert!(
+        e.contains("join its rows on id, as in SELECT * FROM karate.nodes JOIN pagerank(karate) USING (id)"),
+        "{e}"
+    );
+    let e = fails(&format!(
+        "{graph} ALTER PROPERTY GRAPH karate ADD VERTEX TABLES (x)"
+    ));
+    assert!(e.contains("use CREATE OR REPLACE PROPERTY GRAPH"), "{e}");
+    assert!(csv(&format!("{graph} SUMMARIZE PROPERTY GRAPH karate")).contains("\n34,78,"));
+
+    // ORDER BY ALL, SHOW 'file', TEMP tables.
+    assert_eq!(
+        csv(&format!(
+            "SELECT dst, src FROM '{edges}' ORDER BY ALL DESC LIMIT 1"
+        )),
+        "dst,src\n33,32\n"
+    );
+    assert!(csv(&format!("SHOW '{edges}'")).contains("src,Int64,YES"));
+    assert_eq!(
+        csv("CREATE TEMP TABLE t AS SELECT 1 AS x; SELECT x FROM t"),
+        "x\n1\n"
+    );
+
+    // DuckDB's function names.
+    assert_eq!(
+        csv(&format!(
+            "SELECT strftime(DATE '2024-03-05', '%d/%m/%Y') AS day, epoch_ms(86400000) AS t, \
+             arg_max(dst, src) AS last_dst, array_length(list_value(1, 2)) AS n FROM '{edges}'"
+        )),
+        "day,t,last_dst,n\n05/03/2024,1970-01-02T00:00:00,33,2\n"
+    );
+}
