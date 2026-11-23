@@ -47,25 +47,89 @@ impl std::fmt::Display for BadOrder {
 
 impl std::error::Error for BadOrder {}
 
+/// An edge order, wherever it is held: a vector here, or an array of a
+/// page's that a view reads a run at a time (#501), so that a million
+/// edges' order is not copied into the view's memory to be written to the
+/// GPU from there.
+pub trait EdgeOrder {
+    /// How many edges it orders.
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Copy the edges of the slots from `start` on into `out`, all of it.
+    fn read(&self, start: usize, out: &mut [u32]);
+}
+
+impl EdgeOrder for Vec<u32> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn read(&self, start: usize, out: &mut [u32]) {
+        out.copy_from_slice(&self[start..start + out.len()]);
+    }
+}
+
+/// How many slots of an order are read at a time.
+const ORDER_RUN: usize = 1 << 16;
+
 /// Check that `order` is a permutation of the first `order.len()` of
 /// `n_edges` edges, in an eighth of a byte an edge.
 pub fn check_order(order: &[u32], n_edges: usize) -> Result<(), BadOrder> {
+    let mut seen = Seen::new(order.len(), n_edges)?;
+    seen.check(0, order)
+}
+
+/// [`check_order`] of an order read a run at a time.
+pub fn check_order_from(order: &dyn EdgeOrder, n_edges: usize) -> Result<(), BadOrder> {
     let len = order.len();
-    if len > n_edges {
-        return Err(BadOrder::TooLong { len, n_edges });
-    }
-    let mut seen = vec![0u64; len.div_ceil(64)];
-    for (at, &edge) in order.iter().enumerate() {
-        if edge as usize >= len {
-            return Err(BadOrder::OutOfRange { at, edge });
-        }
-        let (word, bit) = (edge as usize / 64, 1u64 << (edge % 64));
-        if seen[word] & bit != 0 {
-            return Err(BadOrder::Repeated { at, edge });
-        }
-        seen[word] |= bit;
+    let mut seen = Seen::new(len, n_edges)?;
+    let mut run = vec![0u32; ORDER_RUN.min(len)];
+    let mut start = 0;
+    while start < len {
+        let run = &mut run[..ORDER_RUN.min(len - start)];
+        order.read(start, run);
+        seen.check(start, run)?;
+        start += run.len();
     }
     Ok(())
+}
+
+/// The edges of an order met so far: a bit each.
+struct Seen {
+    len: usize,
+    bits: Vec<u64>,
+}
+
+impl Seen {
+    fn new(len: usize, n_edges: usize) -> Result<Self, BadOrder> {
+        if len > n_edges {
+            return Err(BadOrder::TooLong { len, n_edges });
+        }
+        Ok(Self {
+            len,
+            bits: vec![0u64; len.div_ceil(64)],
+        })
+    }
+
+    /// The slots from `start` on hold `edges`.
+    fn check(&mut self, start: usize, edges: &[u32]) -> Result<(), BadOrder> {
+        for (i, &edge) in edges.iter().enumerate() {
+            let at = start + i;
+            if edge as usize >= self.len {
+                return Err(BadOrder::OutOfRange { at, edge });
+            }
+            let (word, bit) = (edge as usize / 64, 1u64 << (edge % 64));
+            if self.bits[word] & bit != 0 {
+                return Err(BadOrder::Repeated { at, edge });
+            }
+            self.bits[word] |= bit;
+        }
+        Ok(())
+    }
 }
 
 /// How many of a view's edges are drawn in an order of their own: the

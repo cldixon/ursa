@@ -618,7 +618,11 @@ if (CREATE_CASES.length) {
     if (r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
     if (r.edges !== 1_000_000) fail(`${r.edges} edges, not 1,000,000`);
     if (!(longest <= 60)) fail(`making the view held the page's thread for ${longest} ms in one task; at most 60 ms are allowed`);
-    if (!fromResult && !(wasm <= 20 * 2 ** 20)) fail(`the page's wasm memory is ${mib(wasm)} after making the view; at most 20 MiB are allowed`);
+    // A view made from a result (#501) holds the result and no second copy
+    // of its edges; here the demo also builds the result's bytes in the
+    // same memory (resultFromEdges), 8 MB more than a page given them holds.
+    const limit = (fromResult ? 34 : 20) * 2 ** 20;
+    if (!(wasm <= limit)) fail(`the page's wasm memory is ${mib(wasm)} after making the view; at most ${mib(limit)} are allowed`);
     if (runs.some((x) => x.topology) || r.topologyInUse) fail("the view built the graph's adjacency without a layout of its own");
     if (!r.topologyStepped || r.iterations !== 1) fail(`step(1) should build the adjacency and run one iteration (built: ${r.topologyStepped}, iterations: ${r.iterations})`);
     console.log(

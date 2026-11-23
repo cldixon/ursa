@@ -473,8 +473,8 @@ impl GraphResult {
             Op::PopEdges(batch) => self.pop_edges(batch)?,
             Op::RemoveNodes(nodes) => set_flags(&mut self.node_flags, nodes, true, "node")?,
             Op::RestoreNodes(nodes) => set_flags(&mut self.node_flags, nodes, false, "node")?,
-            Op::RemoveEdges(edges) => set_flags(&mut self.edge_flags, edges, true, "edge")?,
-            Op::RestoreEdges(edges) => set_flags(&mut self.edge_flags, edges, false, "edge")?,
+            Op::RemoveEdges(edges) => self.flag_edges(edges, true)?,
+            Op::RestoreEdges(edges) => self.flag_edges(edges, false)?,
             Op::SetColumn {
                 target,
                 index,
@@ -517,7 +517,6 @@ impl GraphResult {
         if n + count > NULL as usize {
             return err("more nodes than a u32 can number");
         }
-        let mut keys = Vec::with_capacity(count);
         for (i, &label) in batch.labels.iter().enumerate() {
             let Some(node_label) = self.node_labels.get(label as usize) else {
                 return err(format!(
@@ -525,13 +524,12 @@ impl GraphResult {
                     self.node_labels.len()
                 ));
             };
-            let key = Key::parse(node_label.key, batch.keys.get(i)).map_err(|e| {
+            Key::check(node_label.key, batch.keys.get(i)).map_err(|e| {
                 ModelError(format!(
                     "new node {i} of the label '{}': {e}",
                     node_label.name
                 ))
             })?;
-            keys.push((label, key));
         }
         match (&self.positions, &batch.positions) {
             (Some(_), Some(p)) => check_positions(p, count)?,
@@ -542,21 +540,30 @@ impl GraphResult {
         check_batch_columns(&self.node_columns, &batch.columns, count, "node")?;
 
         // The identities must be new, among the nodes and among themselves.
-        for (i, id) in keys.iter().enumerate() {
-            if let Some(&first) = self.index.get(id) {
-                for done in &keys[..i] {
-                    self.index.remove(done);
-                }
-                return err(format!(
-                    "'{}' of the label '{}' is node {first} already",
-                    id.1, self.node_labels[id.0 as usize].name
-                ));
-            }
-            self.index.insert(id.clone(), (n + i) as u32);
-        }
-
+        // The index reads a node's key and label from the result, so the
+        // new ones go in first, and come out again if one is refused.
         self.node_label.extend_from_slice(&batch.labels);
         self.node_keys.extend(&batch.keys);
+        for i in n..n + count {
+            let first = self
+                .index
+                .insert(&self.node_keys, &self.node_label, i as u32);
+            if let Some(first) = first {
+                for done in n..i {
+                    self.index
+                        .remove(&self.node_keys, &self.node_label, done as u32);
+                }
+                let refused = err(format!(
+                    "'{}' of the label '{}' is node {first} already",
+                    self.node_keys.get(i),
+                    self.node_labels[self.node_label[i] as usize].name
+                ));
+                self.node_label.truncate(n);
+                self.node_keys.truncate(n);
+                return refused;
+            }
+        }
+
         self.node_flags.resize(n + count, 0);
         extend_columns(&mut self.node_columns, &batch.columns, count);
         if let (Some(p), Some(new)) = (&mut self.positions, &batch.positions) {
@@ -602,8 +609,8 @@ impl GraphResult {
         }
 
         for i in n..n + count {
-            let id = (self.node_label[i], self.node_key(i));
-            self.index.remove(&id);
+            self.index
+                .remove(&self.node_keys, &self.node_label, i as u32);
         }
         self.node_label.truncate(n);
         self.node_keys.truncate(n);
@@ -633,13 +640,14 @@ impl GraphResult {
         if m + count > NULL as usize {
             return err("more edges than a u32 can number");
         }
-        self.check_edges(&batch.src, &batch.dst, &batch.labels, self.n_nodes(), m)?;
+        let labels = Some(&batch.labels[..]);
+        self.check_edges(&batch.src, &batch.dst, labels, self.n_nodes(), m)?;
         check_batch_columns(&self.edge_columns, &batch.columns, count, "edge")?;
 
         self.src.extend_from_slice(&batch.src);
         self.dst.extend_from_slice(&batch.dst);
         self.edge_label.extend_from_slice(&batch.labels);
-        self.edge_flags.resize(m + count, 0);
+        self.edge_flags.extend_zeros(count);
         let known = batch
             .rows
             .as_ref()
@@ -654,6 +662,24 @@ impl GraphResult {
         extend_columns(&mut self.edge_columns, &batch.columns, count);
         self.note_named(m);
         Ok(())
+    }
+
+    /// Remove or restore `edges`. While no edge is removed nothing is held
+    /// for their flags, and a restore that cannot apply does not change
+    /// that.
+    fn flag_edges(&mut self, edges: &[u32], remove: bool) -> Result<(), ModelError> {
+        let m = self.n_edges();
+        if !remove && self.edge_flags.as_slice().is_none() {
+            return match edges.first() {
+                None => Ok(()),
+                Some(&e) if (e as usize) < m => err(format!("edge {e} is not removed")),
+                Some(&e) => err(format!("edge {e}, but the result has {m} edges")),
+            };
+        }
+        if edges.is_empty() {
+            return Ok(());
+        }
+        set_flags(self.edge_flags.make_mut(), edges, remove, "edge")
     }
 
     fn pop_edges(&mut self, batch: &EdgeBatch) -> Result<(), ModelError> {
@@ -671,12 +697,12 @@ impl GraphResult {
         if batch.dst.len() != count
             || self.src[m..] != batch.src[..]
             || self.dst[m..] != batch.dst[..]
-            || self.edge_label[m..] != batch.labels[..]
+            || !self.edge_label.ends_with(m, &batch.labels)
             || !rows_match
         {
             return err("the last edges are not the ones this op takes off");
         }
-        if self.edge_flags[m..].iter().any(|&f| f != 0) {
+        if self.edge_flags.any_from(m) {
             return err("one of the last edges is removed; restore it first");
         }
         check_tail_columns(&self.edge_columns, &batch.columns, m, "edge")?;

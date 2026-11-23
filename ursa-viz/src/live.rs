@@ -2,9 +2,13 @@
 //!
 //! A scene is a base [`GraphResult`] and the [`GraphDelta`]s applied to it.
 //! [`LiveResult`] holds the result and applies a delta to what is drawn from
-//! it: the graph, the positions, each node's radius, colour and flags. It
-//! gives back the [`Changes`]: which slots the renderer has to write. None of
-//! this touches the GPU; [`crate::view::View::apply`] does the writing.
+//! it: the positions, each node's radius, colour and flags. It gives back
+//! the [`Changes`]: which slots the renderer has to write. None of this
+//! touches the GPU; [`crate::view::View::apply`] does the writing.
+//!
+//! The result is the one holder of the nodes and the edges: what is drawn
+//! reads them from it ([`LiveResult::result`]), and nothing here keeps a
+//! second copy of the edge list.
 //!
 //! The cost of a delta is the delta's, not the graph's:
 //!
@@ -34,7 +38,7 @@ use ursa_core::algo::{fa2_seed_positions, Fa2Params};
 
 use crate::highlight::HighlightState;
 use crate::model::{GraphDelta, GraphResult, ModelError, Op, Target, Values, NULL, REMOVED};
-use crate::scene::{bounds, Graph, NodeStyle, Pairs, Theme, NO_CATEGORY};
+use crate::scene::{bounds, NodeStyle, Pairs, Theme, NO_CATEGORY};
 
 /// The radii a column maps to ([`NodeStyle::sizes_from`]), in pixels.
 pub const SIZE_BY_RADII: (f32, f32) = (3.0, 14.0);
@@ -61,7 +65,6 @@ const GOLDEN_ANGLE: f32 = 2.399_963_1;
 
 /// What a view draws, borrowed for a delta to change.
 pub struct Parts<'a> {
-    pub graph: &'a mut Graph,
     pub x: &'a mut Vec<f32>,
     pub y: &'a mut Vec<f32>,
     pub style: &'a mut NodeStyle,
@@ -74,7 +77,6 @@ pub struct Parts<'a> {
 /// What a view draws, owned: what [`LiveResult::new`] makes of a result.
 #[derive(Debug)]
 pub struct Drawn {
-    pub graph: Graph,
     pub x: Vec<f32>,
     pub y: Vec<f32>,
     pub style: NodeStyle,
@@ -85,7 +87,6 @@ pub struct Drawn {
 impl Drawn {
     pub fn parts<'a>(&'a mut self, theme: &'a Theme) -> Parts<'a> {
         Parts {
-            graph: &mut self.graph,
             x: &mut self.x,
             y: &mut self.y,
             style: &mut self.style,
@@ -168,18 +169,19 @@ struct Degrees {
 }
 
 impl Degrees {
-    fn new(graph: &Graph) -> Self {
-        let (base, degree) = Pairs::new(graph);
-        Self::of(graph, base, degree)
+    fn new(result: &GraphResult) -> Self {
+        let (base, degree) = Pairs::new(result.n_nodes(), result.src(), result.dst());
+        Self::of(result.n_edges(), base, degree)
     }
 
-    /// `graph`'s pairs and degrees ([`Pairs::new`]), kept.
-    fn of(graph: &Graph, mut base: Pairs, degree: Vec<u32>) -> Self {
+    /// The pairs and degrees ([`Pairs::new`]) of a graph of `n_edges`
+    /// edges, kept.
+    fn of(n_edges: usize, mut base: Pairs, degree: Vec<u32>) -> Self {
         base.shrink();
         Self {
             degree,
             base,
-            base_edges: graph.n_edges(),
+            base_edges: n_edges,
             added: HashMap::new(),
         }
     }
@@ -329,7 +331,7 @@ fn runs(sorted: impl IntoIterator<Item = usize>) -> Vec<Range<usize>> {
 }
 
 impl LiveResult {
-    /// `result`, and what a view draws of it: its graph, each node where
+    /// `result`, and what a view draws of it: each node where
     /// the result puts it (or where a layout would start it), sized and
     /// coloured as the result's encodings say (by degree, in the theme's
     /// node colour, without), with its highlights and its removed nodes
@@ -338,35 +340,29 @@ impl LiveResult {
     /// No adjacency is built for it, and no layout: the degrees are counted
     /// from the edge list ([`Graph::degrees`]).
     pub fn new(mut result: GraphResult, theme: &Theme) -> (Self, Drawn) {
-        let graph = Self::graph_of(&mut result);
-        let (pairs, degrees) = Pairs::new(&graph);
-        Self::with_graph(result, graph, pairs, degrees, theme)
+        Self::make_room(&mut result);
+        let (pairs, degrees) = Pairs::new(result.n_nodes(), result.src(), result.dst());
+        Self::with_pairs(result, pairs, degrees, theme)
     }
 
     /// The first part of [`LiveResult::new`], for a caller that gives its
     /// thread up between the parts (a view being made on a page): room in
-    /// `result` for its first deltas, and its graph, with as much room.
-    pub(crate) fn graph_of(result: &mut GraphResult) -> Graph {
+    /// `result` for its first deltas. A result decoded with that room
+    /// (`model::Room`, [`room`]) has it already, and nothing moves.
+    pub(crate) fn make_room(result: &mut GraphResult) {
         let (n, m) = (result.n_nodes(), result.n_edges());
         result.reserve(room(n), room(m));
-        let mut graph = Graph::new(n, result.src().to_vec(), result.dst().to_vec())
-            .expect("a result's edges name its nodes");
-        graph.reserve(room(m));
-        graph
     }
 
-    /// The last part of [`LiveResult::new`]: `graph` is
-    /// [`LiveResult::graph_of`] this `result`, and `pairs` and `degrees`
-    /// are that graph's ([`Pairs::new`]).
-    pub(crate) fn with_graph(
+    /// The last part of [`LiveResult::new`]: `pairs` and `degrees` are
+    /// [`Pairs::new`] of this `result`'s nodes and edges.
+    pub(crate) fn with_pairs(
         result: GraphResult,
-        graph: Graph,
         pairs: Pairs,
         degrees: Vec<u32>,
         theme: &Theme,
     ) -> (Self, Drawn) {
         let n = result.n_nodes();
-        debug_assert_eq!((n, result.n_edges()), (graph.n_nodes(), graph.n_edges()));
         let more_nodes = room(n);
         let (x, y) = match result.positions() {
             Some(p) => (p.x.clone(), p.y.clone()),
@@ -379,16 +375,15 @@ impl LiveResult {
             .expect("the highlight has the result's nodes");
         let removed = |flags: &[u8]| flags.iter().filter(|&&f| f & REMOVED != 0).count();
         let mut live = Self {
-            degrees: Degrees::of(&graph, pairs, degrees),
+            degrees: Degrees::of(result.n_edges(), pairs, degrees),
             hidden_nodes: removed(result.node_flags()),
-            removed_edges: removed(result.edge_flags()),
+            removed_edges: removed(result.edge_flags().as_slice().unwrap_or(&[])),
             result,
             size_range: None,
             counts: OnceLock::new(),
         };
         live.size_range = live.scan_size_range();
         let mut drawn = Drawn {
-            graph,
             x,
             y,
             style: NodeStyle {
@@ -402,13 +397,14 @@ impl LiveResult {
         for i in 0..n {
             live.style_node(i, &mut drawn.parts(theme));
         }
-        live.degrees.degree.reserve(more_nodes);
-        drawn.x.reserve(more_nodes);
-        drawn.y.reserve(more_nodes);
-        drawn.style.radius.reserve(more_nodes);
-        drawn.style.color.reserve(more_nodes);
+        // Exactly: `reserve` on a full vector doubles it.
+        live.degrees.degree.reserve_exact(more_nodes);
+        drawn.x.reserve_exact(more_nodes);
+        drawn.y.reserve_exact(more_nodes);
+        drawn.style.radius.reserve_exact(more_nodes);
+        drawn.style.color.reserve_exact(more_nodes);
         if let Some(categories) = &mut drawn.categories {
-            categories.reserve(more_nodes);
+            categories.reserve_exact(more_nodes);
         }
         drawn.highlight.reserve(more_nodes);
         (live, drawn)
@@ -461,19 +457,26 @@ impl LiveResult {
     /// The edges of `range` as the renderer draws them: `src, dst` each, or
     /// `src, src` for a removed edge, which draws nothing.
     pub fn line_indices(&self, range: Range<usize>) -> Vec<u32> {
-        let (src, dst, flags) = (
-            self.result.src(),
-            self.result.dst(),
-            self.result.edge_flags(),
-        );
+        let (src, dst) = (self.result.src(), self.result.dst());
         let mut out = Vec::with_capacity(2 * range.len());
-        for e in range {
-            out.push(src[e]);
-            out.push(if flags[e] & REMOVED != 0 {
-                src[e]
-            } else {
-                dst[e]
-            });
+        match self.result.edge_flags().as_slice() {
+            // No edge is removed.
+            None => {
+                for e in range {
+                    out.push(src[e]);
+                    out.push(dst[e]);
+                }
+            }
+            Some(flags) => {
+                for e in range {
+                    out.push(src[e]);
+                    out.push(if flags[e] & REMOVED != 0 {
+                        src[e]
+                    } else {
+                        dst[e]
+                    });
+                }
+            }
         }
         out
     }
@@ -626,15 +629,8 @@ impl LiveResult {
         changes.new_nodes_from = low_n;
         changes.new_edges_from = low_m;
 
-        // The graph: the slots that stayed, then the new ones.
-        parts.graph.truncate_checked(low_n, low_m);
-        let (src, dst) = (self.result.src(), self.result.dst());
-        parts
-            .graph
-            .append(n1 - low_n, &src[low_m..], &dst[low_m..])
-            .expect("a result's edges name its nodes");
         if rebuild_degrees {
-            self.degrees = Degrees::new(parts.graph);
+            self.degrees = Degrees::new(&self.result);
             restyle_all = true;
         }
         if unplaced {

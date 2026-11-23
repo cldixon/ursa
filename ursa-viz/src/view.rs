@@ -6,22 +6,31 @@
 //! notebook widget would be others.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use ursa_core::algo::{fa2_seed_positions, Fa2Params};
+use ursa_core::topology::UndirectedCsr;
 
 use crate::budget::{split, total_units, Frame, FrameBudget};
 use crate::highlight::{flag, BadHighlight, HighlightState, MARK_REACH};
 use crate::interact::nearest_edge;
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
-use crate::model::{GraphDelta, GraphResult, ModelError, Op};
-use crate::order::{check_order, BadOrder, Ordered};
+use crate::model::{GraphDelta, GraphResult, ModelError, Op, Room, Source, UgrError};
+use crate::order::{check_order_from, BadOrder, EdgeOrder, Ordered};
 use crate::pace::{ready, yield_now, Pace};
 use crate::render::{disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
 use crate::spatial::{Discs, EdgeGrid, NodeGrid};
 
 pub struct View {
-    graph: Graph,
+    /// The graph, for a view made of one ([`View::new`]). A view made from
+    /// a result ([`View::from_result`]) has none: the result (`live`) is
+    /// the one holder of its nodes and edges, and they are read from it.
+    graph: Option<Graph>,
+    /// A result's undirected adjacency, for a layout on this thread: built
+    /// on the first [`View::step`], and again after a delta. A graph keeps
+    /// its own ([`Graph::adjacency`]).
+    adjacency: Option<Arc<UndirectedCsr>>,
     /// The layout, when it runs on this thread: made on the first
     /// [`View::step`]. A view whose layout runs elsewhere (a Web Worker) gets
     /// its positions through [`View::set_positions`] and never makes one.
@@ -85,8 +94,9 @@ struct SomeNodes {
 /// An edge order on its way to the GPU: the frames draw the buffer there
 /// was until the new one is whole.
 struct Reorder {
-    /// `order[slot]` is the edge to draw in that slot.
-    order: Vec<u32>,
+    /// `order[slot]` is the edge to draw in that slot: read a run at a
+    /// time, from wherever it is held.
+    order: Box<dyn EdgeOrder>,
     /// The new buffer, and how many of its slots are written.
     buffer: wgpu::Buffer,
     written: usize,
@@ -179,6 +189,36 @@ struct Fitted {
     before: Vec<(usize, Bounds)>,
 }
 
+/// The room a view's result is decoded with: [`crate::live::room`] for its
+/// first deltas.
+fn room_of(nodes: usize, edges: usize) -> Room {
+    Room {
+        nodes: crate::live::room(nodes),
+        edges: crate::live::room(edges),
+    }
+}
+
+/// The most turns of the event loop [`settle`] waits for the GPU: a GPU
+/// that slow is waited for no longer, and the view is made holding more.
+const SETTLE_TURNS: usize = 32;
+
+/// For a paced view: give the event loop turns until the GPU has taken
+/// everything written to it, so that the staging of those writes is freed.
+async fn settle(device: &wgpu::Device, pace: &mut Pace) {
+    if !pace.yields() {
+        return;
+    }
+    for _ in 0..SETTLE_TURNS {
+        pace.turn().await;
+        if device
+            .poll(wgpu::PollType::Poll)
+            .map_or(true, |status| status.is_queue_empty())
+        {
+            return;
+        }
+    }
+}
+
 /// What a new view draws.
 enum Scene {
     Graph(Graph),
@@ -188,6 +228,11 @@ enum Scene {
 /// How many edges go to the GPU at a time when a view is made: half a
 /// megabyte of indexes.
 const EDGE_RUN: usize = 1 << 16;
+
+/// How many bytes of edges a paced view writes to the GPU before it gives
+/// the event loop a turn, so that the writes' staging is freed: half a
+/// megabyte, a run.
+const EDGE_STAGING: usize = 1 << 19;
 
 /// What [`View::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +322,29 @@ impl View {
         Self::make(device, queue, format, scene, width, height, &mut pace).await
     }
 
+    /// [`View::from_result_paced`] of a result still in its wire format
+    /// (UGR), wherever those bytes are ([`Source`]): each section is copied
+    /// once, from the source to where the result keeps it, with room for
+    /// the view's first deltas, and decoding gives the event loop its turns
+    /// as making the view does. So a page's thread is not held while a
+    /// large result is read, and the buffer is never in this program's
+    /// memory beside the result made of it.
+    pub async fn from_ugr_paced(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        ugr: &dyn Source,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, UgrError> {
+        let mut pace = Pace::yielding();
+        // The header says how many nodes and edges to make room for; the
+        // sections are read with it.
+        let result = GraphResult::read_paced(ugr, &room_of, &mut pace).await?;
+        let scene = Scene::Result(Box::new(result));
+        Ok(Self::make(device, queue, format, scene, width, height, &mut pace).await)
+    }
+
     async fn make(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -288,27 +356,38 @@ impl View {
     ) -> Self {
         let theme = Theme::light();
         pace.breathe().await;
-        // The graph, and its degrees from the edge list, a pass at a time.
-        let (graph, result) = match scene {
-            Scene::Graph(graph) => (graph, None),
-            Scene::Result(mut result) => (LiveResult::graph_of(&mut result), Some(result)),
+        // The graph, or the result that holds it, and its degrees from the
+        // edge list, a pass at a time.
+        let (graph, mut result) = match scene {
+            Scene::Graph(graph) => (Some(graph), None),
+            Scene::Result(result) => (None, Some(result)),
         };
-        pace.breathe().await;
-        let mut counted = Pairs::count(&graph);
-        pace.breathe().await;
-        counted.fill(&graph);
-        pace.breathe().await;
-        let (pairs, degrees) = counted.finish();
+        if let Some(result) = &mut result {
+            LiveResult::make_room(result);
+            pace.breathe().await;
+        }
+        let (pairs, degrees) = {
+            let (n, src, dst) = match (&graph, &result) {
+                (Some(graph), _) => (graph.n_nodes(), graph.src(), graph.dst()),
+                (None, Some(result)) => (result.n_nodes(), result.src(), result.dst()),
+                (None, None) => unreachable!("a scene is a graph or a result"),
+            };
+            let mut counted = Pairs::count(n, src, dst);
+            pace.breathe().await;
+            counted.fill(src, dst);
+            pace.breathe().await;
+            counted.finish()
+        };
         pace.breathe().await;
         let (live, drawn) = match result {
             None => {
                 drop(pairs);
+                let n = graph.as_ref().map_or(0, Graph::n_nodes);
                 let style = NodeStyle::by_degree(&degrees);
                 // The seeded positions, as a layout starts from them.
-                let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
-                let highlight = HighlightState::new(graph.n_nodes());
+                let (x, y) = fa2_seed_positions(n, &Fa2Params::default());
+                let highlight = HighlightState::new(n);
                 let drawn = Drawn {
-                    graph,
                     x,
                     y,
                     style,
@@ -318,19 +397,22 @@ impl View {
                 (None, drawn)
             }
             Some(result) => {
-                let (live, drawn) = LiveResult::with_graph(*result, graph, pairs, degrees, &theme);
+                let (live, drawn) = LiveResult::with_pairs(*result, pairs, degrees, &theme);
                 (Some(live), drawn)
             }
         };
         let Drawn {
-            graph,
             x,
             y,
             style,
             categories,
             highlight,
         } = drawn;
-        let (n, m) = (graph.n_nodes(), graph.n_edges());
+        let (n, m) = match (&graph, &live) {
+            (Some(graph), _) => (graph.n_nodes(), graph.n_edges()),
+            (None, Some(live)) => (live.result().n_nodes(), live.result().n_edges()),
+            (None, None) => unreachable!("a scene is a graph or a result"),
+        };
         // A view that takes deltas has room for the first, so that they do
         // not grow the buffers.
         let room = match live {
@@ -341,20 +423,33 @@ impl View {
         // The edges, a run at a time: each is in the GPU's hands, and its
         // staging freed, before the next is made.
         let mut start = 0;
+        let mut staged = 0;
         while start < m {
             let run = start..m.min(start + EDGE_RUN);
-            let lines = match &live {
-                Some(live) => live.line_indices(run.clone()),
-                None => graph.line_indices(run.clone()),
+            let lines = match (&live, &graph) {
+                (Some(live), _) => live.line_indices(run.clone()),
+                (None, Some(graph)) => graph.line_indices(run.clone()),
+                (None, None) => unreachable!("a scene is a graph or a result"),
             };
             renderer.write_edges(queue, start, &lines);
             queue.submit([]);
             let _ = device.poll(wgpu::PollType::Poll);
             start = run.end;
-            pace.breathe().await;
+            // What is written is staged in this program's memory until
+            // the GPU has taken it, which on WebGL2 it does between the
+            // page's tasks, in its own time: wait for it after each run,
+            // or all the runs are held at once.
+            staged += lines.len() * 4;
+            if staged >= EDGE_STAGING {
+                staged = 0;
+                settle(device, pace).await;
+            } else {
+                pace.breathe().await;
+            }
         }
         let mut view = Self {
             graph,
+            adjacency: None,
             layout: None,
             x,
             y,
@@ -436,7 +531,7 @@ impl View {
             ));
         };
         if let Some((x, y)) = positions {
-            let mut n = self.graph.n_nodes();
+            let mut n = live.result().n_nodes();
             for op in &delta.ops {
                 match op {
                     Op::AddNodes(batch) => n += batch.len(),
@@ -455,7 +550,6 @@ impl View {
         let mut changes = live.apply(
             delta,
             &mut Parts {
-                graph: &mut self.graph,
                 x: &mut self.x,
                 y: &mut self.y,
                 style: &mut self.style,
@@ -563,6 +657,7 @@ impl View {
 
         if (n0, m0) != (n1, m1) {
             self.layout_stale = true;
+            self.adjacency = None;
         }
         if changes.positions {
             self.budget.moved();
@@ -596,8 +691,35 @@ impl View {
         uploaded(&self.renderer) - before
     }
 
-    pub fn graph(&self) -> &Graph {
-        &self.graph
+    /// How many nodes there are: every slot, hidden or not.
+    pub fn n_nodes(&self) -> usize {
+        match (&self.graph, &self.live) {
+            (Some(graph), _) => graph.n_nodes(),
+            (None, Some(live)) => live.result().n_nodes(),
+            (None, None) => 0,
+        }
+    }
+
+    /// How many edges there are: every slot, removed or not.
+    pub fn n_edges(&self) -> usize {
+        self.edges().0.len()
+    }
+
+    /// The edges, `(src[i], dst[i])` as node indexes: the graph's, or the
+    /// result's for a view made from one, which holds them once.
+    pub fn edges(&self) -> (&[u32], &[u32]) {
+        match (&self.graph, &self.live) {
+            (Some(graph), _) => (graph.src(), graph.dst()),
+            (None, Some(live)) => (live.result().src(), live.result().dst()),
+            (None, None) => (&[], &[]),
+        }
+    }
+
+    /// Whether an adjacency has been built on this thread: only
+    /// [`View::step`] builds one, so a view whose layout runs elsewhere
+    /// never has.
+    pub fn has_adjacency(&self) -> bool {
+        self.adjacency.is_some() || self.graph.as_ref().is_some_and(Graph::has_adjacency)
     }
 
     pub fn camera(&self) -> &Camera {
@@ -626,23 +748,40 @@ impl View {
         if iterations == 0 {
             return;
         }
-        let graph = &self.graph;
+        // The adjacency: the graph's own, or built here from the result's
+        // edges (every slot, as a graph of them would have).
+        let adjacency = match (&self.graph, &self.live) {
+            (Some(graph), _) => Arc::clone(graph.adjacency()),
+            (None, Some(live)) => {
+                let r = live.result();
+                Arc::clone(self.adjacency.get_or_insert_with(|| {
+                    Arc::new(UndirectedCsr::from_edges(r.n_nodes(), r.src(), r.dst()))
+                }))
+            }
+            (None, None) => return,
+        };
+        let n = adjacency.offsets.len() - 1;
         if std::mem::take(&mut self.layout_stale) {
             // The graph changed under the layout ([`View::apply`]): grow it,
             // or, if nodes went, start again from what is drawn.
             if let Some(mut layout) = self.layout.take() {
-                let fits = layout.positions().0.len() <= graph.n_nodes();
-                self.layout = if fits && layout.grow(graph, Growth::default()).is_ok() {
+                let fits = layout.positions().0.len() <= n;
+                let grown = fits
+                    && layout
+                        .grow_on(Arc::clone(&adjacency), Growth::default())
+                        .is_ok();
+                self.layout = if grown {
                     Some(layout)
                 } else {
                     let (x, y) = (self.x.clone(), self.y.clone());
-                    LiveLayout::from_positions(graph, Fa2Params::default(), x, y).ok()
+                    let params = Fa2Params::default();
+                    LiveLayout::from_positions_on(Arc::clone(&adjacency), params, x, y).ok()
                 };
             }
         }
         let layout = self
             .layout
-            .get_or_insert_with(|| LiveLayout::new(graph, Fa2Params::default()));
+            .get_or_insert_with(|| LiveLayout::new_on(adjacency, Fa2Params::default()));
         layout.step(iterations);
         let (x, y) = layout.positions();
         self.x.copy_from_slice(x);
@@ -658,10 +797,24 @@ impl View {
         x: &[f32],
         y: &[f32],
     ) {
-        assert_eq!(x.len(), self.graph.n_nodes());
-        assert_eq!(y.len(), self.graph.n_nodes());
+        assert_eq!(x.len(), self.n_nodes());
+        assert_eq!(y.len(), self.n_nodes());
         self.x.copy_from_slice(x);
         self.y.copy_from_slice(y);
+        self.upload(device, queue);
+    }
+
+    /// [`View::set_positions`] for a caller whose positions are not in a
+    /// slice here (a page's array): `fill(x, y)` writes every node's into
+    /// the positions the view keeps, in place, and they are uploaded from
+    /// there.
+    pub fn set_positions_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fill: impl FnOnce(&mut [f32], &mut [f32]),
+    ) {
+        fill(&mut self.x, &mut self.y);
         self.upload(device, queue);
     }
 
@@ -784,8 +937,8 @@ impl View {
     }
 
     pub fn set_style(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, style: NodeStyle) {
-        assert_eq!(style.radius.len(), self.graph.n_nodes());
-        assert_eq!(style.color.len(), self.graph.n_nodes());
+        assert_eq!(style.radius.len(), self.n_nodes());
+        assert_eq!(style.color.len(), self.n_nodes());
         self.renderer.set_style(queue, &style);
         self.spatial.max_radius = max_radius(&style.radius);
         self.spatial.disc_area.set(None);
@@ -813,7 +966,7 @@ impl View {
         categories: Option<Vec<u32>>,
     ) {
         if let Some(c) = &categories {
-            assert_eq!(c.len(), self.graph.n_nodes());
+            assert_eq!(c.len(), self.n_nodes());
         }
         self.categories = categories;
         self.recolor(device, queue);
@@ -831,7 +984,7 @@ impl View {
         let mut style = self.style.clone();
         style.color = match &self.categories {
             Some(c) => self.theme.colors(c),
-            None => vec![self.theme.node; self.graph.n_nodes()],
+            None => vec![self.theme.node; self.n_nodes()],
         };
         self.set_style(device, queue, style);
     }
@@ -1000,7 +1153,7 @@ impl View {
     fn edge_is_gone(&self, e: u32) -> bool {
         let flags = self.highlight.flags();
         let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
-        let (src, dst) = (self.graph.src(), self.graph.dst());
+        let (src, dst) = self.edges();
         hidden(src[e as usize])
             || hidden(dst[e as usize])
             || (self.live.as_ref()).is_some_and(|l| !l.result().edge_is_shown(e as usize))
@@ -1016,14 +1169,16 @@ impl View {
     /// ([`View::pick_edge_linear`]).
     pub fn pick_edge(&mut self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
         self.rested();
-        let (src, dst) = (self.graph.src(), self.graph.dst());
-        let at_rest = self.grid_is_fresh() && src.len() <= EDGE_GRID_MAX;
+        let at_rest = self.grid_is_fresh() && self.n_edges() <= EDGE_GRID_MAX;
         if at_rest && self.spatial.edges.is_none() {
             self.spatial.edge_picks += 1;
             if self.spatial.edge_picks >= 2 {
-                self.spatial.edges = Some(EdgeGrid::build(src, dst, &self.x, &self.y));
+                let (src, dst) = self.edges();
+                let grid = EdgeGrid::build(src, dst, &self.x, &self.y);
+                self.spatial.edges = Some(grid);
             }
         }
+        let (src, dst) = self.edges();
         let Some(grid) = self.spatial.edges.as_ref().filter(|_| at_rest) else {
             return self.pick_edge_linear(px, py, tolerance);
         };
@@ -1035,7 +1190,7 @@ impl View {
 
     /// [`View::pick_edge`], testing every edge.
     pub fn pick_edge_linear(&self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
-        let (src, dst) = (self.graph.src(), self.graph.dst());
+        let (src, dst) = self.edges();
         let at = self.camera.to_world(px, py);
         let reach = tolerance / self.camera.pixels_per_unit;
         let skip = |e| self.edge_is_gone(e);
@@ -1255,13 +1410,30 @@ impl View {
         device: &wgpu::Device,
         order: Vec<u32>,
     ) -> Result<(), BadOrder> {
-        check_order(&order, self.graph.n_edges())?;
+        self.set_edge_order_from(device, Box::new(order))
+    }
+
+    /// [`View::set_edge_order`] of an order held elsewhere (a page's
+    /// array): it is checked and then written a run at a time from there,
+    /// and never held here whole.
+    pub fn set_edge_order_from(
+        &mut self,
+        device: &wgpu::Device,
+        order: Box<dyn EdgeOrder>,
+    ) -> Result<(), BadOrder> {
+        check_order_from(&*order, self.n_edges())?;
         self.reorder = Some(Reorder {
             order,
             buffer: self.renderer.edge_buffer(device),
             written: 0,
         });
         Ok(())
+    }
+
+    /// Whether an edge order is on its way to the GPU
+    /// ([`View::order_edges`] has more to write).
+    pub fn is_ordering(&self) -> bool {
+        self.reorder.is_some()
     }
 
     /// Write up to `max_edges` more edges of the order being set
@@ -1278,7 +1450,7 @@ impl View {
         let Some(mut reorder) = self.reorder.take() else {
             return false;
         };
-        let m = self.graph.n_edges();
+        let m = self.n_edges();
         let ordered = reorder.order.len();
         let mut left = max_edges;
         while reorder.written < m && left > 0 {
@@ -1286,12 +1458,14 @@ impl View {
             let end = m.min(start + left.min(EDGE_RUN));
             // The ordered edges, then the rest in the slots of their indexes.
             let lines = if start < ordered {
-                let end = end.min(ordered);
-                self.lines_of(&reorder.order[start..end])
+                let mut run = vec![0u32; end.min(ordered) - start];
+                reorder.order.read(start, &mut run);
+                self.lines_of(&run)
             } else {
-                match &self.live {
-                    Some(live) => live.line_indices(start..end),
-                    None => self.graph.line_indices(start..end),
+                match (&self.live, &self.graph) {
+                    (Some(live), _) => live.line_indices(start..end),
+                    (None, Some(graph)) => graph.line_indices(start..end),
+                    (None, None) => Vec::new(),
                 }
             };
             self.renderer
@@ -1315,7 +1489,7 @@ impl View {
         match &self.live {
             Some(live) => live.lines_of(edges),
             None => {
-                let (src, dst) = (self.graph.src(), self.graph.dst());
+                let (src, dst) = self.edges();
                 edges
                     .iter()
                     .flat_map(|&e| [src[e as usize], dst[e as usize]])
@@ -1393,7 +1567,7 @@ impl View {
     /// (then twice as many as asked for, so that a budget that grows a
     /// little does not gather every frame).
     fn gather_some(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, count: usize) {
-        let n = self.graph.n_nodes();
+        let n = self.n_nodes();
         if self.some.order.len() != n {
             let radius = &self.style.radius;
             let mut order: Vec<u32> = (0..n as u32).collect();

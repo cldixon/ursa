@@ -48,6 +48,9 @@ function valuesOf(columns, i) {
  * The drawing of `result` (ugr.js's readResult of the engine's buffer):
  *
  *   n, src, dst    the nodes' count and the edges' ends, as dense node indexes
+ *   adjacency      the edges' undirected adjacency, where the engine had it
+ *                  to send ({offsets, targets}, UGR's edges.adjacency.*), for
+ *                  the layout to use as it is; else null
  *   ids            each node's id as the shell prints it: {length, get(i)}
  *   removed, edgeRemoved
  *                  a byte for each node and each edge: 1 for one that is
@@ -91,6 +94,7 @@ export function drawingOf(result, skipped = 0) {
     ids: nodes.keys,
     removed: nodes.flags,
     edgeRemoved: edges.flags,
+    adjacency: edges.adjacency,
     skipped,
     name: result.graph,
     provenance: result.provenance,

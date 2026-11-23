@@ -13,7 +13,7 @@ use ursa_core::algo::{
     fa2_grow, layout_layers, layout_rings, Fa2Multilevel, Fa2Params, Fa2State, LayersParams,
     MultilevelParams, RingsParams, WarmParams,
 };
-use ursa_core::topology::Topology;
+use ursa_core::topology::UndirectedCsr;
 
 /// A graph to show: `n_nodes` nodes, and one edge per `(src[i], dst[i])`, as
 /// dense node indexes below `n_nodes`.
@@ -25,18 +25,18 @@ use ursa_core::topology::Topology;
 /// A graph is two things. What a frame needs is the node count and the
 /// edge list, which is all [`Graph::new`] keeps: making one reads the edges
 /// once, to check them. What a layout needs is the adjacency
-/// ([`Graph::topology`]), which costs far more than the edge list in time
-/// and memory, so it is built when first asked for and not before. A view
+/// ([`Graph::adjacency`]), which costs as much again as the edge list, and
+/// a sort, so it is built when first asked for and not before. A view
 /// whose layout runs on another thread never asks.
 ///
 /// A graph grows and shrinks at its end ([`Graph::append`],
-/// [`Graph::truncate`]) in time proportional to the change: its topology
+/// [`Graph::truncate`]) in time proportional to the change: its adjacency
 /// is built again when next asked for.
 #[derive(Debug)]
 pub struct Graph {
     n_nodes: usize,
-    /// Built on demand ([`Graph::topology`]), and again after a change.
-    topology: OnceLock<Arc<Topology>>,
+    /// Built on demand ([`Graph::adjacency`]), and again after a change.
+    adjacency: OnceLock<Arc<UndirectedCsr>>,
     src: Vec<u32>,
     dst: Vec<u32>,
 }
@@ -71,7 +71,7 @@ impl Graph {
         check_edges(n_nodes, 0, &src, &dst)?;
         Ok(Self {
             n_nodes,
-            topology: OnceLock::new(),
+            adjacency: OnceLock::new(),
             src,
             dst,
         })
@@ -90,7 +90,7 @@ impl Graph {
             self.n_nodes += new_nodes;
             self.src.extend_from_slice(src);
             self.dst.extend_from_slice(dst);
-            self.topology = OnceLock::new();
+            self.adjacency = OnceLock::new();
         }
         Ok(())
     }
@@ -121,7 +121,7 @@ impl Graph {
             self.n_nodes = n_nodes;
             self.src.truncate(n_edges);
             self.dst.truncate(n_edges);
-            self.topology = OnceLock::new();
+            self.adjacency = OnceLock::new();
         }
     }
 
@@ -153,35 +153,34 @@ impl Graph {
     }
 
     /// Each node's undirected degree (distinct neighbours, self-loops left
-    /// out): the degree the topology's undirected adjacency gives, counted
-    /// from the edge list without building it.
+    /// out): the degree the adjacency gives, counted from the edge list
+    /// without building it.
     pub fn degrees(&self) -> Vec<u32> {
-        match self.topology.get() {
-            Some(topology) => {
-                let adj = topology.undirected();
-                (0..self.n_nodes() as u32)
-                    .map(|u| adj.degree(u) as u32)
-                    .collect()
-            }
-            None => Pairs::new(self).1,
+        match self.adjacency.get() {
+            Some(adj) => (0..self.n_nodes() as u32)
+                .map(|u| adj.degree(u) as u32)
+                .collect(),
+            None => Pairs::new(self.n_nodes, &self.src, &self.dst).1,
         }
     }
 
     /// Whether the adjacency is built: a view that only draws never builds
     /// it.
-    pub fn has_topology(&self) -> bool {
-        self.topology.get().is_some()
+    pub fn has_adjacency(&self) -> bool {
+        self.adjacency.get().is_some()
     }
 
-    /// The graph's adjacency, for a layout: built when first asked for, and
-    /// again after the graph changes ([`Graph::append`],
-    /// [`Graph::truncate`]), when it is next asked for.
-    pub fn topology(&self) -> &Arc<Topology> {
-        self.topology.get_or_init(|| {
-            Arc::new(Topology::build(
+    /// The graph's undirected adjacency, for a layout: built when first
+    /// asked for, and again after the graph changes ([`Graph::append`],
+    /// [`Graph::truncate`]), when it is next asked for. It is built from
+    /// the edge list alone ([`UndirectedCsr::from_edges`]), with no
+    /// `Topology` beside it: a layout reads nothing else.
+    pub fn adjacency(&self) -> &Arc<UndirectedCsr> {
+        self.adjacency.get_or_init(|| {
+            Arc::new(UndirectedCsr::from_edges(
                 self.n_nodes,
-                self.src.clone(),
-                self.dst.clone(),
+                &self.src,
+                &self.dst,
             ))
         })
     }
@@ -210,23 +209,24 @@ impl Pairs {
     /// time it is asked about, and searched.
     const SHORT: usize = 32;
 
-    /// The pairs of `graph`, and each node's distinct neighbours
-    /// (self-loops left out).
-    pub(crate) fn new(graph: &Graph) -> (Self, Vec<u32>) {
-        let mut counted = Self::count(graph);
-        counted.fill(graph);
+    /// The pairs of the graph of `n_nodes` nodes and the edges
+    /// `(src[i], dst[i])`, which name only those nodes, and each node's
+    /// distinct neighbours (self-loops left out).
+    pub(crate) fn new(n_nodes: usize, src: &[u32], dst: &[u32]) -> (Self, Vec<u32>) {
+        let mut counted = Self::count(n_nodes, src, dst);
+        counted.fill(src, dst);
         counted.finish()
     }
 
     /// The first of the three passes [`Pairs::new`] makes, for a caller
     /// that gives its thread up between them: then [`Counted::fill`] and
-    /// [`Counted::finish`], with the same graph.
-    pub(crate) fn count(graph: &Graph) -> Counted {
+    /// [`Counted::finish`], with the same edges.
+    pub(crate) fn count(n_nodes: usize, src: &[u32], dst: &[u32]) -> Counted {
         // The lists' sizes, then their starts; filling them moves each
         // start to its list's end, which is the next list's start.
-        let mut offsets = vec![0u32; graph.n_nodes() + 1];
+        let mut offsets = vec![0u32; n_nodes + 1];
         let mut pairs = 0usize;
-        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
+        for (&s, &d) in src.iter().zip(dst) {
             if s != d {
                 offsets[s.min(d) as usize + 1] += 1;
                 pairs += 1;
@@ -281,9 +281,9 @@ pub(crate) struct Counted {
 
 impl Counted {
     /// The second pass: every edge into its list.
-    pub(crate) fn fill(&mut self, graph: &Graph) {
+    pub(crate) fn fill(&mut self, src: &[u32], dst: &[u32]) {
         let (offsets, other) = (&mut self.offsets, &mut self.other);
-        for (&s, &d) in graph.src().iter().zip(graph.dst()) {
+        for (&s, &d) in src.iter().zip(dst) {
             if s != d {
                 let next = &mut offsets[s.min(d) as usize + 1];
                 other[*next as usize] = s.max(d);
@@ -366,7 +366,8 @@ fn check_edges(n_nodes: usize, first: usize, src: &[u32], dst: &[u32]) -> Result
 /// a short warm schedule settles them while what was drawn is held.
 #[derive(Debug)]
 pub struct LiveLayout {
-    topology: Arc<Topology>,
+    /// The graph's undirected adjacency: all a layout reads of it.
+    adjacency: Arc<UndirectedCsr>,
     engine: Engine,
 }
 
@@ -487,10 +488,18 @@ impl std::error::Error for BadGrowth {}
 
 impl LiveLayout {
     pub fn new(graph: &Graph, params: Fa2Params) -> Self {
-        let topology = Arc::clone(graph.topology());
-        let state = Fa2State::new(topology.undirected(), params);
+        Self::new_on(Arc::clone(graph.adjacency()), params)
+    }
+
+    /// [`LiveLayout::new`] for a caller that holds the graph's undirected
+    /// adjacency and not its edge list: it is used as it is, and nothing is
+    /// built or sorted. The layout is the same, bit for bit, as the one of
+    /// a [`Graph`] with that adjacency. So are the other `_on` constructors
+    /// and [`LiveLayout::grow_on`].
+    pub fn new_on(adjacency: Arc<UndirectedCsr>, params: Fa2Params) -> Self {
+        let state = Fa2State::new(&adjacency, params);
         Self {
-            topology,
+            adjacency,
             engine: Engine::Flat(state),
         }
     }
@@ -498,10 +507,18 @@ impl LiveLayout {
     /// Coarse to fine: the graph's hierarchy is built here, and every node
     /// has a position from the start (its coarsest ancestor's, spread out).
     pub fn multilevel(graph: &Graph, params: MultilevelParams) -> Self {
-        let topology = Arc::clone(graph.topology());
-        let state = Fa2Multilevel::new(topology.undirected(), params);
+        Self::multilevel_on(Arc::clone(graph.adjacency()), params)
+    }
+
+    /// [`LiveLayout::multilevel`], on an adjacency ([`LiveLayout::new_on`]).
+    ///
+    /// The hierarchy is a lean one (`Fa2Multilevel::new_lean`): the same
+    /// positions at every step, holding less of a graph whose levels do not
+    /// thin.
+    pub fn multilevel_on(adjacency: Arc<UndirectedCsr>, params: MultilevelParams) -> Self {
+        let state = Fa2Multilevel::new_lean(&adjacency, params);
         Self {
-            topology,
+            adjacency,
             engine: Engine::Multilevel(Box::new(state)),
         }
     }
@@ -516,17 +533,27 @@ impl LiveLayout {
         x: Vec<f32>,
         y: Vec<f32>,
     ) -> Result<Self, BadGrowth> {
-        let n = graph.n_nodes();
+        Self::from_positions_on(Arc::clone(graph.adjacency()), params, x, y)
+    }
+
+    /// [`LiveLayout::from_positions`], on an adjacency
+    /// ([`LiveLayout::new_on`]).
+    pub fn from_positions_on(
+        adjacency: Arc<UndirectedCsr>,
+        params: Fa2Params,
+        x: Vec<f32>,
+        y: Vec<f32>,
+    ) -> Result<Self, BadGrowth> {
+        let n = adjacency.offsets.len() - 1;
         if x.len() != n || y.len() != n {
             return Err(BadGrowth::Positions {
                 n_nodes: n,
                 got: x.len() + y.len(),
             });
         }
-        let topology = Arc::clone(graph.topology());
-        let mass = degree_mass(&topology);
+        let mass = degree_mass(&adjacency);
         Ok(Self {
-            topology,
+            adjacency,
             engine: Engine::Warm {
                 state: Fa2State::from_positions(params, x, y, mass),
                 run: 0,
@@ -544,7 +571,16 @@ impl LiveLayout {
     /// and it is done at once: [`Self::is_done`] from the start, with no
     /// iterations to run.
     pub fn rings(graph: &Graph, distance: &[u32], params: RingsParams) -> Result<Self, BadLevels> {
-        Self::fixed(graph, distance, LayoutKind::Rings, |adj| {
+        Self::rings_on(Arc::clone(graph.adjacency()), distance, params)
+    }
+
+    /// [`LiveLayout::rings`], on an adjacency ([`LiveLayout::new_on`]).
+    pub fn rings_on(
+        adjacency: Arc<UndirectedCsr>,
+        distance: &[u32],
+        params: RingsParams,
+    ) -> Result<Self, BadLevels> {
+        Self::fixed(adjacency, distance, LayoutKind::Rings, |adj| {
             layout_rings(adj, distance, params)
         })
     }
@@ -556,28 +592,36 @@ impl LiveLayout {
     /// is `ursa_core::algo::layout_layers`, done at once like
     /// [`Self::rings`].
     pub fn layers(graph: &Graph, layer: &[u32], params: LayersParams) -> Result<Self, BadLevels> {
-        Self::fixed(graph, layer, LayoutKind::Layers, |adj| {
+        Self::layers_on(Arc::clone(graph.adjacency()), layer, params)
+    }
+
+    /// [`LiveLayout::layers`], on an adjacency ([`LiveLayout::new_on`]).
+    pub fn layers_on(
+        adjacency: Arc<UndirectedCsr>,
+        layer: &[u32],
+        params: LayersParams,
+    ) -> Result<Self, BadLevels> {
+        Self::fixed(adjacency, layer, LayoutKind::Layers, |adj| {
             layout_layers(adj, layer, params)
         })
     }
 
     fn fixed(
-        graph: &Graph,
+        adjacency: Arc<UndirectedCsr>,
         levels: &[u32],
         kind: LayoutKind,
-        place: impl FnOnce(&ursa_core::topology::UndirectedCsr) -> (Vec<f32>, Vec<f32>),
+        place: impl FnOnce(&UndirectedCsr) -> (Vec<f32>, Vec<f32>),
     ) -> Result<Self, BadLevels> {
-        let n = graph.n_nodes();
+        let n = adjacency.offsets.len() - 1;
         if levels.len() != n {
             return Err(BadLevels {
                 n_nodes: n,
                 got: levels.len(),
             });
         }
-        let topology = Arc::clone(graph.topology());
-        let (x, y) = place(topology.undirected());
+        let (x, y) = place(&adjacency);
         Ok(Self {
-            topology,
+            adjacency,
             engine: Engine::Fixed { kind, x, y },
         })
     }
@@ -618,22 +662,21 @@ impl LiveLayout {
     /// as a force layout (coarse to fine's force law): the new nodes settle
     /// beside their parents, not on a ring or a layer.
     pub fn grow(&mut self, graph: &Graph, growth: Growth<'_>) -> Result<(), BadGrowth> {
+        // Checked before the adjacency is built: a graph that does not fit
+        // costs nothing.
+        self.check_growth(graph.n_nodes(), &growth)?;
+        self.grow_on(Arc::clone(graph.adjacency()), growth)
+    }
+
+    /// [`LiveLayout::grow`], to the graph with this adjacency
+    /// ([`LiveLayout::new_on`]).
+    pub fn grow_on(
+        &mut self,
+        adjacency: Arc<UndirectedCsr>,
+        growth: Growth<'_>,
+    ) -> Result<(), BadGrowth> {
         let had = self.positions().0.len();
-        let n = graph.n_nodes();
-        if n < had {
-            return Err(BadGrowth::Shrunk { had, got: n });
-        }
-        if let Some(p) = growth.parents {
-            if p.len() != n - had {
-                return Err(BadGrowth::Parents {
-                    new_nodes: n - had,
-                    got: p.len(),
-                });
-            }
-        }
-        if let Some(&node) = growth.pinned.iter().find(|&&p| p as usize >= n) {
-            return Err(BadGrowth::Pinned { node, n_nodes: n });
-        }
+        self.check_growth(adjacency.offsets.len() - 1, &growth)?;
         let placeholder = Engine::Warm {
             state: Fa2State::from_positions(Fa2Params::default(), vec![], vec![], vec![]),
             run: 0,
@@ -650,10 +693,10 @@ impl LiveLayout {
                 Fa2State::from_positions(MultilevelParams::default().fa2, x, y, vec![1.0; had])
             }
         };
-        self.topology = Arc::clone(graph.topology());
+        self.adjacency = adjacency;
         let total = fa2_grow(
             &mut state,
-            self.topology.undirected(),
+            &self.adjacency,
             growth.parents,
             growth.pinned,
             growth.params,
@@ -666,12 +709,33 @@ impl LiveLayout {
         Ok(())
     }
 
+    /// Whether a graph of `n` nodes is one this layout can grow to with
+    /// `growth`.
+    fn check_growth(&self, n: usize, growth: &Growth<'_>) -> Result<(), BadGrowth> {
+        let had = self.positions().0.len();
+        if n < had {
+            return Err(BadGrowth::Shrunk { had, got: n });
+        }
+        if let Some(p) = growth.parents {
+            if p.len() != n - had {
+                return Err(BadGrowth::Parents {
+                    new_nodes: n - had,
+                    got: p.len(),
+                });
+            }
+        }
+        if let Some(&node) = growth.pinned.iter().find(|&&p| p as usize >= n) {
+            return Err(BadGrowth::Pinned { node, n_nodes: n });
+        }
+        Ok(())
+    }
+
     /// Run `iterations` more iterations. Coarse to fine, that is work worth
     /// as many iterations of the whole graph, spent on as many iterations of
     /// the current level as it buys. A grown layout runs no more than its
     /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
-        let adj = self.topology.undirected();
+        let adj = &*self.adjacency;
         match &mut self.engine {
             Engine::Flat(s) => s.step(adj, iterations),
             Engine::Multilevel(s) => s.step(adj, f64::from(iterations)),
@@ -753,8 +817,32 @@ impl LiveLayout {
     /// If `src` and `dst` differ in length.
     pub fn edge_order(&self, src: &[u32], dst: &[u32]) -> Vec<u32> {
         match &self.engine {
-            Engine::Multilevel(s) if s.coarse_levels() > 0 => s.edge_order(src, dst),
-            _ => ursa_core::algo::edge_order_by_degree(self.topology.undirected(), src, dst),
+            Engine::Multilevel(s) if s.coarse_levels() > 0 => {
+                s.edge_order(&self.adjacency, src, dst)
+            }
+            _ => ursa_core::algo::edge_order_by_degree(&self.adjacency, src, dst),
+        }
+    }
+
+    /// [`LiveLayout::edge_order`] for a caller whose edges are not slices
+    /// here and which has no room to spare (a browser's worker): the
+    /// `edges` edges are read a run at a time (`read(start, src, dst)`),
+    /// and each edge's sort key is left in `keys`, which may be memory
+    /// outside this program's ([`ursa_core::algo::OrderKeys`]). Sorted
+    /// ascending, the keys are the order: `ursa_core::algo::edge_of_key`
+    /// of each is its edge.
+    pub fn edge_order_keys(
+        &self,
+        edges: usize,
+        read: &mut ursa_core::algo::ReadEdges<'_>,
+        keys: &mut dyn ursa_core::algo::OrderKeys,
+    ) {
+        let adj = &self.adjacency;
+        match &self.engine {
+            Engine::Multilevel(s) if s.coarse_levels() > 0 => {
+                s.edge_order_keys(adj, edges, read, keys)
+            }
+            _ => ursa_core::algo::edge_order_by_degree_keys(adj, edges, read, keys),
         }
     }
 
@@ -769,9 +857,8 @@ impl LiveLayout {
 }
 
 /// ForceAtlas2's mass for each node: its undirected degree plus one.
-fn degree_mass(topology: &Topology) -> Vec<f32> {
-    let adj = topology.undirected();
-    (0..topology.n_nodes() as u32)
+fn degree_mass(adj: &UndirectedCsr) -> Vec<f32> {
+    (0..adj.offsets.len() as u32 - 1)
         .map(|u| 1.0 + adj.degree(u) as f32)
         .collect()
 }
@@ -1082,20 +1169,20 @@ mod tests {
     #[test]
     fn a_graph_builds_no_adjacency_until_a_layout_asks() {
         let graph = skewed(300, 4000);
-        assert!(!graph.has_topology());
+        assert!(!graph.has_adjacency());
         // Degrees and line indices come from the edge list.
         let degrees = graph.degrees();
         assert_eq!(graph.line_indices(0..4000).len(), 8000);
-        assert!(!graph.has_topology());
+        assert!(!graph.has_adjacency());
         // The seeded positions are a layout's, and need no layout.
         let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
-        assert!(!graph.has_topology());
+        assert!(!graph.has_adjacency());
 
         // A layout asks; its adjacency gives the same degrees, and it
         // starts from the same positions, bit for bit.
         let layout = LiveLayout::new(&graph, Fa2Params::default());
-        assert!(graph.has_topology());
-        let adj = graph.topology().undirected();
+        assert!(graph.has_adjacency());
+        let adj = graph.adjacency();
         let exact: Vec<u32> = (0..300).map(|u| adj.degree(u) as u32).collect();
         assert_eq!(degrees, exact);
         assert_eq!(graph.degrees(), exact);
@@ -1106,9 +1193,9 @@ mod tests {
         // A change drops the adjacency, until it is next asked for.
         let mut graph = graph;
         graph.append(1, &[300], &[0]).unwrap();
-        assert!(!graph.has_topology());
+        assert!(!graph.has_adjacency());
         assert_eq!(graph.degrees()[300], 1);
-        assert!(!graph.has_topology());
+        assert!(!graph.has_adjacency());
     }
 
     #[test]
@@ -1120,8 +1207,8 @@ mod tests {
             Graph::new(0, vec![], vec![]).unwrap(),
         ] {
             let n = graph.n_nodes() as u32;
-            let (mut pairs, degrees) = Pairs::new(&graph);
-            let adj = graph.topology().undirected();
+            let (mut pairs, degrees) = Pairs::new(graph.n_nodes(), graph.src(), graph.dst());
+            let adj = graph.adjacency();
             let exact: Vec<u32> = (0..n).map(|u| adj.degree(u) as u32).collect();
             assert_eq!(degrees, exact);
             // Each pair is kept once.
@@ -1139,7 +1226,8 @@ mod tests {
             assert!(!pairs.joined(0, n) && !pairs.joined(n + 3, 0));
         }
         // The hubs' lists are long enough to be sorted and searched.
-        let (pairs, _) = Pairs::new(&skewed(300, 4000));
+        let hubs = skewed(300, 4000);
+        let (pairs, _) = Pairs::new(hubs.n_nodes(), hubs.src(), hubs.dst());
         assert!(pairs.offsets[1] as usize > Pairs::SHORT);
     }
 
@@ -1153,7 +1241,7 @@ mod tests {
         assert_eq!(graph.line_indices(2..5), [2, 3, 3, 4, 0, 4]);
         // The adjacency is the grown graph's, when next asked for.
         assert_eq!(graph.degrees(), [2, 2, 2, 2, 2]);
-        assert_eq!(graph.topology().n_nodes(), 5);
+        assert_eq!(graph.adjacency().offsets.len() - 1, 5);
 
         // An edge that names no node changes nothing, and says which.
         let bad = graph.append(1, &[5, 0], &[0, 6]).unwrap_err();
@@ -1182,6 +1270,89 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_on_an_adjacency_is_the_layout_of_the_graph() {
+        let bits = |l: &LiveLayout| {
+            let (x, y) = l.positions();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            (bits(x), bits(y))
+        };
+        let g = skewed(400, 3000);
+        // The adjacency as another holder hands it over: its parts, checked.
+        let built = g.adjacency();
+        let handed = || {
+            let parts = UndirectedCsr::from_parts(
+                g.n_nodes(),
+                built.offsets.clone(),
+                built.targets.clone(),
+            );
+            Arc::new(parts.unwrap())
+        };
+        // It is the one a topology builds, so nothing a layout reads differs.
+        let topology =
+            ursa_core::topology::Topology::build(g.n_nodes(), g.src().to_vec(), g.dst().to_vec());
+        assert_eq!(topology.undirected().offsets, built.offsets);
+        assert_eq!(topology.undirected().targets, built.targets);
+
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        let mut of_graph = LiveLayout::multilevel(&g, params);
+        let mut of_parts = LiveLayout::multilevel_on(handed(), params);
+        assert!(of_graph.levels() > 2);
+        assert_eq!(bits(&of_graph), bits(&of_parts));
+        while !of_graph.is_done() {
+            of_graph.step(7);
+            of_parts.step(7);
+            assert_eq!(bits(&of_graph), bits(&of_parts));
+        }
+        assert!(of_parts.is_done());
+        // And it is the one-call layout, which holds every level's weights.
+        let mut whole = Fa2Multilevel::new(built, params);
+        whole.step(built, f64::INFINITY);
+        let (x, y) = whole.positions();
+        let (px, py) = of_parts.positions();
+        assert_eq!(
+            (x.iter().map(|f| f.to_bits()).collect::<Vec<_>>(), y.len()),
+            (px.iter().map(|f| f.to_bits()).collect::<Vec<_>>(), py.len())
+        );
+
+        let flat = (
+            LiveLayout::new(&g, Fa2Params::default()),
+            LiveLayout::new_on(handed(), Fa2Params::default()),
+        );
+        let (mut a, mut b) = flat;
+        a.step(5);
+        b.step(5);
+        assert_eq!(bits(&a), bits(&b));
+
+        let level: Vec<u32> = (0..g.n_nodes() as u32).map(|v| v % 5).collect();
+        let rings = LiveLayout::rings(&g, &level, RingsParams::default()).unwrap();
+        let on = LiveLayout::rings_on(handed(), &level, RingsParams::default()).unwrap();
+        assert_eq!(bits(&rings), bits(&on));
+        let layers = LiveLayout::layers(&g, &level, LayersParams::default()).unwrap();
+        let on = LiveLayout::layers_on(handed(), &level, LayersParams::default()).unwrap();
+        assert_eq!(bits(&layers), bits(&on));
+        assert!(LiveLayout::rings_on(handed(), &level[1..], RingsParams::default()).is_err());
+
+        // Growing: to the graph, or to its adjacency.
+        let mut bigger = Graph::new(g.n_nodes(), g.src().to_vec(), g.dst().to_vec()).unwrap();
+        bigger.append(3, &[0, 400, 401], &[400, 401, 402]).unwrap();
+        let (mut a, mut b) = (of_graph, of_parts);
+        a.grow(&bigger, Growth::default()).unwrap();
+        b.grow_on(Arc::clone(bigger.adjacency()), Growth::default())
+            .unwrap();
+        while !a.is_done() {
+            a.step(10);
+            b.step(10);
+        }
+        assert_eq!(bits(&a), bits(&b));
+        assert!(b
+            .grow_on(Arc::clone(g.adjacency()), Growth::default())
+            .is_err());
+    }
+
+    #[test]
     fn a_live_layout_is_layout_fa2() {
         let g = square();
         let params = Fa2Params::default();
@@ -1189,8 +1360,8 @@ mod tests {
         live.step(3);
         live.step(7);
         assert_eq!(live.iterations(), 10);
-        let mut state = Fa2State::new(g.topology().undirected(), params);
-        state.step(g.topology().undirected(), 10);
+        let mut state = Fa2State::new(g.adjacency(), params);
+        state.step(g.adjacency(), 10);
         let (x, y) = live.positions();
         let (ex, ey) = state.positions();
         assert_eq!((x, y), (ex, ey));
@@ -1206,7 +1377,7 @@ mod tests {
         assert!(rings.is_done());
         assert_eq!((rings.iterations(), rings.total()), (0, Some(0)));
         assert_eq!((rings.level(), rings.levels()), (0, 1));
-        let (ex, ey) = layout_rings(g.topology().undirected(), &level, RingsParams::default());
+        let (ex, ey) = layout_rings(g.adjacency(), &level, RingsParams::default());
         assert_eq!(rings.positions(), (&ex[..], &ey[..]));
         let (x, y) = rings.positions();
         for v in 0..4 {
@@ -1276,8 +1447,8 @@ mod tests {
             live.step(7);
         }
         assert!(live.iterations().abs_diff(total) <= 1);
-        let mut state = Fa2Multilevel::new(g.topology().undirected(), params);
-        state.step(g.topology().undirected(), f64::INFINITY);
+        let mut state = Fa2Multilevel::new(g.adjacency(), params);
+        state.step(g.adjacency(), f64::INFINITY);
         assert_eq!(live.positions(), state.positions());
     }
 

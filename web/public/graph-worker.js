@@ -7,8 +7,15 @@
 //   {type: "init", module}                 -> {type: "ready"}  (ursa-viz loaded,
 //                                             ahead of the graph: graph.js preload)
 //   {type: "start", module, n, src, dst, layout?}
+//   {type: "start", module, n, adjacency: {offsets, targets}, src, dst, layout?}
 //     -> {type: "positions", xy, iterations, level, levels, total} ..., then {type: "done", iterations}
 //     or {type: "error", message}
+//     The graph is its edges (src, dst), or, where the page was given it,
+//     its undirected adjacency (UGR's edges.adjacency.*), which the layout
+//     uses as it is, sorting nothing. The layout is the same either way.
+//     With an adjacency the edges still come, for the "order" below, which
+//     is of the page's edges as it numbers them; the layout does not read
+//     them.
 //   {type: "grow", epoch, n, src, dst}     the graph grew (an expansion, #443):
 //     the same nodes, new ones after them, and the edges shown now. The new
 //     nodes start beside their neighbours and the layout runs warm, the old
@@ -37,6 +44,10 @@
 // `origin`, this worker's time origin): when it got the graph and when its
 // hierarchy was built, for the page's timings. Every "positions" and "done"
 // carries `memory`, the bytes of this worker's WebAssembly memory.
+//
+// Positions are copied twice between the layout and the GPU (#501): once
+// here, from the layout's state into the array posted (Layout.positions),
+// which is transferred, and once on the page, into the view.
 
 let loaded = null;
 // ursa-viz's wasm exports, once loaded: `memory` is what graphMemory reports.
@@ -106,7 +117,8 @@ async function handle(data) {
 }
 
 /** The layout the page asked for: coarse to fine, or rings or layers by `layout.level`. */
-function make(Layout, { n, src, dst, layout }) {
+function make(Layout, { n, src, dst, adjacency, layout }) {
+  if (adjacency) return Layout.fromAdjacency(n, adjacency.offsets, adjacency.targets, layout?.kind, layout?.level);
   if (!layout) return new Layout(n, src, dst);
   if (layout.kind === "rings") return Layout.rings(n, src, dst, layout.level);
   if (layout.kind === "layers") return Layout.layers(n, src, dst, layout.level);
@@ -114,7 +126,8 @@ function make(Layout, { n, src, dst, layout }) {
 }
 
 function post() {
-  const xy = new Float32Array(layout.positions());
+  // A new array, filled from the layout's memory: this message's to give.
+  const xy = layout.positions();
   const message = { type: "positions", epoch, xy, iterations: layout.iterations, level: layout.level, levels: layout.levels, total: layout.total, memory: wasm.memory.buffer.byteLength };
   if (times) {
     message.times = times;
@@ -130,7 +143,10 @@ function post() {
  * the first positions: the hierarchy it comes from never changes.
  */
 function postOrder({ src, dst }) {
+  if (!src || !dst) return;
   const t = performance.now();
+  // The edges stay here: the layout reads them a run at a time, and writes
+  // the order into an array of this worker's, to give away (#501).
   const order = layout.edgeOrder(src, dst);
   self.postMessage({ type: "order", order, ms: performance.now() - t }, [order.buffer]);
 }

@@ -672,6 +672,70 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   and fails over 60 ms. The shell keeps what its layout worker says while
   the view is being made, so a small graph's layout that ends first is not
   lost.
+- **The graph view holds a million edges in 74 MB, not 164** (#501, with
+  #492). On `.graph rmat` in the Web Shell (46,318 nodes, 1,000,000 edges)
+  the page's view holds 17.9 MiB of WebAssembly memory where it held 59.6,
+  and the layout worker 55.7 MB where it held 101; no task of the page's is
+  over 60 ms while the view is made (decoding the result was one of 63 to
+  92 ms); and a position update is copied twice on its way from the layout
+  to the GPU, not six times. Layouts are the same, bit for bit.
+  - **The page's view.** `createViewFromResult(canvas, bytes)` takes the
+    `Uint8Array` and reads the result out of it a section at a time, with
+    turns of the event loop between (`GraphResult::read_paced` over a
+    `model::Source`, `View::from_ugr_paced`), so the buffer is never copied
+    whole into the view's memory. A view made from a result keeps no second
+    copy of the edges (`View::edges` reads the result's; `View::graph` is
+    gone, for `n_nodes`, `n_edges` and `edges`). Edge labels and flags that
+    are all zero hold nothing (`model::Sparse`, which `edge_label()` and
+    `edge_flags()` now return); the key index is a table of node indexes
+    over the result's own keys; `GraphResult::reserve` no longer doubles
+    what it was asked to grow by a sixty-fourth; a paced view waits for the
+    GPU to take each run of edges, so WebGL2's staging is freed as it goes;
+    and `resultBytes()` writes the result into a `Uint8Array` a section at
+    a time (`GraphResult::encoded`).
+  - **The layout worker.** A layout reads a graph's undirected adjacency
+    and nothing else, so that is all that is built
+    (`UndirectedCsr::from_edges`, the same adjacency as
+    `Topology::undirected` without the topology), and `Graph::topology` is
+    `Graph::adjacency`. `Fa2Multilevel::new_lean`, which `LiveLayout` uses,
+    holds the weights of a coarse level that grouping does not thin only
+    while that level is laid out, and every level is released once the
+    layout is past it: same positions at every step, for one more
+    contraction for each such level between it and the graph (six at 1M
+    edges on R-MAT, none for a graph whose levels shrink).
+  - **An adjacency can travel with a result.** UGR has optional
+    `edges.adjacency.offsets` and `.targets` sections
+    (`GraphResult::to_bytes_with_adjacency`, `ugr::read_adjacency`,
+    `ui/ugr.js`'s `edges.adjacency`), which `Layout.fromAdjacency` and
+    `LiveLayout`'s `_on` constructors use as they are, checked in one pass
+    (`UndirectedCsr::from_parts`) and with nothing sorted; the page hands
+    one to its worker when a result has it. The engine does not write them
+    yet: `.graph` numbers a drawing's nodes as it reads them, not as the
+    graph's index does, so it has no adjacency in the drawing's numbering
+    to give.
+  - **Positions.** `Layout.positions()` and `GraphView.positions()` return
+    a `Float32Array` filled straight from the layout's or the view's
+    memory, and `setPositions` takes one and copies it once, into the
+    positions the view keeps and uploads.
+  - **The edge order of #495, within the same memory.** `Layout.edgeOrder`
+    reads `src` and `dst` from the caller's `Uint32Array`s a run at a time,
+    keeps the sort keys in a `BigUint64Array` outside its WebAssembly
+    memory and sorts them there (`Fa2Multilevel::edge_order_keys` over an
+    `OrderKeys`), so the worker's memory does not grow by the order (it
+    grew by 11 MiB). On a lean hierarchy the weights it ranks by are
+    counted again from the adjacency, two bytes an entry, and the order is
+    the same; `edge_order` takes the input adjacency for that, and after
+    the layout has come down a level gives the order by degree.
+    `GraphView.setEdgeOrder` takes the `Uint32Array` and reads it a run at
+    a time (`order::EdgeOrder`), and `orderEdges` writes 65,536 edges a
+    call and waits for the GPU to take them, so the view does not hold the
+    order or its staging (6 MiB). Ordering a million edges takes the worker
+    510 to 620 ms where it took 285 to 325.
+  - **Measured.** `graphTimings().memory` gives `{edges, view, layout}`,
+    each instance's bytes and bytes an edge, and `tests/graph-timing.ts`
+    fails over 20 MiB for the view or 60 MB for the worker on rmat.
+    `ursa-viz/tests/memory_scale.rs` counts every allocation of a view and
+    a layout at a million edges, in CI.
 - **Scenes that change in place in the graph view** (#441): a view made
   from a graph result applies a delta in time proportional to the delta, not
   to the graph. `createViewFromResult(canvas, bytes)` takes a result as UGR
