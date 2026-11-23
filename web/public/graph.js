@@ -36,6 +36,10 @@
 // show() hands the worker the graph before it builds the view, so the
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
+// A large graph's first drawing is the coarsest level of its layout's
+// hierarchy, a few dozen discs, and then each level the layout comes to
+// (#497, graph-levels.js): the graph's own nodes and edges are first drawn
+// when the layout reaches them.
 //
 // The graph comes from the engine as one UGR buffer (ursa-viz/UGR.md), a
 // graph result: ugr.js (ursa-viz/ui/ugr.js, copied in by the build) reads it
@@ -53,6 +57,7 @@
 
 import { drawingOf } from "./graph-data.js";
 import { createInspector } from "./graph-inspector.js";
+import { createLevels } from "./graph-levels.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
@@ -353,6 +358,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     iterations: 0,
     level: null,
     levels: null,
+    // The levels of the layout's hierarchy as they arrive (#497), and how
+    // many nodes the one drawn in place of the graph has (null: the graph
+    // is drawn).
+    hierarchy: createLevels({ animate: !matchMedia("(prefers-reduced-motion: reduce)").matches }),
+    groups: null,
     // Nothing is drawn before the layout's first positions.
     positioned: false,
     layoutDone: false,
@@ -450,7 +460,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     } else if (state.growing) {
       text = `${counts}${drawn} · Placing the new nodes`;
     } else if (state.levels !== null) {
-      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
+      // A coarse level drawn in place of the graph says how many nodes it has.
+      const groups = state.groups === null ? "" : ` · ${plural(state.groups, "group")}`;
+      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}${groups}`;
     } else {
       text = `Loading graph view… ${counts}`;
     }
@@ -474,7 +486,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const draw = (frameTime) => {
     state.frame = 0;
     if (current !== state || state.paused || !state.positioned) return;
-    if (state.pending) {
+    // The level drawn, its nodes on their way out from their parents or in
+    // place (#497); or the graph's own, on their way out from level 1.
+    const split = state.hierarchy.frame(performance.now());
+    if (split && split.level > 0) {
+      if (state.groups !== null) view.setLevelPositions(split.xy);
+    } else if (split && split.xy.length === 2 * view.nodeCount) {
+      view.setPositions(split.xy);
+      state.pending = null;
+    } else if (state.pending) {
       view.setPositions(state.pending);
       state.pending = null;
     }
@@ -490,6 +510,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.frames++;
       times.firstDraw ??= end;
       if (moving) budgeted(frameTime);
+      if (split?.moving) redraw(false);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
@@ -560,9 +581,36 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (data.type === "order") return orderEdges(data);
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
-    if (data.type === "positions") {
+    if (data.type === "level" || data.type === "levelPositions") {
+      // The layout at a level of its hierarchy (#497): drawn in place of
+      // the graph while it is a coarse one. Level 0 is the graph itself:
+      // its positions follow, and its nodes come out from level 1's.
+      times.firstPositions ??= performance.now();
+      if (data.type === "levelPositions") state.hierarchy.place(data.level, data.xy);
+      else {
+        state.hierarchy.add(data, performance.now());
+        if (data.level > 0) {
+          view.setLevel(data.level, data.levels, data.mass, data.src, data.dst, data.weight, data.totalEdges);
+          state.groups = data.n;
+        }
+      }
+      if (data.level === 0) return;
+      state.iterations = data.iterations;
+      state.level = data.level;
+      state.levels = data.levels;
+      state.positioned = true;
+      header();
+      redraw(false);
+    } else if (data.type === "positions") {
       if (data.xy.length !== 2 * view.nodeCount) return;
       times.firstPositions ??= performance.now();
+      // The graph itself, from here on.
+      if (state.groups !== null) {
+        view.clearLevel();
+        state.groups = null;
+        times.graphDrawn ??= performance.now();
+      }
+      state.hierarchy.place(0, data.xy);
       state.pending = data.xy;
       state.iterations = data.iterations;
       state.level = data.level;
@@ -1044,6 +1092,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // nothing changed, if the delta does not fit what is drawn.
   state.apply = (bytes, { kind = "step", command = kind, at: began = performance.now(), engine = null } = {}) => {
     const start = performance.now();
+    // A step while a coarse level is drawn (#497): the graph is drawn from
+    // here on, and the layout, grown, has a place for every node.
+    if (state.groups !== null) {
+      view.clearLevel();
+      state.groups = null;
+    }
+    state.hierarchy.forget();
     // The layout's newest positions are the ones the step starts from.
     if (state.pending) {
       view.setPositions(state.pending);
@@ -1392,6 +1447,12 @@ export function info() {
     // (GraphView.frameInfo), whether the last frame left anything out, and
     // the ms the layout worker took to order the edges (null until it has).
     frame: { ...current.view.frameInfo(), partial: current.view.framePartial, orderMs: current.orderMs },
+    // The level of the layout's hierarchy drawn in place of the graph
+    // (#497): {level, levels, nodes, nodesDrawn, edges, edgesDrawn,
+    // totalEdges} (GraphView.levelInfo), or null when the graph is drawn;
+    // and the levels that have arrived, coarsest first: [level, nodes].
+    coarse: current.view.levelInfo() ?? null,
+    hierarchy: current.hierarchy.levels.filter(Boolean).map((l) => [l.level, l.n]).reverse(),
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
@@ -1498,6 +1559,9 @@ export async function memory({ timeoutMs = 10_000 } = {}) {
  * where the node will be.
  */
 function atNewest(state) {
+  // Nodes on their way out from their parents (#497): in place.
+  const split = state.hierarchy.settle();
+  if (split?.level === 0 && split.xy.length === 2 * state.view.nodeCount) state.pending = split.xy;
   if (!state.pending) return;
   state.view.setPositions(state.pending);
   state.pending = null;
