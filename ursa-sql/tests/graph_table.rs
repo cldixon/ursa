@@ -325,8 +325,9 @@ async fn patterns_that_cannot_be_matched_are_refused() {
             "has no upper bound, so its walks are endless",
         ),
         (
-            "SELECT * FROM GRAPH_TABLE (social MATCH (a:person))",
-            "a GRAPH_TABLE needs COLUMNS (…)",
+            "SELECT * FROM GRAPH_TABLE (social MATCH (:person))",
+            "a GRAPH_TABLE without COLUMNS returns the properties of the pattern's named nodes \
+             and edges, and it names none",
         ),
         (
             "SELECT * FROM GRAPH_TABLE (nope MATCH (a) COLUMNS (a.id))",

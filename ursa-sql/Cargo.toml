@@ -26,3 +26,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3"
 # The graph view's model, to read what graph::view returns (tests/graph_rules.rs).
 ursa-viz = { path = "../ursa-viz", version = "0.12.0-dev", default-features = false }
+# `statement error <regex>` in the conformance suite (tests/conformance.rs; already
+# in the tree via ursa-io).
+regex = "1"

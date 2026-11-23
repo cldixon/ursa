@@ -147,6 +147,19 @@ impl RelationPlanner for GraphFunctions {
         relation: TableFactor,
         context: &mut dyn RelationPlannerContext,
     ) -> Result<RelationPlanning> {
+        // `LATERAL GRAPH_TABLE (…)` (#414).
+        if let TableFactor::Function { name, .. } = &relation {
+            if let [part] = name.0.as_slice() {
+                if part.as_ident().is_some_and(|i| {
+                    context.normalize_ident(i.clone()) == super::pattern::FUNCTION
+                }) {
+                    return Err(plan(
+                        "in GRAPH_TABLE: a GRAPH_TABLE cannot refer to tables outside it yet, so LATERAL is not supported; join on its output columns instead"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         let TableFactor::Table {
             name,
             args: Some(args),
@@ -1519,6 +1532,7 @@ impl GraphFunctions {
             .collect();
         let mut used: HashMap<String, PathColumns> = HashMap::new();
         for condition in &mut conditions {
+            super::predicates::rewrite(condition, &lowered, graph, context)?;
             path_functions(condition, &paths, &mut used, context)?;
         }
         for item in &mut columns {
@@ -1529,6 +1543,7 @@ impl GraphFunctions {
                 if super::path_search::FUNCTIONS
                     .iter()
                     .any(|(f, _)| *f == function)
+                    || matches!(function.as_str(), "same" | "all_different")
                 {
                     *item = ast::SelectItem::ExprWithAlias {
                         expr: expr.clone(),
@@ -1536,6 +1551,7 @@ impl GraphFunctions {
                     };
                 }
             }
+            super::predicates::rewrite(item, &lowered, graph, context)?;
             path_functions(item, &paths, &mut used, context)?;
         }
 
@@ -1830,6 +1846,9 @@ impl GraphFunctions {
                             .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
                             .collect();
                         if columns.is_empty() {
+                            if let Some(refusal) = several_edges(pattern, &var) {
+                                return Err(refusal);
+                            }
                             return Err(plan(format!(
                                 "in GRAPH_TABLE: COLUMNS ({var}.*) names no variable '{var}'"
                             )));
@@ -1842,6 +1861,19 @@ impl GraphFunctions {
                     )))
                     }
                 }
+            }
+            // An aggregate would aggregate over the match's rows (#414).
+            let aggregate = |e: &Expr| {
+                datafusion::common::tree_node::TreeNode::exists(e, |e| {
+                    Ok(matches!(e, Expr::AggregateFunction(_)))
+                })
+                .unwrap_or(false)
+            };
+            if projection.iter().any(aggregate) {
+                return Err(plan(
+                    "in GRAPH_TABLE: aggregates in COLUMNS need a quantified edge variable, which is not supported yet; aggregate outside: SELECT count(*) FROM GRAPH_TABLE (…)"
+                        .to_string(),
+                ));
             }
             // Each column says what it is (`provenance`): a variable's key,
             // a property, a path's nodes. A computed column says nothing.
@@ -2502,6 +2534,34 @@ fn plan_reads_only_files(plan: &LogicalPlan) -> bool {
 /// `e`, said in the pattern's terms when it is a property a variable does
 /// not have: "node 'a' has no property 's'; its properties are …", rather
 /// than DataFusion's, which names Ursa's internal relations (#325).
+/// The refusal of reading edge `var`'s properties when it stands for several
+/// edges: it is quantified, or the edge of a path searched as a whole (#413).
+fn several_edges(pattern: &super::pattern::Pattern, var: &str) -> Option<DataFusionError> {
+    use super::pattern::{Element, Mode, Selector};
+    for path in &pattern.paths {
+        let whole = path.var.is_some() || path.selector != Selector::All || path.mode != Mode::Walk;
+        for element in &path.elements {
+            let Element::Edge(spec, _, quantifier) = element else {
+                continue;
+            };
+            if spec.var.as_deref() != Some(var) {
+                continue;
+            }
+            if quantifier.is_some() {
+                return Some(plan(format!(
+                    "in GRAPH_TABLE: edge '{var}' is quantified, so it stands for several edges; use edges(p), or an aggregate once group variables are supported"
+                )));
+            }
+            if whole {
+                return Some(plan(format!(
+                    "in GRAPH_TABLE: edge '{var}' is the edge of a searched path (one with a path variable, a selector or a path mode), so its properties are not read yet; use edges(p)"
+                )));
+            }
+        }
+    }
+    None
+}
+
 fn explain_field_error(
     e: DataFusionError,
     pattern: &super::pattern::Pattern,
@@ -2515,6 +2575,23 @@ fn explain_field_error(
             DataFusionError::Collection(errors) => errors.iter().find_map(schema_error),
             _ => None,
         }
+    }
+    fn plan_message(e: &DataFusionError) -> Option<&str> {
+        match e {
+            DataFusionError::Plan(message) => Some(message),
+            DataFusionError::Diagnostic(_, e) | DataFusionError::Context(_, e) => plan_message(e),
+            _ => None,
+        }
+    }
+    // A subquery's table that the statement does not name (#414, B4).
+    if let Some(table) = plan_message(&e)
+        .and_then(|m| m.strip_prefix("table '"))
+        .and_then(|m| m.strip_suffix("' not found"))
+    {
+        let table = table.rsplit('.').next().unwrap_or(table);
+        return plan(format!(
+            "in GRAPH_TABLE: a subquery inside the pattern reads table '{table}', which the statement does not name outside the GRAPH_TABLE; for now such a subquery sees only the tables the statement names: join the GRAPH_TABLE's columns to '{table}' instead, or name it in the statement too"
+        ));
     }
     let Some(SchemaError::FieldNotFound { field, .. }) = schema_error(&e) else {
         return e;
@@ -2547,11 +2624,15 @@ fn explain_field_error(
     let kind = if nodes.contains(&var) {
         "node"
     } else if edges.contains(&var) {
+        if let Some(refusal) = several_edges(pattern, &var) {
+            return refusal;
+        }
         "edge"
     } else {
         let vars: Vec<&String> = nodes.iter().chain(&edges).collect();
         return plan(format!(
-            "in GRAPH_TABLE: '{var}' is not a variable of the pattern; its variables are {}",
+            "in GRAPH_TABLE: '{var}' is not a variable of the pattern; its variables are {}. \
+             A GRAPH_TABLE cannot refer to tables outside it yet; join on its output columns instead",
             vars.iter()
                 .map(|v| v.as_str())
                 .collect::<Vec<_>>()
