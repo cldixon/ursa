@@ -826,9 +826,10 @@ fn effect(ctx: &SessionContext, statement: &UrsaStatement) -> Result<Effect> {
                 normalizes(ctx),
             )?)],
         },
-        UrsaStatement::DescribeGraph(_) | UrsaStatement::ShowGraphs | UrsaStatement::Attach(_) => {
-            Effect::None
-        }
+        UrsaStatement::DescribeGraph(_)
+        | UrsaStatement::SummarizeGraph(_)
+        | UrsaStatement::ShowGraphs
+        | UrsaStatement::Attach(_) => Effect::None,
         UrsaStatement::DataFusion(statement) => match statement.as_ref() {
             DFStatement::CreateExternalTable(t) if t.temporary => Effect::Session,
             DFStatement::CreateExternalTable(t) => Effect::Define {

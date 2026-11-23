@@ -59,22 +59,25 @@ Each match binds `a` to a node, `e` to an edge between it and `b`, and `b` to th
 ```text
 GRAPH_TABLE ( graph
   MATCH path [, path …]
+  [KEEP selector]
   [WHERE condition]
-  COLUMNS ( expression [AS name], … ) )
+  [ONE ROW PER MATCH]
+  [COLUMNS ( expression [AS name], … ) | COLUMNS (*)] )
 
 path := node (edge node)*
 node := ( [variable] [:label | IS label] [WHERE condition] )
-edge := -[ … ]->   from left to right
-      | <-[ … ]-   from right to left
-      | -[ … ]-    either way
-      | ->  |  <-  |  -     the same, with no variable
+edge := -[ … ]->               from left to right
+      | <-[ … ]-               from right to left
+      | -[ … ]-  |  <-[ … ]->  either way
+      | ->  |  <-  |  -  |  <->     the same, with no variable
 ```
 
 - **Variables** name what a node or edge binds to, so conditions and `COLUMNS` can refer to it. A variable used twice is the same node: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)` finds triangles.
 - **Labels** say which table a variable reads: `(p:person)` or `(p IS person)`. A table's labels are its name and the labels its definition gives. Without a label, a variable reads the only table it can: the one its edges `REFERENCES`, or the graph's only vertex or edge table. When that cannot be told, the query is refused and asks for a label. A label that contradicts the edge is refused too: an edge matches only between the vertex tables its edge table `REFERENCES`, so `(a:person)-[:knows]->(s:school)` is an error when `knows` goes from `person` to `person`. The standard gives such a pattern no rows; Ursa reports it, as DuckPGQ does, because it is almost always a mistake.
 - **Conditions** go inside a node or edge (`(a WHERE a.age > 30)`), or after the pattern, where they can use every variable.
 - **Properties.** A variable's properties are its table's columns, or what its labels' `PROPERTIES` clauses give, under their property names.
-- **Either way.** `-[e]-` matches each edge in both directions, so each friendship of two members is two matches; an edge from a node to itself matches once.
+- **Either way.** `-[e]-` matches each edge in both directions, so each friendship of two members is two matches; an edge from a node to itself matches once. `<-[e]->` is the standard's "left or right", and means the same, since every edge of an Ursa graph is directed. The standard's undirected edges (`~[e]~`) are refused for that reason.
+- **COLUMNS.** Left out, or written `COLUMNS (*)`, it returns every property of each named node and edge, in the order they first appear, as `COLUMNS (a.*, e.*, b.*)` would; a repeated name gets a suffix (`id`, `id:1`). This is DuckPGQ's form.
 
 Two steps out from member 0, with each friend of a friend once:
 
@@ -101,6 +104,61 @@ LIMIT 5;
 │                5 │
 └──────────────────┘
 ```
+
+## Graph predicates
+
+SQL/PGQ's predicates on elements work in conditions and in `COLUMNS`:
+
+| predicate | is true when |
+|---|---|
+| `SAME(a, b, …)` | the nodes are one node |
+| `ALL_DIFFERENT(a, b, …)` | no two of the nodes are one node |
+| `x IS [NOT] LABELED l` | `x`'s table has the label `l` |
+| `a IS [NOT] SOURCE OF e` | edge `e` starts at node `a` |
+| `a IS [NOT] DESTINATION OF e` | edge `e` ends at node `a` |
+
+`element_id(a)` is a node's key. Triangles, each of its three members different:
+
+```sql
+SELECT count(*) AS triangles
+FROM GRAPH_TABLE (karate
+  MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)
+  WHERE all_different(a, b, c)
+  COLUMNS (a.id)
+);
+```
+
+```text
+┌───────────┐
+│ triangles │
+│   Int64   │
+├───────────┤
+│        45 │
+└───────────┘
+```
+
+Member 16's friends, and which way each tie is stored:
+
+```sql
+SELECT *
+FROM GRAPH_TABLE (karate
+  MATCH (a WHERE a.id = 16)-[e]-(b)
+  COLUMNS (element_id(b) AS friend, a IS SOURCE OF e AS from_16)
+)
+ORDER BY friend;
+```
+
+```text
+┌────────┬─────────┐
+│ friend │ from_16 │
+│ Int64  │ Boolean │
+├────────┼─────────┤
+│      5 │ false   │
+│      6 │ false   │
+└────────┴─────────┘
+```
+
+`SAME` and `ALL_DIFFERENT` compare nodes for now. `element_id(e)` of an edge is its row in the edge table, the number `edges(p)` lists, so the edge must be the one edge of a path with a variable: `MATCH p = (a)-[e]->(b) COLUMNS (element_id(e))`.
 
 ## With graph algorithms
 
@@ -182,6 +240,8 @@ A selector, after `p =`, says which of a pair of nodes' paths to keep:
 | `ANY SHORTEST`, or `ANY` | one shortest path |
 | `SHORTEST k`, or `ANY k` | the `k` shortest paths |
 | `ALL SHORTEST` | every path as short as the shortest |
+
+`KEEP` after a pattern of one path says the same: `MATCH p = (a)-[e]-*(b) KEEP ANY SHORTEST` is `MATCH p = ANY SHORTEST (a)-[e]-*(b)`, and `KEEP TRAIL` is a path mode, as below. `ONE ROW PER MATCH`, what a `GRAPH_TABLE` returns anyway, is accepted.
 
 When several paths are as short, they are ordered by their edges' rows in the edge table: the path whose first edge comes first, then its second, and so on. `ANY SHORTEST` keeps the first, so the same query always picks the same path.
 
@@ -289,12 +349,16 @@ Either way, the rows are the same.
 
 These are refused with a message:
 
-- a path variable, selector or path mode on a path of more than one edge;
-- a condition inside a quantified edge, or an edge variable of one in `COLUMNS` (use `edges(p)`);
+- a path variable, selector or path mode on a path of more than one edge, and `KEEP` on a pattern of several paths;
+- a condition inside a quantified edge, an edge variable of one in `COLUMNS` (use `edges(p)`), and aggregates in `COLUMNS` (aggregate outside: `SELECT count(*) FROM GRAPH_TABLE (…)`);
 - a quantified edge between two vertex tables;
 - label expressions (`:a|b`) and parenthesized path patterns (`((a)-[e]->(b))*`);
-- `KEEP` and `ONE ROW PER`: write the selector or path mode before the path, and every match is one row.
+- `ONE ROW PER VERTEX` and `ONE ROW PER STEP`: return `vertices(p)` or `edges(p)` and `unnest` them;
+- a pattern that refers to a table outside the `GRAPH_TABLE`, with `LATERAL` or by a column of another table in the `FROM`: join on the `GRAPH_TABLE`'s columns instead;
+- `SAME` and `ALL_DIFFERENT` on edges.
+
+Cypher's forms inside a pattern are refused with the SQL/PGQ to write: a property map, `(a:person {name: 'Ann'})`, is `(a:person WHERE a.name = 'Ann')`, and a range, `-[e*1..3]->`, is `-[e]->{1,3}`.
 
 Text left over after a `WHERE` condition or a `COLUMNS` item is a syntax error that names it and its position, so a missing `AND` or comma is reported: `WHERE a.id = 0 b.id = 3` does not run as `WHERE a.id = 0`.
 
-`COLUMNS` is required. `GRAPH TABLE`, in two words, works too.
+`GRAPH TABLE`, in two words, works too.

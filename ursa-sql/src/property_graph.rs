@@ -8,8 +8,8 @@
 //!
 //! vertex_table := table [AS name] [KEY (column)] [labels]
 //! edge_table   := table [AS name] [KEY (column)]
-//!                 SOURCE KEY (column) [REFERENCES vertex (column)]
-//!                 DESTINATION KEY (column) [REFERENCES vertex (column)]
+//!                 SOURCE KEY (column) [REFERENCES vertex [(column)]]
+//!                 DESTINATION KEY (column) [REFERENCES vertex [(column)]]
 //!                 [labels]
 //! labels       := properties                       -- the default label
 //!               | DEFAULT LABEL [properties]
@@ -59,18 +59,21 @@ pub struct EdgeTableDef {
     pub labels: Vec<LabelDef>,
 }
 
-/// `KEY (key) [REFERENCES table (column)]`, after `SOURCE` or `DESTINATION`.
+/// `KEY (key) [REFERENCES table [(column)]]`, after `SOURCE` or `DESTINATION`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointDef {
     pub key: Ident,
     pub references: Option<References>,
 }
 
-/// `REFERENCES vertex (column)`: a vertex table's element name or table name.
+/// `REFERENCES vertex [(column)]`: a vertex table's element name or table
+/// name, and its key. The column may be left out when the vertex table's key
+/// is known (its `KEY`, its primary key, or another `REFERENCES`), as the
+/// standard allows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct References {
     pub table: ObjectName,
-    pub column: Ident,
+    pub column: Option<Ident>,
 }
 
 /// One label of an element table and its properties. `name: None` is the
@@ -179,7 +182,10 @@ impl fmt::Display for EndpointDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "KEY ({})", self.key)?;
         if let Some(r) = &self.references {
-            write!(f, " REFERENCES {} ({})", r.table, r.column)?;
+            write!(f, " REFERENCES {}", r.table)?;
+            if let Some(column) = &r.column {
+                write!(f, " ({column})")?;
+            }
         }
         Ok(())
     }
@@ -313,7 +319,10 @@ fn parse_endpoint(p: &mut Parser, side: &str) -> Result<EndpointDef> {
     let key = parse_key(p)?;
     let references = if consume_words(p, &["REFERENCES"]) {
         let table = p.parse_object_name(false)?;
-        let column = parse_key(p)?;
+        let column = match p.peek_token_ref().token {
+            Token::LParen => Some(parse_key(p)?),
+            _ => None,
+        };
         Some(References { table, column })
     } else {
         None
@@ -497,7 +506,7 @@ mod tests {
             key: Ident::new(key),
             references: references.map(|(table, column)| References {
                 table: name(&[table]),
-                column: Ident::new(column),
+                column: Some(Ident::new(column)),
             }),
         }
     }

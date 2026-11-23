@@ -37,7 +37,7 @@ ursa --skill                                            # this guide, for the ve
 - A `-f` file or stdin may hold the shell's dot-commands, one a line, as in DuckDB: `.mode json`, `.timer on`, `.read other.sql`, `.functions pagerank` (one function's parameters, one a line), `.schema` (the statements that define the database's views and graphs), `.once FILE` (the next result to a file). `.mode markdown` writes a Markdown table, for a person to read or paste; `.mode line` one `column = value` a line. A syntax error anywhere in a file runs none of it; otherwise the first error stops the run.
 - A statement that returns rows prints a header even with no rows. DDL (`CREATE`, `DROP`) and `SET` print nothing.
 - SIGINT (Ctrl-C) cancels a run: `ursa` prints `Error: interrupted` to stderr, writes nothing more to stdout, and exits with status 130.
-- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead.
+- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead. Common DuckDB habits work: `COPY ... TO 'f' (FORMAT parquet, HEADER, DELIMITER '|')`, `SET threads = 4`, `ORDER BY ALL`, `DROP GRAPH g`, and the functions `list_value`, `strftime`, `epoch_ms`, `arg_max` and `arg_min`. Graph functions are table functions: `SELECT * FROM pagerank(g)`, never `SELECT pagerank(g)`.
 - With no `-c`, `--file` or stdin, `ursa` starts an interactive shell and waits for input. Don't start it from an agent.
 
 ## Define a graph from files
@@ -276,15 +276,16 @@ ORDER BY b.club;
 └─────────┴───────┘
 ```
 
-- Nodes are `(var:label WHERE …)`, edges `-[var:label WHERE …]->`, `<-[…]-`, or `-[…]-` (either way; each mutual tie is two matches). `->`, `<-`, `-` with no variable.
-- `COLUMNS (…)` is required. Properties are the element table's columns (or its `PROPERTIES`).
+- Nodes are `(var:label WHERE …)`, edges `-[var:label WHERE …]->`, `<-[…]-`, or `-[…]-` (either way, as is `<-[…]->`; each mutual tie is two matches). `->`, `<-`, `-`, `<->` with no variable. No `~` edges: every edge is directed.
+- `COLUMNS (…)` lists what to return. Left out, or `COLUMNS (*)`, it is every property of each named node and edge (`a.*, e.*, b.*`). Properties are the element table's columns (or its `PROPERTIES`).
+- Predicates: `SAME(a, b)`, `ALL_DIFFERENT(a, b, c)`, `x IS [NOT] LABELED l`, `a IS [NOT] SOURCE OF e`, `a IS [NOT] DESTINATION OF e`. `element_id(a)` is a node's key.
 - Several paths share variables: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)`.
 - Labels pick the table in a graph of several tables; without one, a variable takes the table its edges `REFERENCES`. Ambiguous patterns are refused with a request for a label.
-- Quantifiers go after the edge: `-[e]->{1,3}`, `->*`, `-[e]-+`, `?`, `{2,}`. Name the path and pick paths per pair of end nodes: `MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b)` (also `ALL SHORTEST`, `SHORTEST k`; modes `TRAIL`, `SIMPLE`, `ACYCLIC`). In `COLUMNS`: `path_length(p)`, `vertices(p)` (node keys), `edges(p)` (edge rows from 0), `element_id(p)`.
+- Quantifiers go after the edge: `-[e]->{1,3}`, `->*`, `-[e]-+`, `?`, `{2,}`. Name the path and pick paths per pair of end nodes: `MATCH p = ANY SHORTEST (a WHERE a.id = 16)-[e]-*(b)` (also `ALL SHORTEST`, `SHORTEST k`; modes `TRAIL`, `SIMPLE`, `ACYCLIC`; or after a one-path pattern, `KEEP ANY SHORTEST`). In `COLUMNS`: `path_length(p)`, `vertices(p)` (node keys), `edges(p)` (edge rows from 0), `element_id(p)`.
 - Ties between equally short paths go to the path whose edges come first in the edge table. Without a selector, an unbounded quantifier needs `TRAIL`, `SIMPLE` or `ACYCLIC`.
 - For speed on a large graph, bind a node by its key: `(a WHERE a.id = 7)`, `a.id IN (1, 2)` or `a.id IN (SELECT …)`. Its path's edges are then followed on the graph index (as `hop` does) instead of joined to the whole edge table, and a search to a bound last node (`(b WHERE b.id = 9)`) stops there, as `shortest_path` does. Read only the keys of nodes you do not need properties of; reading an edge's columns (`e.since`) makes that edge a join. `EXPLAIN` shows `PathSearchExec` for each edge followed on the index.
 - Put conditions on the first node of a quantified edge: the search starts from the nodes they keep.
-- Not yet: a path variable, selector or mode on a path of several edges; conditions inside a quantified edge; `:a|b`.
+- Not yet: a path variable, selector or mode on a path of several edges; conditions inside a quantified edge; aggregates in `COLUMNS` (aggregate outside the `GRAPH_TABLE`); `ONE ROW PER VERTEX`/`STEP`; `:a|b`; a pattern that reads a table outside it (join on its columns instead). Cypher's `{name: 'x'}` and `*1..3` are not SQL/PGQ: write `WHERE a.name = 'x'` and `-[e]->{1,3}`.
 
 ## The .ursa database file
 

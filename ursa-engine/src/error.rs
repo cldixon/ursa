@@ -57,6 +57,23 @@ pub mod matched {
     /// has lost its leading `/` (`Users/me/x.csv`): [`super::user_message`]
     /// puts it back (#327, N14).
     pub const CSV_FILE_CONTEXT: &str = "Error when processing CSV file ";
+
+    /// The start of DataFusion's error for a call of a scalar or aggregate
+    /// function it does not have (`Invalid function 'pagerank'.`), followed
+    /// by the name. `ursa-sql` says a graph function is a table function.
+    pub const INVALID_FUNCTION: &str = "Invalid function '";
+
+    /// The start and end of DataFusion's error for a table it cannot find
+    /// (`table 'datafusion.edges.csv' not found`). `ursa-sql` says to quote
+    /// an unquoted file name.
+    pub const TABLE_NOT_FOUND_START: &str = "table '";
+    /// See [`TABLE_NOT_FOUND_START`].
+    pub const TABLE_NOT_FOUND_END: &str = "' not found";
+
+    /// In DataFusion's error for `SET` of a name with no namespace it knows
+    /// (`could not find config namespace for key "threads"`). `ursa-sql`
+    /// names the prefixes Ursa's settings have.
+    pub const UNKNOWN_SETTING: &str = "could not find config namespace for key";
 }
 
 /// `location`, an object store location, as the local path the user wrote
@@ -302,6 +319,32 @@ mod tests {
                  matched::TOKENIZER_EOF: {sql}: {message}"
             );
         }
+    }
+
+    /// #417: the messages `ursa-sql` adds a DuckDB hint to.
+    #[tokio::test]
+    async fn datafusion_still_says_invalid_function_table_not_found_and_no_namespace() {
+        let ctx = SessionContext::new();
+        let message = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move { user_message(&ctx.sql(sql).await.unwrap_err()) }
+        };
+        let m = message("SELECT pagerank(1)").await;
+        assert!(
+            m.starts_with(&format!("{}pagerank'", matched::INVALID_FUNCTION)),
+            "update matched::INVALID_FUNCTION: {m}"
+        );
+        let m = message("SELECT * FROM edges.csv").await;
+        assert!(
+            m.starts_with(matched::TABLE_NOT_FOUND_START)
+                && m.ends_with(matched::TABLE_NOT_FOUND_END),
+            "update matched::TABLE_NOT_FOUND_*: {m}"
+        );
+        let m = message("SET threads = 2").await;
+        assert!(
+            m.contains(matched::UNKNOWN_SETTING),
+            "update matched::UNKNOWN_SETTING: {m}"
+        );
     }
 
     /// N14: a CSV file DataFusion cannot read is named by its path, with its

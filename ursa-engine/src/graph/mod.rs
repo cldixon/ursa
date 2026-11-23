@@ -67,6 +67,7 @@ mod kernels;
 mod node;
 pub mod path_search;
 pub mod pattern;
+mod predicates;
 pub mod provenance;
 mod relation;
 mod schema_metadata;
