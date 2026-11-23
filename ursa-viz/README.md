@@ -171,14 +171,16 @@ when it rests (#495, the design's §5).
   One late frame is a hiccup and changes nothing. Under a steady load the
   budget moves by 4%.
 - **At rest** (200 ms after the last movement; `frameRestMs`) a frame draws
-  everything, as `render()` always does. The page draws that frame when
-  `framePartial` says the last one left something out; a layout that is
-  still running counts as movement (`keepMoving()`).
+  everything: at once, as `render()` always does, if that fits in a frame,
+  and else in slices ([below](#refinement-at-rest)). The page draws that
+  frame when `framePartial` says the last one left something out; a layout
+  that is still running counts as movement (`keepMoving()`).
 - `frameInfo()` (and `info().frame`) says what the budget is doing:
-  `{k, nodes, edges, ordered, p95, frames, limit}`: the edges and nodes the
-  last moving frame drew, the edges there are, how many are in importance
-  order, the p95 of the last 120 moving frames' costs, how many were
-  measured, and the cost a frame is held to.
+  `{k, nodes, edges, ordered, p95, frames, limit, refining, refined,
+  refinement}`: the edges and nodes the last moving frame drew, the edges
+  there are, how many are in importance order, the p95 of the last 120
+  moving frames' costs, how many were measured, the cost a frame is held
+  to, and the refinement at rest.
 
 The view keeps no table of where each edge went (it would be four bytes an
 edge for as long as the view lives), only how many are ordered. So a delta
@@ -205,6 +207,93 @@ scripted wheel zoom are 26 to 31 ms apart at the 95th percentile over three
 runs, where they were 3.3 s; they draw 512 to 1,081 edges and 170 to 360
 nodes, which is all this renderer shows in a frame. Ordering the million edges takes the layout
 worker 0.3 s. It has not been measured on a GPU.
+
+## Refinement at rest
+
+Everything, at rest, is seconds of a software renderer's time, and more
+than a frame of an integrated GPU's. Drawn at once it holds up whatever
+comes next: a zoom begun under it waits for it. So where everything does
+not fit in a frame (the budget says: it is what a moving frame leaves
+something out of), the frame at rest is drawn in slices into a texture,
+and the texture is kept (#496, the design's §5; `refine.rs`).
+
+- **The slices.** `renderFrame` at rest leaves the canvas as it is (the
+  last moving frame) and sets `refining`. The page then calls
+  `refine(performance.now())` a task at a time. Each call sends the GPU a
+  run of the edge buffer, and after the edges a run of the node pass, drawn
+  into a texture the size of the canvas over what the runs before left
+  there; the first clears it. A slice is sized to take the GPU 16 ms: the
+  first is what a moving frame draws, and each is at most twice the last,
+  or a quarter of it, by what the last took (`SlicePace`). The GPU says
+  when it has finished one (`queue.onSubmittedWorkDone`: a fence under
+  WebGL2), and is kept one slice ahead so that it is never idle; `refine`
+  sends no more than that, so nothing queues behind seconds of drawing.
+  When it returns `false` the page draws a frame.
+- **The frame.** That frame, and every frame at rest after it, is the
+  texture, copied texel for texel, and over it the highlighted edges and
+  the nodes in front: `framePartial` is false again. A hover or a click on
+  a million edges is a frame of next to nothing (in the shell with no GPU,
+  0.1 s from the click to its frame, where it was 2.5 to 4 s).
+- **Any movement stops the slices**: a pan, a zoom, a resize, new
+  positions. It waits for the slices the GPU has (two at most), not for
+  the rest. A change that only a frame can show (a hover's ring) while
+  they are drawn stops them too: a frame of what fits shows it, and they
+  begin again.
+- **While the view moves**, the texture is drawn under the moving frame's
+  own edges and nodes, moved and scaled as the camera has been since it
+  was drawn: the whole picture stays on screen through a pan, as a map's
+  tiles do, a little soft through a zoom, and what the texture does not
+  cover is the prefix alone. A texture whose slices were stopped is drawn
+  the same way, with what it has. At the next rest it is drawn again.
+- **One render target**, the size of the canvas (4 bytes a pixel), made
+  when a refinement first needs it, and destroyed when the view is freed
+  (which is what the page does when the pane closes or the context is
+  lost), when the canvas changes size, and when everything fits in a frame
+  again. It needs nothing WebGL2 lacks: a node slice is drawn from where
+  its buffers are bound, not from a first instance.
+
+**The same pixels.** The texture is what `render()` puts under its
+highlighted edges: the background, every edge, every node not in front, in
+the same order, with the same blending, in the canvas's format. A slice is
+a run of the same draw, and blending reads what is in the target whichever
+pass put it there, so the refined frame is the frame drawn at once **byte
+for byte: the tolerance is 0**, and `tests/browser/view.ts` holds it to
+that on WebGL2 (`snapshotRefined()` against `snapshot()`). Two cases are
+not byte for byte, both after the fact:
+
+- A node that comes to the front **after** the texture was drawn (hovered,
+  selected) is drawn in front as ever, over its copy in the texture. Where
+  the two discs are the same size the rim's pixels are blended twice: at
+  most a quarter of the way further from what is under the node to its
+  colour, on the rim of that node alone. Nodes under 3 px (every node of a
+  large graph, fitted) are drawn at 3 px in front and cover their copy
+  whole: no pixel differs. When the node leaves the front the frame is
+  exact again.
+- A node that was in front **when** the texture was drawn and no longer is
+  has no copy in it: it is drawn over the texture, after every other node
+  and not among them, so it differs where another node overlaps it.
+
+Any other change of flags (a highlight, which dims the rest; a hidden or a
+pinned node), a delta, new positions, a style, a theme or the edges'
+opacity draws the texture again; an edge order written under the slices,
+or the grid's being built, begins them again.
+
+`tests/browser/view.ts` (`ONLY=refine`) checks, on WebGL2: karate fits in
+a frame and is never refined; on R-MAT with 100K edges the frame at rest
+leaves the canvas alone, is drawn in 30 to 40 slices with no call of
+`refine` over 3 ms, and is then the frame drawn at once, 0 bytes apart,
+read back and on the canvas: fitted, zoomed in eight times (the nodes in
+view alone), in the dark theme, with a path highlighted, a node hidden,
+after a delta, and after an order written under the slices; a hover and a
+selection draw no slices; a pan stops them, and its frame over the texture
+inks as much as everything does. `ONLY="refine rmat 1M"` is the issue's
+size.
+
+Measured on R-MAT with 1M edges in headless Chromium's software WebGL2
+([`BENCH.md`](BENCH.md#refinement-at-rest)): no task of the page over
+50 ms while the slices are drawn, and everything drawn REFINE_RANGE after
+the view rests, which is what drawing it at once takes there and a tenth
+more. It has not been measured on a GPU.
 
 ## Making a view
 
@@ -785,6 +874,13 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
 
 ## Not yet
 
+- **Refinement that survives a hover.** A change of flags while the slices
+  are drawn begins them again (#496), so with no GPU, where they take
+  seconds, the full picture comes only once the pointer stops crossing
+  nodes. And there is one texture: a refinement begun after a pan draws
+  over the picture the pan was showing, so a frame needed before it ends
+  (that hover) has only what fits. A second target would keep the old
+  picture until the new one is whole, at 4 bytes a pixel more.
 - **A 1M-edge R-MAT graph fully converged in seconds.** Coarse to fine
   draws its shape in 7.5 s, and it looks as flat ForceAtlas2 does after
   500 iterations; but by edge length it is where flat is after about 170, as

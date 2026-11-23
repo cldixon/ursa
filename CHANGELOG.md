@@ -228,6 +228,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **The graph view at rest is drawn in slices, and kept: nothing waits for
+  a million edges** (#496). Where everything does not fit in a frame, the
+  frame at rest is no longer drawn at once (with no GPU, 2.5 to 6 s after
+  the layout, after every pan and zoom, and for every click and hover on
+  the view at rest, during which a zoom waited). It is drawn offscreen,
+  into one texture the size of the canvas: the edges a run of the buffer
+  at a time, then the nodes, each slice sized to take the GPU 16 ms and
+  sent when the GPU has finished the last but one. A pan or a zoom stops
+  the slices. The frame that follows them is the frame drawn at once, byte
+  for byte (read back on WebGL2: fitted, zoomed in, themed, highlighted,
+  after deltas); every frame at rest after it is that texture under the
+  highlighted edges and the nodes in front, so a hover or a click draws no
+  edge; and the frames of the next pan or zoom draw it under their own
+  edges and nodes, moved and scaled with the camera, so the full picture
+  stays on screen while it moves. The Graph pane's status line says
+  `refining…` while slices remain. `ursa-viz` gains `refine` (the slices'
+  pace, and what a change of flags asks of the texture);
+  `View::plan_frame`, `draw_planned`, `refine`, `refining`,
+  `snapshot_refined` and `set_refining`; `Renderer::draw_slice` and
+  `draw_over`; and in the wasm API `refine`, `refining`, `setRefining`,
+  `snapshotRefined` and `frameInfo().refining`, `refined` and
+  `refinement`. On `.graph rmat` (1M edges) in headless Chromium's
+  software WebGL2, everything is drawn REFINE_RANGE after the view rests
+  (what drawing it at once takes there, and a tenth more) with no task of
+  the page over 50 ms, and a click at rest is shown CLICK_RANGE after it
+  (2.5 to 4.1 s). Not measured on a GPU, where the target is 0.3 s
+  (`ursa-viz/BENCH.md`).
 - **A frame budget for the graph view: pan and zoom no longer wait for the
   graph's size** (#495). While the camera or the positions change, a frame
   draws a prefix of the edges and, where the nodes are too many as well,

@@ -12,7 +12,7 @@
 //! ([`crate::refine`]).
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -121,8 +121,12 @@ struct Held {
     edges: usize,
     nodes: usize,
     node_total: usize,
-    /// The slice the GPU has not finished.
-    pending: Option<Pending>,
+    /// The slices the GPU has not finished, oldest first: at most
+    /// [`SLICES_AHEAD`].
+    pending: VecDeque<Pending>,
+    /// When the GPU was last seen to finish a slice, or was sent one with
+    /// none before it: the slice it is on began then.
+    busy_since: f64,
     began_ms: f64,
     slices: u32,
     longest_ms: f64,
@@ -142,6 +146,12 @@ enum Progress {
     /// Everything is there.
     Done,
 }
+
+/// How many slices the GPU is sent ahead of the one it is on: one, so
+/// that it has the next when it finishes, and is not idle until the next
+/// call of [`View::refine`] finds it has. A pan or a zoom waits for those
+/// two at most.
+const SLICES_AHEAD: usize = 2;
 
 /// A slice sent to the GPU.
 struct Pending {
@@ -172,8 +182,9 @@ pub struct Refinement {
     pub ms: f64,
     /// How many slices it took.
     pub slices: u32,
-    /// The longest the GPU took over one, in milliseconds, as
-    /// [`View::refine`] saw it: to the call that found it done.
+    /// The longest the GPU took over the slices one call of
+    /// [`View::refine`] found done (one, or two), in milliseconds, as the
+    /// calls saw it.
     pub longest_slice_ms: f64,
     /// The edges and the nodes in its last full slices.
     pub slice_edges: usize,
@@ -1807,7 +1818,7 @@ impl View {
         if let Some(held) = self.detail.held.as_mut() {
             if held.progress == Progress::Refining {
                 held.progress = Progress::Stopped;
-                held.pending = None;
+                held.pending.clear();
             }
         }
     }
@@ -1908,68 +1919,90 @@ impl View {
             return false;
         };
         let _ = device.poll(wgpu::PollType::Poll);
-        if let Some(pending) = held.pending.take() {
-            let took = now_ms - pending.sent_ms;
-            if !pending.done.load(Ordering::Acquire) && took < SLICE_TIMEOUT_MS {
-                held.pending = Some(pending);
-                return true;
+        // The slices the GPU has finished since the last call: what they
+        // took, together, sizes the next.
+        let mut finished: Option<(Option<Kind>, usize, bool)> = None;
+        while let Some(pending) = held.pending.front() {
+            let timed_out = now_ms - pending.sent_ms >= SLICE_TIMEOUT_MS;
+            if !pending.done.load(Ordering::Acquire) && !timed_out {
+                break;
             }
+            finished = Some(match finished {
+                None => (pending.kind, pending.drawn, pending.whole),
+                Some((kind, drawn, whole)) if kind == pending.kind => {
+                    (kind, drawn + pending.drawn, whole && pending.whole)
+                }
+                Some(first) => first,
+            });
+            held.pending.pop_front();
+        }
+        if let Some((kind, drawn, whole)) = finished {
+            let took = now_ms - held.busy_since;
+            held.busy_since = now_ms;
             held.longest_ms = held.longest_ms.max(took);
-            if let Some(kind) = pending.kind {
-                pace.observe(kind, pending.drawn, pending.whole, took);
+            if let Some(kind) = kind {
+                pace.observe(kind, drawn, whole, took);
             }
         }
-        let (kind, slice) = if held.edges < m {
-            let size = pace.slice(Kind::Edges, usize::MAX);
-            let end = m.min(held.edges.saturating_add(size));
-            (Some(Kind::Edges), Slice::Edges(held.edges..end))
-        } else if held.nodes < held.node_total {
-            let size = pace.slice(Kind::Nodes, usize::MAX);
-            let end = held.node_total.min(held.nodes.saturating_add(size));
-            (Some(Kind::Nodes), Slice::Nodes(held.nodes..end))
-        } else if !held.cleared {
-            // Nothing to draw but the background.
-            (None, Slice::Nothing)
-        } else {
-            held.progress = Progress::Done;
-            held.flags = flags.to_vec();
-            held.missing.clear();
-            *last = Some(Refinement {
-                ms: now_ms - held.began_ms,
-                slices: held.slices,
-                longest_slice_ms: held.longest_ms,
-                slice_edges: pace.slice(Kind::Edges, usize::MAX),
-                slice_nodes: pace.slice(Kind::Nodes, usize::MAX),
+        while held.pending.len() < SLICES_AHEAD {
+            let (kind, slice) = if held.edges < m {
+                let size = pace.slice(Kind::Edges, usize::MAX);
+                let end = m.min(held.edges.saturating_add(size));
+                (Some(Kind::Edges), Slice::Edges(held.edges..end))
+            } else if held.nodes < held.node_total {
+                let size = pace.slice(Kind::Nodes, usize::MAX);
+                let end = held.node_total.min(held.nodes.saturating_add(size));
+                (Some(Kind::Nodes), Slice::Nodes(held.nodes..end))
+            } else if !held.cleared {
+                // Nothing to draw but the background.
+                (None, Slice::Nothing)
+            } else if !held.pending.is_empty() {
+                // The last slices are with the GPU.
+                break;
+            } else {
+                held.progress = Progress::Done;
+                held.flags = flags.to_vec();
+                held.missing.clear();
+                *last = Some(Refinement {
+                    ms: now_ms - held.began_ms,
+                    slices: held.slices,
+                    longest_slice_ms: held.longest_ms,
+                    slice_edges: pace.slice(Kind::Edges, usize::MAX),
+                    slice_nodes: pace.slice(Kind::Nodes, usize::MAX),
+                });
+                self.renderer.set_patch_nodes(device, queue, &[]);
+                return false;
+            };
+            let scale = f32::from_bits(held.key.radius_scale);
+            self.renderer
+                .draw_slice(device, queue, &held.camera, scale, !held.cleared, &slice);
+            held.cleared = true;
+            held.slices += 1;
+            let (drawn, whole) = match (&slice, kind) {
+                (Slice::Edges(run), Some(kind)) => {
+                    held.edges = run.end;
+                    (run.len(), run.len() == pace.slice(kind, usize::MAX))
+                }
+                (Slice::Nodes(run), Some(kind)) => {
+                    held.nodes = run.end;
+                    (run.len(), run.len() == pace.slice(kind, usize::MAX))
+                }
+                _ => (0, false),
+            };
+            let done = Arc::new(AtomicBool::new(false));
+            let signal = done.clone();
+            queue.on_submitted_work_done(move || signal.store(true, Ordering::Release));
+            if held.pending.is_empty() {
+                held.busy_since = now_ms;
+            }
+            held.pending.push_back(Pending {
+                done,
+                sent_ms: now_ms,
+                kind,
+                drawn,
+                whole,
             });
-            self.renderer.set_patch_nodes(device, queue, &[]);
-            return false;
-        };
-        let scale = f32::from_bits(held.key.radius_scale);
-        self.renderer
-            .draw_slice(device, queue, &held.camera, scale, !held.cleared, &slice);
-        held.cleared = true;
-        held.slices += 1;
-        let (drawn, whole) = match (&slice, kind) {
-            (Slice::Edges(run), Some(kind)) => {
-                held.edges = run.end;
-                (run.len(), run.len() == pace.slice(kind, usize::MAX))
-            }
-            (Slice::Nodes(run), Some(kind)) => {
-                held.nodes = run.end;
-                (run.len(), run.len() == pace.slice(kind, usize::MAX))
-            }
-            _ => (0, false),
-        };
-        let done = Arc::new(AtomicBool::new(false));
-        let signal = done.clone();
-        queue.on_submitted_work_done(move || signal.store(true, Ordering::Release));
-        held.pending = Some(Pending {
-            done,
-            sent_ms: now_ms,
-            kind,
-            drawn,
-            whole,
-        });
+        }
         true
     }
 
@@ -1998,7 +2031,8 @@ impl View {
             edges: 0,
             nodes: 0,
             node_total,
-            pending: None,
+            pending: VecDeque::new(),
+            busy_since: now_ms,
             began_ms: now_ms,
             slices: 0,
             longest_ms: 0.0,

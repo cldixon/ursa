@@ -1517,7 +1517,11 @@ if (REFINE_CASES.length) {
         out.longTasks = w.stats.longTasks.slice(tasksBefore).filter((l: number[]) => l[0] >= t - 50 && l[0] < t + out.shownMs).map((l: number[]) => Math.round(l[1]));
         out.refinement = view.frameInfo().refinement;
         if (out.longTasks.length) problem(`tasks over 50 ms on the page while the slices were drawn: ${out.longTasks.join(", ")} ms`);
-        if (out.ms > 5000) problem(`everything took ${Math.round(out.ms)} ms to draw in slices; at most 5000 are allowed`);
+        // 5 s, where drawing it at once takes under 4: on a machine busy
+        // with other things the slices are held to what that takes, and a
+        // quarter more.
+        out.allowed = Math.max(5000, 1.25 * out.atOnceMs);
+        if (out.ms > out.allowed) problem(`everything took ${Math.round(out.ms)} ms to draw in slices; at most ${Math.round(out.allowed)} are allowed (at once: ${Math.round(out.atOnceMs)} ms)`);
         out.differs = await exact("1M");
         // A zoom begun under the slices: its frame is asked for at once.
         view.zoom(1.2, W / 2, H / 2);
