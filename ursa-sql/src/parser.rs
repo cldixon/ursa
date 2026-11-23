@@ -28,11 +28,13 @@ pub enum UrsaStatement {
     DataFusion(Box<DFStatement>),
     /// `CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name …` (SQL/PGQ).
     CreatePropertyGraph(Box<CreatePropertyGraph>),
-    /// `DROP PROPERTY GRAPH [IF EXISTS] name`.
+    /// `DROP [PROPERTY] GRAPH [IF EXISTS] name`.
     DropPropertyGraph(DropPropertyGraph),
     /// `DESCRIBE GRAPH name` (or `DESC GRAPH name`).
     DescribeGraph(DescribeGraph),
-    /// `SHOW GRAPHS`.
+    /// `SUMMARIZE [PROPERTY] GRAPH name` (DuckPGQ): `describe(name)`'s row.
+    SummarizeGraph(DescribeGraph),
+    /// `SHOW [PROPERTY] GRAPHS`.
     ShowGraphs,
     /// `ATTACH [DATABASE] 'file.ursa' [AS name]`.
     Attach(Attach),
@@ -76,6 +78,7 @@ impl UrsaStatement {
             UrsaStatement::CreatePropertyGraph(_) => "CREATE PROPERTY GRAPH",
             UrsaStatement::DropPropertyGraph(_) => "DROP PROPERTY GRAPH",
             UrsaStatement::DescribeGraph(_) => "DESCRIBE GRAPH",
+            UrsaStatement::SummarizeGraph(_) => "SUMMARIZE PROPERTY GRAPH",
             UrsaStatement::ShowGraphs => "SHOW GRAPHS",
             UrsaStatement::Attach(_) => "ATTACH",
         }
@@ -106,6 +109,7 @@ impl fmt::Display for UrsaStatement {
                 write!(f, "{}", s.name)
             }
             UrsaStatement::DescribeGraph(s) => write!(f, "DESCRIBE GRAPH {}", s.name),
+            UrsaStatement::SummarizeGraph(s) => write!(f, "SUMMARIZE PROPERTY GRAPH {}", s.name),
             UrsaStatement::ShowGraphs => write!(f, "SHOW GRAPHS"),
             UrsaStatement::Attach(s) => {
                 write!(f, "ATTACH '{}'", s.path.replace('\'', "''"))?;
@@ -236,6 +240,24 @@ impl<'a> UrsaParser<'a> {
 
     /// Parse one statement.
     pub fn parse_statement(&mut self) -> Result<UrsaStatement> {
+        // DuckPGQ's `SUMMARIZE PROPERTY GRAPH g`, before SUMMARIZE's refusal.
+        if self.word(0, "SUMMARIZE") {
+            let at = if self.word(1, "PROPERTY") { 2 } else { 1 };
+            if self.word(at, "GRAPH")
+                && matches!(self.df.parser.peek_nth_token_ref(at + 1).token, Token::Word(_))
+            {
+                for _ in 0..=at {
+                    self.df.parser.next_token();
+                }
+                let name = self.df.parser.parse_object_name(false)?;
+                return Ok(UrsaStatement::SummarizeGraph(DescribeGraph { name }));
+            }
+        }
+        if self.word(0, "ALTER")
+            && (self.word(1, "GRAPH") || (self.word(1, "PROPERTY") && self.word(2, "GRAPH")))
+        {
+            return Err(DataFusionError::NotImplemented(ALTER_GRAPH.to_string()));
+        }
         if let Some(message) = self.duckdb_statement() {
             return Err(DataFusionError::NotImplemented(message.to_string()));
         }
@@ -248,7 +270,11 @@ impl<'a> UrsaParser<'a> {
             if self.word(at, "PROPERTY") && self.word(at + 1, "GRAPH") {
                 return self.parse_create_property_graph();
             }
-        } else if self.word(0, "DROP") && self.word(1, "PROPERTY") && self.word(2, "GRAPH") {
+        } else if self.word(0, "DROP")
+            && ((self.word(1, "PROPERTY") && self.word(2, "GRAPH")) || self.word(1, "GRAPH"))
+        {
+            // `DROP GRAPH g`, as `SHOW GRAPHS` and `DESCRIBE GRAPH` leave out
+            // PROPERTY too (#417).
             return Ok(self.parse_drop_property_graph()?);
         } else if (self.word(0, "DESCRIBE") || self.word(0, "DESC"))
             && self.word(1, "GRAPH")
@@ -275,6 +301,34 @@ impl<'a> UrsaParser<'a> {
                 self.df.parser.next_token();
             }
             return Ok(UrsaStatement::ShowGraphs);
+        } else if self.word(0, "SHOW") && self.word(1, "PROPERTY") && self.word(2, "GRAPHS") {
+            for _ in 0..3 {
+                self.df.parser.next_token();
+            }
+            return Ok(UrsaStatement::ShowGraphs);
+        } else if self.word(0, "SHOW")
+            && matches!(
+                self.df.parser.peek_nth_token_ref(1).token,
+                Token::SingleQuotedString(_)
+            )
+            && matches!(
+                self.df.parser.peek_nth_token_ref(2).token,
+                Token::EOF | Token::SemiColon
+            )
+        {
+            // DuckDB's `SHOW 'file.csv'` is `DESCRIBE 'file.csv'`.
+            self.df.parser.next_token(); // SHOW
+            let file = self.df.parser.next_token().to_string();
+            let describe = format!("DESCRIBE {file}");
+            let statement = DFParserBuilder::new(describe.as_str())
+                .with_dialect(self.dialect)
+                .build()?
+                .parse_statement()?;
+            return Ok(UrsaStatement::DataFusion(Box::new(statement)));
+        } else if self.word(0, "COPY") && !self.word(1, "INTO") {
+            if let Some(statement) = crate::copy_options::parse_copy(&mut self.df)? {
+                return Ok(UrsaStatement::DataFusion(Box::new(statement)));
+            }
         } else if self.word(0, "ATTACH") {
             return Ok(self.parse_attach()?);
         }
@@ -362,7 +416,9 @@ impl<'a> UrsaParser<'a> {
     }
 
     fn parse_drop_property_graph(&mut self) -> Result<UrsaStatement, ParserError> {
-        self.consume_words(&["DROP", "PROPERTY", "GRAPH"]);
+        self.consume_word("DROP");
+        self.consume_word("PROPERTY");
+        self.consume_word("GRAPH");
         let if_exists = self.consume_words(&["IF", "EXISTS"]);
         let name = self.df.parser.parse_object_name(false)?;
         Ok(UrsaStatement::DropPropertyGraph(DropPropertyGraph {
@@ -419,6 +475,10 @@ const DUCKDB_STATEMENTS: &[(&str, &str)] = &[
          and SELECT * FROM ursa_functions() for the graph functions",
     ),
 ];
+
+/// The refusal for `ALTER [PROPERTY] GRAPH`.
+const ALTER_GRAPH: &str = "ALTER PROPERTY GRAPH is not supported; use CREATE OR REPLACE \
+     PROPERTY GRAPH with the whole new definition";
 
 /// The refusal for `TABLESAMPLE`, which DataFusion parses but ignores.
 const TABLESAMPLE: &str = "TABLESAMPLE is not supported (it would be ignored and every row read); \
