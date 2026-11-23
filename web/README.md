@@ -407,10 +407,13 @@ static assets and an R2 bucket.
     finished), and `partial` stays true until the refined frame is drawn.
 
     On `.graph rmat` (1M edges, headless Chromium, software WebGL2,
-    2026-11-23, REFINE_RUNS): everything is drawn REFINE_RANGE after the
-    view rests, in REFINE_SLICES slices, with no task of the page over
-    50 ms meanwhile; a click on the view at rest is shown CLICK_RANGE after
-    it (2.5 to 4.1 s). `tests/graph-timing.ts` fails a run with a task
+    2026-11-23, three runs at a load of 4): the slices take 2.2, 2.4 and
+    2.9 s (137 to 177 of them), so everything is shown 2.5 to 3.1 s after a
+    zoom's last event, with no task of the page over 50 ms meanwhile; a
+    click on the view at rest is shown 90 to 140 ms after it (2.2 to 2.9 s
+    on main in the same hour); and the wheel zoom's frames are as far apart
+    as before (p95 26 to 27 ms; main 25 to 26). On a busier machine (a
+    load of 5 to 7) the slices took 2.3 to 4.6 s. `tests/graph-timing.ts` fails a run with a task
     over 50 ms while the slices are drawn, or slices that take over 5 s.
     Not measured on a GPU, where the target is 0.3 s.
 

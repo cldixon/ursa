@@ -220,6 +220,14 @@ jobs:
           WEBGPU: "0"
           ONLY: delta karate
 
+      # Refinement at rest (#496), frames read back on WebGL2: the frame
+      # drawn in slices is the frame drawn at once, byte for byte.
+      - name: Refinement at rest in Chromium
+        run: bun ursa-viz/tests/browser/view.ts
+        env:
+          WEBGPU: "0"
+          ONLY: refine
+
       # The UGR wire format (#424), Rust to JavaScript: ui/ugr.js reads the
       # fixtures the Rust encoder wrote, bit for bit.
       - name: The UGR reader in JavaScript

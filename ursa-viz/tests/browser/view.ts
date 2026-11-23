@@ -1695,6 +1695,44 @@ if (REFINE_CASES.length) {
     await page.close();
   }
   await gl.close();
+  // The slices under WebGPU, whose validation is the stricter: the
+  // texture is drawn into and drawn from, texel for texel and moved, with
+  // no error from the device. Its frames cannot be read back here.
+  if (webgpu && REFINE_CASES.some((c) => c.name === "refine rmat 100K")) {
+    const gpu = await chromium.launch({ args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan"] });
+    const page = await gpu.newPage({ viewport: { width: 1000, height: 700 } });
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    await page.goto(`${base}?graph=rmat&scale=14&edges=100000&result=1`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    const r: any = await page.evaluate(async () => {
+      const w = window as any, view = w.view;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      let now = 100_000;
+      view.pan(3, 0);
+      view.renderFrame((now += 16));
+      view.renderFrame((now += 1000));
+      const began = view.refining;
+      while (view.refine(performance.now())) await new Promise((r) => setTimeout(r));
+      view.renderFrame((now += 16));
+      const refined = view.frameInfo();
+      view.setHovered(5);
+      view.renderFrame((now += 16));
+      view.pan(30, 10);
+      view.zoom(1.5, 400, 300);
+      view.renderFrame((now += 16));
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      w.pauseFrames(false);
+      return { backend: view.backend, began, refined, partial: view.framePartial };
+    });
+    await page.waitForTimeout(300);
+    for (const e of errors) failures.push(`refine on ${r.backend}: ${e}`);
+    if (!r.began || !r.refined.refined || !r.partial) failures.push(`refine on ${r.backend}: ${JSON.stringify(r)}`);
+    console.log(`refine on ${r.backend}: 100K edges drawn in ${r.refined.refinement?.slices} slices, shown, hovered, and panned and zoomed over the texture with ${errors.length} errors`);
+    await gpu.close();
+  }
 }
 server.stop();
 if (failures.length) {

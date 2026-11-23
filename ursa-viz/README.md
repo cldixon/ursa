@@ -280,8 +280,8 @@ or the grid's being built, begins them again.
 
 `tests/browser/view.ts` (`ONLY=refine`) checks, on WebGL2: karate fits in
 a frame and is never refined; on R-MAT with 100K edges the frame at rest
-leaves the canvas alone, is drawn in 30 to 40 slices with no call of
-`refine` over 3 ms, and is then the frame drawn at once, 0 bytes apart,
+leaves the canvas alone, is drawn in 25 to 40 slices with no call of
+`refine` over 5 ms, and is then the frame drawn at once, 0 bytes apart,
 read back and on the canvas: fitted, zoomed in eight times (the nodes in
 view alone), in the dark theme, with a path highlighted, a node hidden,
 after a delta, and after an order written under the slices; a hover and a
@@ -291,9 +291,10 @@ size.
 
 Measured on R-MAT with 1M edges in headless Chromium's software WebGL2
 ([`BENCH.md`](BENCH.md#refinement-at-rest)): no task of the page over
-50 ms while the slices are drawn, and everything drawn REFINE_RANGE after
-the view rests, which is what drawing it at once takes there and a tenth
-more. It has not been measured on a GPU.
+50 ms while the slices are drawn, and everything drawn in 2.2 to 2.9 s in
+the shell (46,318 nodes) and 3.8 to 5.4 s in the demo (131,072 nodes),
+which is what drawing it at once takes there, to a tenth more. It has not
+been measured on a GPU.
 
 ## Making a view
 

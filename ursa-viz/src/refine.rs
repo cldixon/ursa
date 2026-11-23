@@ -5,10 +5,10 @@
 //! fit in a frame that is seconds of a software renderer's time. So it is
 //! drawn in slices, into a texture the size of the canvas: the edges a run
 //! of the buffer at a time, then the nodes a run at a time, each slice sent
-//! only when the GPU has finished the last. A pan, a zoom or any other
-//! change stops it: nothing waits for more than one slice. When the last
-//! slice is done the texture is put on the canvas, under the highlighted
-//! edges and the nodes in front, and it stays:
+//! only when the GPU has finished the last but one. A pan, a zoom or any
+//! other change stops it: nothing waits for more than two slices. When the
+//! last slice is done the texture is put on the canvas, under the
+//! highlighted edges and the nodes in front, and it stays:
 //!
 //! - **At rest**, a frame is the texture and those two small layers, so a
 //!   hover or a selection costs a frame of next to nothing.
@@ -46,11 +46,12 @@
 use crate::budget::{MIN_UNITS, NODE_UNITS};
 use crate::highlight::flag;
 
-/// How long the GPU is to take over a slice, in milliseconds: what a pan
-/// or a zoom begun during the refinement waits for at most, and, where
-/// drawing holds the page's thread (a software renderer), how long one
-/// task holds it. Short of the 50 ms a task may take, with room for a
-/// slice that costs twice what the last did.
+/// How long the GPU is to take over a slice, in milliseconds: a frame. A
+/// pan or a zoom begun during the refinement waits for the slices the GPU
+/// has, which are two at most. (The thread that sends a slice is not held
+/// for it: a browser draws in another process, also with no GPU.) Longer
+/// slices are no faster: at 32 ms a million edges took a software
+/// renderer what they took at 16.
 pub const SLICE_MS: f64 = 16.0;
 
 /// The most a slice grows by from one to the next: the cost of an edge

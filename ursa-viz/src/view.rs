@@ -1026,6 +1026,7 @@ impl View {
         self.moved();
         // The texture is the size the canvas was.
         self.forget_detail();
+        self.renderer.release_detail();
         self.camera.viewport = (width.max(1) as f32, height.max(1) as f32);
         self.uncull();
         if self.follow {
@@ -1895,11 +1896,10 @@ impl View {
     /// the frame drawn then begins the refinement again once the view
     /// rests.
     ///
-    /// A call holds the thread for as long as it takes to send a slice,
-    /// which is not long: the GPU draws it afterwards. Where "the GPU" is
-    /// this thread (a software renderer in the browser's own process),
-    /// that is the slice's cost, which is held to
-    /// [`crate::refine::SLICE_MS`].
+    /// A call holds the thread for as long as it takes to send a slice or
+    /// two, which is not long (1 to 6 ms at a million edges in a browser
+    /// with no GPU): the GPU draws them afterwards, and is kept one slice
+    /// ahead so that it does not wait for the next call.
     pub fn refine(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, now_ms: f64) -> bool {
         if std::mem::take(&mut self.detail.wanted) {
             self.begin_refining(device, now_ms);

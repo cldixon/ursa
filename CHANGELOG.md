@@ -250,10 +250,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `draw_over`; and in the wasm API `refine`, `refining`, `setRefining`,
   `snapshotRefined` and `frameInfo().refining`, `refined` and
   `refinement`. On `.graph rmat` (1M edges) in headless Chromium's
-  software WebGL2, everything is drawn REFINE_RANGE after the view rests
-  (what drawing it at once takes there, and a tenth more) with no task of
-  the page over 50 ms, and a click at rest is shown CLICK_RANGE after it
-  (2.5 to 4.1 s). Not measured on a GPU, where the target is 0.3 s
+  software WebGL2, the slices take 2.2 to 2.9 s over three runs (what
+  drawing it at once takes there, to a tenth more; up to 4.6 s on a busier
+  machine) with no task of the page over 50 ms, and a click at rest is
+  shown 90 to 140 ms after it (2.2 to 2.9 s). Not measured on a GPU, where the target is 0.3 s
   (`ursa-viz/BENCH.md`).
 - **A frame budget for the graph view: pan and zoom no longer wait for the
   graph's size** (#495). While the camera or the positions change, a frame
