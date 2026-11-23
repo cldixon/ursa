@@ -149,7 +149,7 @@ DROP PROPERTY GRAPH first;
 DROP PROPERTY GRAPH IF EXISTS first;
 ```
 
-Dropping a graph leaves its tables and views alone.
+Dropping a graph leaves its tables and views alone. `PROPERTY` may be left out: `DROP GRAPH first`. There is no `ALTER PROPERTY GRAPH`; to change a graph, write its whole new definition with `CREATE OR REPLACE PROPERTY GRAPH`.
 
 ## SHOW GRAPHS
 

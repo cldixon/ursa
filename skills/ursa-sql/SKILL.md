@@ -37,7 +37,7 @@ ursa --skill                                            # this guide, for the ve
 - A `-f` file or stdin may hold the shell's dot-commands, one a line, as in DuckDB: `.mode json`, `.timer on`, `.read other.sql`, `.functions pagerank` (one function's parameters, one a line), `.schema` (the statements that define the database's views and graphs), `.once FILE` (the next result to a file). `.mode markdown` writes a Markdown table, for a person to read or paste; `.mode line` one `column = value` a line. A syntax error anywhere in a file runs none of it; otherwise the first error stops the run.
 - A statement that returns rows prints a header even with no rows. DDL (`CREATE`, `DROP`) and `SET` print nothing.
 - SIGINT (Ctrl-C) cancels a run: `ursa` prints `Error: interrupted` to stderr, writes nothing more to stdout, and exits with status 130.
-- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead.
+- On error, `ursa` prints `Error: <message>` to stderr and exits with status 1. The message usually names the fix. DuckDB-only syntax (`SUMMARIZE`, `USING SAMPLE`, `PIVOT`, `PRAGMA`) is refused with what to write instead. Common DuckDB habits work: `COPY ... TO 'f' (FORMAT parquet, HEADER, DELIMITER '|')`, `SET threads = 4`, `ORDER BY ALL`, `DROP GRAPH g`, and the functions `list_value`, `strftime`, `epoch_ms`, `arg_max` and `arg_min`. Graph functions are table functions: `SELECT * FROM pagerank(g)`, never `SELECT pagerank(g)`.
 - With no `-c`, `--file` or stdin, `ursa` starts an interactive shell and waits for input. Don't start it from an agent.
 
 ## Define a graph from files

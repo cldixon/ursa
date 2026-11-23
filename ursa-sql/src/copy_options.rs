@@ -60,6 +60,31 @@ pub(crate) fn parse_copy(df: &mut DFParser) -> Result<Option<DFStatement>> {
         };
         let value = match df.parser.peek_token().token {
             Token::Comma | Token::RParen => None,
+            // A list, as in `PARTITION_BY (a, b)`: none of the options mapped
+            // takes one, so it is kept only to be refused by name.
+            Token::LParen => {
+                let mut depth = 0usize;
+                let mut text = String::new();
+                loop {
+                    let token = df.parser.next_token().token;
+                    match token {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::EOF => {
+                            return Err(ParserError::ParserError(
+                                "Expected: ')' to close a COPY option's list, found: EOF".into(),
+                            )
+                            .into())
+                        }
+                        _ => {}
+                    }
+                    text.push_str(&token.to_string());
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(text)
+            }
             _ => Some(option_value(df.parse_option_value()?)),
         };
         written.push((key, value));

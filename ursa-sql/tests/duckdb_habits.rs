@@ -153,6 +153,13 @@ async fn copy_takes_duckdbs_options() {
         m.starts_with("the COPY option ROW_GROUP_SIZE is not supported; Ursa maps DuckDB's FORMAT, HEADER"),
         "{m}"
     );
+    // An option whose value is a list is refused by name too.
+    let m = err(
+        &ctx,
+        &format!("COPY Student TO '{}' (FORMAT csv, PARTITION_BY (id, name))", path("x")),
+    )
+    .await;
+    assert!(m.starts_with("the COPY option PARTITION_BY is not supported"), "{m}");
     let m = err(&ctx, &format!("COPY Student TO '{}' (FORMAT)", path("x.parquet"))).await;
     assert_eq!(m, "the COPY option FORMAT needs a value");
     let m = err(&ctx, &format!("COPY Student TO '{}' (HEADER maybe)", path("x.csv"))).await;

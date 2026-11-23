@@ -80,6 +80,33 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - `SHOW TABLES` leaves out `information_schema`'s own views.
   - Docs: a "Differences from DuckDB" page, the file formats and `read_*`
     functions in the statements page, and `COPY`'s row count.
+- **Ursa SQL: more DuckDB and DuckPGQ habits** (#417). Each of these failed
+  with a parser error or a message that did not name the fix.
+  - `COPY … TO 'f' (FORMAT parquet, HEADER, DELIMITER '|', COMPRESSION
+    zstd)`, and `WITH (…)`: DuckDB's option list maps onto `STORED AS` and
+    `OPTIONS`. `DELIM` and `SEP` are `DELIMITER`'s other names; any other
+    option is refused by name.
+  - `SET threads = n` sets `datafusion.execution.target_partitions`. `SET`
+    of another name without an `ursa.` or `datafusion.` prefix says that
+    Ursa's settings start with one, and that `SHOW ALL` lists them.
+  - `DROP GRAPH g` and `SHOW PROPERTY GRAPHS`. DuckPGQ's `SUMMARIZE
+    PROPERTY GRAPH g` returns `describe(g)` for a graph of one edge table
+    and says to name the pair for more. `ALTER PROPERTY GRAPH` says to use
+    `CREATE OR REPLACE PROPERTY GRAPH`.
+  - `ORDER BY ALL` orders by every column of the `SELECT` list; after
+    `SELECT *`, the error says to name the columns or their positions.
+  - `SHOW 'file.csv'` is `DESCRIBE 'file.csv'`. `CREATE TEMP TABLE` and
+    `CREATE TEMP VIEW` run; a database file does not store them.
+  - Hints: `SELECT pagerank(g)`, for every graph function, says it is a
+    table function (`SELECT * FROM pagerank(g)`); `SELECT id, pagerank FROM
+    g.nodes` says to join the function's rows on `id` (#300); an unquoted
+    file name, `FROM karate_edges.csv`, says to quote the path.
+  - DuckDB's names for DataFusion's functions: `list_value` (`make_array`),
+    `strftime` (`to_char`, either argument order), `epoch_ms` (milliseconds
+    to a timestamp and back), and the aggregates `arg_max` and `arg_min`
+    (`first_value … ORDER BY`, skipping NULLs).
+  - Tests: `DESCRIBE FROM`, `EXPLAIN FROM`, `CREATE VIEW v AS FROM` and
+    `COPY (FROM t) TO` together, on DuckPGQ's graph.
 - **`ursa` for agents and scripts** (#312):
   - `-f` files, `-c` and SQL on stdin take dot-commands, as `-init` files
     and `.read` do, and as in DuckDB: `.timer on`, `.mode csv`, `.read`. In
