@@ -489,7 +489,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // callback ran. And if it left anything out, a frame with everything once
   // nothing has moved for a while.
   const budgeted = (frameTime) => {
-    requestAnimationFrame((next) => current === state && view.frameCost(next - frameTime));
+    requestAnimationFrame((next) => current === state && !state.paused && view.frameCost(next - frameTime));
     clearTimeout(state.rest);
     state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
   };
@@ -505,7 +505,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // view writes it to the GPU a piece a task, and draws the order it had
   // until the new one is whole. A frame with every edge is the same either way.
   const orderEdges = ({ order, ms }) => {
-    if (!state.orderable) return;
+    if (!state.orderable || current !== state) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void setTimeout(() => orderEdges({ order, ms }), 50);
     state.orderMs = ms;
     try {
       view.setEdgeOrder(order);
@@ -513,7 +515,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       // Not an order of this view's edges: they stay as they are.
       return;
     }
-    const more = () => current === state && view.orderEdges() && setTimeout(more);
+    const more = () => {
+      if (current !== state) return;
+      if (state.paused) return void setTimeout(more, 50);
+      if (view.orderEdges()) setTimeout(more);
+    };
     more();
   };
   // `input` unless the layout or a test asked: graphTimings' frame intervals
