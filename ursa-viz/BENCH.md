@@ -104,6 +104,12 @@ load the wasm (`wasm-release`).
 - **Grid** (from the next run on): the median of nine `view.rebuildGrid()`
   calls, and `view.nodesDrawn` for a frame zoomed 10× into the middle of
   the drawing (1% of its area).
+- **Refinement at rest**: after the budgeted pan and zoom, the frame with
+  everything as a page draws it at rest: `view.renderFrame` leaves the
+  canvas alone, `view.refine(performance.now())` is called a task at a
+  time until it returns false, and a frame is drawn. The time from the
+  first call to the animation frame after that frame, the slices, and the
+  page's tasks over 50 ms meanwhile (a `longtask` observer).
 - **The frame budget**: the pan and the zoom again, as a page draws them:
   `view.renderFrame(now)` each animation frame, and the time from that frame
   to the next told to `view.frameCost`, with the edges in the layout's
@@ -586,11 +592,11 @@ a run over it. What the numbers say:
   rasterising a million edges after each set of positions: it draws the
   positions as they come, and the worker's messages do not queue behind 4 s
   frames.
-- **A frame at rest still draws everything**, in one go: 2.5 to 6 s of the
-  page's thread here, as every frame took before. There is one 200 ms
-  after the layout's end and one 200 ms after each movement's, and a click
-  or a hover on the view at rest draws another. A zoom begun under one
-  waits for it. Drawing it in slices is the design's next step (P3-2).
+- **A frame at rest still drew everything**, in one go, when this was
+  measured: 2.5 to 6 s here, as every frame took before; one 200 ms after
+  the layout's end, one 200 ms after each movement's, and another for a
+  click or a hover on the view at rest; and a zoom begun under one waited
+  for it. It is drawn in slices now: [below](#refinement-at-rest).
 - **The order costs the layout 0.3 s**, once, after its first positions,
   and 8 MiB of the worker's heap while it sorts (eight bytes an edge, and
   the copy of the edge list the call is given). The view holds nothing for
@@ -624,6 +630,91 @@ bun bench/report.ts bench/results-laptop.json
 ```
 
 **It has not been measured on a GPU**: there is none here.
+
+## Refinement at rest
+
+Where everything does not fit in a frame, the frame at rest is drawn in
+slices into a texture and kept (#496;
+[README](README.md#refinement-at-rest)). Three measurements, on this
+container (no GPU: SwiftShader on 4 cores shared with another build, a
+load of 3 to 5 unless said), 2026-11-23. The issue's targets with no GPU
+are no task of the page over 50 ms while the slices are drawn, and
+everything drawn within 5 s of the view's coming to rest, at 1M edges.
+
+**In the shell**, `.graph rmat` (46,318 nodes with an edge, 1,000,000
+edges) at 1280 × 800, with `web/tests/graph-timing.ts`: after its wheel
+zoom, a long-task observer on the page until the frame with everything is
+shown. Three runs, and main (`777a930`) in the same hour:
+
+| | main | with refinement (three runs) |
+|---|---|---|
+| the slices, after the layout | – (one draw) | 2.2, 2.4 and 2.5 s, 144 to 157 slices |
+| the slices, after the zoom | – | **2.2, 2.4 and 2.9 s**, 137 to 177 slices |
+| everything shown, from the zoom's last event (200 ms of it waiting to be at rest) | not measured | 2.5, 2.7 and 3.1 s |
+| page tasks over 50 ms meanwhile | the draw itself | **none** |
+| the GPU's longest over the slices one call found done | – | 35 to 42 ms |
+| a click on the view at rest, to its frame | 2.2, 2.4 and 2.9 s | **90, 120 and 138 ms** |
+| wheel-zoom frame interval, p95 | 25.2, 25.4 and 26.5 ms | 25.8, 26.4 and 26.9 ms |
+
+At a load of 5 to 7 (two earlier runs) the slices took 2.3 and 4.6 s, 137
+and 271 of them, still with no long task. `graph-timing.ts` fails a run
+with a task over 50 ms while the slices are drawn or with slices that take
+over 5 s; the e2e allows a task 100 ms.
+
+**In the bare view** (`tests/browser/view.ts`, `ONLY="refine rmat 1M"`:
+131,072 nodes, every one drawn, 1,000,000 edges, 1000 × 700), against the
+frame drawn at once and read back in the same page:
+
+| load | drawn at once | in slices | slices | calls of `refine`, the longest | page tasks over 50 ms | pixels that differ |
+|---|---|---|---|---|---|---|
+| about 4 | 5.2 s | 5.4 s | 325 | 1,237, 6.2 ms | none | 0 |
+| about 5 | 7.0 s | 7.8 s | 468 | 1,809, 5.4 ms | none | 0 |
+
+A zoom begun six calls into the slices had its frame drawn 5 and 12 ms
+later.
+
+**In the bench** (`BACKENDS=webgl2 GRAPHS=rmat MODES=multilevel`), after
+the budgeted pan and zoom:
+
+| graph | pan frame, every edge, ms (median) | first slice to the frame shown, ms | slices | the GPU's longest, ms | last slices (edges / nodes) | longest call of `refine`, ms | page tasks over 50 ms |
+|---|---|---|---|---|---|---|---|
+| rmat 10k | 65 | 71 | 10 | 23 | 5,648 / 1,276 | 1.4 | none |
+| rmat 100k | 498 | 437 | 34 | 26 | 21,711 / 734 | 1.8 | none |
+| rmat 1m | 3785 | 3776 | 239 | 26 | 16,405 / 986 | 5.2 | none |
+
+What the numbers say:
+
+- **The slices cost what the draw costs.** This renderer draws about
+  600,000 edges or 60,000 nodes a second whether it is given them at once
+  or 16 ms at a time, so everything takes as long as it took (within a
+  tenth), and is within 5 s where one draw is: in the shell's 46K nodes
+  with room, with all 131K nodes drawn at about 4 to 5 s, and not on a
+  busy machine. What changes is that nothing waits for it: the page's
+  thread is never held (the calls are 1 to 6 ms; the GPU process does the
+  drawing), a zoom begun under the slices is drawn at once, and a click at
+  rest draws the texture and a ring.
+- **The first version sent one slice at a time**, and the GPU idled from
+  each slice's end until the next call noticed it (a timer's 4 ms): 10.2 s
+  against 7.6 s at once on a busy machine. One slice ahead, it is 7.8 s
+  against 7.0.
+- **16 ms a slice is not the page's 50 ms.** The page's tasks are the
+  calls. The slice is what a zoom waits for at the GPU: two of them at
+  most. 32 ms slices were no faster (5.3 s against 5.2).
+- **A moving frame draws the texture under its prefix** and costs no more
+  for it here: the wheel zoom's frames are as far apart as on main.
+- **The frame read back is the frame drawn at once, byte for byte**, at
+  1M and at 100K edges (fitted, zoomed in, both themes, a highlight, a
+  hidden node, a delta, an order written under the slices), which is what
+  the arithmetic says: the tolerance is 0.
+
+**It has not been measured on a GPU.** The target there is everything
+within 0.3 s of the view's coming to rest at 1M edges. Run the bench
+headed ([above](#on-a-laptop-with-a-real-gpu)) and read the "Refinement at
+rest" table `bun bench/report.ts` prints: "first slice to the frame shown"
+is the number, and "–" means the GPU fits everything in a frame and
+nothing is drawn in slices. Or, for the read-back check and the
+comparison with one draw, `ONLY="refine rmat 1M" bun
+tests/browser/view.ts` (WebGL2).
 
 ## Memory at a million edges
 

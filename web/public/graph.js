@@ -381,6 +381,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     hoverPicks: 0,
     tip,
     frames: 0,
+    // The frame at rest is being drawn in slices (#496), and the timer of the next.
+    refining: false,
+    refine: 0,
     // The layout worker's wasm memory, in bytes, as its last message gave it.
     layoutMemory: null,
     paused: false,
@@ -454,6 +457,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     } else {
       text = `Loading graph view… ${counts}`;
     }
+    // The frame at rest is being drawn in slices (#496): what is on the
+    // canvas is not yet everything.
+    if (state.refining && state.layoutDone) text += " · refining…";
     // Only when it changes: the line is a live region.
     if (status.textContent !== text) status.textContent = text;
     status.title = `${counts}${drawn} · drawn with ${state.backend}`;
@@ -490,12 +496,44 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.frames++;
       times.firstDraw ??= end;
       if (moving) budgeted(frameTime);
+      else if (view.refining) refineSoon();
+      refiningIs(view.refining);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
     }
     placeBusy();
   };
+  // Refinement at rest (#496). A frame at rest that does not fit in a frame
+  // is not drawn at once: renderFrame leaves the canvas as it is, and the
+  // view draws everything offscreen a slice a task, each sent when the GPU
+  // has finished the last, so a pan or a zoom begun meanwhile waits for one
+  // slice at most. Then a frame, which has everything, and so has every
+  // frame at rest after it; the frames of the next pan or zoom draw it
+  // under their own, moved as the camera is. If the view moved or changed
+  // meanwhile, the slices stop and that frame is the one that shows it.
+  const refine = () => {
+    state.refine = 0;
+    if (current !== state) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void (state.refine = setTimeout(refine, 50));
+    try {
+      if (view.refine(performance.now())) state.refine = setTimeout(refine);
+      else redraw(false);
+    } catch (e) {
+      fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
+    }
+  };
+  const refineSoon = () => {
+    state.refine ||= setTimeout(refine);
+  };
+  // The status line says so while slices remain.
+  const refiningIs = (on) => {
+    if (state.refining === on) return;
+    state.refining = on;
+    header();
+  };
+  state.cleanup.push(() => clearTimeout(state.refine));
   // After a moving frame: what it cost, which the budget follows, is the
   // time to the next animation frame (with no GPU the browser rasterises on
   // this thread first; with one, a late frame misses a refresh), from one
@@ -1388,9 +1426,11 @@ export function info() {
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,
-    // The frame budget (#495): {k, nodes, edges, ordered, p95, frames, limit}
-    // (GraphView.frameInfo), whether the last frame left anything out, and
-    // the ms the layout worker took to order the edges (null until it has).
+    // The frame budget (#495) and the refinement at rest (#496): {k, nodes,
+    // edges, ordered, p95, frames, limit, refining, refined, refinement}
+    // (GraphView.frameInfo), whether the canvas lacks anything after the
+    // last frame, and the ms the layout worker took to order the edges
+    // (null until it has).
     frame: { ...current.view.frameInfo(), partial: current.view.framePartial, orderMs: current.orderMs },
     drawnAs: current.drawnAs,
     width: current.canvas.width,

@@ -396,12 +396,39 @@ static assets and an R2 bucket.
     31 ms apart at the p95 (3.3 s before), each with 512 to 1,081 edges and
     170 to 360 nodes, which is what that renderer shows in a frame; the
     first frame is shown 1.3 s after Enter (6.0 s) and the layout is done at
-    5.6 s (10.6 s). A frame at rest still draws everything in one go, 2.5
-    to 6 s of the page's thread with no GPU: one after the layout, one after each movement, and
-    one for a click on the view at rest. `tests/graph-timing.ts` starts its
+    5.6 s (10.6 s). `tests/graph-timing.ts` starts its
     zoom from rest and fails a run whose p95 is over 50 ms; the e2e allows
     100 (`ursa-viz/BENCH.md` has the runs, and what a busy machine does to
     them).
+
+  - **Refinement at rest** (#496): where everything does not fit in a
+    frame, the frame at rest is not drawn at once (with no GPU that was
+    2.5 to 6 s of drawing after the layout, after each movement and for
+    each click, and a zoom begun under it waited). `renderFrame` leaves the
+    canvas as it is, and `graph.js` calls `view.refine(performance.now())`
+    a task at a time while `view.refining`: each call sends the GPU one
+    slice of the edges or the nodes, drawn offscreen into a texture the
+    size of the canvas, once the GPU has finished the last but one. Then a
+    frame, which is that texture under the highlighted edges and the nodes
+    in front, and so is every frame at rest after it: a hover or a click
+    draws no edge. A pan or a zoom stops the slices and waits for two of
+    them at most; its frames draw the texture under their own edges, moved
+    and scaled with the camera, so the whole picture stays on screen while
+    it moves. The status line ends in ` · refining…` while slices remain.
+    `ursaShell.graph().frame` gains `refining`, `refined` and `refinement`
+    (`{ms, slices, longestSliceMs, sliceEdges, sliceNodes}` of the last one
+    finished), and `partial` stays true until the refined frame is drawn.
+
+    On `.graph rmat` (1M edges, headless Chromium, software WebGL2,
+    2026-11-23, three runs at a load of 4): the slices take 2.2, 2.4 and
+    2.9 s (137 to 177 of them), so everything is shown 2.5 to 3.1 s after a
+    zoom's last event, with no task of the page over 50 ms meanwhile; a
+    click on the view at rest is shown 90 to 140 ms after it (2.2 to 2.9 s
+    on main in the same hour); and the wheel zoom's frames are as far apart
+    as before (p95 26 to 27 ms; main 25 to 26). On a busier machine (a
+    load of 5 to 7) the slices took 2.3 to 4.6 s. `tests/graph-timing.ts` fails a run with a task
+    over 50 ms while the slices are drawn, or slices that take over 5 s.
+    Not measured on a GPU, where the target is 0.3 s.
 
     The layout worker (`graph-worker.js`) also lays out **rings and layers**
     (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,
@@ -554,7 +581,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

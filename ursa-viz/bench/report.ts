@@ -61,6 +61,23 @@ for (const b of backends) {
     }
     out.push("");
   }
+  // Refinement at rest (#496): the frame with everything, in slices.
+  if (ml.some((c: any) => c.refine)) {
+    out.push("Refinement at rest (`refine`): the frame with everything, drawn in slices once the view rests. \"–\" where everything fits in a frame.");
+    out.push("");
+    out.push("| graph | first slice to the frame shown, ms | slices | the GPU's longest, ms | last slices (edges / nodes) | longest call of `refine`, ms | page tasks over 50 ms |");
+    out.push("|---|---|---|---|---|---|---|");
+    for (const c of ml) {
+      const f = c.refine;
+      if (c.refine === undefined) continue;
+      out.push(
+        f
+          ? `| ${label(c)} | ${ms(f.ms)} | ${f.slices} | ${ms(f.longestSliceMs)} | ${f.sliceEdges.toLocaleString("en")} / ${f.sliceNodes.toLocaleString("en")} | ${ms(f.longestCall, 1)} | ${f.longTasks.length ? f.longTasks.join(", ") + " ms" : "none"} |`
+          : `| ${label(c)} | – | – | – | – | – | – |`,
+      );
+    }
+    out.push("");
+  }
 }
 
 for (const [label, n] of Object.entries(r.native ?? {}) as [string, any][]) {
