@@ -316,7 +316,8 @@ static assets and an R2 bucket.
     while the engine still runs the query. The graph goes to the worker
     before the page builds its view, and nothing is drawn before the
     layout's first positions. The header then reads `… · Laying out · level
-    k of n`, then `N nodes · M edges · Done`. `window.ursaShell.graphTimings()`
+    k of n` (and, while a coarse level is drawn, `· G groups`), then
+    `N nodes · M edges · Done`. `window.ursaShell.graphTimings()`
     gives when each step ended, and `bun tests/graph-timing.ts [url] [runs]`
     times `.graph rmat` (1M edges): in headless Chromium, the first drawing
     went from 4.6 s after Enter to 0.95 s, and the layout's end from 12.1 s
@@ -370,6 +371,35 @@ static assets and an R2 bucket.
     heaps are 49 MiB (engine), 52 MiB (view) and 97 MiB (layout worker),
     of 219 MiB for the page and its workers. On karate: frames 16.7 ms
     apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
+
+  - **The first paint** (#497): a graph of 200,000 nodes and edges or more
+    is first drawn as the coarsest level of its layout's hierarchy, laid
+    out: a few dozen discs, each with area by the mass of the nodes it
+    stands for, and the merged edges between them, as wide as their weights
+    say. Then each level the layout comes to, twice the discs each time,
+    their nodes moving out from their parents over 150 ms (at once under
+    `prefers-reduced-motion`), the header counting them: `… · Laying out ·
+    level 3 of 11 · 110 groups`. The graph's own nodes and edges are first
+    drawn when the layout reaches them. `graph-worker.js` sends each level
+    as it reaches it (`level`: masses, parents, the 16,384 heaviest merged
+    edges and positions, as transferred typed arrays, read before the
+    hierarchy lets the level go; then `levelPositions` after each batch)
+    in place of every node's position; `graph-levels.js` keeps them
+    (`levels[l]`, for whoever cuts through the hierarchy later) and says
+    where the nodes are on their way; the view draws the level
+    (`ursa-viz`'s `setLevel`). Nothing is picked while a level is drawn.
+    The layout's final positions are the same bits, and the worker holds
+    what it held (55.6 MB at a million edges).
+    `window.ursaShell.graph()` gives `coarse` (what is drawn of the
+    level, or null), `hierarchy` (`[level, nodes]` of the levels that
+    arrived) and `levelFrames` (what the levels' frames cost);
+    `graphTimings().graphDrawn` is when the graph itself was first drawn.
+    On `.graph rmat` (headless Chromium, software WebGL2, three runs,
+    2026-11-23) the first frame is shown 941 to 953 ms after Enter (1,130
+    to 1,230 ms before), the levels' frames are 33 ms apart at the p95 and
+    50 ms at most, and the graph itself is first drawn at 4.2 to 4.5 s.
+    The 600 ms #497 asks for is not met: the engine answers at 345 to
+    366 ms, and the worker's hierarchy is built 520 to 540 ms after that.
 
   - **The frame budget** (#495): while the view moves (a pan, a zoom, a
     layout still running) a frame draws only what fits in one: a prefix of
@@ -581,7 +611,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

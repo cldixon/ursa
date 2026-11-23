@@ -388,34 +388,43 @@ fn coarse_rows(
         }
         let rows: Vec<(Vec<u32>, Vec<f32>, f32)> = (start..end)
             .into_par_iter()
-            .map_init(Vec::<(u32, f32)>::new, |scratch, c| {
-                scratch.clear();
-                let mut m = 0.0f32;
-                for &u in &members[member_offsets[c] as usize..member_offsets[c + 1] as usize] {
-                    m += mass[u as usize];
-                    let base = adj.offsets[u as usize] as usize;
-                    for (e, &v) in adj.neighbors(u).iter().enumerate() {
-                        // A grouped node's neighbours are all grouped: only
-                        // isolated nodes are dropped.
-                        let gv = group[v as usize];
-                        if gv as usize != c {
-                            scratch.push((gv, weights.map_or(1.0, |w| w[base + e])));
+            .map_init(
+                || (vec![0.0f32; nc], vec![false; nc], Vec::<u32>::new()),
+                |(sum, met, targets), c| {
+                    // Each target's weights are added in the order its
+                    // edges are met (members in index order, each one's
+                    // neighbours in theirs), into a slot of its own: the
+                    // sums a stable sort by target and a merge would give,
+                    // without sorting the edges.
+                    targets.clear();
+                    let mut m = 0.0f32;
+                    for &u in &members[member_offsets[c] as usize..member_offsets[c + 1] as usize] {
+                        m += mass[u as usize];
+                        let base = adj.offsets[u as usize] as usize;
+                        for (e, &v) in adj.neighbors(u).iter().enumerate() {
+                            // A grouped node's neighbours are all grouped: only
+                            // isolated nodes are dropped.
+                            let gv = group[v as usize] as usize;
+                            if gv != c {
+                                let w = weights.map_or(1.0, |w| w[base + e]);
+                                if met[gv] {
+                                    sum[gv] += w;
+                                } else {
+                                    met[gv] = true;
+                                    sum[gv] = w;
+                                    targets.push(gv as u32);
+                                }
+                            }
                         }
                     }
-                }
-                scratch.sort_by_key(|&(t, _)| t);
-                let mut targets: Vec<u32> = Vec::new();
-                let mut ws: Vec<f32> = Vec::new();
-                for &(t, w) in scratch.iter() {
-                    if targets.last() == Some(&t) {
-                        *ws.last_mut().unwrap() += w;
-                    } else {
-                        targets.push(t);
-                        ws.push(w);
+                    targets.sort_unstable();
+                    let ws: Vec<f32> = targets.iter().map(|&t| sum[t as usize]).collect();
+                    for &t in targets.iter() {
+                        met[t as usize] = false;
                     }
-                }
-                (targets, ws, m)
-            })
+                    (targets.clone(), ws, m)
+                },
+            )
             .collect();
         for (t, w, m) in rows {
             weights_out.extend_from_slice(&w);

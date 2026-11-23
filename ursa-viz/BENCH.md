@@ -716,6 +716,54 @@ nothing is drawn in slices. Or, for the read-back check and the
 comparison with one draw, `ONLY="refine rmat 1M" bun
 tests/browser/view.ts` (WebGL2).
 
+## The first paint
+
+A large graph is first drawn as the coarsest level of its layout's
+hierarchy, then each level the layout comes to (#497;
+[README](README.md#the-first-paint-a-level-of-the-hierarchy)). In the
+shell, `.graph rmat` (46,318 nodes with an edge, 1,000,000 edges) at
+1280 × 800, with `web/tests/graph-timing.ts`, on this container (no GPU:
+SwiftShader, 4 cores, a load of 1 to 2), 2026-11-23. Times are from Enter;
+"shown" is the `.graph` action's `frame`, when the page's thread was free
+of the frame (`firstDraw` is when `render()` returned). Three runs, and
+main (`5c03374`, two runs) in the same session:
+
+| | main | a level at a time (three runs) |
+|---|---|---|
+| the engine's answer | 388, 393 ms | 345, 364, 366 ms |
+| the graph posted to the layout worker | 403, 412 ms | 359, 380, 378 ms |
+| the view made | 774, 847 ms | 764, 767, 769 ms |
+| the hierarchy built | 967, 1,072 ms | 898, 897, 904 ms |
+| the first positions on the page | 968, 1,073 ms | 907, 905, 912 ms |
+| the first frame, `render()` returned | 1,004, 1,101 ms | 914, 915, 928 ms |
+| **the first frame shown** | 1,128, 1,234 ms | **941, 941, 953 ms** |
+| what it shows | 273 of the nodes and 822 of the edges, at their groups' places before any iteration | 27 discs, laid out, and the merged edges between them |
+| frames before the graph itself, each to the next | – | 59 to 65 frames: p50 16.7 ms, **p95 33.3 ms, max 50 ms** |
+| the graph itself first drawn | 968 ms | 4.2 to 4.5 s |
+| the layout done | 6.1, 6.3 s | 5.4, 5.5, 5.4 s |
+| the layout worker's memory | 55.7 MB | 55.6 MB |
+| the view's memory | 18.3 MiB | 17.9 to 18.3 MiB |
+
+The issue asks for a first frame within 0.6 s, and for frames before level
+0 of at most 50 ms each. The second is met. The first is not: of the
+0.94 s, 0.35 to 0.37 s is the engine's and 0.52 to 0.54 s is the layout
+worker building the graph's adjacency (0.15 s, timed alone) and the
+hierarchy (0.35 s), with the page making its view on another core
+meanwhile; no level exists to draw before the hierarchy does. From the
+hierarchy to the pixels is 40 to 50 ms (it was 100 ms before the level's
+pipelines were made with the view). What was gained: the worker lays out
+the coarsest level and sends it (10 ms) where it prolonged every level to
+the graph and the page drew a quarter of a million vertices; and the
+hierarchy's rows are gathered without sorting their edges
+(`ursa-core/examples/fa2_multilevel.rs bench 1m rmat`: 225 ms where it was
+336 ms, one core, native). The layout ends sooner as well: it no longer
+prolongs ten levels to the graph, nor does the page upload 46,318
+positions, after every batch.
+
+`tests/browser/view.ts` (`ONLY=levels`) reads frames back at the four
+coarsest levels of a 100K-edge R-MAT graph on WebGL2 (49, 99, 198 and 397
+discs).
+
 ## Memory at a million edges
 
 What the two `ursa-viz` instances hold in the shell on `.graph rmat`

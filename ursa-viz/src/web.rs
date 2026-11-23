@@ -169,6 +169,11 @@ impl Source for PageBytes {
     }
 }
 
+/// A graph of this many nodes and edges is drawn a level at a time while
+/// it is laid out (the shell's layout worker says which; this is its
+/// threshold): its view warms the level pipelines as it is made.
+const LEVELS_FROM: usize = 200_000;
+
 async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, JsValue> {
     let (width, height) = (canvas.width().max(1), canvas.height().max(1));
     let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
@@ -241,6 +246,14 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
                 .map_err(js_err)?
         }
     };
+    let mut view = view;
+    // A graph this large is first seen as a level of its layout's
+    // hierarchy (#497): what draws one is made now, not in that frame.
+    if view.n_nodes() + view.n_edges() >= LEVELS_FROM {
+        // In a task of its own: compiling is not quick everywhere.
+        crate::pace::yield_now().await;
+        view.warm_levels(&device, &queue, config.format);
+    }
     Ok(GraphView {
         view,
         _instance: instance,

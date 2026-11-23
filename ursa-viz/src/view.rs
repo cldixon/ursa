@@ -1337,7 +1337,7 @@ impl View {
     /// ([`View::pick_linear`]).
     pub fn pick(&mut self, px: f32, py: f32) -> Option<u32> {
         // A level's discs are not the graph's nodes: nothing to pick.
-        if self.level.is_some() {
+        if self.draws_level() {
             return None;
         }
         self.rested();
@@ -1350,7 +1350,7 @@ impl View {
 
     /// [`View::pick`], testing every node: what the grid must agree with.
     pub fn pick_linear(&self, px: f32, py: f32) -> Option<u32> {
-        if self.level.is_some() {
+        if self.draws_level() {
             return None;
         }
         self.discs().pick_linear(px, py)
@@ -1376,7 +1376,7 @@ impl View {
     /// otherwise every edge. The answer is the same either way
     /// ([`View::pick_edge_linear`]).
     pub fn pick_edge(&mut self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
-        if self.level.is_some() {
+        if self.draws_level() {
             return None;
         }
         self.rested();
@@ -1401,7 +1401,7 @@ impl View {
 
     /// [`View::pick_edge`], testing every edge.
     pub fn pick_edge_linear(&self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
-        if self.level.is_some() {
+        if self.draws_level() {
             return None;
         }
         let (src, dst) = self.edges();
@@ -1438,7 +1438,7 @@ impl View {
     /// The frame is the same, bit for bit: only nodes that put nothing on
     /// the canvas are left out, and the rest are drawn in the same order.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.level.is_some() {
+        if self.draws_level() {
             return self.prepare_level(device, queue);
         }
         self.rested();
@@ -1837,7 +1837,7 @@ impl View {
         now_ms: f64,
     ) -> Planned {
         // A level of the hierarchy, while one is set, in place of the graph.
-        if self.level.is_some() {
+        if self.draws_level() {
             let frame = self.plan_level_frame(device, queue, now_ms);
             let how = How::Level;
             return Planned { frame, how };
@@ -2311,7 +2311,7 @@ impl View {
     /// Draw a frame into `target`: everything, whether the view moves or
     /// not.
     pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
-        if self.level.is_some() {
+        if self.draws_level() {
             return self.draw_level(device, queue, target);
         }
         self.renderer.draw(

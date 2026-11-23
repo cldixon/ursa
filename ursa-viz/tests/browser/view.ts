@@ -70,6 +70,10 @@
 // draw the texture under their own. ONLY=refine runs these alone, and
 // ONLY="refine rmat 1M" the issue's size: no task of the page over 50 ms
 // while the slices are drawn, and how long they take.
+//
+// Then a level of the layout's hierarchy drawn in place of the graph
+// (#497), on WebGL2: frames read back at the four coarsest levels of the
+// 100K-edge R-MAT graph. ONLY=levels runs these alone.
 import { chromium, type Page } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -1737,6 +1741,138 @@ if (REFINE_CASES.length) {
     console.log(`refine on ${r.backend}: 100K edges drawn in ${r.refined.refinement?.slices} slices, shown, hovered, and panned and zoomed over the texture with ${errors.length} errors`);
     await gpu.close();
   }
+}
+// A level of the layout's hierarchy drawn in place of the graph (#497), on
+// WebGL2, where frames can be read back: the coarsest level of a 100K-edge
+// R-MAT graph, and the levels under it as the layout comes down. Every
+// disc is on the canvas where its node is, the heaviest merged edge is
+// drawn between its ends, a moving frame of a large level draws the
+// heaviest of it, nothing is picked, and once the level is cleared the
+// frame is the graph's own, byte for byte. And the layout stepped a level
+// at a time ends on the bits of one stepped whole. ONLY=levels runs this
+// alone.
+if (!ONLY || "levels".startsWith(ONLY)) {
+  const name = "levels rmat 100K";
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+  page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+  page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+  await page.goto(`${base}?graph=rmat&scale=14&edges=100000&result=1`);
+  await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+  await page.waitForTimeout(500);
+  const r: any = await page.evaluate(async () => {
+    const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+    const canvas = document.getElementById("view") as HTMLCanvasElement;
+    const [W, H] = [canvas.width, canvas.height];
+    w.pauseFrames(true);
+    await new Promise((r) => setTimeout(r, 200));
+    const out: any = { backend: view.backend, problems: [] as string[], levels: [] as any[] };
+    const problem = (what: string) => out.problems.push(what);
+    const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+    const ink = (px: Uint8Array) => { let c = 0; for (let i = 0; i < px.length; i += 4) if (px[i] < 235 || px[i + 1] < 235 || px[i + 2] < 235) c++; return c; };
+    const at = (px: Uint8Array, x: number, y: number) => { const i = 4 * (Math.round(y) * W + Math.round(x)); return [px[i], px[i + 1], px[i + 2]]; };
+    // Everything, read back.
+    const frame = async (): Promise<Uint8Array> => { view.render(); return view.snapshot(); };
+    view.fit();
+    const graphFrame = await frame();
+    const picked = view.pick(W / 2, H / 2);
+    if (view.levelInfo() !== undefined) problem("a view with no level set says it draws one");
+
+    // The layout the levels come from, and one stepped whole, to end on
+    // the same bits.
+    const layout = new viz.Layout(g.n, g.src, g.dst);
+    const whole = new viz.Layout(g.n, g.src, g.dst);
+    out.count = layout.levels;
+    if (!(layout.levels > 3)) problem(`the layout has ${layout.levels} levels`);
+    while (!layout.levelFinished) layout.stepLevel(1);
+    // Where the camera, fitted to `xy`, puts a point: Camera::fit's margin.
+    const place = (xy: Float32Array, n: number) => {
+      let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < n; i++) { x0 = Math.min(x0, xy[i]); x1 = Math.max(x1, xy[i]); y0 = Math.min(y0, xy[n + i]); y1 = Math.max(y1, xy[n + i]); }
+      const scale = Math.min(W / Math.max(x1 - x0, 1e-6), H / Math.max(y1 - y0, 1e-6)) * 0.92;
+      return (i: number) => [W / 2 + (xy[i] - (x0 + x1) / 2) * scale, H / 2 - (xy[n + i] - (y0 + y1) / 2) * scale];
+    };
+    let above = 0;
+    let disc: number[] | null = null;
+    for (let step = 0; step < 4; step++) {
+      const level = layout.levelGraph(4096);
+      const n = level.mass.length;
+      const xy: Float32Array = layout.levelPositions();
+      const tag = `level ${level.level}`;
+      if (level.level !== layout.level || level.levels !== layout.levels || xy.length !== 2 * n) problem(`${tag}: ${n} masses, ${xy.length} positions, level ${layout.level}`);
+      if (step === 0 ? level.parents !== undefined : level.parents?.length !== n || level.parents.some((p: number) => p >= above && p !== 0xffffffff)) problem(`${tag}: its parents are not nodes of the level above`);
+      if (level.src.length !== level.dst.length || level.src.length !== level.weight.length || level.src.length > 4096 || level.totalEdges < level.src.length) problem(`${tag}: ${level.src.length} edges of ${level.totalEdges}`);
+      if (level.weight.some((x: number, i: number) => i > 0 && x > level.weight[i - 1])) problem(`${tag}: the edges are not heaviest first`);
+      view.setLevel(level.level, level.levels, level.mass, level.src, level.dst, level.weight, level.totalEdges);
+      view.setLevelPositions(xy);
+      const px = await frame();
+      const info = view.levelInfo();
+      if (info?.level !== level.level || info.nodes !== n || info.nodesDrawn !== n || info.edges !== level.src.length || info.edgesDrawn !== level.src.length || info.totalEdges !== level.totalEdges) problem(`${tag}: levelInfo ${JSON.stringify(info)}`);
+      // The heaviest discs, where their nodes are, in the nodes' colour.
+      const to = place(xy, n);
+      const heaviest = Array.from(level.mass as Float32Array, (m, i) => [m, i]).sort((a, b) => b[0] - a[0]).slice(0, 5).map(([, i]) => i);
+      for (const i of heaviest) {
+        const [x, y] = to(i);
+        const c = at(px, x, y);
+        disc ??= c;
+        if (c.some((v, k) => Math.abs(v - disc![k]) > 2) || c.every((v) => v > 235)) problem(`${tag}: node ${i} at ${Math.round(x)},${Math.round(y)} is ${c}, not a disc (${disc})`);
+      }
+      // The heaviest edge, half way between its ends (unless a disc is there).
+      if (level.src.length) {
+        const [a, b] = [to(level.src[0]), to(level.dst[0])];
+        const c = at(px, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+        if (c.every((v) => v > 235)) problem(`${tag}: nothing is drawn half way along its heaviest edge`);
+      }
+      if (!differ(px, graphFrame)) problem(`${tag}: the frame is the graph's`);
+      if (view.pick(W / 2, H / 2) !== undefined || view.pickLinear(W / 2, H / 2) !== undefined || view.pickEdge(W / 2, H / 2, 4) !== undefined) problem(`${tag}: something was picked`);
+      // A moving frame: within the budget, the heaviest of the level.
+      view.keepMoving();
+      view.renderFrame(performance.now());
+      const moving = view.levelInfo();
+      const part: Uint8Array = await view.snapshot();
+      if (!(moving.nodesDrawn >= 1 && moving.nodesDrawn <= n && moving.edgesDrawn <= level.src.length)) problem(`${tag}: a moving frame drew ${JSON.stringify(moving)}`);
+      if (moving.nodesDrawn < n && !(view.framePartial && ink(part) < ink(px))) problem(`${tag}: a moving frame of ${moving.nodesDrawn} of ${n} nodes is not less than all of it`);
+      out.levels.push({ level: level.level, nodes: n, edges: level.src.length, totalEdges: level.totalEdges, ink: ink(px), movingNodes: moving.nodesDrawn, movingEdges: moving.edgesDrawn });
+      above = n;
+      // Down a level, and that level to its last iteration.
+      const from = layout.level;
+      layout.stepLevel(1);
+      if (layout.level !== from - 1) problem(`${tag}: a step from a finished level went to level ${layout.level}`);
+      while (!layout.levelFinished && !layout.done) layout.stepLevel(1);
+    }
+    // More positions than the level has nodes are refused.
+    let refused = false;
+    try { view.setLevelPositions(new Float32Array(3)); } catch { refused = true; }
+    if (!refused) problem("positions of the wrong length were taken");
+    // The graph again: its own frame, byte for byte, and its picks.
+    view.clearLevel();
+    view.fit();
+    out.afterClear = differ(await frame(), graphFrame);
+    if (out.afterClear) problem(`once the level is cleared, ${out.afterClear} bytes of the frame differ from the graph's`);
+    if (view.levelInfo() !== undefined || view.pick(W / 2, H / 2) !== picked) problem("once the level is cleared, the graph is not picked as before");
+    try { view.setLevelPositions(new Float32Array(2)); problem("positions were taken with no level set"); } catch { /* refused */ }
+    // To the end, a level at a time, against one stepped whole.
+    const t = performance.now();
+    while (!layout.done) layout.stepLevel(8);
+    out.layoutMs = performance.now() - t;
+    while (!whole.done) whole.step(8);
+    const [a, b]: Float32Array[] = [layout.positions(), whole.positions()];
+    const bits = (f: Float32Array) => new Uint32Array(f.buffer, f.byteOffset, f.length);
+    out.sameBits = a.length === b.length && bits(a).every((v, i) => v === bits(b)[i]);
+    if (!out.sameBits) problem("a layout stepped a level at a time does not end on the bits of one stepped whole");
+    const last = layout.levelGraph(16);
+    if (last.level !== 0 || last.mass.length || last.src.length || last.totalEdges <= 0) problem(`level 0: ${last.mass.length} masses, ${last.src.length} edges of ${last.totalEdges}`);
+    layout.free();
+    whole.free();
+    w.pauseFrames(false);
+    return out;
+  });
+  for (const problem of r.problems) failures.push(`${name}: ${problem}`);
+  console.log(
+    `${name}: ${r.backend} · ${r.count} levels · read back ${r.levels.map((l: any) => `level ${l.level}: ${l.nodes} discs, ${l.edges} of ${l.totalEdges} edges, ${l.ink} px inked (moving: ${l.movingNodes} discs, ${l.movingEdges} edges)`).join("; ")} · ` +
+      `cleared, ${r.afterClear} bytes differ from the graph's frame · a level at a time ends on the same bits: ${r.sameBits}`,
+  );
+  await gl.close();
 }
 server.stop();
 if (failures.length) {

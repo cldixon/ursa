@@ -363,6 +363,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // is drawn).
     hierarchy: createLevels({ animate: !matchMedia("(prefers-reduced-motion: reduce)").matches }),
     groups: null,
+    // What each frame of a coarse level cost, in ms: the time to the next
+    // animation frame, as the frame budget measures a moving frame.
+    levelFrames: [],
     // Nothing is drawn before the layout's first positions.
     positioned: false,
     layoutDone: false,
@@ -562,7 +565,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // callback ran. And if it left anything out, a frame with everything once
   // nothing has moved for a while.
   const budgeted = (frameTime) => {
-    requestAnimationFrame((next) => current === state && !state.paused && view.frameCost(next - frameTime));
+    // A frame of a coarse level (#497): its cost is kept too, for graphTimings.
+    const level = state.groups !== null;
+    requestAnimationFrame((next) => {
+      if (current !== state || state.paused) return;
+      view.frameCost(next - frameTime);
+      if (level) state.levelFrames.push(next - frameTime);
+    });
     clearTimeout(state.rest);
     state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
   };
@@ -1443,6 +1452,13 @@ export function close() {
   state.inspector?.remove();
 }
 
+/** How many `values` there are, and their median, 95th percentile and greatest (null for none). */
+function spread(values) {
+  const sorted = Float64Array.from(values).sort();
+  const at = (q) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] * 100) / 100 : null);
+  return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
+}
+
 /** For tests: what is drawn. */
 export function info() {
   if (!current) return null;
@@ -1492,6 +1508,9 @@ export function info() {
     // totalEdges} (GraphView.levelInfo), or null when the graph is drawn;
     // and the levels that have arrived, coarsest first: [level, nodes].
     coarse: current.view.levelInfo() ?? null,
+    // What the frames of the coarse levels cost: how many, and the median,
+    // the 95th percentile and the most, in ms (null before any).
+    levelFrames: spread(current.levelFrames),
     hierarchy: current.hierarchy.levels.filter(Boolean).map((l) => [l.level, l.n]).reverse(),
     drawnAs: current.drawnAs,
     width: current.canvas.width,

@@ -255,6 +255,34 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Graph view: a large graph is first seen as the coarsest level of its
+  layout, and refines level by level** (#497). The coarse-to-fine layout
+  works down a pyramid of the graph; until it reaches the graph itself, the
+  view now draws the level being laid out: a disc for each of its nodes,
+  with area by the mass of the nodes it stands for, and its heaviest merged
+  edges, as wide as the number of edges each stands for. Each new level's
+  nodes move out from their parents over 150 ms (at once under
+  `prefers-reduced-motion`), and the status reads `… · Laying out · level 3
+  of 11 · 110 groups`. The graph's own nodes and edges are first drawn when
+  the layout reaches them. On `.graph rmat` (a million edges, headless
+  Chromium with no GPU) the first frame is shown 0.94 s after Enter where
+  it took 1.13 to 1.23 s, and shows the drawing's shape; the levels' frames
+  come 33 ms apart at the 95th percentile. The layout ends on the same
+  positions, bit for bit. Graphs under 200,000 nodes and edges are drawn as
+  before.
+  - `ursa-core`: `Fa2Multilevel::step_level`, `level_positions`,
+    `level_mass`, `parents_below`, `level_edges` (`LevelEdges`),
+    `level_finished` and `prolong`. Building a hierarchy gathers each
+    coarse row without sorting its edges (the same sums, in the same
+    order): 225 ms where it took 336 ms for the 1M-edge R-MAT graph on one
+    core.
+  - `ursa-viz`: `LiveLayout::step_level`, `level_graph` and
+    `level_positions`; `levels` (`LevelGraph`, `LevelScene`) and
+    `level_render`; `View::set_level`, `set_level_positions`,
+    `clear_level`, `level_info` and `warm_levels`. In the browser:
+    `Layout.stepLevel`, `levelGraph`, `levelPositions`, `levelFinished`
+    and `work`; `GraphView.setLevel`, `setLevelPositions`, `clearLevel`
+    and `levelInfo`.
 - **The graph view at rest is drawn in slices, and kept: nothing waits for
   a million edges** (#496). Where everything does not fit in a frame, the
   frame at rest is no longer drawn at once (with no GPU, 2.5 to 6 s after
