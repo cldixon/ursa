@@ -68,6 +68,13 @@ pub struct View {
     /// The camera's zoom when last fitted: nodes grow back toward full size
     /// as the user zooms in past it.
     fitted_zoom: f32,
+    /// Pixels a fit leaves free at each side ([`View::set_fit_padding`]),
+    /// and how many of the first nodes it fits, if not all of them.
+    fit_padding: f32,
+    fit_first: Option<usize>,
+    /// Pixels a fit keeps clear at the left, top, right and bottom of the
+    /// canvas ([`View::set_fit_inset`]): what a panel over the view covers.
+    fit_inset: [f32; 4],
     /// Draw nodes as well as edges.
     pub draw_nodes: bool,
     /// The result drawn, for a view made from one ([`View::from_result`]):
@@ -631,6 +638,9 @@ impl View {
             renderer,
             follow: true,
             fitted_zoom: 1.0,
+            fit_padding: 0.0,
+            fit_first: None,
+            fit_inset: [0.0; 4],
             draw_nodes: true,
             live,
             layout_stale: false,
@@ -1215,12 +1225,55 @@ impl View {
         self.fit_camera();
     }
 
+    /// Leave `pixels` free at each side of the canvas when the camera fits
+    /// ([`View::fit`], and while it follows): for what is drawn larger
+    /// around a node than a node is, as the discs of `GROUP BY`'s groups
+    /// are (#499). 0, the default, is the fit as it was.
+    ///
+    /// With `first`, a fit is of the first `first` nodes alone, whatever
+    /// nodes come after them: the groups of a grouped drawing, whose
+    /// members are drawn inside their groups' discs, so that a group that
+    /// opens does not move the camera.
+    pub fn set_fit_padding(&mut self, pixels: f32, first: Option<usize>) {
+        self.fit_padding = if pixels > 0.0 { pixels } else { 0.0 };
+        self.fit_first = first;
+        if self.follow {
+            self.fit_camera();
+        }
+    }
+
+    /// Keep `left`, `top`, `right` and `bottom` pixels of the canvas clear
+    /// when the camera fits ([`View::fit`], and while it follows): the part
+    /// of the canvas that a panel drawn over it covers, so that a fit is of
+    /// the part still in sight, and centred in it (#493). All 0, the
+    /// default, is the fit as it was. The fit is never to less than a
+    /// tenth of the canvas's width or height.
+    ///
+    /// A camera that does not follow stays where it is: its owner moves it.
+    pub fn set_fit_inset(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
+        let inset = [left, top, right, bottom].map(|v| if v > 0.0 { v } else { 0.0 });
+        if inset == self.fit_inset {
+            return;
+        }
+        self.fit_inset = inset;
+        if self.follow {
+            self.fit_camera();
+        }
+    }
+
+    /// Whether the camera follows the layout ([`View::fit`]), as it does
+    /// until a pan or a zoom.
+    pub fn following(&self) -> bool {
+        self.follow
+    }
+
     fn fit_camera(&mut self) {
         // A level's nodes, while one is drawn: the graph's have no place yet.
         if let Some(b) = self.level_bounds() {
             return self.fit_to(b);
         }
-        let b = bounds(&self.x, &self.y);
+        let first = self.fit_first.map_or(self.x.len(), |k| k.min(self.x.len()));
+        let b = bounds(&self.x[..first], &self.y[..first]);
         self.fit_to(b);
         self.fitted = Some(Fitted {
             bounds: b,
@@ -1232,6 +1285,20 @@ impl View {
         if let Some(b) = bounds {
             self.moved();
             self.camera.fit(b);
+            let [left, top, right, bottom] = self.fit_inset;
+            let inset = left + top + right + bottom > 0.0;
+            if self.fit_padding > 0.0 || inset {
+                // As if the canvas were that much smaller at each side.
+                let (w, h) = self.camera.viewport;
+                let room =
+                    |side: f32, taken: f32| (side - taken - 2.0 * self.fit_padding).max(0.1 * side);
+                let (x0, y0, x1, y1) = b;
+                let (bw, bh) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
+                let padded = (room(w, left + right) / bw).min(room(h, top + bottom) / bh) * 0.92;
+                self.camera.pixels_per_unit = self.camera.pixels_per_unit.min(padded);
+                // In the middle of what is left clear.
+                self.camera.pan((left - right) * 0.5, (top - bottom) * 0.5);
+            }
             self.fitted_zoom = self.camera.pixels_per_unit;
             self.uncull();
         }
@@ -1244,6 +1311,13 @@ impl View {
     /// the same whichever order its points are added in.
     fn refit(&mut self, changes: &Changes) {
         let (n0, n1) = changes.nodes;
+        // A fit of the first nodes alone is found again: it is cheap.
+        if self.fit_first.is_some() {
+            if self.follow {
+                self.fit_camera();
+            }
+            return;
+        }
         let fitted = match self.fitted.take() {
             Some(fitted) if self.follow && !changes.positions => fitted,
             _ => {

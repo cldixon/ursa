@@ -202,6 +202,9 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         // and wgpu keeps its own reference to the canvas for the surface.
         unsafe { instance.create_surface_unsafe(target) }.map_err(js_err)?
     };
+    // Making the canvas's context is a piece of its own (20 ms of software
+    // WebGL2), and so is asking for the adapter and the device.
+    crate::pace::yield_now().await;
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -254,10 +257,16 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
     // A graph this large is first seen as a level of its layout's
     // hierarchy (#497): what draws one is made now, not in that frame.
     if view.n_nodes() + view.n_edges() >= LEVELS_FROM {
-        // In a task of its own: compiling is not quick everywhere.
-        crate::pace::yield_now().await;
-        view.warm_levels(&device, &queue, config.format);
+        // In tasks of its own, a piece at a time (#520): compiling is not
+        // quick everywhere.
+        let mut pace = crate::pace::Pace::yielding();
+        view.warm_levels_paced(&device, &queue, config.format, &mut pace)
+            .await;
     }
+    // What the caller does with the view is a task of its own, not the
+    // tail of the last piece here (the level's first draw, or the last
+    // run of edges): on the shell's page that is 12 to 27 ms more (#520).
+    crate::pace::yield_now().await;
     Ok(GraphView {
         view,
         _instance: instance,
@@ -575,9 +584,44 @@ impl GraphView {
         self.view.fit();
     }
 
+    /// Leave `pixels` free at each side of the canvas when the camera
+    /// fits: for discs drawn larger around a node than a node is
+    /// (`GROUP BY`'s groups, #499). 0 is the fit as it was. With `first`,
+    /// a fit is of the first `first` nodes alone: the groups, whose
+    /// members are drawn inside their discs.
+    #[wasm_bindgen(js_name = setFitPadding)]
+    pub fn set_fit_padding(&mut self, pixels: f32, first: Option<u32>) {
+        self.view.set_fit_padding(pixels, first.map(|k| k as usize));
+    }
+
+    /// Keep `left`, `top`, `right` and `bottom` pixels of the canvas clear
+    /// when the camera fits: what a panel over the view covers (#493). A
+    /// camera that follows the layout is fitted again at once; one that
+    /// does not stays where it is.
+    #[wasm_bindgen(js_name = setFitInset)]
+    pub fn set_fit_inset(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
+        self.view.set_fit_inset(left, top, right, bottom);
+    }
+
+    /// Whether the camera follows the layout (`fit`), as it does until a
+    /// pan or a zoom.
+    pub fn following(&self) -> bool {
+        self.view.following()
+    }
+
     /// A frame drawn offscreen: RGBA pixels, canvas-sized, row by row from
     /// the top (`new ImageData(new Uint8ClampedArray(px), width)`). Call no
     /// other method until it resolves.
+    ///
+    /// A level's or a cut's discs (#497, #498, #499) are given to the GPU
+    /// by a frame, so of those this is the last frame's: call
+    /// [`GraphView::refresh_level`] first for the view as it is now.
+    ///
+    /// The view is borrowed, shared, until the promise settles: a method
+    /// that reads the view may be called meanwhile, and one that changes
+    /// it, or `free()`, throws. (It must not borrow the view to change it:
+    /// then every call made meanwhile would throw, and each one that does
+    /// leaves the view unable to be freed.)
     pub async fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pixels = self
@@ -588,6 +632,15 @@ impl GraphView {
             return Err(js_err(format!("snapshot: {e}")));
         }
         pixels.map_err(js_err)
+    }
+
+    /// Give the GPU the discs of the level or the cut being drawn as they
+    /// are now (their places, colours and selection rings), as a frame
+    /// does: for a [`GraphView::snapshot`] taken before the next frame.
+    /// Nothing, when the graph itself is drawn.
+    #[wasm_bindgen(js_name = refreshLevel)]
+    pub fn refresh_level(&mut self) {
+        self.view.refresh_level(&self.device, &self.queue);
     }
 
     /// The node under the pixel `(x, y)`, or `undefined`. With the
@@ -1264,6 +1317,12 @@ impl GraphView {
     /// No disc is drawn with a radius over `maxRadius` pixels, if given:
     /// the discs of a cut stand a known distance apart.
     ///
+    /// `kinds`, if given, says how each group is drawn where it is not by
+    /// its mass (`GROUP BY`'s groups, #499, one value per group): `0` by
+    /// its mass; above 0, an open disc of that radius in the layout's
+    /// units, a rim under the others; below 0, a point of that many
+    /// pixels' radius over them; NaN, not at all, nor its edges.
+    ///
     /// The camera is not moved: the cut is the graph's own drawing,
     /// coarser. A group's disc takes the colour of most of its nodes
     /// ([`GraphView::color_by`]) and carries a ring in the selection
@@ -1283,6 +1342,7 @@ impl GraphView {
         weight: Vec<f32>,
         total_edges: Option<u32>,
         max_radius: Option<f32>,
+        kinds: Option<Vec<f32>>,
     ) -> Result<(), JsValue> {
         let groups = mass.len();
         if xy.length() as usize != 2 * groups {
@@ -1296,6 +1356,7 @@ impl GraphView {
         let mut scene =
             crate::levels::LevelScene::new(0, 1, mass, src, dst, weight, total).map_err(js_err)?;
         scene.set_max_radius(max_radius.unwrap_or(0.0));
+        scene.set_kinds(kinds.unwrap_or_default()).map_err(js_err)?;
         let (x, y) = scene.positions_mut();
         let n = groups as u32;
         xy.subarray(0, n).copy_to(x);
@@ -1333,6 +1394,13 @@ impl GraphView {
     #[wasm_bindgen(js_name = pickGroup)]
     pub fn pick_group(&self, x: f32, y: f32) -> Option<u32> {
         self.view.pick_group(x, y)
+    }
+
+    /// The radius group `group` of the cut drawn has on the canvas now,
+    /// in pixels, or `undefined`.
+    #[wasm_bindgen(js_name = groupRadius)]
+    pub fn group_radius(&self, group: u32) -> Option<f32> {
+        self.view.group_radius(group)
     }
 
     /// The graph's nodes that group `group` of the cut drawn stands for,

@@ -152,10 +152,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 /// [`Shell::explore`]. Name, arguments, help.
 pub const EXPLORE_COMMANDS: &[(&str, &str, &str)] = &[
     (
+        ".collapse",
+        "group:N",
+        "Close a group that .expand group:N opened, in a graph drawn with GROUP BY",
+    ),
+    (
         ".expand",
         "ID ?in|out|both? ?LIMIT n? ?--sql?",
         "Add a node's neighbours to the graph drawn, and the edges among its nodes: the 100 of \
-         highest degree that are not shown, or LIMIT n; --sql prints the SQL instead",
+         highest degree that are not shown, or LIMIT n; --sql prints the SQL instead. In a \
+         graph drawn with GROUP BY, .expand group:N opens group N: its members, in its disc",
     ),
     (
         ".find",
@@ -358,7 +364,10 @@ impl<O: Write, E: Write> Shell<O, E> {
         text: &str,
     ) -> Result<(usize, Option<view::Positions>)> {
         let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, self.last.clone()).await?;
-        self.explorer = Some(ExploreSession::new(drawn.result));
+        self.explorer = Some(match drawn.groups {
+            Some(groups) => ExploreSession::grouped(drawn.result, groups),
+            None => ExploreSession::new(drawn.result),
+        });
         Ok((drawn.skipped, drawn.positions))
     }
 
@@ -1536,6 +1545,8 @@ Then any of these clauses, in any order:
   ON graph                       the property graph the ids belong to
   NODES (SELECT id, … FROM …)    values for the nodes, for SIZE BY and COLOR BY to use
   SIZE BY x  COLOR BY y          a column or an algorithm: SIZE BY pagerank COLOR BY louvain
+  GROUP BY z                     a disc for each group in place of its nodes, and the edges
+                                 between groups, counted: a column or an algorithm
   LAYOUT force|rings|layers      the layout: by the edges' pull, or by distance or step
                                  on circles or in rows
   POSITIONS (SELECT id, x, y …)  where each node is: drawn there, with no layout to run
@@ -1543,6 +1554,13 @@ Then any of these clauses, in any order:
 AS names the columns when the result's own names do not say what they are:
   .graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)
   .graph AS hops(start, reached, steps) ON karate LAYOUT layers
+
+GROUP BY draws the groups, and opens one where it is:
+  .graph karate GROUP BY club          .graph g GROUP BY louvain
+  .expand group:0                      its members, in its disc (or double-click the disc)
+  .collapse group:0                    closed again
+After a query, write it in parentheses, so that GROUP BY is not the query's own:
+  .graph (SELECT * FROM louvain(g)) GROUP BY louvain
 
 A graph too large to lay out while you wait is laid out once and drawn from that:
   COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';
@@ -2440,6 +2458,8 @@ mod tests {
             "AS hops(seed, id, distance)",
             "ON graph",
             "LAYOUT force|rings|layers",
+            "GROUP BY z",
+            ".expand group:0",
             "POSITIONS (SELECT id, x, y …)",
             "ursa.graph_max_edges",
         ] {

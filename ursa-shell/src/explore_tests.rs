@@ -659,3 +659,67 @@ async fn not_shown_counts_follow_the_steps() {
         assert_eq!(count, degree - shown, "node {key}");
     }
 }
+
+/// `GROUP BY` (#499) as the shell runs it, on Ursa's whole dialect: a
+/// grouped drawing, a group opened and closed, and the steps undone. (The
+/// grouped result against SQL's own `GROUP BY` is `ursa-engine`'s
+/// `graph_groups` test.)
+#[tokio::test]
+async fn a_grouped_graph_opens_a_group_and_closes_it() {
+    let mut host = Host::karate().await;
+    assert_eq!(host.says(".graph karate GROUP BY club").await, "");
+    assert_eq!(host.session().shown(), (2, 1));
+    let base = host.session().result().to_bytes();
+    assert_eq!(
+        host.session().grouping().map(|g| (g.by(), g.len())),
+        Some(("club", 2))
+    );
+
+    // The club's ties, read from the tables.
+    let (out, _) = host
+        .run(
+            "SELECT count(*) FROM ties t JOIN members a ON a.id = t.src \
+             JOIN members b ON b.id = t.dst WHERE a.club = 'Mr. Hi' AND b.club = 'Mr. Hi';",
+        )
+        .await;
+    let inside: usize = out
+        .lines()
+        .find_map(|l| l.trim_matches(|c| c == '│' || c == ' ').parse().ok())
+        .unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(
+        host.says(".expand group:0").await,
+        format!("+17 nodes, +{inside} edges")
+    );
+    assert_eq!(host.session().shown(), (19, 1 + inside));
+    assert_eq!(
+        host.says(".expand group:0").await,
+        "Nothing changed: group 0 is open already; .collapse group:0 closes it"
+    );
+    assert_eq!(
+        host.says(".collapse group:0").await,
+        format!("-17 nodes, -{inside} edges")
+    );
+    assert_eq!(host.session().shown(), (2, 1));
+    assert_eq!(
+        host.says(".expand group:0").await,
+        format!("+17 nodes, +{inside} edges")
+    );
+    // The view was sent every change, and has what the session has.
+    assert_eq!(host.view.as_ref(), Some(host.session().result()));
+    assert_eq!(host.sent.len(), 3);
+    for _ in 0..3 {
+        host.says(".undo").await;
+    }
+    assert_eq!(host.session().result().to_bytes(), base);
+    assert_eq!(host.view.as_ref().unwrap().to_bytes(), base);
+
+    // In a grouped drawing .expand opens groups; .help lists .collapse.
+    let (_, err) = host.run(".expand 5").await;
+    assert!(err.contains("takes one of its groups"), "{err}");
+    let (out, _) = host.run(".help").await;
+    assert!(out.contains(".collapse group:N"), "{out}");
+    // A drawing that is not grouped has none to close.
+    host.says(".graph karate").await;
+    let (_, err) = host.run(".collapse group:0").await;
+    assert!(err.contains("this one is not grouped"), "{err}");
+}

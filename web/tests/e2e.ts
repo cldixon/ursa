@@ -274,6 +274,32 @@ await type(".history 2");
 check((await after(".history 2")).includes(".files"), ".history");
 await type(".dataset");
 check(lastTable(await after(".dataset")).rows.length === datasets.length, ".dataset lists");
+// COPY … TO writes a file in the session, which a read finds by its name
+// (#517). A relative path was "relative URL without a base", and
+// memory://uploads/… ended the engine.
+await type("COPY (SELECT * FROM layout_fa2(karate)) TO 'pos.parquet';");
+check(lastTable(await after("COPY (SELECT * FROM layout_fa2(karate))")).rows[0]?.[0] === "34" && (await errors()) === errorsSoFar, "COPY … TO a relative path writes a session file", await after("COPY (SELECT * FROM layout_fa2(karate))"));
+await type("SELECT count(*) AS n, count(x) AS placed FROM 'pos.parquet';");
+check(JSON.stringify(lastTable(await after("SELECT count(*) AS n, count(x)")).rows[0]) === '["34","34"]', "a file COPY wrote reads back by its name", await after("SELECT count(*) AS n, count(x)"));
+await type("COPY (SELECT * FROM ties LIMIT 5) TO 'memory://uploads/ties.csv';");
+const tiesWritten = lastTable(await after("COPY (SELECT * FROM ties LIMIT 5)")).rows[0]?.[0];
+await type("SELECT count(*) AS n FROM 'memory://uploads/ties.csv';");
+const tiesByUrl = lastTable(await after("SELECT count(*) AS n FROM 'memory:")).rows[0]?.[0];
+await type("SELECT count(*) AS n FROM 'ties.csv';");
+const tiesByName = lastTable(await after("SELECT count(*) AS n FROM 'ties.csv'")).rows[0]?.[0];
+check(Number(tiesWritten) > 0 && tiesByUrl === tiesWritten && tiesByName === tiesWritten && !(await screen()).includes("the engine stopped"), "COPY … TO 'memory://uploads/…' writes the file, and the engine runs on", `${tiesWritten} written, ${tiesByUrl} by URL, ${tiesByName} by name`);
+for (const ext of ["json", "arrow"]) {
+  await type(`COPY (SELECT 7 AS seven) TO 'seven.${ext}';`);
+  await type(`SELECT seven + 1 AS eight FROM 'seven.${ext}';`);
+  check(lastTable(await after("SELECT seven + 1 AS eight")).rows[0]?.[0] === "8", `COPY … TO a .${ext} file round-trips`, await after("COPY (SELECT 7 AS seven)"));
+}
+await type(".files");
+t = lastTable(await after(".files"));
+check(
+  ["pos.parquet", "ties.csv", "seven.json", "seven.arrow"].every((f) => t.rows.some((r) => r[0] === f && Number(r[1]) > 0 && r[2] === "written here")) && t.rows.some((r) => r[0] === "karate_edges.parquet"),
+  ".files lists the files COPY wrote",
+  JSON.stringify(t.rows.filter((r) => r[2] === "written here")),
+);
 // The forms .help graph shows, on the karate graph: they must parse and run.
 for (const sql of [
   "FROM GRAPH_TABLE (karate MATCH (a)<-[e]-(b) WHERE a.id = 1 COLUMNS (b.id));",
@@ -285,6 +311,18 @@ for (const sql of [
 ])
   await type(sql);
 check((await errors()) === errorsSoFar, "no errors from the dot-commands and graph forms", `${(await errors()) - errorsSoFar} new`);
+// What cannot be written is refused, with what works; nothing stops.
+for (const [target, says] of [
+  ["https://example.com/pos.parquet", "writes only this session's files"],
+  ["out/pos.parquet", "with no folder"],
+  ["pos.txt", "names no format"],
+]) {
+  await type(`COPY (SELECT 1 AS a) TO '${target}';`);
+  const said = (await after("COPY (SELECT 1 AS a)")).replace(/\n/g, " ");
+  check(said.includes("Error: ") && said.replace(/\s+/g, " ").includes(says) && said.includes(`'${target}'`) && !said.includes("memory:") && said.includes("name.parquet") === (target !== "pos.txt"), `COPY … TO '${target}' is refused, saying what works`, said);
+}
+await type("SELECT 41 + 1 AS still;");
+check(lastTable(await after("SELECT 41 + 1 AS still;")).rows[0]?.[0] === "42" && !(await screen()).includes("the engine stopped"), "the engine runs on after the COPY refusals");
 
 // Type-ahead: keys pressed while a line runs are kept.
 await page.keyboard.type("SELECT 2 AS");
@@ -790,7 +828,16 @@ async function watchedContext(options: Parameters<typeof browser.newContext>[0])
   ctx.on("console", (m) => {
     if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
   });
-  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  ctx.on("page", (p) =>
+    p.on("pageerror", (e) => {
+      // Said at once too: a later step may stop the run before the end.
+      console.log(`FAIL page error: ${e.message}`);
+      failures.push(`page error: ${e.message}`);
+    }),
+  );
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /panicked|unreachable|recursive use|borrowed/i.test(m.text())) console.log(`CONSOLE ${m.text().slice(0, 600)}`);
+  });
   return ctx;
 }
 const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
@@ -818,6 +865,8 @@ async function graphSettled(p: Page) {
     throw new Error(`the graph view did not settle: ${JSON.stringify(seen)}`, { cause: e });
   }
 }
+/** Wait until the camera has made room for the inspector's panel, or given it back (#493). */
+const roomSettled = (p: Page) => p.waitForFunction(() => (window as any).ursaShell.graph()?.room.waits === false, null, { timeout: 10_000, polling: 50 }).catch(() => {});
 /** The terminal's columns, once a resize has settled. */
 async function settledCols(p: Page) {
   let last = -1;
@@ -1499,7 +1548,7 @@ for (const scheme of ["light", "dark"] as const) {
       return squeezed(await after(line, s));
     };
     const status = async () => (await s.locator("#graph-status").textContent()) ?? "";
-    // The selection's box, in CSS pixels of the canvas, once the camera rests.
+    // The selection's box, in CSS pixels, once the camera rests.
     const fitted = async () => {
       await s.waitForFunction(() => !(window as any).ursaShell.graph()?.fitting, null, { timeout: 10_000 });
       await s.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
@@ -1510,7 +1559,10 @@ for (const scheme of ["light", "dark"] as const) {
         const xs = at.map((p: any) => p.x);
         const ys = at.map((p: any) => p.y);
         const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-        return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth, height: canvas.clientHeight, ids: shell.graph().selection.map((n: any) => String(n.id)) };
+        // In the part of the canvas the inspector's panel leaves clear (#493).
+        const ratio = shell.graph().width / canvas.clientWidth;
+        const [left, top, right, bottom] = shell.graph().room.inset.map((v: number) => v / ratio);
+        return { cx: (x0 + x1) / 2 - left, cy: (y0 + y1) / 2 - top, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth - left - right, height: canvas.clientHeight - top - bottom, ids: shell.graph().selection.map((n: any) => String(n.id)) };
       });
     };
     const centred = (b: any) => Math.abs(b.cx - b.width / 2) <= 2 && Math.abs(b.cy - b.height / 2) <= 2;
@@ -1652,7 +1704,9 @@ for (const scheme of ["light", "dark"] as const) {
       const status = (await s.locator("#graph-status").textContent()) ?? "";
       check(status.startsWith("Selected node 2: ") && status.includes("+4 not shown") && /not shown\s*\+4/.test(tip), "a node with neighbours not shown says +N, in the header and the tooltip", `${status} | ${tip}`);
     }
-    // The frame before: node 2 selected, the pointer off the canvas.
+    // The frame before: node 2 selected, the pointer off the canvas, and the
+    // camera at rest, having made room for the inspector's panel (#493).
+    await roomSettled(s);
     await away();
     await s.waitForFunction(() => (window as any).ursaShell.graph().hovered === null);
     const places = async (ids: number[]) => Promise.all(ids.map(place));
@@ -2329,6 +2383,9 @@ for (const scheme of ["light", "dark"] as const) {
       await known();
       // A node not yet expanded, with neighbours to add, the fewest first:
       // the hubs of this graph have thousands.
+      // With the inspector open, once the camera has made room for its
+      // panel (#493): any node in sight can be double-clicked.
+      await roomSettled(r);
       const all: any[] = await r.evaluate(() => (window as any).ursaShell.graphExpandable(100_000));
       const next = all.filter((c) => !commands.includes(`.expand ${c.id}`)).sort((a, b) => a.notShown - b.notShown)[0];
       if (!next) break;
@@ -2481,6 +2538,30 @@ for (const scheme of ["light", "dark"] as const) {
   const missing = Number(((await status()).match(/ · ([\d,]+) of 46,318 nodes had no saved position and were placed beside their neighbours · /)?.[1] ?? "0").replace(/,/g, ""));
   check(missing > 4_000 && partial.bad === 0 && partial.kept === 46_318 - missing && partial.moved === missing, "saved positions: the nodes without one are placed beside their neighbours, and the others do not move", `${await status()}; ${JSON.stringify(partial)}`);
 
+  // The positions as a file (#517): COPY writes it in the session, and the
+  // drawing from it is the drawing from the table.
+  await type("COPY (SELECT * FROM layout_fa2(rmat)) TO 'pos.parquet';", s);
+  const wrote = lastTable(await after("COPY (SELECT * FROM layout_fa2(rmat))", s)).rows[0]?.[0];
+  await type(".graph rmat POSITIONS (SELECT * FROM 'pos.parquet')", s);
+  await graphSettled(s);
+  const fromFile = await s.evaluate(() => {
+    const w = window as any;
+    const g = w.ursaShell.graphPlacement();
+    const n = g.ids.length;
+    let kept = 0;
+    for (let i = 0; i < n; i++) {
+      const a = w.__live.get(g.ids[i]);
+      if (Object.is(a[0], g.xy[i]) && Object.is(a[1], g.xy[n + i])) kept++;
+    }
+    return { n, kept };
+  });
+  const filed = await graphInfo(s);
+  check(
+    wrote === "46318" && filed.saved === true && filed.iterations === 0 && (await status()).includes(" · saved positions · Done") && fromFile.n === 46_318 && fromFile.kept === 46_318,
+    "saved positions: COPY … TO 'pos.parquet' saves a layout, and .graph … POSITIONS (SELECT * FROM 'pos.parquet') draws from it",
+    `${wrote} rows; ${await status()}; ${JSON.stringify(fromFile)}`,
+  );
+
   // A drawing at saved positions grows as any other: the layout worker is
   // at them, and places the new nodes.
   await type(".graph SELECT src, dst FROM rmat_edges LIMIT 300 ON rmat POSITIONS (SELECT * FROM pos)", s);
@@ -2515,8 +2596,437 @@ for (const scheme of ["light", "dark"] as const) {
     "over two million edges: the status line offers saved positions while the layout runs",
     offered.find((t) => t.includes("Laying out")) ?? (await status()),
   );
-  check(told.includes("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);") && told.includes(".graph g POSITIONS (SELECT * FROM pos)") && told.includes("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), "over two million edges: the terminal says how to save the positions", told);
+  const [copyAt, tableAt] = [told.indexOf("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), told.indexOf("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);")];
+  check(copyAt >= 0 && told.includes(".graph g POSITIONS (SELECT * FROM 'pos.parquet')") && tableAt > copyAt && told.includes(".graph g POSITIONS (SELECT * FROM pos)"), "over two million edges: the terminal says how to save the positions, COPY first", told);
   await sctx.close();
+}
+// #499: GROUP BY. `.graph karate GROUP BY club` draws a disc for each club
+// and the ties between the two, counted as SQL counts them; a double-click
+// opens a group, its members inside its disc; .undo is the closed drawing
+// again, to the pixel (a read-back of the frame); and .collapse closes one.
+{
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const k = await gctx.newPage();
+  await k.goto(`${base}/?dataset=karate`);
+  await ready(k);
+  await idle(k);
+  await k.click("#terminal");
+  const status = () => k.evaluate(() => document.getElementById("graph-status")!.textContent ?? "");
+  const ink = () => k.evaluate(() => (window as any).ursaShell.graphInked());
+  const openIs = (groups: number[]) =>
+    k.waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g?.grouped && g.grouped.open.join() === want && !(window as any).ursaShell.busy(); }, groups.join(), { timeout: 30_000, polling: 50 }).catch(() => {});
+  // What SQL says of the clubs: their sizes, and the ties between them.
+  await type("SELECT club, count(*) AS n FROM members GROUP BY club ORDER BY n DESC, club;", k);
+  const clubs = lastTable(await screen(k)).rows;
+  await type("SELECT count(*) AS n FROM ties t JOIN members a ON a.id = t.src JOIN members b ON b.id = t.dst WHERE a.club <> b.club;", k);
+  const between = lastTable(await screen(k)).rows[0]?.[0];
+  await type("SELECT a.club, count(*) AS n FROM ties t JOIN members a ON a.id = t.src JOIN members b ON b.id = t.dst WHERE a.club = b.club GROUP BY a.club ORDER BY a.club;", k);
+  const inside = Object.fromEntries(lastTable(await screen(k)).rows);
+
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  let g = await graphInfo(k);
+  const said = (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "");
+  check(
+    g.grouped?.groups === 2 && g.grouped.total === 34 && g.nodes === 2 && g.edges === 1 && g.cut?.groups === 2 && g.cut.groupsDrawn === 2 && g.cut.edgesDrawn === 1,
+    "GROUP BY: karate by club is two discs and the one edge between them",
+    JSON.stringify({ grouped: g.grouped && { groups: g.grouped.groups, total: g.grouped.total }, cut: g.cut }),
+  );
+  check(
+    clubs.length === 2 && g.groupLabels.includes(`${clubs[0][0]} · ${clubs[0][1]}`) && g.groupLabels.includes(`${clubs[1][0]} · ${clubs[1][1]}`) && Number(between) > 0 && g.groupLabels.includes(String(between)),
+    "GROUP BY: each disc says its club and its members, and the edge its ties, as SQL's GROUP BY counts them",
+    `${JSON.stringify(g.groupLabels)}; SQL: ${JSON.stringify(clubs)}, ${between} between`,
+  );
+  const legend = await k.evaluate(() => document.getElementById("graph-legend")!.textContent ?? "");
+  check(
+    /^grouped by club: 2 groups of 34 nodes · drawn as groups of karate · Done$/.test(await status()) && legend.startsWith("grouped by club: 2 groups") && said.includes("Drawing groups of karate: 2 groups of 34 nodes by club, with 1 edge between groups"),
+    "GROUP BY: the status line, the legend and the terminal say grouped by club: 2 groups",
+    `${await status()} | ${legend} | ${said}`,
+  );
+  // The frame, read back: two discs of the first two colours, each the
+  // size 17 of 34 nodes gives (3% of the canvas), and neither over the other.
+  const closed = await ink();
+  const disc = Math.min(0.12 * Math.min(closed.width, closed.height), Math.sqrt((0.06 * closed.width * closed.height * 0.5) / Math.PI));
+  const area = Math.PI * disc * disc;
+  const apart = Math.hypot(g.grouped.at[0][0] - g.grouped.at[1][0], g.grouped.at[0][1] - g.grouped.at[1][1]);
+  check(
+    Math.abs(closed.palette[0] - area) < 0.1 * area && Math.abs(closed.palette[1] - area) < 0.1 * area && apart > 2 * disc,
+    "GROUP BY: the frame read back has the two clubs' discs, each its share of the canvas, apart",
+    `${closed.palette[0]} and ${closed.palette[1]} px for ${Math.round(area)}; centres ${Math.round(apart)} px apart, radius ${Math.round(disc)}`,
+  );
+
+  // A double-click on the first club's disc opens it.
+  const box = (await k.locator("#graph-stage canvas").boundingBox())!;
+  const ratio = g.width / box.width;
+  const at = (i: number) => [box.x + g.grouped.at[i][0] / ratio, box.y + g.grouped.at[i][1] / ratio] as const;
+  await k.mouse.dblclick(...at(0));
+  await openIs([0]);
+  await idle(k);
+  g = await graphInfo(k);
+  const within = (info: any, group: number) => {
+    const reach = info.grouped.radii[group] * info.camera[2];
+    const [cx, cy] = info.grouped.at[group];
+    const members = info.grouped.at.slice(info.grouped.groups).filter((m: number[]) => m[2] === group);
+    return { members: members.length, outside: members.filter((m: number[]) => Math.hypot(m[0] - cx, m[1] - cy) > reach + 0.5).length, reach };
+  };
+  const first = within(g, 0);
+  const opened = (await screen(k)).replace(/\n/g, "");
+  check(
+    g.grouped.open.join() === "0" && g.slots === 2 + Number(clubs[0][1]) && first.members === Number(clubs[0][1]) && first.outside === 0 && Math.abs(first.reach - disc) < 1,
+    "GROUP BY: a double-click opens a group: its members are in its disc, which keeps its size",
+    `${first.members} members, ${first.outside} outside a disc of ${first.reach.toFixed(1)} px (closed: ${disc.toFixed(1)}); open ${g.grouped.open}`,
+  );
+  check(
+    opened.includes(".expand group:0") && opened.includes(`+${clubs[0][1]} nodes, +${inside[clubs[0][0]]} edges`) && g.edges === 1 + Number(inside[clubs[0][0]]) && (await status()).includes(" · 1 open"),
+    "GROUP BY: opening ran .expand group:0, which added the club's members and the ties among them, as SQL counts them",
+    `${opened.slice(-160)}; ${g.edges} edges; ${await status()}`,
+  );
+  const open = await ink();
+  check(open.inked > 0 && open.palette[0] > 17 * 4 && open.palette[0] < 0.5 * closed.palette[0] && Math.abs(open.palette[1] - closed.palette[1]) < 0.02 * area, "GROUP BY: read back, the open disc is a rim with its members inside, and the other is as it was", `${JSON.stringify(open.palette.slice(0, 2))} after ${JSON.stringify(closed.palette.slice(0, 2))}`);
+  if (shots) await k.screenshot({ path: `${shots}/graph-group-open.png` });
+
+  // .undo is the closed drawing again: the same frame, to the pixel count.
+  await k.click("#terminal");
+  await type(".undo", k);
+  await openIs([]);
+  // (Nothing selected, as when the closed frame was read: no ring.) No
+  // frame is drawn between the click and the read-back: a read-back is of
+  // the view as it is, not of its last frame, whose discs had the ring.
+  // (Under load the frame came after the read-back, and the ring with it.)
+  await k.evaluate(() => {
+    (window as any).__raf = window.requestAnimationFrame;
+    window.requestAnimationFrame = () => 0;
+  });
+  await k.mouse.click(box.x + 6, box.y + 6);
+  g = await graphInfo(k);
+  const undone = await ink();
+  // Frames again, and one drawn (a read-back asks for one when it ends).
+  await k.evaluate(async () => {
+    window.requestAnimationFrame = (window as any).__raf;
+    await (window as any).ursaShell.graphInked();
+  });
+  check(
+    g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
+    "GROUP BY: .undo restores the closed drawing, read back",
+    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}`,
+  );
+
+  // Both open: every tie is drawn. .collapse closes one, and opening it
+  // again needs no query.
+  await k.click("#terminal");
+  await type(".expand group:0", k);
+  await type(".expand group:1", k);
+  await openIs([0, 1]);
+  g = await graphInfo(k);
+  const both = [within(g, 0), within(g, 1)];
+  await type("SELECT count(*) AS n FROM ties;", k);
+  const ties = Number(lastTable(await screen(k)).rows[0]?.[0]);
+  check(g.nodes === 36 && g.edges === 1 + ties && both.every((b) => b.members === 17 && b.outside === 0), "GROUP BY: with both clubs open every member is in its own club's disc, and every tie is drawn", `${g.nodes} nodes, ${g.edges} edges for ${ties} ties; ${JSON.stringify(both)}`);
+  await type(".collapse group:0", k);
+  await openIs([1]);
+  g = await graphInfo(k);
+  const collapsed = (await after(".collapse group:0", k)).replace(/\n/g, "");
+  check(g.grouped.open.join() === "1" && g.nodes === 19 && collapsed.includes("-17 nodes"), ".collapse group:0 closes the group", `${collapsed}; open ${g.grouped.open}; ${g.nodes} nodes`);
+
+  // A click selects a group, and the status says what it is.
+  await k.mouse.click(...at(0));
+  g = await graphInfo(k);
+  const selected = await status();
+  check(
+    g.selection.length === 1 && g.selection[0].index === 0 && selected.startsWith(`Selected group:0: club ${clubs[0][0]}, members ${clubs[0][1]}, edges inside ${inside[clubs[0][0]]} · grouped by club: 2 groups of 34 nodes`),
+    "GROUP BY: a click selects a group, and the status says its club, its members and the ties inside it",
+    selected,
+  );
+  await k.keyboard.press("Enter");
+  await openIs([0, 1]);
+  check((await graphInfo(k)).grouped.open.join() === "0,1", "GROUP BY: Enter opens the selected group", JSON.stringify((await graphInfo(k)).grouped.open));
+
+  // What does not go with GROUP BY is refused, and the drawing stays; an
+  // algorithm groups too, and a query's rows, in parentheses.
+  await k.click("#terminal");
+  await type(".graph karate GROUP BY club SIZE BY pagerank", k);
+  const refused = (await after(".graph karate GROUP BY club SIZE", k)).replace(/\n/g, "");
+  check(refused.includes("SIZE BY pagerank is of the nodes") && (await graphInfo(k)).grouped?.by === "club", "GROUP BY with SIZE BY is refused, and says why", refused);
+  await type("SELECT count(DISTINCT louvain) AS n FROM louvain(karate, seed => 1);", k);
+  const communities = Number(lastTable(await screen(k)).rows[0]?.[0]);
+  await type(".graph karate GROUP BY louvain", k);
+  await graphSettled(k);
+  g = await graphInfo(k);
+  check(communities > 2 && g.grouped?.by === "louvain" && g.grouped.groups === communities && g.cut.nodes === 34 && (await status()).startsWith(`grouped by louvain: ${communities} groups of 34 nodes`), "GROUP BY louvain: a disc for each community louvain finds", `${g.grouped?.groups} groups for ${communities} communities; ${await status()}`);
+  await type(".graph (SELECT * FROM louvain(karate, seed => 1)) GROUP BY louvain", k);
+  await graphSettled(k);
+  g = await graphInfo(k);
+  check(g.grouped?.groups === communities && g.cut.nodes === 34, "GROUP BY after a query in parentheses groups the query's rows", `${g.grouped?.groups} groups; ${await status()}`);
+  // A read-back borrows the view until its pixels come. What reads the
+  // view meanwhile still works (a call that found the view borrowed would
+  // throw, and leave it unable to be freed: the next .graph then failed
+  // with "attempted to take ownership of Rust value while it was borrowed").
+  const during = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    const threw: string[] = [];
+    for (let t = 0; t < 4; t++) {
+      await new Promise((r) => setTimeout(r, 0));
+      try {
+        w.ursaShell.graph();
+      } catch (e) {
+        threw.push(String(e));
+      }
+    }
+    return { threw, inked: (await ink)?.inked ?? 0 };
+  });
+  check(during.threw.length === 0 && during.inked > 0, "a read-back of the view does not keep what reads the view from it", `${during.threw[0] ?? "nothing threw"}; ${during.inked} px inked`);
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.by === "club" && (await errors(k)) === 1, "after a read-back with the view read meanwhile, the next drawing replaces it", (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "").slice(0, 160));
+  // And the pane closed while a read-back is on its way: the view is
+  // freed once the pixels have come, with no error.
+  const before = failures.length;
+  const shut = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    await new Promise((r) => setTimeout(r, 0));
+    document.getElementById("graph-close")!.click();
+    const open = w.ursaShell.graphOpen();
+    return { open, inked: (await ink)?.inked ?? 0 };
+  });
+  await k.waitForTimeout(200);
+  check(!shut.open && shut.inked > 0 && failures.length === before && !(await graphOpen(k)), "the pane closes while its view is read back: the view is freed afterwards, with no error", JSON.stringify(shut));
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.groups === 2, "and it is drawn again after that", await status());
+  check((await errors(k)) === 1, "GROUP BY: the one error on the screen is the refusal", `${await errors(k)} errors`);
+  await gctx.close();
+}
+// #499 on rmat: the communities of a million edges are drawn within 2 s of
+// the algorithm's result, a disc for each community of more than one node,
+// and the largest opens with its members in its disc.
+{
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const r = await gctx.newPage();
+  await r.goto(`${base}/?dataset=rmat`);
+  await ready(r);
+  await idle(r);
+  await r.click("#terminal");
+  await type("SELECT count(*) AS n, count(*) FILTER (WHERE members > 1) AS over_one, max(members) AS largest FROM (SELECT louvain, count(*) AS members FROM louvain(rmat, seed => 1) GROUP BY louvain);", r);
+  const [found, overOne, largest] = lastTable(await screen(r)).rows[0].map(Number);
+  await type(".graph rmat GROUP BY louvain", r);
+  await graphSettled(r);
+  let g = await graphInfo(r);
+  const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
+  const drawn = times.firstDraw - times.engine;
+  check(drawn > 0 && drawn <= 2_000, "GROUP BY louvain on rmat is drawn within 2 s of the algorithm's result", `${Math.round(drawn)} ms after the engine's answer (${Math.round(times.engine)} ms after Enter)`);
+  check(
+    found > 1 && g.grouped?.groups === Math.min(found, 2000) + (found > 2000 ? 1 : 0) && g.cut.merged === overOne && g.cut.nodes === 46_318 && g.cut.groupsDrawn === g.grouped.groups,
+    "GROUP BY louvain on rmat: a disc for each community, every one of more than one node among them, and the groups hold every node",
+    `${g.grouped?.groups} discs, ${g.cut?.merged} of more than one node, for ${found} communities (${overOne} over one); ${g.cut?.nodes} nodes`,
+  );
+  await type(".expand group:0", r);
+  await r.waitForFunction(() => (window as any).ursaShell.graph()?.grouped?.open.length === 1, null, { timeout: 60_000, polling: 100 }).catch(() => {});
+  g = await graphInfo(r);
+  const reach = g.grouped.radii[0] * g.camera[2];
+  const [cx, cy] = g.grouped.at[0];
+  const members = g.grouped.at.slice(g.grouped.groups).filter((m: number[]) => m[2] === 0);
+  const outside = members.filter((m: number[]) => Math.hypot(m[0] - cx, m[1] - cy) > reach + 0.5).length;
+  check(
+    g.nodes === g.grouped.groups + largest && members.length === Math.min(largest, 5000 - g.grouped.groups) && outside === 0 && reach > 5,
+    "GROUP BY on rmat: the largest group opens, its members within its disc",
+    `${g.nodes - g.grouped.groups} members shown for ${largest}; ${outside} of ${members.length} outside a disc of ${reach.toFixed(1)} px`,
+  );
+  if (shots) await r.screenshot({ path: `${shots}/graph-group-rmat.png` });
+  await type(".undo", r);
+  g = await graphInfo(r);
+  check(g.grouped.open.length === 0 && g.nodes === g.grouped.groups && (await errors(r)) === 0, "GROUP BY on rmat: .undo closes the group again", `${g.nodes} nodes; open ${g.grouped.open}`);
+  await gctx.close();
+}
+// #493: the inspector's panel never keeps a node from the pointer. With the
+// panel open the camera makes room for it, so a node that was under it can
+// be double-clicked and expands; closing it gives the view back; and the
+// panel opens at once on the side away from what was selected. On a desktop
+// (a column at the right, a mouse) and a phone (a sheet across the bottom,
+// fingers).
+for (const phone of [false, true]) {
+  const name = phone ? "a phone" : "a desktop";
+  const rctx = await watchedContext(phone ? { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true } : { viewport: { width: 1280, height: 800 } });
+  const p = await rctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  await p.click("#terminal");
+  await type(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')", p);
+  await graphSettled(p);
+  await p.waitForFunction(() => (window as any).ursaShell.graph()?.notShownKnown === true, null, { timeout: 30_000, polling: 50 }).catch(() => {});
+  const box = (await p.locator("#graph-stage canvas").boundingBox())!;
+  type At = { id: number; x: number; y: number };
+  /** Where every node drawn is, in CSS pixels of the canvas. */
+  const places = (): Promise<At[]> =>
+    p.evaluate(() => {
+      const shell = (window as any).ursaShell;
+      const out: { id: number; x: number; y: number }[] = [];
+      for (let id = 0; id < 34; id++) {
+        const at = shell.graphNodePlace(id);
+        if (at && !at.hidden) out.push({ id, x: at.x, y: at.y });
+      }
+      return out;
+    });
+  const inspector = (): Promise<any> => p.evaluate(() => (window as any).ursaShell.graphInspector());
+  const panel = () => p.locator("#graph-stage .graph-inspector").boundingBox();
+  const onCanvas = (at: { x: number; y: number }) => p.evaluate(([x, y]) => document.elementFromPoint(x, y)?.tagName === "CANVAS", [box.x + at.x, box.y + at.y]);
+  /** The camera has made room for the panel (`open`), or has given it back. */
+  const room = (open: boolean) =>
+    p
+      .waitForFunction(
+        (open) => {
+          const r = (window as any).ursaShell.graph()?.room;
+          return r && !r.waits && r.inset.some((v: number) => v > 0) === open;
+        },
+        open,
+        { timeout: 10_000, polling: 50 },
+      )
+      .then(() => true, () => false);
+  const cdp = phone ? await rctx.newCDPSession(p) : null;
+  const touch = (type: "touchStart" | "touchMove" | "touchEnd", at: { x: number; y: number }[]) => cdp!.send("Input.dispatchTouchEvent", { type, touchPoints: at.map((f, id) => ({ x: box.x + f.x, y: box.y + f.y, id })) });
+  const click = async (at: { x: number; y: number }) => {
+    if (!phone) return p.mouse.click(box.x + at.x, box.y + at.y);
+    await touch("touchStart", [at]);
+    await touch("touchEnd", []);
+  };
+  const dblclick = async (at: { x: number; y: number }) => {
+    if (!phone) return p.mouse.dblclick(box.x + at.x, box.y + at.y);
+    await click(at);
+    await p.waitForTimeout(60);
+    await click(at);
+  };
+  const drag = async (from: { x: number; y: number }, to: { x: number; y: number }) => {
+    const steps = 8;
+    const at = (i: number) => ({ x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps });
+    if (phone) {
+      await touch("touchStart", [from]);
+      for (let i = 1; i <= steps; i++) await touch("touchMove", [at(i)]);
+      await touch("touchEnd", []);
+    } else {
+      await p.mouse.move(box.x + from.x, box.y + from.y);
+      await p.mouse.down();
+      for (let i = 1; i <= steps; i++) await p.mouse.move(box.x + at(i).x, box.y + at(i).y);
+      await p.mouse.up();
+    }
+  };
+  const esc = async () => {
+    await p.focus("#graph-stage canvas");
+    await p.keyboard.press("Escape");
+  };
+  // Along the side the panel takes: across a desktop's view, down a phone's.
+  const along = (at: { x: number; y: number }) => (phone ? at.y : at.x);
+  const extent = phone ? box.height : box.width;
+  const within = (at: { x: number; y: number }) => at.x >= 0 && at.y >= 0 && at.x <= box.width && at.y <= box.height;
+  const find = (all: At[], id: number) => all.find((n) => n.id === id)!;
+
+  // A node to expand, drawn where the panel opens (a drag puts it there:
+  // the camera no longer follows the layout), and a node to select, far
+  // from that side.
+  const expandable: At[] = (await p.evaluate(() => (window as any).ursaShell.graphExpandable(100))).map((n: any) => ({ id: Number(n.id), x: n.x, y: n.y }));
+  const b0 = expandable.filter((n) => n.id !== 0).reduce((a, b) => (along(b) > along(a) ? b : a), expandable[0]);
+  const spot = phone ? { x: b0.x, y: box.height - 40 } : { x: box.width - 40, y: 60 };
+  await drag({ x: 5, y: 5 }, { x: 5 + spot.x - b0.x, y: 5 + spot.y - b0.y });
+  const before = await places();
+  const b = find(before, b0.id);
+  const a = before.filter((n) => n.id !== b.id && n.x > 20 && n.y > 20 && n.x < box.width - 20 && n.y < box.height - 20).reduce((a, b) => (along(b) < along(a) ? b : a));
+  check(Math.hypot(b.x - spot.x, b.y - spot.y) < 3 && along(a) < extent / 2 && !(await graphInfo(p)).room.following, `#493, ${name}: a node to expand is drawn where the panel opens, and one to select away from it`, `node ${b?.id} at ${Math.round(b.x)},${Math.round(b.y)}, node ${a?.id} at ${Math.round(a.x)},${Math.round(a.y)}, of ${Math.round(box.width)} x ${Math.round(box.height)}`);
+
+  // Selecting opens the panel at once, over the first node; then the
+  // camera makes room, and no node in sight is under the panel.
+  await click(a);
+  const opened = await inspector();
+  check(await room(true), `#493, ${name}: the camera makes room for the panel`, JSON.stringify((await graphInfo(p)).room));
+  const over = (await panel())!;
+  const wasUnder = box.x + b.x > over.x && box.x + b.x < over.x + over.width && box.y + b.y > over.y && box.y + b.y < over.y + over.height;
+  const made = await places();
+  const clearNow = await Promise.all(made.filter(within).map(onCanvas));
+  check(
+    opened?.kind === "node" && opened.side === "right" && wasUnder && before.filter(within).every((n) => within(find(made, n.id))) && clearNow.length >= before.filter(within).length && clearNow.every(Boolean),
+    `#493, ${name}: every node that was in sight is in sight still, and none is under the panel`,
+    `side ${opened?.side}; node ${b.id} was at ${Math.round(b.x)},${Math.round(b.y)}, the panel at ${JSON.stringify(over)}; ${clearNow.filter(Boolean).length} of the ${clearNow.length} in sight clear`,
+  );
+  if (shots) await p.screenshot({ path: `${shots}/graph-inspector-room-${phone ? "phone" : "desktop"}.png` });
+
+  // Closing the panel gives the view back as it was.
+  await esc();
+  const back = await room(false);
+  const restored = await places();
+  const moved = Math.max(...before.map((n) => Math.hypot(find(restored, n.id).x - n.x, find(restored, n.id).y - n.y)));
+  check(back && (await inspector()) === null && moved < 1, `#493, ${name}: closing the panel puts the view back where it was`, `${moved.toFixed(2)} px`);
+
+  // Under prefers-reduced-motion the camera moves in one step; otherwise over several frames.
+  const steps = async (reduced: boolean) => {
+    await p.emulateMedia({ reducedMotion: reduced ? "reduce" : "no-preference" });
+    await p.evaluate(() => {
+      const w = window as any;
+      w.__room = [];
+      const look = () => {
+        const now = JSON.stringify(w.ursaShell.graph()?.room.inset);
+        if (w.__room.at(-1) !== now) w.__room.push(now);
+      };
+      look();
+      w.__look = setInterval(look, 5);
+    });
+    await click(find(await places(), a.id));
+    await room(true);
+    const seen: string[] = await p.evaluate(() => {
+      clearInterval((window as any).__look);
+      return (window as any).__room;
+    });
+    return seen.length - 1;
+  };
+  const eased = await steps(false);
+  await esc();
+  await room(false);
+  const atOnce = await steps(true);
+  await p.emulateMedia({ reducedMotion: "no-preference" });
+  check(eased > 2 && atOnce === 1, `#493, ${name}: the camera eases to make room, and moves in one step under prefers-reduced-motion`, `${eased} steps, then ${atOnce}`);
+
+  // The acceptance: with the panel open, a double-click on the node that
+  // was under it expands it.
+  const nodes0 = (await graphInfo(p)).nodes;
+  const target = find(await places(), b.id);
+  const reached = await onCanvas(target);
+  await dblclick(target);
+  await idle(p);
+  await graphSettled(p);
+  const grown = await graphInfo(p);
+  const said = (await screen(p)).replace(/\s+/g, "");
+  check(
+    reached && grown.nodes > nodes0 && said.includes(`fromthegraphmemoryU.expand${b.id}`) && (await inspector())?.title === `node ${b.id}`,
+    `#493, ${name}: with the panel open, a double-click on a node that was under it expands the node`,
+    `${nodes0} -> ${grown.nodes} nodes; inspecting ${(await inspector())?.title}`,
+  );
+
+  // A fit is of the part the panel leaves clear, and follows the layout there.
+  await room(true);
+  await p.focus("#graph-stage canvas");
+  await p.keyboard.press("0");
+  await p.waitForTimeout(100);
+  const fit = await places();
+  const fitClear = await Promise.all(fit.map(onCanvas));
+  const info = await graphInfo(p);
+  check(info.room.following && fit.every(within) && fitClear.every(Boolean), `#493, ${name}: 0 fits the graph in the part of the view the panel leaves clear`, `${fitClear.filter(Boolean).length} of ${fit.length} clear; ${JSON.stringify(info.room)}`);
+  // The panel is still reached from the keys: i goes in, Esc comes back.
+  await p.keyboard.press("i");
+  const inPanel = (await inspector())?.focused;
+  await p.keyboard.press("Escape");
+  check(inPanel === true && (await p.evaluate(() => document.activeElement?.tagName)) === "CANVAS" && (await inspector()) !== null, `#493, ${name}: i still moves into the panel, and Esc back to the view`);
+
+  // The panel takes the other side when what is selected is drawn under
+  // its own: a second click or tap reaches the node at once.
+  await esc();
+  await room(false);
+  const last = (await places()).filter(within).reduce((a, b) => (along(b) > along(a) ? b : a));
+  await drag({ x: 5, y: 5 }, phone ? { x: 5, y: 5 + extent - 40 - along(last) } : { x: 5 + extent - 40 - along(last), y: 5 });
+  const low = find(await places(), last.id);
+  await click(low);
+  const flipped = await inspector();
+  check(flipped?.side === "left" && (await onCanvas(low)), `#493, ${name}: the panel opens on the other side when the node selected is drawn under its own`, `side ${flipped?.side}, node ${low.id} at ${Math.round(along(low))} of ${Math.round(extent)}`);
+  check((await errors(p)) === 0, `#493, ${name}: no error`, `${await errors(p)}`);
+  await rctx.close();
 }
 // #502: a phone (a coarse pointer and at most 4 GB of memory) starts at
 // 500,000 edges, and its refusal names the setting.
@@ -2668,9 +3178,12 @@ for (const scheme of ["light", "dark"] as const) {
     await tap(panned[a.n]);
     const tapped = (await graphInfo(p)).picked;
     check(tapped?.index === a.n && /^Selected node \S+: /.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap selects the node under the finger", JSON.stringify(tapped));
-    await p.waitForTimeout(400);
+    // The camera makes room for the inspector's panel, and gives it back
+    // when the selection is cleared (#493).
+    await roomSettled(p);
     const empty = { x: 6, y: 6 };
     await tap(empty);
+    await roomSettled(p);
     check(off(pinched2, await spots(), [a.n], start, { x: start.x - 25, y: start.y + 35 }, 1) <= 2, "one tap beside the graph leaves the view where it is");
     await p.waitForTimeout(400);
     await tap(empty);
@@ -2689,10 +3202,12 @@ for (const scheme of ["light", "dark"] as const) {
       const text = await screen(p);
       check(id !== undefined && text.replace(/\s+/g, "").includes(`fromthegraphmemoryU.expand${id}`), "a double tap on a node runs .expand for it", text.split("\n").slice(-3).join(" | "));
     }
-    // One tap beside the graph: nothing is selected again.
+    // One tap beside the graph: nothing is selected again, and the camera
+    // gives back the room it made for the inspector's panel.
     await p.waitForTimeout(400);
     await tap(empty);
     await p.waitForTimeout(400);
+    await roomSettled(p);
 
     // A mouse still drags and zooms with its wheel on the same canvas, and the keys work.
     await p.mouse.move(box.x + 20, box.y + 20);

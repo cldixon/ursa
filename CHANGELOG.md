@@ -255,6 +255,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Web shell: `GROUP BY` draws a graph as its groups, and a group opens in
+  place** (#499). `.graph karate GROUP BY club` draws a disc for each club
+  and the ties between the clubs, counted; `.graph rmat GROUP BY louvain`
+  draws a million edges as their communities, within a quarter of a second
+  of the algorithm's result. What groups the nodes is a column of `NODES
+  (query)`, of the result's rows or of the graph's vertex tables, `degree`,
+  or an algorithm, found as `COLOR BY` finds it. A disc's area is its share
+  of the nodes, an edge's width its count, and each says its number; more
+  than 2,000 groups are the 2,000 largest and one "other". A double-click on
+  a disc (or `.expand group:N`) adds the group's members and the edges among
+  the members of the open groups (`induced_edges`), laid out inside the
+  disc; `.collapse group:N` closes it, and `.undo` takes the members away.
+  After a query, `GROUP BY` is the clause when the query is in parentheses.
+  `ursa_engine::graph::view` has a `groups` module, `Style::group`,
+  `GraphView::groups` and `Session::grouped`; `ursa-viz`'s level scene draws
+  open discs and points (`LevelScene::set_kinds`), and a view's fit can
+  leave room for discs (`View::set_fit_padding`).
 - **Web shell: a graph is drawn from saved positions, and the edge cap is a
   setting, 5,000,000 by default** (#502). `.graph … POSITIONS (SELECT id, x,
   y …)` draws each node where the query puts it and runs no layout, so a
@@ -995,6 +1012,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The graph view keeps clear of its inspector** (#493). The inspector's
+  panel is drawn over the web shell's Graph view, and the nodes under it
+  could not be clicked, double-clicked or expanded. Now the camera makes
+  room: 450 ms after a selection opens the panel (once a second click or
+  tap would no longer be a double one), what was in sight moves into the
+  part of the view the panel leaves clear, over 200 ms, or in one step
+  under `prefers-reduced-motion`. Closing the panel puts the view back.
+  While the panel is open, `0`, `f` and a double-click on empty space fit
+  into the clear part, and a camera that follows the layout follows it
+  there. The panel opens at once after a tap too (it waited 350 ms): on a
+  phone, where it is a sheet across the bottom, it opens across the top
+  when the node tapped is drawn low, as it opens on the left on a desktop
+  when the node is on the right. The sheet is at most 45% of the view's
+  height (it was 55%). `ursa-viz`: `GraphView.setFitInset(left, top,
+  right, bottom)` keeps part of the canvas clear when the camera fits,
+  and `following()` says whether the camera follows the layout.
 - **SQL: graph function parameters and columns renamed, one name per role**
   (breaking, #415). The old names are not accepted. Each one gets a "did
   you mean" with its new name, and so do `k`, `max_hops` and `depth`:
@@ -1724,6 +1757,57 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- **Making the graph view of a large graph no longer holds the page for
+  over 60 ms** (#520). On `.graph rmat` in the Web Shell
+  `tests/graph-timing.ts` saw one task of 51 to 80 ms while the view was
+  made, in four runs of five over its limit of 60 ms. It was the last task
+  of `createViewFromResult`: the shader, the two pipelines and the first
+  draw of the coarse levels (#514), 43 to 46 ms in one go, and then,
+  with no turn of the event loop between, the page's own work with the
+  view it was handed, 12 to 27 ms. Each is now a piece, paced as the rest
+  of the view is (#426): `View::warm_levels_paced` and
+  `LevelRenderer::new_paced` in `ursa-viz`; `createView` and
+  `createViewFromResult` give the event loop a turn before they resolve,
+  and one between making the canvas's context and asking for the device;
+  and the shell counts the degrees in a task of its own. Six runs of six
+  have no task over 50 ms (`ursa-viz/BENCH.md` has the spread); making
+  the view takes up to six turns of the event loop longer, about 4 ms
+  each. What is drawn is the same.
+
+- **Web shell: `COPY … TO` writes a file in the session, and no longer ends
+  the engine** (#517). A browser has no disk, so `COPY … TO 'pos.parquet'`
+  (or `.csv`, `.json`, `.arrow`; `'memory://uploads/pos.parquet'` is the
+  same file) keeps the file in memory beside the imported ones:
+  `FROM 'pos.parquet'` reads it, a session file being found by its name
+  before the datasets' files, and `.files` lists it as `written here`. So a
+  layout is saved as the CLI saves it: `COPY (SELECT * FROM layout_fa2(g))
+  TO 'pos.parquet'`, then `.graph g POSITIONS (SELECT * FROM
+  'pos.parquet')`, which the terminal's hint for a large graph now gives
+  first. Before, a relative path failed with "relative URL without a base",
+  and a `memory://uploads/…` target ended the engine: DataFusion's file
+  sinks start tokio tasks, and the browser has no tokio runtime to start
+  them on. The engine now writes the file itself in such a session
+  (`ursa_engine::session_files`), with the serializers and options
+  DataFusion's sinks use. What it cannot write is refused with a message
+  that says what works: a name with a folder or other characters than ASCII
+  letters, digits, `.`, `_` and `-`; a URL elsewhere; `PARTITIONED BY`;
+  compressed CSV or JSON; and `INSERT INTO` a table of files or `EXPLAIN
+  ANALYZE` of a `COPY`, which ran the same sinks. An `.arrow` file is
+  written uncompressed. `WebShell.files()` lists the session's files. The
+  CLI's `COPY` is unchanged.
+
+- **Graph view: a snapshot of a level, a cut or a grouped drawing is of the
+  view as it is** (#499). `GraphView.snapshot()` drew the discs the last
+  frame had given the GPU, so a read-back taken before the next frame
+  still showed a selection ring that had been cleared.
+  `GraphView.refreshLevel()` gives the GPU the discs as they are now, and
+  the page's read-back calls it first. On screen nothing changes: a frame
+  always did. The snapshot borrows the view shared, as it did before (it
+  borrowed it to change it for a day, and every call made during a read-back
+  then threw and left the view unable to be freed, so the next `.graph`
+  failed to start); the pane's hover waits for a read-back, and a pane
+  closed or drawn again during one frees its view when the pixels have come.
 
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,

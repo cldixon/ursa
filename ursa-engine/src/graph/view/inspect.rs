@@ -272,6 +272,14 @@ async fn inspect_node(
         Ok(graph) => graph,
         Err(note) => return Ok(Inspected::said(note)),
     };
+    if super::groups::is_group(result, node) {
+        return Ok(Inspected::said(format!(
+            "a group of {}'s nodes, not a row of its tables: its values are above, and .expand \
+             group:{} opens it",
+            graph.name,
+            result.node_keys().get(node)
+        )));
+    }
     let label = &result.node_labels()[result.node_label()[node] as usize];
     let key = result.node_keys().get(node);
     // The label's vertex table; with no label, each of the graph's in turn.
@@ -332,6 +340,12 @@ async fn inspect_edge(
         Ok(graph) => graph,
         Err(note) => return Ok(Inspected::said(note)),
     };
+    if super::groups::is_group(result, result.src()[edge] as usize) {
+        return Ok(Inspected::said(format!(
+            "the edges of {} between two groups, counted: not one row of its tables",
+            graph.name
+        )));
+    }
     let label = &result.edge_labels()[result.edge_label()[edge] as usize];
     let row = result.edge_row(edge);
     let end = |node: u32| {
@@ -452,6 +466,10 @@ pub async fn graph_neighbours(
     };
     if at >= result.n_nodes() {
         return plan_err(format!("the drawing has no node {node}"));
+    }
+    // A group is no node of the graph.
+    if super::groups::is_group(result, at) {
+        return Ok(None);
     }
     let ty = result.node_labels()[result.node_label()[at] as usize].key;
     let (_, key) = literal(result.node_keys().get(at), ty);

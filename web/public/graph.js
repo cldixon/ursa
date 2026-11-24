@@ -21,7 +21,9 @@
 // selected ("Selected node 33: …"). A click on an edge (within 4 px of it,
 // with no node under the pointer) selects the edge. Whatever is selected, the
 // inspector (graph-inspector.js) shows what is known of it, in a panel over
-// the right of the view: `i` moves the focus into it, and Esc back. A mouse or a pen over a node rings it and
+// the right of the view: `i` moves the focus into it, and Esc back. The
+// camera makes room for the panel, so no node in sight is under it (#493).
+// A mouse or a pen over a node rings it and
 // shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
 // On a touch screen one finger pans, two pinch to zoom (and pan), a tap
 // selects a node and a double tap expands it, or fits. `f` fits the selection,
@@ -65,6 +67,7 @@ import { drawingOf } from "./graph-data.js";
 import { createInspector } from "./graph-inspector.js";
 import { createLevels } from "./graph-levels.js";
 import { DISC_RADIUS, LABEL_RADIUS, MAX_LABELS, REST_MS, SEPARATION, aggregatedText, countLabel, createCuts } from "./graph-cut.js";
+import { MEMBER_RADIUS, discRadii, groupedText, heaviest, idOf, pack, place, sceneOf } from "./graph-groups.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
@@ -168,6 +171,22 @@ const EDGE_REACH_PX = 4;
 const MAX_KEYS_NAMED = 5;
 /** Fitting the selection (`f`, .find) moves the camera over this long, in ms. */
 const FIT_MS = 200;
+// The inspector's panel (graph-inspector.css): under this width of window it
+// is a sheet across the view, at most this share of its height; and what it
+// keeps of the view is its own size and this much more, in CSS pixels.
+const SHEET_QUERY = "(max-width: 640px)";
+const SHEET_SHARE = 0.45;
+const PANEL_GAP = 24;
+/**
+ * The camera makes room for the inspector's panel this long after the
+ * selection last changed, in ms: once a second click or tap would no longer
+ * make a double one, so that the node is still under the pointer for it.
+ */
+const ROOM_WAIT_MS = 450;
+// A grouped drawing (#499): the most edges between groups that say their
+// count, and how long one is on the canvas to carry it, in CSS pixels.
+const COUNT_LABELS = 12;
+const COUNT_SPAN = 60;
 /** It zooms in by no more than this at once, and leaves this share of the canvas around the selection. */
 const MAX_FIT_ZOOM = 8;
 const FIT_MARGIN = 0.8;
@@ -207,6 +226,14 @@ function shownEdges(graph) {
 }
 
 /** Each node's degree among the edges of `graph` that are shown. */
+/** The edges between the groups of a grouped drawing, shown or not: what its layout is of. */
+function groupEdges(graph) {
+  const g = graph.grouped.groups;
+  const keep = [];
+  for (let e = 0; e < graph.src.length; e++) if (graph.src[e] < g && graph.dst[e] < g) keep.push(e);
+  return { src: Uint32Array.from(keep, (e) => graph.src[e]), dst: Uint32Array.from(keep, (e) => graph.dst[e]) };
+}
+
 function degreesOf(graph) {
   const { src, dst, removed, edgeRemoved } = graph;
   const degree = new Float32Array(graph.n);
@@ -298,7 +325,12 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
     // (graph-worker.js): each node's distance or layer in `level`.
     const start = { type: "start", n: graph.n, module: url, layout: graph.layout };
-    if (sent.positions) {
+    if (graph.grouped) {
+      // A grouped drawing (#499): the groups are laid out, by the edges
+      // between them. A member is placed in its group's disc.
+      const { src, dst } = groupEdges(graph);
+      worker.postMessage({ ...start, n: graph.grouped.groups, layout: undefined, src, dst }, [src.buffer, dst.buffer]);
+    } else if (sent.positions) {
       // Saved positions (#502): the worker's layout is at them, with
       // nothing to run, for an expansion to grow from. A copy: these are
       // the view's to draw.
@@ -344,7 +376,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
         "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click empty space or press 0 to fit. " +
         "Click a node to select it, Shift+click to add another, click empty space or press Escape to clear the selection. " +
         "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection. " +
-        "A large graph is drawn as groups of nodes once it is laid out, which open as the view zooms in: click a group to select its nodes, and press A for every node and edge.",
+        "A large graph is drawn as groups of nodes once it is laid out, which open as the view zooms in: click a group to select its nodes, and press A for every node and edge." +
+        (graph.grouped ? ` This one is drawn as its groups, ${groupedText(graph.grouped.by, graph.grouped.groups)}: double-click a group, or press Enter with it selected, to open it where it is, and again to close it.` : ""),
     );
   };
   describeCanvas(graph.n, graph.src.length);
@@ -358,9 +391,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const size = () => [Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr))];
   [canvas.width, canvas.height] = size();
 
+  // A turn of the event loop: reading the result and sending its edges to
+  // the layout, counting the degrees, and the view reading the result
+  // again are three tasks of the page, not one long one (#426, #520).
+  await new Promise((resolve) => setTimeout(resolve));
   const degree = degreesOf(graph);
-  // A turn of the event loop: reading the result here, and the view reading
-  // it again, are two tasks of the page, not one long one.
   await new Promise((resolve) => setTimeout(resolve));
   let view;
   try {
@@ -374,7 +409,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   times.view = performance.now();
   if (mine !== seq) {
     worker.terminate();
-    view.free();
+    freeView(view);
     canvas.remove();
     throw new Error("replaced by a newer drawing");
   }
@@ -386,15 +421,24 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const style = (degree) => {
     if (graph.size) view.sizeBy(graph.size, 3 * dpr, 14 * dpr);
     else view.sizeBy(degree, 1.5 * dpr, 8 * dpr);
-    if (graph.color) view.colorBy(graph.color);
+    // A grouped drawing's discs take their group's colour, and so do the
+    // members of an open one.
+    if (graph.grouped) view.colorBy(graph.grouped.color);
+    else if (graph.color) view.colorBy(graph.color);
   };
   style(degree);
   // A selection shows its nodes' edges too.
   view.selectionEdges = true;
   // Saved positions: the nodes are where POSITIONS put them, from the
   // first frame.
-  const placed = sent.positions?.length === 2 * view.nodeCount;
+  const placed = !graph.grouped && sent.positions?.length === 2 * view.nodeCount;
   if (placed) view.setPositions(sent.positions);
+  // A group's disc is drawn around its node, up to the level renderer's
+  // greatest radius (12% of the shorter side): a fit leaves room for it.
+  // And it is a fit of the groups: a group that opens does not move the
+  // camera.
+  const padFit = () => graph.grouped && view.setFitPadding(0.12 * Math.min(canvas.width, canvas.height) + 8 * dpr, graph.grouped.groups);
+  padFit();
   view.fit();
 
   const state = {
@@ -419,7 +463,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // drawn in place of the graph once it is laid out; the timer of the
     // next one, asked for when the camera has rested; the camera of the
     // last frame; and the labels of the groups on the canvas.
-    cuts: createCuts({ nodes: graph.n, edges: graph.src.length, detail: fullDetail, separation: SEPARATION * dpr }),
+    // (A grouped drawing is its own aggregation: no cut is asked for.)
+    cuts: createCuts({ nodes: graph.n, edges: graph.src.length, detail: fullDetail, separation: SEPARATION * dpr, ...(graph.grouped ? { from: Infinity } : {}) }),
+    // A grouped drawing (#499, graph-groups.js): where the layout has the
+    // groups (x for each, then y), and the radius each open group's disc
+    // has, in the layout's units: what it had when the group opened.
+    groupXY: null,
+    radii: new Map(),
     cutRest: 0,
     camera: null,
     labels: [],
@@ -492,6 +542,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // label (the vertex table it is of), its degree, and its SIZE BY and COLOR
   // BY values, as [name, value] pairs.
   const describe = (i) => {
+    // A group, or a member of an open one: what the result says of it.
+    if (graph.grouped) return { id: idOf(graph.grouped, state.ids, i), label: graph.grouped.isGroup(i) ? null : graph.labelOf(i), degree: state.degree[i], values: graph.valuesOf(i), notShown: 0, group: graph.grouped.isGroup(i) };
     const values = [];
     if (graph.size) values.push([graph.sizeBy, Number.isNaN(graph.size[i]) ? "none" : short(graph.size[i])]);
     if (graph.color) values.push([graph.colorBy, categoryName(graph, graph.color[i], i)]);
@@ -502,6 +554,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const selectionText = () => {
     const nodes = state.selection;
     if (state.edge) return `Selected edge ${state.ids.get(state.edge.src)} → ${state.ids.get(state.edge.dst)}`;
+    if (nodes.length === 1 && graph.grouped) {
+      const d = describe(nodes[0]);
+      return `Selected ${d.group ? "" : "node "}${d.id}: ${d.values.map(([name, value]) => `${name} ${value}`).join(", ")}`;
+    }
     if (nodes.length === 1) {
       const d = describe(nodes[0]);
       // SIZE BY degree is the degree already said.
@@ -510,7 +566,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       const parts = [d.label && `label ${d.label}`, `degree ${number(d.degree)}`, ...values.map(([name, value]) => `${name} ${value}`), d.notShown > 0 && `+${number(d.notShown)} not shown`];
       return `Selected node ${d.id}: ${parts.filter(Boolean).join(", ")}`;
     }
-    const keys = nodes.slice(0, MAX_KEYS_NAMED).map((i) => state.ids.get(i));
+    const keys = nodes.slice(0, MAX_KEYS_NAMED).map((i) => (graph.grouped ? idOf(graph.grouped, state.ids, i) : state.ids.get(i)));
     const more = nodes.length - keys.length;
     // A search that matched more than it selected says how many (.find's cap).
     const of = state.matched > nodes.length ? ` of ${number(state.matched)} matching` : "";
@@ -523,7 +579,12 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // A cut is drawn in place of the graph (#498): always said, and first,
     // where a narrow pane does not cut it off.
     const shown = state.cuts.shown;
-    const counts = `${shown ? aggregatedText(shown.groups, state.nodes) : plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
+    const g = graph.grouped;
+    // A grouped drawing (#499): its groups and what they stand for, and
+    // the groups that are open.
+    const counts = g
+      ? `${groupedText(g.by, g.groups)} of ${plural(g.total, "node")}${g.open.length ? ` · ${number(g.open.length)} open` : ""}`
+      : `${shown ? aggregatedText(shown.groups, state.nodes) : plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
     // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
     const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
@@ -575,6 +636,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.pending = null;
     } else if (state.pending) {
       view.setPositions(state.pending);
+      // A grouped drawing's scene has a disc for each node, at its place.
+      if (graph.grouped) view.setLevelPositions(state.pending);
       state.pending = null;
     }
     try {
@@ -740,24 +803,44 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // The groups' labels: how many nodes each disc that is large enough
   // stands for, over the canvas.
   const placeLabels = () => {
-    const found = state.cuts.shown ? view.groupLabels(LABEL_RADIUS * dpr, MAX_LABELS) : [];
-    const count = found.length / 5;
-    while (state.labels.length < count) {
+    const g = graph.grouped;
+    const found = state.cuts.shown || (g && state.positioned) ? view.groupLabels(LABEL_RADIUS * dpr, MAX_LABELS) : [];
+    // What to say and where, in CSS pixels, the most important first.
+    const wanted = [];
+    for (let i = 0; i < found.length; i += 5) {
+      const [group, x, y, radius, members] = found.slice(i, i + 5);
+      // A grouped drawing's disc says its group too; an open one's label
+      // is over its rim, clear of its members.
+      const text = g ? `${g.names.get(group)} · ${countLabel(members)}` : countLabel(members);
+      const above = g && g.open.includes(group) ? radius + 10 * dpr : 0;
+      wanted.push([text, x / dpr, (y - above) / dpr]);
+    }
+    if (g && state.positioned) {
+      // The heaviest edges between groups say their counts, halfway
+      // along, where they are long enough on the canvas to carry one.
+      graph.heaviest ??= heaviest(graph.result, g, COUNT_LABELS);
+      const [w, h] = [canvas.width, canvas.height];
+      for (const { src, dst, count } of graph.heaviest) {
+        const [a, b] = [view.nodePixel(src), view.nodePixel(dst)];
+        const [x, y] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        if (Math.hypot(a[0] - b[0], a[1] - b[1]) < COUNT_SPAN * dpr || x < 0 || x > w || y < 0 || y > h) continue;
+        wanted.push([number(count), x / dpr, y / dpr]);
+      }
+    }
+    while (state.labels.length < wanted.length) {
       const label = document.createElement("div");
       label.className = "graph-group";
       label.setAttribute("aria-hidden", "true");
       stage.append(label);
       state.labels.push(label);
     }
-    // Heaviest first: a label that would lie over one already placed is
-    // left out.
+    // A label that would lie over one already placed is left out.
     const placed = [];
     state.labels.forEach((label, i) => {
       label.hidden = true;
-      if (i >= count) return;
-      const [, x, y, , members] = found.slice(5 * i, 5 * i + 5);
-      const text = countLabel(members);
-      const [cx, cy, w, h] = [x / dpr, y / dpr, 7 * text.length + 12, 18];
+      if (i >= wanted.length) return;
+      const [text, cx, cy] = wanted[i];
+      const [w, h] = [7 * text.length + 12, 18];
       if (placed.some((b) => Math.abs(b[0] - cx) < (b[2] + w) / 2 && Math.abs(b[1] - cy) < (b[3] + h) / 2)) return;
       placed.push([cx, cy, w, h]);
       if (label.textContent !== text) label.textContent = text;
@@ -794,6 +877,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
     if (data.type === "cut") return applyCut(data);
+    if (graph.grouped) return fromGroupLayout(data);
     if (data.type === "level" || data.type === "levelPositions") {
       // The layout at a level of its hierarchy (#497): drawn in place of
       // the graph while it is a coarse one. Level 0 is the graph itself:
@@ -844,6 +928,81 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       fail(`the layout stopped: ${data.message}`);
     }
   };
+  // A grouped drawing (#499). Its scene: a disc for each group and a
+  // point for each member of an open one (graph-groups.js), drawn in place
+  // of the graph as a cut is. Set again when the result changes.
+  const setScene = () => {
+    const g = graph.grouped;
+    const scene = sceneOf(graph.result, g, state.radii, MEMBER_RADIUS * dpr);
+    const xy = place(g, state.groupXY ?? new Float32Array(2 * g.groups), state.radii, graph.n);
+    view.setCut(xy, scene.mass, scene.members, scene.of, scene.src, scene.dst, scene.weight, scene.totalEdges, undefined, scene.kinds);
+    view.setPositions(xy);
+    state.pending = null;
+  };
+  // The radius an open group's disc has from here on, in the layout's
+  // units: the one its closed disc is drawn with now. Once the layout has
+  // a place for the groups, which the camera is fitted to.
+  const openRadii = (closed = closedRadii()) => {
+    for (const group of graph.grouped.open) {
+      if (!state.radii.has(group) && closed.get(group) > 0) state.radii.set(group, closed.get(group));
+    }
+  };
+  // Each closed group's radius as it is drawn now, in the layout's units:
+  // none before the layout has a place for the groups.
+  const closedRadii = () => {
+    const closed = new Map();
+    const ppu = view.camera()[2];
+    if (!state.positioned || !(ppu > 0)) return closed;
+    for (let group = 0; group < graph.grouped.groups; group++) {
+      if (!state.radii.has(group)) closed.set(group, view.groupRadius(group) / ppu);
+    }
+    return closed;
+  };
+  // The layout of the groups: each new set of positions places every
+  // node, the members with their groups.
+  const fromGroupLayout = (data) => {
+    if (data.type === "positions") {
+      if (data.xy.length !== 2 * graph.grouped.groups) return;
+      times.firstPositions ??= performance.now();
+      times.graphDrawn ??= times.firstPositions;
+      // The layout says which group is beside which; the discs are then
+      // moved apart until none covers another (graph-groups.js's pack).
+      // Their places are in pixels from here, about the origin.
+      state.groupXY = pack(data.xy, discRadii(graph.grouped, canvas.width, canvas.height), canvas.width, canvas.height);
+      state.pending = place(graph.grouped, state.groupXY, state.radii, graph.n);
+      state.iterations = data.iterations;
+      const first = !state.positioned;
+      state.positioned = true;
+      if (first && graph.grouped.open.length) {
+        // Groups opened before the layout had a place for them (a link's
+        // replay): their discs, now that the camera can be fitted.
+        view.setPositions(state.pending);
+        view.setLevelPositions(state.pending);
+        openRadii();
+        setScene();
+      }
+      header();
+      redraw(false);
+      if (pointerAt) hoverSoon();
+    } else if (data.type === "done") {
+      times.done ??= performance.now();
+      state.layoutDone = true;
+      header();
+    } else if (data.type === "error") {
+      fail(`the layout stopped: ${data.message}`);
+    }
+  };
+  if (graph.grouped) {
+    try {
+      setScene();
+    } catch (e) {
+      worker.terminate();
+      freeView(view);
+      canvas.remove();
+      current = null;
+      throw new Error(String(e?.message ?? e));
+    }
+  }
   const workerFailed = (e) => {
     e.preventDefault();
     fail(`the layout stopped: ${e.message || "its worker failed"}`);
@@ -918,10 +1077,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       return line;
     };
     tip.replaceChildren(
-      row("node", d.id, "id"),
+      d.group ? row("group", d.id.slice(d.id.indexOf(":") + 1), "id") : row("node", d.id, "id"),
       ...(d.label ? [row("label", d.label)] : []),
       ...d.values.map(([name, value]) => row(name, value)),
-      row("degree", number(d.degree)),
+      // (A group's degree is among the groups: its edges say more.)
+      ...(graph.grouped ? [] : [row("degree", number(d.degree))]),
       // The +N a badge would say: its edges in the graph that lead to something not shown.
       ...(d.notShown > 0 ? [row("not shown", `+${number(d.notShown)}`, "more")] : []),
     );
@@ -938,11 +1098,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const hover = () => {
     hoverFrame = 0;
     if (current !== state || !state.positioned) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void hoverSoon();
     let node = null;
     // Not while a button or a finger is down: that is a drag.
     if (pointerAt && pointers.size === 0) {
       const start = performance.now();
-      node = view.hover(pointerAt.x, pointerAt.y) ?? null;
+      // A grouped drawing: the disc there, a group's or a member's.
+      node = (graph.grouped ? view.pickGroup(pointerAt.x, pointerAt.y) : view.hover(pointerAt.x, pointerAt.y)) ?? null;
       timings.picked(performance.now() - start);
       state.hoverPicks++;
     } else {
@@ -968,31 +1131,93 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
 
   // The selection is the view's: it is told what was clicked, and says what
   // is selected now.
-  // The inspector follows. After a tap (`byTouch`) it waits until a second
-  // tap would no longer be a double tap: its panel, under the view on a
-  // phone, would otherwise open over the node between the two taps and
-  // take the second, so a double tap never expanded (#443).
-  let inspectLater = 0;
-  const inspectNow = () => {
-    clearTimeout(inspectLater);
-    inspectLater = 0;
-    if (current === state) state.inspector.selectionChanged();
-  };
-  state.inspectNow = () => inspectLater && inspectNow();
-  state.cleanup.push(() => clearTimeout(inspectLater));
+  // The inspector follows, at once: its panel opens on the side away from
+  // what was selected, so a second click or tap still reaches the node.
   // `matched`: how many nodes the search that selected them matched.
-  const selectionChanged = (byTouch = false, matched = 0) => {
+  const selectionChanged = (matched = 0) => {
     state.matched = matched;
     state.selection = Array.from(view.selection());
     const edge = view.selectedEdge();
     state.edge = edge ? { edge: edge[0], src: edge[1], dst: edge[2] } : null;
     header();
     redraw();
-    if (!byTouch) return inspectNow();
-    clearTimeout(inspectLater);
-    inspectLater = setTimeout(inspectNow, DOUBLE_TAP_MS + 50);
+    state.inspector.selectionChanged();
   };
-  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw });
+
+  // Room for the inspector (#493). Its panel is over part of the view, and
+  // what is under it cannot be seen or clicked. So the part it covers is
+  // kept clear (`state.room`: canvas pixels at the left, top, right and
+  // bottom): a fit is of the rest of the canvas (the view's setFitInset),
+  // and when the panel opens, moves or closes the camera moves what was in
+  // sight into what is now clear, over FIT_MS (at once under
+  // prefers-reduced-motion). It waits ROOM_WAIT_MS first, and for the
+  // pointer to be up: nothing moves under a double-click.
+  state.room = [0, 0, 0, 0];
+  const clearOf = ([left, top, right, bottom]) => {
+    const [w, h] = [canvas.width - left - right, canvas.height - top - bottom];
+    return { x: left + w / 2, y: top + h / 2, w, h, share: Math.min(w / canvas.width, h / canvas.height) };
+  };
+  /** The part of the canvas no panel is over: its middle and its size, in canvas pixels. */
+  const clear = () => clearOf(state.room);
+  const setRoom = (room) => {
+    const was = state.room;
+    if (room.every((v, i) => v === was[i])) return;
+    state.room = room;
+    // A camera that follows the layout is fitted to what is clear; one the
+    // user has moved shows what it showed, as much smaller as the clear
+    // part is, in its middle.
+    const following = view.following();
+    view.setFitInset(...room);
+    if (!following) {
+      const [a, b] = [clearOf(was), clearOf(room)];
+      view.zoom(b.share / a.share, a.x, a.y);
+      view.pan(b.x - a.x, b.y - a.y);
+    }
+    redraw(false);
+    if (pointerAt) hoverSoon();
+  };
+  let roomTimer = 0;
+  let roomFrame = 0;
+  const roomStop = () => {
+    clearTimeout(roomTimer);
+    roomTimer = 0;
+    if (roomFrame) cancelAnimationFrame(roomFrame);
+    roomFrame = 0;
+  };
+  state.cleanup.push(roomStop);
+  /** Room for the panel as it is now, with no wait and no motion. */
+  const roomNow = () => {
+    roomStop();
+    setRoom(state.inspector.inset());
+  };
+  const roomMove = () => {
+    roomTimer = 0;
+    // A pointer is down: when it is up again (release). The view is being
+    // read back (state.paused): when it has been.
+    if (current !== state || pointers.size) return;
+    if (state.paused) return void (roomTimer = setTimeout(roomMove, 50));
+    const [from, to] = [state.room, state.inspector.inset()];
+    if (to.every((v, i) => v === from[i])) return;
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return setRoom(to);
+    const start = performance.now();
+    const tick = (now) => {
+      roomFrame = 0;
+      if (current !== state) return;
+      if (state.paused) return void (roomFrame = requestAnimationFrame(tick));
+      const t = Math.min(1, Math.max(0, (now - start) / FIT_MS));
+      const p = 1 - (1 - t) ** 3;
+      setRoom(t < 1 ? to.map((v, i) => from[i] + (v - from[i]) * p) : to);
+      if (t < 1) roomFrame = requestAnimationFrame(tick);
+    };
+    roomFrame = requestAnimationFrame(tick);
+  };
+  /** Room for the panel as it is now, once the pointer has rested. */
+  const roomSoon = () => {
+    roomStop();
+    roomTimer = setTimeout(roomMove, ROOM_WAIT_MS);
+  };
+  state.roomWaits = () => roomTimer !== 0 || roomFrame !== 0;
+  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved: roomSoon });
   state.clearSelection = () => {
     if (!view.clearSelection()) return false;
     selectionChanged();
@@ -1004,6 +1229,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     pointers.set(e.pointerId, at(e));
     // No hover while dragging.
     hoverSoon();
+    // The camera stops where it is, until the pointer is up.
+    if (state.roomWaits()) roomStop();
     // A second finger: what the first began is no tap. A third is ignored.
     if (pointers.size === 1) drag = { id: e.pointerId, moved: false, from: pointers.get(e.pointerId), slop: (e.pointerType === "mouse" ? 1.5 : TAP_SLOP_PX) * dpr };
     else if (drag) drag.moved = true;
@@ -1047,6 +1274,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       drag = null;
       // The pointer is over what the drag left under it.
       hoverAt(cancelled ? null : e);
+      roomSoon();
     }
     if (!tap) return;
     const { x, y } = at(e);
@@ -1061,7 +1289,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       }
     }
     timings.action("click", e.timeStamp);
-    if (!pick(x, y, e.shiftKey, e.pointerType !== "mouse")) shownSoon();
+    if (!pick(x, y, e.shiftKey)) shownSoon();
   };
   on(canvas, "pointerup", (e) => release(e, false));
   on(canvas, "pointercancel", (e) => release(e, true));
@@ -1092,19 +1320,21 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     }
     const step = 40 * dpr;
     const pan = { ArrowLeft: [step, 0], ArrowRight: [-step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] }[e.key];
-    const middle = [canvas.width / 2, canvas.height / 2];
+    // The middle of what no panel is over.
+    const middle = [clear().x, clear().y];
     if (pan) view.pan(...pan);
     else if (e.key === "+" || e.key === "=") view.zoom(1.25, ...middle);
     else if (e.key === "-" || e.key === "_") view.zoom(0.8, ...middle);
     else if (e.key === "0") view.fit();
     else if (e.key === "a") {
       // Full detail, or aggregated again (#498): `.graph detail on|off`.
+      // (Not of a grouped drawing: its groups open one at a time.)
+      if (graph.grouped) return;
       e.preventDefault();
       detail(state.cuts.wanted);
       return;
     } else if (e.key === "i") {
       // Into the inspector, if it is open; Esc there comes back.
-      state.inspectNow();
       if (state.inspector.focus()) e.preventDefault();
       return;
     } else return;
@@ -1116,14 +1346,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // A click at (x, y): the node there is selected (added to the selection,
   // or taken out of it, with Shift), and a click on empty space clears the
   // selection. Returns whether the selection changed, and so the frame.
-  function pick(x, y, extend, byTouch = false) {
+  function pick(x, y, extend) {
     const start = performance.now();
-    // A cut is drawn (#498): the group there, for its nodes.
-    if (state.cuts.shown) {
+    // A cut is drawn (#498): the group there, for its nodes. A grouped
+    // drawing's discs are its nodes, one each (#499).
+    if (state.cuts.shown || graph.grouped) {
       const group = view.pickGroup(x, y);
       timings.picked(performance.now() - start);
       const changed = view.selectGroup(group, extend);
-      if (changed) selectionChanged(byTouch);
+      if (changed) selectionChanged();
       return changed;
     }
     const node = view.pick(x, y);
@@ -1132,14 +1363,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const edge = node === undefined && !extend ? view.pickEdge(x, y, EDGE_REACH_PX * dpr) : undefined;
     timings.picked(performance.now() - start);
     const changed = edge === undefined ? view.select(node, extend) : view.selectEdge(edge);
-    if (changed) selectionChanged(byTouch);
+    if (changed) selectionChanged();
     return changed;
   }
 
   // Fit the selection (`f`, and a search's matches): the camera moves over
-  // FIT_MS so that the selected nodes fill FIT_MARGIN of the canvas, or at
-  // once under prefers-reduced-motion. One node (or nodes on one point) is
-  // centred at the zoom the view has. Returns whether there was a selection
+  // FIT_MS so that the selected nodes fill FIT_MARGIN of the canvas (of the
+  // part the inspector's panel is not over), or at once under
+  // prefers-reduced-motion. One node (or nodes on one point) is centred
+  // there at the zoom the view has. Returns whether there was a selection
   // to fit.
   let fitFrame = 0;
   const cancelFit = () => {
@@ -1152,6 +1384,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     cancelFit();
     const nodes = state.selection;
     if (!nodes.length || !state.positioned) return false;
+    // Into what the panel leaves clear, as the panel is now.
+    roomNow();
     if (state.pending) {
       view.setPositions(state.pending);
       state.pending = null;
@@ -1172,19 +1406,19 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       const [l, r, t, b] = sides.map((i) => view.nodePixel(i));
       return [(l[0] + r[0]) / 2, (t[1] + b[1]) / 2];
     };
-    const [w, h] = [canvas.width, canvas.height];
+    const { x: mx, y: my, w, h } = clear();
     const [bw, bh] = [x1 - x0, y1 - y0];
     const factor = bw < 1 && bh < 1 ? 1 : Math.min(MAX_FIT_ZOOM, FIT_MARGIN * Math.min(w / Math.max(bw, 1), h / Math.max(bh, 1)));
     const from = centre();
     let zoomed = 1;
-    // `p` of the way, 0 to 1: zoomed by factor^p about the canvas's middle,
-    // the box's centre that far towards it.
+    // `p` of the way, 0 to 1: zoomed by factor^p about the middle (of what
+    // is clear), the box's centre that far towards it.
     const moveTo = (p) => {
       const z = factor ** p;
-      view.zoom(z / zoomed, w / 2, h / 2);
+      view.zoom(z / zoomed, mx, my);
       zoomed = z;
       const [cx, cy] = centre();
-      view.pan(from[0] + (w / 2 - from[0]) * p - cx, from[1] + (h / 2 - from[1]) * p - cy);
+      view.pan(from[0] + (mx - from[0]) * p - cx, from[1] + (my - from[1]) * p - cy);
       redraw(false);
       if (pointerAt) hoverSoon();
     };
@@ -1227,7 +1461,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // yet): a node the view has not got is left out.
     const count = view.nodeCount;
     view.setSelection(nodes.every((i) => i < count) ? nodes : nodes.filter((i) => i < count));
-    selectionChanged(false, matched);
+    selectionChanged(matched);
     fitSelection();
   };
   // Expanding (#443). A double-click, a double tap or Enter asks the page
@@ -1239,7 +1473,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const actions = [];
   function expand(node, all, when) {
     if (!onCommand) return;
-    const command = `.expand ${commandId(String(state.ids.get(node)))}${all ? " LIMIT 5000" : ""}`;
+    const g = graph.grouped;
+    // In a grouped drawing a group opens, or closes if it is open; a
+    // member has nothing to add.
+    if (g && !g.isGroup(node)) return;
+    const command = g ? `${g.open.includes(node) ? ".collapse" : ".expand"} ${idOf(g, state.ids, node)}` : `.expand ${commandId(String(state.ids.get(node)))}${all ? " LIMIT 5000" : ""}`;
     // For graphTimings: the action begins now, and the frame that draws its
     // delta shows it (state.apply records it then: a frame drawn meanwhile
     // shows nothing of it).
@@ -1264,7 +1502,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // (with `all`, up to the engine's cap), and on empty space it fits.
   function expandOrFit(x, y, all, when) {
     const start = performance.now();
-    const node = state.positioned ? view.pick(x, y) : undefined;
+    const node = !state.positioned ? undefined : graph.grouped ? view.pickGroup(x, y) : view.pick(x, y);
     timings.picked(performance.now() - start);
     if (node !== undefined) {
       expand(node, all, when);
@@ -1327,6 +1565,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // nothing changed, if the delta does not fit what is drawn.
   state.apply = (bytes, { kind = "step", command = kind, at: began = performance.now(), engine = null } = {}) => {
     const start = performance.now();
+    if (graph.grouped) return applyGrouped(bytes, { command, began, engine, start });
     // A step while a coarse level is drawn (#497): the graph is drawn from
     // here on, and the layout, grown, has a place for every node.
     if (state.groups !== null) {
@@ -1415,6 +1654,55 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     redraw(false);
     return { nodes: state.nodes, edges: state.edges, slots: n1, bytesUploaded: uploaded, restored: !!restored };
   };
+  // A delta of a grouped drawing (#499): a group opened or closed, a node
+  // hidden or shown, or a step undone. The groups stay where the layout
+  // has them, and each member is put in its group's disc; the layout is
+  // not told, for it lays out the groups alone.
+  const applyGrouped = (bytes, { command, began, engine, start }) => {
+    if (state.pending) {
+      view.setPositions(state.pending);
+      view.setLevelPositions(state.pending);
+      state.pending = null;
+    }
+    // The closed discs as they are drawn before the change: a group that
+    // opens keeps its disc.
+    const closed = closedRadii();
+    const stats = view.applyDelta(bytes);
+    const uploaded = stats.bytesUploaded;
+    stats.free();
+    graph = drawingOf(readResult(view.resultBytes()), graph.skipped);
+    state.graph = graph;
+    state.ids = graph.ids;
+    state.degree = degreesOf(graph);
+    style(state.degree);
+    const shown = view.info();
+    state.nodes = shown.nodes;
+    state.edges = shown.edges;
+    state.deltas++;
+    state.notShown = null;
+    state.drawnAs = graph.drawnAs;
+    renderLegend(legend, graph);
+    describeCanvas(state.nodes, state.edges);
+    // A group that opened takes the radius its closed disc had; one with
+    // no member shown any more gives its up.
+    for (const group of [...state.radii.keys()]) if (!graph.grouped.open.includes(group)) state.radii.delete(group);
+    openRadii(closed);
+    setScene();
+    state.selection = Array.from(view.selection());
+    // What the inspector says of a group that opened or closed is new.
+    if (state.selection.length) state.inspector.selectionChanged();
+    state.hovered = null;
+    canvas.classList.remove("over-node");
+    if (pointerAt) hoverSoon();
+    else showTip();
+    header();
+    const i = actions.findIndex((a) => a.command === command);
+    const record = timings.action(command, i >= 0 ? actions.splice(i, 1)[0].at : began);
+    record.engine = engine;
+    record.delta = performance.now() - start;
+    redraw(false);
+    return { nodes: state.nodes, edges: state.edges, slots: view.nodeCount, bytesUploaded: uploaded, restored: false };
+  };
   state.setNotShown = (counts) => {
     if (counts.length !== view.nodeCount) return false;
     state.notShown = counts;
@@ -1430,6 +1718,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     canvas.width = w;
     canvas.height = h;
     view.resize(w, h);
+    padFit();
+    // The panel's size follows the view's.
+    if (state.roomWaits()) roomSoon();
+    else setRoom(state.inspector.inset());
     redraw();
   });
   ro.observe(canvas);
@@ -1437,7 +1729,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   state.cleanup.push(() => legend.replaceChildren());
   state.cleanup.push(() => (legend.hidden = true));
 
-  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs, saved: placed, graph: graph.name };
+  const grouped = graph.grouped && { by: graph.grouped.by, groups: graph.grouped.groups, total: graph.grouped.total };
+  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs, saved: placed, graph: graph.name, grouped };
 }
 
 /**
@@ -1445,14 +1738,18 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
  * `stage`: it shows what is selected, each time the selection changes. This
  * says what is selected as the inspector's plain data, and does what its
  * buttons ask: `run` a command in the terminal, `inspect` a row in the
- * engine, pin a node, select an edge's end. Returns {selectionChanged(),
+ * engine, pin a node, select an edge's end. `moved` is called when the panel
+ * has opened, changed sides or closed. Returns {selectionChanged(), inset(),
  * focus(), state(), remove()}.
  */
-function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }) {
+function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved }) {
   const { view, graph, canvas } = state;
   // The pinned nodes: marked with a small ring (the highlight layer's).
   state.pinned = new Set();
   const key = (i) => String(state.ids.get(i));
+  // What a command names a node by: in a grouped drawing a group is
+  // "group:3" (state.graph: the drawing as it is now).
+  const idFor = (i) => (state.graph.grouped ? idOf(state.graph.grouped, state.ids, i) : key(i));
   const panel = createInspector({
     run: (command) => run?.(command),
     fetchRow: (subject) => (subject.kind === "node" ? inspect({ node: subject.index, key: subject.key }) : inspect({ edge: subject.index, src: subject.src.key, dst: subject.dst.key })),
@@ -1469,20 +1766,39 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
       if (view.select(index, false)) selectionChanged();
     },
     onLeave: () => canvas.focus(),
+    onClose: () => moved(),
   });
   stage.append(panel.element);
   const name = graph.name ?? null;
   // A column of a node's row can size or colour the nodes where the drawing
   // is the graph itself: there SIZE BY and COLOR BY read the vertex tables.
   const styled = name !== null && graph.provenance?.rule === "graph";
-  const node = (i) => ({ index: i, key: key(i), keyType: graph.keyTypeOf(i) });
-  // The panel is over the right of the view, unless what is selected is drawn
-  // there: then over the left, so a click never hides what it selected.
+  const node = (i) => ({ index: i, key: key(i), id: idFor(i), keyType: state.graph.keyTypeOf(i) });
+  // In a grouped drawing: an open or a closed group, or a member.
+  const groupKind = (i) => {
+    const g = state.graph.grouped;
+    if (!g) return null;
+    return !g.isGroup(i) ? "member" : g.open.includes(i) ? "open" : "closed";
+  };
+  // The panel is a column at the right of the view, or a sheet across its
+  // bottom in a narrow window; `depth` is how far in from that side it and
+  // the gap it keeps reach, in CSS pixels.
+  const sheet = () => matchMedia(SHEET_QUERY).matches;
+  const depth = () => (sheet() ? SHEET_SHARE * canvas.clientHeight : Math.min(280, canvas.clientWidth * 0.45) + PANEL_GAP);
+  // It takes the other side ("left": the left, or the top) when what is
+  // selected is drawn under it, so a click never hides what it selected,
+  // and a second click or tap still reaches it. While it is open it stays
+  // on its side if it can: the camera has made room for it there.
   const sideOf = (...nodes) => {
     const ratio = canvas.width / Math.max(1, canvas.clientWidth);
-    const width = canvas.clientWidth;
-    const edge = width - Math.min(280, width * 0.45) - 24;
-    return nodes.some((i) => view.nodePixel(i)[0] / ratio > edge) ? "left" : "right";
+    const across = sheet();
+    const extent = across ? canvas.clientHeight : canvas.clientWidth;
+    const reach = depth();
+    const at = nodes.map((i) => view.nodePixel(i)[across ? 1 : 0] / ratio);
+    const under = { right: at.some((v) => v > extent - reach), left: at.some((v) => v < reach) };
+    const keep = panel.state()?.side ?? "right";
+    const other = keep === "right" ? "left" : "right";
+    return under[keep] && !under[other] ? other : keep;
   };
   return {
     selectionChanged() {
@@ -1497,11 +1813,12 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
           kind: "node",
           side: sideOf(i),
           ...node(i),
-          label: graph.labelOf(i),
+          label: state.graph.labelOf(i),
+          group: groupKind(i),
           graph: name,
           command: state.times.command ?? ".graph",
           degree: state.degree[i],
-          values: i < graph.n ? graph.valuesOf(i) : [],
+          values: i < state.graph.n ? state.graph.valuesOf(i) : [],
           pinned: state.pinned.has(i),
           styled,
         });
@@ -1513,6 +1830,22 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
       } else {
         panel.close();
       }
+      moved();
+    },
+    /**
+     * What the panel keeps of the canvas: canvas pixels at its left, top,
+     * right and bottom (all 0 while it is closed, and where it would leave
+     * too little of the view to be worth clearing).
+     */
+    inset() {
+      const none = [0, 0, 0, 0];
+      if (panel.element.hidden) return none;
+      const ratio = canvas.width / Math.max(1, canvas.clientWidth);
+      const across = sheet();
+      const reach = depth();
+      if ((across ? canvas.clientHeight : canvas.clientWidth) - reach < 80) return none;
+      none[(across ? 1 : 0) + (panel.element.classList.contains("left") ? 0 : 2)] = Math.round(reach * ratio);
+      return none;
     },
     focus: () => panel.focus(),
     state: () => panel.state(),
@@ -1553,7 +1886,31 @@ function renderLegend(legend, graph) {
     line.append(key, " size: ", el("span", "key", graph.sizeBy), Number.isFinite(lo) ? ` ${short(lo)}–${short(hi)}` : "");
     parts.push(line);
   }
-  if (graph.color) {
+  if (graph.grouped) {
+    // A grouped drawing (#499): what it is grouped by and how many groups
+    // there are, and the colours of the largest.
+    const g = graph.grouped;
+    parts.length = 0;
+    parts.push(el("span", "color-head", groupedText(g.by, g.groups)));
+    const list = el("ul", "colors");
+    list.setAttribute("aria-label", `Groups by ${g.by}`);
+    const top = Math.min(g.groups, 8);
+    for (let i = 0; i < top; i++) {
+      const li = el("li");
+      const sw = el("span", `swatch c${i}`);
+      sw.setAttribute("aria-hidden", "true");
+      li.append(sw, el("span", "label", g.names.get(i)), " ", el("span", "count", `(${number(g.members[i])})`));
+      list.append(li);
+    }
+    if (g.groups > top) {
+      const li = el("li");
+      const sw = el("span", "swatch other");
+      sw.setAttribute("aria-hidden", "true");
+      li.append(sw, el("span", "label", `${number(g.groups - top)} more`));
+      list.append(li);
+    }
+    parts.push(list);
+  } else if (graph.color) {
     const head = el("span", "color-head");
     head.append("colour: ", el("span", "key", graph.colorBy));
     parts.push(head);
@@ -1649,6 +2006,20 @@ export function setNotShown(counts) {
   return current?.setNotShown?.(counts) ?? false;
 }
 
+/**
+ * Free a view that is done with. A view that cannot be freed (a call that
+ * found it borrowed leaves it so, for good: wasm-bindgen counts the caller
+ * and throws before it uncounts) is left to the page's memory: the pane it
+ * was drawn in is closed or drawn again all the same.
+ */
+function freeView(view) {
+  try {
+    view.free();
+  } catch (e) {
+    console.warn(`a graph view could not be freed: ${String(e?.message ?? e)}`);
+  }
+}
+
 /** Stop the layout and drop the view and its canvas. */
 export function close() {
   seq++;
@@ -1658,7 +2029,10 @@ export function close() {
   if (state.frame) cancelAnimationFrame(state.frame);
   state.worker?.terminate();
   for (const undo of state.cleanup) undo();
-  state.view.free();
+  // Not under a read-back (inked): the view is borrowed until it settles,
+  // and freeing a borrowed view throws.
+  if (state.reading) state.reading.finally(() => freeView(state.view));
+  else freeView(state.view);
   state.canvas.remove();
   state.tip.remove();
   state.inspector?.remove();
@@ -1736,7 +2110,24 @@ export function info() {
     cut: current.view.cutInfo() ?? null,
     cuts: { on: current.cuts.on, large: current.cuts.large, detail: !current.cuts.wanted, waiting: current.cuts.waiting || current.cutRest !== 0, ms: spread(current.cuts.took), last: current.cuts.took.at(-1) ?? null, prepared: current.cuts.prepared },
     groupLabels: current.labels.filter((l) => !l.hidden).map((l) => l.textContent),
+    // A grouped drawing (#499): what it is grouped by, its groups and the
+    // nodes they stand for, the open groups, each open group's radius in
+    // the layout's units, and where each node is on the canvas now with
+    // its group's node ([x, y, group], in canvas pixels); null otherwise.
+    grouped: current.graph.grouped && {
+      by: current.graph.grouped.by,
+      groups: current.graph.grouped.groups,
+      total: current.graph.grouped.total,
+      open: current.graph.grouped.open,
+      radii: Object.fromEntries(current.radii),
+      names: Array.from({ length: Math.min(current.graph.grouped.groups, 50) }, (_, i) => current.graph.grouped.names.get(i)),
+      at: Array.from({ length: Math.min(current.view.nodeCount, 5000) }, (_, i) => [...current.view.nodePixel(i), current.graph.grouped.of[i]]),
+    },
     camera: Array.from(current.view.camera()),
+    // What is kept clear for the inspector's panel: canvas pixels at the
+    // left, top, right and bottom, whether the camera follows the layout,
+    // and whether a move to make room is waiting or under way.
+    room: { inset: current.room, following: current.view.following(), waits: current.roomWaits() },
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
@@ -1753,7 +2144,14 @@ export async function inked() {
   const state = current;
   if (!state) return null;
   state.paused = true;
+  // The view is borrowed until the pixels come: frames, slices and the
+  // hover wait (state.paused), and close() frees it afterwards.
+  let read;
+  state.reading = new Promise((resolve) => (read = resolve));
   try {
+    // The view as it is now, not as its last frame was: a level's or a
+    // cut's discs are given to the GPU by a frame.
+    state.view.refreshLevel();
     const px = await state.view.snapshot();
     const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
     const { background, palette } = theme();
@@ -1776,7 +2174,9 @@ export async function inked() {
     return { width: state.canvas.width, height: state.canvas.height, inked: count, corner: [px[0], px[1], px[2]], palette: counts };
   } finally {
     state.paused = false;
-    state.redraw?.(false);
+    state.reading = null;
+    read();
+    if (current === state) state.redraw?.(false);
   }
 }
 
@@ -1886,13 +2286,14 @@ export function nodePlace(id) {
  * For tests: up to `limit` shown nodes with the most edges not shown (the
  * engine's count), each {index, id, notShown, x, y} with its place in whole
  * CSS pixels of the canvas; only those on the canvas that a click there picks.
+ * The inspector's panel can be over one until the camera has made room for it
+ * (`graph().room.waits` is false again, #493).
  */
 export function expandable(limit = 10) {
   const state = current;
   if (!state?.notShown) return [];
   atNewest(state);
   const ratio = state.canvas.width / state.canvas.clientWidth;
-  const box = state.canvas.getBoundingClientRect();
   const order = Array.from(state.notShown.keys())
     .filter((i) => state.notShown[i] > 0 && !(state.graph.removed[i] & 1))
     .sort((a, b) => state.notShown[b] - state.notShown[a] || a - b);
@@ -1902,8 +2303,6 @@ export function expandable(limit = 10) {
     // At a whole CSS pixel, as a mouse event gives its place.
     const [x, y] = Array.from(state.view.nodePixel(index), (v) => Math.round(v / ratio));
     if (x < 0 || y < 0 || x >= state.canvas.clientWidth || y >= state.canvas.clientHeight || state.view.pick(x * ratio, y * ratio) !== index) continue;
-    // Not one under the inspector's panel: a click there is the panel's.
-    if (document.elementFromPoint(box.left + x, box.top + y) !== state.canvas) continue;
     out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
   return out;
@@ -1926,7 +2325,6 @@ export function edgeAt(x, y) {
 
 /** For tests: what the inspector shows (graph-inspector.js's state()), or null. */
 export function inspected() {
-  current?.inspectNow?.();
   return current?.inspector?.state() ?? null;
 }
 

@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use bytemuck::{Pod, Zeroable};
 
 use crate::levels::{Disc, Link};
+use crate::pace::{ready, Pace};
 use crate::scene::{rgba, Camera};
 
 #[repr(C)]
@@ -197,15 +198,29 @@ pub struct LevelRenderer {
     bind_group: wgpu::BindGroup,
     disc: Instances,
     link: Instances,
+    /// Discs drawn under the links ([`LevelRenderer::set_under`]).
+    under: Instances,
 }
 
 impl LevelRenderer {
     /// For frames in `format`.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        ready(Self::new_paced(device, format, &mut Pace::never()))
+    }
+
+    /// [`LevelRenderer::new`], giving the event loop a turn as `pace` says
+    /// between compiling the shader and linking each of the two pipelines.
+    pub async fn new_paced(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        pace: &mut Pace,
+    ) -> Self {
+        pace.breathe().await;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ursa-viz level"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
         });
+        pace.breathe().await;
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("level uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -289,6 +304,7 @@ impl LevelRenderer {
                 attributes: &disc_attrs,
             }],
         );
+        pace.breathe().await;
         let link_attrs = [
             attr(wgpu::VertexFormat::Float32x2, 0, 0),
             attr(wgpu::VertexFormat::Float32x2, 8, 1),
@@ -304,6 +320,7 @@ impl LevelRenderer {
                 attributes: &link_attrs,
             }],
         );
+        pace.breathe().await;
         Self {
             discs,
             links,
@@ -311,6 +328,7 @@ impl LevelRenderer {
             bind_group,
             disc: Instances::new(device, "level nodes", DISC_STRIDE),
             link: Instances::new(device, "level edges", LINK_STRIDE),
+            under: Instances::new(device, "level open nodes", DISC_STRIDE),
         }
     }
 
@@ -325,6 +343,13 @@ impl LevelRenderer {
     ) {
         self.disc.set(device, queue, discs);
         self.link.set(device, queue, links);
+    }
+
+    /// Hold these discs to draw under the links, in this order: the open
+    /// discs of a scene (`LevelScene::open_discs`), whose members' edges
+    /// are drawn over them. None, until set.
+    pub fn set_under(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, discs: &[Disc]) {
+        self.under.set(device, queue, discs);
     }
 
     /// Draw the level into `target` as `camera` sees it, on `background`:
@@ -369,6 +394,11 @@ impl LevelRenderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
+            if self.under.len > 0 {
+                pass.set_pipeline(&self.discs);
+                pass.set_vertex_buffer(0, self.under.slice());
+                pass.draw(0..6, 0..self.under.len);
+            }
             if self.link.len > 0 {
                 pass.set_pipeline(&self.links);
                 pass.set_vertex_buffer(0, self.link.slice());
