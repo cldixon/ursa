@@ -133,14 +133,16 @@ const LEVEL_EDGES = 1 << 14;
 // (which loads ursa-viz), but not for the layout to finish.
 let queue = Promise.resolve();
 self.onmessage = ({ data }) => {
+  if (data.type !== "init") started = true;
   queue = queue.then(() => handle(data));
 };
 
 async function handle(data) {
   try {
     if (data.type === "init") {
-      await load(data.module);
+      const { Layout } = await load(data.module);
       self.postMessage({ type: "ready" });
+      warm(Layout);
     } else if (data.type === "start") {
       times = { workerStart: performance.now() };
       const { Layout } = await load(data.module);
@@ -201,6 +203,48 @@ async function handle(data) {
     }
   } catch (e) {
     self.postMessage({ type: "error", message: String(e?.message ?? e) });
+  }
+}
+
+// Whether a graph has come: nothing is warmed after it.
+let started = false;
+/** How many edges the graph laid out to warm the code has, and how many times it is laid out at most. */
+const WARM_EDGES = 60_000;
+const WARM_ROUNDS = 6;
+
+/**
+ * Run the code that builds a layout's adjacency and hierarchy before the
+ * graph comes (#525): a browser compiles WebAssembly quickly and badly at
+ * first, and well only once a function has run for a while, so the first
+ * graph's hierarchy was built by the slow code, in three times what the
+ * same graph takes a second time. A small random graph is laid out a few
+ * times while the engine works on the real one, a few milliseconds a
+ * round, stopping when the graph comes. What a layout computes does not
+ * change: only how soon its code is fast.
+ */
+async function warm(Layout) {
+  const n = WARM_EDGES >> 3;
+  const [src, dst] = [new Uint32Array(WARM_EDGES), new Uint32Array(WARM_EDGES)];
+  let state = 0x9e3779b9;
+  const next = () => {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return (state >>> 0) / 2 ** 32;
+  };
+  // Skewed, as graphs are: a few nodes have many of the edges.
+  for (let i = 0; i < WARM_EDGES; i++) {
+    src[i] = Math.floor(next() ** 3 * n);
+    dst[i] = Math.floor(next() * n);
+  }
+  for (let round = 0; round < WARM_ROUNDS && !started; round++) {
+    try {
+      new Layout(n, src, dst).free();
+    } catch {
+      return;
+    }
+    // The page's messages are taken between rounds.
+    await new Promise((resolve) => setTimeout(resolve));
   }
 }
 

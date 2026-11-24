@@ -296,6 +296,7 @@ pub(crate) fn of_index(
 
 /// Node indexes by id, as [`build`] numbered them: what node values are
 /// joined on.
+#[derive(Debug, PartialEq)]
 pub(crate) struct NodeIndex {
     /// The one type every id was read as.
     pub(crate) key_type: DataType,

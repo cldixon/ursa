@@ -209,7 +209,11 @@ mod turns {
                 return false;
             };
             channel.waiting.push_back(resolve.clone());
-            if channel.post.call1(&channel.port, &JsValue::UNDEFINED).is_err() {
+            if channel
+                .post
+                .call1(&channel.port, &JsValue::UNDEFINED)
+                .is_err()
+            {
                 channel.waiting.pop_back();
                 return false;
             }

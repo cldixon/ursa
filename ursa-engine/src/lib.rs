@@ -114,27 +114,3 @@ pub fn new_session_with_config(config: SessionConfig) -> SessionContext {
     factory.attach(ctx.state_weak_ref());
     ctx
 }
-
-#[doc(hidden)]
-pub mod probe {
-    use std::sync::Mutex;
-    pub static NOW: Mutex<Option<fn() -> f64>> = Mutex::new(None);
-    pub static LOG: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
-    pub fn mark(label: &str) {
-        if let Some(now) = *NOW.lock().unwrap() {
-            LOG.lock().unwrap().push((label.to_string(), now()));
-        }
-    }
-    pub fn take() -> String {
-        let log = std::mem::take(&mut *LOG.lock().unwrap());
-        let mut out = String::new();
-        let mut last = None;
-        for (l, t) in log {
-            if let Some(p) = last {
-                out.push_str(&format!("{l} +{:.0} | ", t - p));
-            }
-            last = Some(t);
-        }
-        out
-    }
-}

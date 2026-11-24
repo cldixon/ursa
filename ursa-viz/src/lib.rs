@@ -71,12 +71,3 @@ pub use model::{GraphDelta, GraphResult};
 pub use scene::{BadGrowth, Camera, Graph, Growth, LiveLayout, NodeStyle};
 #[cfg(feature = "render")]
 pub use view::View;
-
-#[doc(hidden)]
-pub fn probe(_label: &str) {
-    #[cfg(all(target_arch = "wasm32", feature = "web"))]
-    {
-        let t = web_sys::window().and_then(|w| w.performance()).map_or(0.0, |p| p.now());
-        web_sys::console::log_1(&format!("PROBE {_label} {t:.0}").into());
-    }
-}

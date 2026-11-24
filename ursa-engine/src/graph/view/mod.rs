@@ -363,7 +363,6 @@ pub async fn of_command(
     last: Option<Rows>,
 ) -> Result<GraphView> {
     let (text, style) = parse(text)?;
-    crate::probe::mark("start");
     let source = if !text.is_empty() {
         Source::of_text(ctx, sql, &text).await?
     } else {
@@ -375,7 +374,6 @@ pub async fn of_command(
         };
         Source::of_rows(rows)
     };
-    crate::probe::mark("source");
     draw(ctx, sql, source, &style).await
 }
 
@@ -432,9 +430,7 @@ pub async fn draw(
     if let Some(by) = &style.group {
         return group(ctx, sql, drawing, style, by, text).await;
     }
-    crate::probe::mark("drawing");
     apply_style(ctx, sql, &mut drawing, style).await?;
-    crate::probe::mark("style");
     if let Some(layout) = style.layout {
         set_layout(&mut drawing, layout)?;
     }
@@ -462,7 +458,6 @@ pub async fn draw(
     let graph = drawing.graph.as_ref().map(|g| g.name.clone());
     let mut view = to_view(drawing.edges, &drawing.index.key_type, graph, provenance)?;
     view.positions = saved;
-    crate::probe::mark("to_view");
     Ok(view)
 }
 
@@ -1159,6 +1154,16 @@ async fn property_graph_indexed(
     if let Some(drawn) = from_index(ctx, graph, max_edges).await {
         return Ok(drawn);
     }
+    from_rows(ctx, graph, max_edges).await
+}
+
+/// [`property_graph_indexed`] from the rows of `graph`'s tables: every
+/// vertex table's keys, then every edge table's endpoints.
+async fn from_rows(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    max_edges: usize,
+) -> Result<(EdgeList, NodeIndex)> {
     let state = ctx.state();
     let mut vertices = Vec::new();
     for v in &graph.vertex_tables {
@@ -1238,7 +1243,6 @@ async fn from_index(
         "SELECT id FROM degree(\"{}\")",
         graph.name.replace('"', "\"\"")
     );
-    crate::probe::mark("fi:edges_plan");
     let physical = ctx
         .sql(&query)
         .await
@@ -1246,11 +1250,9 @@ async fn from_index(
         .create_physical_plan()
         .await
         .ok()?;
-    crate::probe::mark("fi:planned");
     let index = crate::graph::index_under(&physical, &ctx.task_ctx())
         .await
         .ok()??;
-    crate::probe::mark("fi:index");
     let edges = index.topology.n_edges();
     if index.n_dropped() > 0 || edges == 0 || edges > max_edges {
         return None;

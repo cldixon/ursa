@@ -1386,3 +1386,156 @@ fn what_is_ambiguous_is_decided_and_said() {
         "{err}"
     );
 }
+
+/// A session with the graph `g` over the edge table `e` (`src`, `dst`),
+/// made by `sql`.
+async fn edges_graph(sql: &str) -> (SessionContext, Arc<PropertyGraph>) {
+    let ctx = crate::new_session();
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let def = GraphDef {
+        name: "g".into(),
+        edges: crate::graph::EdgeTable::new(TableReference::bare("e"), "src", "dst"),
+        vertices: None,
+    };
+    crate::graph::create_graph(&ctx, def, false, false)
+        .await
+        .unwrap();
+    let graph = registry_of(&ctx).get("g").unwrap();
+    (ctx, graph)
+}
+
+/// #525: a property graph drawn from the session's index of it is the
+/// drawing its rows give: the same nodes in the same order, the same edges
+/// in the same order, the same ids and the same index of them.
+#[tokio::test]
+async fn a_graph_drawn_from_its_index_is_the_one_its_rows_give() {
+    // Ids with gaps, out of order, repeated edges, both directions, loops,
+    // and a node first seen as a destination.
+    let ints = "(40, 7), (7, 40), (40, 7), (3, 3), (12, 40), (-5, 12), (7, 99), (99, 3), (40, 40)";
+    for (what, sql) in [
+        (
+            "integers",
+            format!("CREATE TABLE e AS SELECT * FROM (VALUES {ints}) v(src, dst)"),
+        ),
+        (
+            "32-bit integers",
+            format!(
+                "CREATE TABLE e AS SELECT CAST(src AS INT) AS src, CAST(dst AS INT) AS dst \
+                 FROM (VALUES {ints}) v(src, dst)"
+            ),
+        ),
+        (
+            "strings",
+            "CREATE TABLE e AS SELECT * FROM (VALUES ('b', 'a'), ('a', 'c'), ('c', 'b'), \
+             ('07', '7'), ('a', 'a'), ('b', 'a')) v(src, dst)"
+                .to_string(),
+        ),
+    ] {
+        let (ctx, graph) = edges_graph(&sql).await;
+        let rows = from_rows(&ctx, &graph, MAX_EDGES).await.unwrap();
+        let indexed = from_index(&ctx, &graph, MAX_EDGES).await;
+        assert_eq!(indexed.as_ref(), Some(&rows), "{what}");
+        // And it is what the command draws.
+        let drawn = of_command(&ctx, &DataFusionSql, "g", None).await.unwrap();
+        assert_eq!(drawn.result.n_edges(), rows.0.src.len(), "{what}");
+        assert_eq!(drawn.result.src(), &rows.0.src[..], "{what}");
+        assert_eq!(drawn.result.dst(), &rows.0.dst[..], "{what}");
+    }
+}
+
+/// #525: a graph in a file, whose index the session keeps: the drawing is
+/// the rows' the first time, when the index is built, and the second,
+/// when nothing is read.
+#[tokio::test]
+async fn a_graph_in_a_file_is_drawn_from_the_index_the_session_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("e.csv");
+    // A few thousand edges over a few hundred nodes, skewed.
+    let mut text = String::from("src,dst\n");
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    for _ in 0..5_000 {
+        let (a, b) = (next(400), next(400));
+        text.push_str(&format!("{},{}\n", a * a / 400 + 1_000, b * 3));
+    }
+    std::fs::write(&path, text).unwrap();
+    let sql = format!(
+        "CREATE EXTERNAL TABLE e STORED AS CSV LOCATION '{}' OPTIONS ('format.has_header' 'true')",
+        path.display()
+    );
+    let (ctx, graph) = edges_graph(&sql).await;
+    let rows = from_rows(&ctx, &graph, MAX_EDGES).await.unwrap();
+    assert_eq!(rows.0.src.len(), 5_000);
+    let builds = crate::graph::index_builds(&ctx);
+    let first = from_index(&ctx, &graph, MAX_EDGES).await;
+    assert_eq!(first.as_ref(), Some(&rows));
+    assert_eq!(crate::graph::index_builds(&ctx), builds + 1);
+    let second = from_index(&ctx, &graph, MAX_EDGES).await;
+    assert_eq!(second.as_ref(), Some(&rows));
+    assert_eq!(
+        crate::graph::index_builds(&ctx),
+        builds + 1,
+        "the index was kept"
+    );
+    // An algorithm over the graph finds the same index.
+    ctx.sql("SELECT * FROM pagerank(g)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(crate::graph::index_builds(&ctx), builds + 1);
+}
+
+/// #525: where the index cannot say what the rows would, the rows are
+/// read: a NULL endpoint (the rows skip its row and count it), more edges
+/// than a drawing may have (the rows' error names the setting), and a
+/// graph with a vertex table (its keys are nodes whether or not an edge
+/// reaches them, and its index drops an edge to a node that is not one).
+#[tokio::test]
+async fn a_graph_its_index_cannot_draw_is_drawn_from_its_rows() {
+    let (ctx, graph) = edges_graph(
+        "CREATE TABLE e AS SELECT * FROM (VALUES (1, 2), (2, NULL), (2, 3)) v(src, dst)",
+    )
+    .await;
+    assert!(from_index(&ctx, &graph, MAX_EDGES).await.is_none());
+    let drawn = of_command(&ctx, &DataFusionSql, "g", None).await.unwrap();
+    assert_eq!((drawn.result.n_edges(), drawn.skipped), (2, 1));
+
+    let (ctx, graph) =
+        edges_graph("CREATE TABLE e AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1)) v(src, dst)")
+            .await;
+    assert!(from_index(&ctx, &graph, 2).await.is_none());
+    assert!(from_index(&ctx, &graph, 3).await.is_some());
+    let refused = from_rows(&ctx, &graph, 2).await.unwrap_err().to_string();
+    assert!(refused.contains("ursa.graph_max_edges"), "{refused}");
+
+    ctx.sql("CREATE TABLE people AS SELECT * FROM (VALUES (1), (2), (3), (4)) v(id)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let def = GraphDef {
+        name: "club".into(),
+        edges: crate::graph::EdgeTable::new(TableReference::bare("e"), "src", "dst"),
+        vertices: Some(crate::graph::VertexTable::new(
+            TableReference::bare("people"),
+            "id",
+        )),
+    };
+    crate::graph::create_graph(&ctx, def, false, false)
+        .await
+        .unwrap();
+    let club = registry_of(&ctx).get("club").unwrap();
+    assert!(from_index(&ctx, &club, MAX_EDGES).await.is_none());
+    let drawn = of_command(&ctx, &DataFusionSql, "club", None)
+        .await
+        .unwrap();
+    assert_eq!(drawn.result.n_nodes(), 4);
+}
