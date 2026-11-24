@@ -255,6 +255,26 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Web shell: a graph is drawn from saved positions, and the edge cap is a
+  setting, 5,000,000 by default** (#502). `.graph … POSITIONS (SELECT id, x,
+  y …)` draws each node where the query puts it and runs no layout, so a
+  graph too large to lay out while you wait is laid out once: `CREATE TABLE
+  pos AS SELECT * FROM layout_fa2(g)` (or, in the CLI, `COPY (SELECT * FROM
+  layout_fa2(g)) TO 'pos.parquet'`), then `.graph g POSITIONS (SELECT * FROM
+  pos)`. The ids are matched to the drawing's keys. `layout_fa2`'s rows are
+  where the view's own layout leaves each node, to the bit (centred on the
+  origin), so the picture is the same; on the 1M-edge R-MAT graph its first
+  frame comes 0.35 to 0.47 s after the engine's answer, where the live
+  layout ends after 5 to 6 s. A node the query has no place for is placed
+  beside its neighbours by one warm pass, the others held, and the status
+  line says how many were. The most edges a view draws is now
+  `ursa.graph_max_edges`: 5,000,000 by default (it was a fixed 2,000,000),
+  500,000 where the page finds a phone (a coarse pointer and at most 4 GB of
+  memory), `0` for no limit; a refusal names the setting and the `SET` that
+  lets the result through. Above 2,000,000 edges without `POSITIONS`, the
+  status line and the terminal say how to save the positions.
+  `ursa_engine::graph::view::GraphView` has a `positions` field, and
+  `Style` a `positions` clause.
 - **Graph view: a large graph is first seen as the coarsest level of its
   layout, and refines level by level** (#497). The coarse-to-fine layout
   works down a pyramid of the graph; until it reaches the graph itself, the

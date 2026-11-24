@@ -69,7 +69,8 @@ static assets and an R2 bucket.
     query's and `.graph NAME` a property graph's (or a table's). The engine
     makes the graph (`ursa-engine`'s `graph::view`, through `WebShell.graph`
     and the `graph` op of the worker; see "The engine's graph" below), at
-    most 2,000,000 edges and 4,000,000 nodes. `ursa-viz` draws it (WebGPU,
+    most `ursa.graph_max_edges` edges (5,000,000; 500,000 on a phone, see
+    "Saved positions and the edge cap" below) and 4,000,000 nodes. `ursa-viz` draws it (WebGPU,
     else WebGL2) with its ForceAtlas2 layout running in `graph-worker.js`,
     nodes sized by degree unless asked otherwise.
   - **What a result is drawn as** (#433, design §3): rows are drawn by the
@@ -116,7 +117,8 @@ static assets and an R2 bucket.
   - **Saying what a result is** (#434): `.graph [SOURCE] [ON graph] [AS
     edges(src, dst [, weight]) | nodes(id) | path(nodes [, edges]) |
     hops(seed, id, distance)] [NODES (query)] [SIZE BY x] [COLOR BY y]
-    [LAYOUT force|rings|layers]`, the clauses in any order after the source.
+    [LAYOUT force|rings|layers] [POSITIONS (query)]`, the clauses in any
+    order after the source.
     - **`AS …` is rule 0**: it says what the rows are and names the columns,
       and nothing is inferred, so a result whose columns have any names is
       drawn: `.graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)`.
@@ -146,6 +148,61 @@ static assets and an R2 bucket.
       karate LAYOUT spiral` is told what `LAYOUT` takes, not handed to SQL.
     - `.help graph` lists the clauses (the shell adds them to the page where
       the host has a `.graph` command).
+  - **Saved positions and the edge cap** (#502):
+    - **`POSITIONS (SELECT id, x, y …)`** draws the nodes where the query
+      puts them, and no layout runs: `CREATE TABLE pos AS SELECT * FROM
+      layout_fa2(rmat);` once, then `.graph rmat POSITIONS (SELECT * FROM
+      pos)`. The query's `id` column (or else its first) is matched to the
+      drawing's keys, as `NODES (query)`'s is, and `x` and `y` (or else the
+      next two columns) are numbers. The engine answers with the positions
+      beside the graph (`WebShell.graph`'s `GraphData.takePositions()`, `x`
+      then `y` in a `Float32Array`; the worker's `graph` op gives
+      `positions`), not in the UGR result: an explore session's deltas are
+      of a result without positions. `graph.js` sets them on the view as
+      soon as it is made and draws: the first frame waits for no worker (on
+      rmat, 0.35 to 0.47 s after the engine's answer, against 0.9 to 1.0 s
+      for a coarse level of a live layout and 5 to 6 s for its end). The
+      layout worker is started with `positions` and runs nothing: its
+      layout is at them (`Layout.fromPositions`) for an `.expand` to grow
+      from, and it sends the edges' drawing order, by degree, since there
+      is no hierarchy to order them by. The status line says `· saved
+      positions · Done`.
+    - **They are the live layout's end state.** `layout_fa2(g)` and the
+      view's own layout are the same coarse-to-fine ForceAtlas2 on the same
+      node numbering, so its rows are where `.graph g` leaves each node, to
+      the bit, less the picture's centroid (`layout_fa2` centres what it
+      returns; a view fits the picture, so it is the same frame). The e2e
+      test reads both back on rmat, and `ursa-engine`'s `graph_view` test
+      checks the same without a browser.
+    - **A node with no saved position** (no row, or a NULL or a non-finite
+      `x` or `y`) is placed by one warm pass in the engine
+      (`ursa_core::algo::fa2_grow`): beside the placed node it is tied to,
+      then a short ForceAtlas2 schedule in which only such nodes move. The
+      placed nodes stay where the query put them, to the bit, and the
+      status line says how many were placed. Rows of no node drawn are
+      counted and said too; a query that places none of the nodes is an
+      error. `POSITIONS` with `LAYOUT` is refused: both say where the nodes
+      go.
+    - **The edge cap is the setting `ursa.graph_max_edges`**: 5,000,000 by
+      default (`0` for no limit), and a refusal names it and the `SET` that
+      lets the result through. On a phone the page starts the session at
+      500,000 (`app.js`'s `onPhone`: the device reports a coarse pointer,
+      and at most 4 GB of memory or none at all, the test #448 names), by
+      a `SET` in the worker's `start` op, so `SHOW` shows it and `SET`
+      raises it.
+    - **Above 2,000,000 edges with no `POSITIONS`**, the status line says,
+      while the layout runs, that the fine level takes about a minute and
+      offers `COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet'`, and the
+      terminal prints the statements. `COPY … TO` has no disk to write to
+      in the browser, so the terminal gives the in-session form first
+      (`CREATE TABLE pos AS …`, `.graph g POSITIONS (SELECT * FROM pos)`)
+      and the `COPY` for the `ursa` CLI, whose file `.files add` brings
+      here.
+    - `bun tests/graph-positions-bench.ts [url] [edges] [scale]` is the
+      benchmark at 5M edges: it generates an R-MAT graph for the run (a CSV
+      in the temporary directory, deleted at the end), draws it live and
+      from saved positions, and prints the times and the memory;
+      `ursa-viz/BENCH.md` has its numbers.
   - **Sizes, colours and the legend** (#389): `.graph [SOURCE] [NODES
     (query)] [SIZE BY x] [COLOR BY y]`, the clauses in any order after the
     source. `.graph karate SIZE BY pagerank COLOR BY louvain` sizes Karate's
