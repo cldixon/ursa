@@ -1758,6 +1758,37 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **A large graph's first frame comes sooner** (#525). On `.graph rmat`
+  (1M edges) in the Web Shell it is shown 0.69 to 0.84 s after Enter
+  where it was 1.0 to 1.3 s, on a machine busy with other builds
+  (`ursa-viz/BENCH.md`, "The first frame"; the 0.6 s the issue asks for
+  is not reached, and the section says what it would take). The final
+  layout is the same, bit for bit.
+  - `.graph NAME` of a property graph that is one edge table (no vertex
+    table, endpoint columns of one integer or string type) is drawn from
+    the session's index of the graph, the one its algorithms run over,
+    and not from its rows: with the index cached nothing is scanned. The
+    drawing is the one the rows give (the same nodes and edges in the
+    same order); a graph the index cannot answer for (a NULL endpoint, a
+    vertex table, more edges than `ursa.graph_max_edges`) is read from
+    its rows as before. The first `.graph` of such a graph builds the
+    index if no algorithm has, and a session with a database stores it,
+    as an algorithm would. In the browser the engine answers in 0.14 to
+    0.23 s where it took 0.36 to 0.54 s, and holds 6 to 14 MiB less: the
+    result is not copied before its bytes are written.
+  - `ursa-core`: a layout's hierarchy no longer sorts the rows of its
+    coarse levels (`Fa2Multilevel`: a row's targets are read off a
+    bitmap), nor `UndirectedCsr::from_edges` the long runs of an
+    adjacency: 140 to 150 ms where it was 200, and 28 ms where it was 39,
+    natively for a 1M-edge R-MAT graph on one core. Both are checked
+    against a sort of every edge.
+  - `ursa-viz`: a view made in pieces gives the event loop its turns as
+    messages, not timers, which a browser makes wait 4 ms each once they
+    nest (`pace`); the turns that wait for the GPU are timers still.
+  - The shell's layout worker lays out a small random graph a few times
+    before the graph comes, so that the browser has compiled the
+    layout's code well by then (`graph-worker.js`).
+
 - **Making the graph view of a large graph no longer holds the page for
   over 60 ms** (#520). On `.graph rmat` in the Web Shell
   `tests/graph-timing.ts` saw one task of 51 to 80 ms while the view was

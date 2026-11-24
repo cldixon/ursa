@@ -74,10 +74,10 @@ console.log(`${browser.browserType().name()} ${browser.version()}${process.env.C
 const VIEW_BYTES = 20 * 2 ** 20;
 const LAYOUT_BYTES = 60e6;
 // When a large graph's first frame should be shown, from Enter (#497,
-// #525): reported, not failed. It is 0.65 to 0.75 s here on a busy
-// machine, where it was 1.0 to 1.4 s (ursa-viz/BENCH.md, "The first
-// frame"): making the view and building the hierarchy each take about
-// 0.4 s of a fresh page's time, side by side.
+// #525): reported, not failed. It is 0.69 to 0.84 s here on a busy
+// machine, where it was 1.0 to 1.3 s (ursa-viz/BENCH.md, "The first
+// frame"): after the engine's 0.15 s, making the view and building the
+// hierarchy each take about 0.4 s of a fresh page's time, side by side.
 const FIRST_FRAME_MS = 600;
 const all: Record<string, number>[] = [];
 // What took too long: the run fails if anything did.

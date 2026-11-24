@@ -774,6 +774,9 @@ main (`5c03374`, two runs) in the same session:
 | the layout worker's memory | 55.7 MB | 55.6 MB |
 | the view's memory | 18.3 MiB | 17.9 to 18.3 MiB |
 
+(#525 took this further, to 0.69 to 0.84 s where main was 1.0 to 1.3 s on
+a busier machine: [The first frame](#the-first-frame).)
+
 The issue asks for a first frame within 0.6 s, and for frames before level
 0 of at most 50 ms each. The second is met. The first is not: of the
 0.94 s, 0.35 to 0.37 s is the engine's and 0.52 to 0.54 s is the layout
@@ -793,6 +796,104 @@ positions, after every batch.
 `tests/browser/view.ts` (`ONLY=levels`) reads frames back at the four
 coarsest levels of a 100K-edge R-MAT graph on WebGL2 (49, 99, 198 and 397
 discs).
+
+## The first frame
+
+What #525 did to the first frame of `.graph rmat` (46,318 nodes with an
+edge, 1,000,000 edges) in the shell, at 1280 × 800, with
+`web/tests/graph-timing.ts`. On this container (no GPU: SwiftShader, 4
+cores) **while three other builds ran on it, a load of 3.3 to 4.2**,
+2026-11-24: main (`3cb60bc`) and the branch turn about, two fresh pages
+each, three times. Every time is from Enter and of a fresh browser
+context, as in [The first paint](#the-first-paint); that table's 0.94 s
+was measured at a load of 1 to 2, and main is 1.0 to 1.3 s here.
+
+| | main (six runs) | now (six runs) |
+|---|---|---|
+| the engine's answer | 357 to 543 ms, median 490 | 138 to 232 ms, median 156 |
+| the graph posted to the layout worker | 374 to 559 ms | 220 to 286 ms |
+| the view made | 872 to 1,094 ms | 597 to 726 ms |
+| the hierarchy built | 950 to 1,217 ms | 590 to 700 ms |
+| **the first frame shown** | 1,000 to 1,265 ms, **median 1,226** | 686 to 841 ms, **median 739** |
+| frames before the graph itself, each to the next, p95 | 33 ms in four runs, 50 and 67 ms | 33 ms in five runs, 50 ms |
+| the graph itself first drawn | 4.7 to 5.5 s | 4.1 to 4.7 s |
+| the layout done | 5.8 to 7.0 s | 5.5 to 6.1 s |
+| the layout worker's memory | 55.6 MB | 55.6 MB |
+| the view's memory | 18.7 MB (17.9 MiB) | 18.7 MB (17.9 MiB) |
+| the engine's memory | 49.9 to 58.1 MiB | 44.1 to 44.4 MiB |
+
+**The 0.6 s the issue asks for is not met here**: the first frame is
+shown 0.69 to 0.84 s after Enter, six tenths of what it was. What took
+the time, and what was done about each:
+
+- **The engine read the graph's rows** (0.35 to 0.5 s): a scan of the
+  Parquet file, each endpoint hashed as a row of bytes, a key formatted
+  for each. A property graph that is one edge table is now drawn from the
+  session's index of it, which its algorithms run over
+  (`ursa_engine::graph::view`, `from_index`): the index numbers nodes as
+  they are first seen and edges by their rows, as the drawing does, so
+  the drawing is the same, and with the index cached nothing is scanned.
+  In the engine, on a fresh page: 10 to 20 ms planning, 5 to 20 ms
+  finding the index (one `HEAD` of the file), 40 to 60 ms making the
+  node keys and putting each edge back at its row, 30 to 60 ms making
+  the result, 5 ms writing it. The result is no longer copied before its
+  bytes are written, which is the 6 to 14 MiB the engine no longer
+  holds. `.graph SELECT src, dst FROM rmat_edges` reads the rows as
+  before.
+- **The hierarchy sorted every row of every level** (`coarse_rows`): a
+  coarse node's targets are now read off a bitmap in ascending order (a
+  row with too few for the scan is still sorted), and the adjacency's
+  long runs likewise (`UndirectedCsr::from_edges`). Natively, one core,
+  for a 1M-edge R-MAT graph numbered as the shell's is (76,543 nodes,
+  1.86M entries): the hierarchy in 140 to 150 ms where it was 200 to
+  205, the adjacency in 28 ms where it was 39. The bits are the same:
+  `ursa-core` checks both against a sort of every edge, and the golden
+  layouts pass unchanged.
+- **A fresh page runs the layout's code slowly**: a browser compiles
+  WebAssembly quickly and badly at first, and well once a function has
+  run for a while, but not in the middle of a call, and the adjacency
+  and each level's grouping are one call each. The same graph's
+  hierarchy takes 0.3 s on a page's second drawing and 0.4 s on its
+  first. The layout worker now lays out a 60,000-edge random graph, up
+  to six times, between loading and the graph's coming
+  (`graph-worker.js`, `warm`). It has little time to: the worker is
+  started 150 ms after Enter and the engine now answers at about that.
+  Back to back with the view's code loaded 60 ms after Enter (which the
+  shell does not do: see below), the worker built the adjacency and the
+  hierarchy in 305 to 463 ms warmed, 416 to 664 ms not.
+- **Making the view waited on timers.** A paced view gives the event
+  loop a turn whenever it has held the thread for 4 ms, and the turn was
+  `setTimeout(0)`, which a browser makes wait 4 ms once timers nest: a
+  view of a million edges gives sixty turns or more. A turn is now a
+  message on a channel (`pace::yield_now`), the next task the loop
+  takes; the turns that wait for the GPU are still timers. On a page's
+  second drawing the view is made in 190 ms where it was 270 to 340.
+
+What is left, on a fresh page here: the engine about 0.15 s, then, side
+by side, 0.35 to 0.45 s making the view on the page's thread (the device
+50 ms, reading and checking the result 100, counting degrees 60, the
+shader and five pipelines 130, uploading the edges 90, the level
+pipelines 50 to 70) and 0.3 to 0.45 s building the adjacency and the
+hierarchy in the worker, then 40 to 60 ms from the level to the pixels.
+0.6 s needs both of the two shortened, and each is a change of design:
+
+- **The first frame waits for the whole view**, and needs a device and
+  the level pipelines of it, 0.1 s of the 0.4. A view that could draw a
+  level before it has read the result, linked the graph's pipelines and
+  uploaded the edges (which the edge order rewrites anyway) would take
+  the page's thread out of the first frame. Compiling earlier does not:
+  the thread is busy from the engine's answer on, and the work is the
+  same.
+- **The layout worker waits for the result**, and needs only the edges.
+  The engine has them 60 to 100 ms before its answer is written and
+  read; sending them on their own would start the adjacency that much
+  sooner.
+- **The view's code is loaded 150 ms after Enter**, when the pane opens,
+  and the engine now answers at about that: the graph is posted 70 ms
+  after the engine's answer where it was 10. Loading it at Enter would
+  load it for a typo too, which `web/tests/e2e.ts` forbids (loading it
+  after 60 ms failed there: an error can take longer); the engine
+  saying that a graph is coming, before it has made it, would do.
 
 ## The aggregated view
 
