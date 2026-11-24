@@ -377,9 +377,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const size = () => [Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr))];
   [canvas.width, canvas.height] = size();
 
+  // A turn of the event loop: reading the result and sending its edges to
+  // the layout, counting the degrees, and the view reading the result
+  // again are three tasks of the page, not one long one (#426, #520).
+  await new Promise((resolve) => setTimeout(resolve));
   const degree = degreesOf(graph);
-  // A turn of the event loop: reading the result here, and the view reading
-  // it again, are two tasks of the page, not one long one.
   await new Promise((resolve) => setTimeout(resolve));
   let view;
   try {

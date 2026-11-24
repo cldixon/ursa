@@ -20,6 +20,7 @@ use crate::budget::{split, total_units, Frame, NODE_UNITS};
 use crate::highlight::flag;
 use crate::level_render::LevelRenderer;
 use crate::levels::{LevelInfo, LevelScene};
+use crate::pace::{ready, Pace};
 use crate::scene::NO_CATEGORY;
 
 use super::View;
@@ -122,10 +123,25 @@ impl View {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
     ) {
+        ready(self.warm_levels_paced(device, queue, format, &mut Pace::never()));
+    }
+
+    /// [`View::warm_levels`], giving the event loop a turn as `pace` says
+    /// between its pieces: the shader, each of the two pipelines, and the
+    /// first draw with each, which is when a GL driver links it. On
+    /// software WebGL2 they are 10 to 30 ms each, and in one task they
+    /// held the page's thread for over 60 ms (#520).
+    pub async fn warm_levels_paced(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        pace: &mut Pace,
+    ) {
         if self.level.is_some() {
             return;
         }
-        let mut gpu = LevelRenderer::new(device, format);
+        let mut gpu = LevelRenderer::new_paced(device, format, pace).await;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("level warm-up"),
             size: wgpu::Extent3d {
@@ -152,15 +168,21 @@ impl View {
             width: 1.0,
             alpha: 0.0,
         };
-        gpu.set(device, queue, &[disc], &[link]);
-        gpu.draw(
-            device,
-            queue,
-            &texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            &self.camera,
-            self.renderer.background,
-            self.theme.edge,
-        );
+        let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // A draw for each pipeline, and a turn after each: the driver
+        // links one at a time.
+        for (discs, links) in [(&[disc][..], &[][..]), (&[][..], &[link][..])] {
+            gpu.set(device, queue, discs, links);
+            gpu.draw(
+                device,
+                queue,
+                &target,
+                &self.camera,
+                self.renderer.background,
+                self.theme.edge,
+            );
+            pace.turn().await;
+        }
         gpu.set(device, queue, &[], &[]);
         self.level = Some(Level {
             scene: None,

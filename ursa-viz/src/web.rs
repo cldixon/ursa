@@ -202,6 +202,9 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         // and wgpu keeps its own reference to the canvas for the surface.
         unsafe { instance.create_surface_unsafe(target) }.map_err(js_err)?
     };
+    // Making the canvas's context is a piece of its own (20 ms of software
+    // WebGL2), and so is asking for the adapter and the device.
+    crate::pace::yield_now().await;
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -254,10 +257,15 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
     // A graph this large is first seen as a level of its layout's
     // hierarchy (#497): what draws one is made now, not in that frame.
     if view.n_nodes() + view.n_edges() >= LEVELS_FROM {
-        // In a task of its own: compiling is not quick everywhere.
-        crate::pace::yield_now().await;
-        view.warm_levels(&device, &queue, config.format);
+        // In tasks of its own, a piece at a time (#520): compiling is not
+        // quick everywhere.
+        let mut pace = crate::pace::Pace::yielding();
+        view.warm_levels_paced(&device, &queue, config.format, &mut pace)
+            .await;
     }
+    // What the caller does with the view is a task of its own, not the
+    // tail of the last piece here.
+    crate::pace::yield_now().await;
     Ok(GraphView {
         view,
         _instance: instance,
