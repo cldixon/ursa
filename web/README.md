@@ -390,10 +390,10 @@ static assets and an R2 bucket.
       commands without writing them or their answers (an error is still
       written, and `.history` still lists them); `.graph echo on` shows
       them again.
-    - **The inspector waits for a double tap.** After a tap its panel
-      (#444) opens 350 ms later, once a second tap would no longer be a
-      double tap: under the view on a phone, it would otherwise open over
-      the node and take the second tap. A mouse's click opens it at once.
+    - **The inspector does not take the second click or tap.** Its panel
+      (#444) opens at once, on the side of the view away from the node, and
+      the camera waits 450 ms before it makes room for the panel (#493,
+      below): nothing moves under a double-click or a double tap.
     - **While a command runs** the next ones wait their turn (the engine
       runs one at a time), and each node waiting carries a busy ring: an
       element over the canvas (`.graph-busy`), moved with its node as each
@@ -661,8 +661,28 @@ static assets and an R2 bucket.
 
     **The inspector** (#444, `graph-inspector.js` and `graph-inspector.css`)
     shows what is known of the selection, in a panel over the top right of
-    the view (the top left when what was selected is drawn on the right; a
-    sheet over the lower half under 640 px):
+    the view (the top left when what was selected is drawn on the right).
+    In a window under 640 px wide it is a sheet across the bottom of the
+    view, at most 45% of its height (across the top when what was selected
+    is drawn low). While it is open it stays on its side if it can.
+
+    **The view keeps clear of the panel** (#493), so every node in sight
+    can be clicked and double-clicked. 450 ms after the selection last
+    changed, and with no pointer down, the camera moves what was in sight
+    into the part of the canvas the panel leaves clear (the panel's width
+    or height and a gap of 24 px): over 200 ms, or in one step under
+    `prefers-reduced-motion`. A camera that follows the layout is fitted
+    to the clear part (`GraphView.setFitInset`) and goes on following; one
+    that was panned or zoomed shows what it showed, smaller. Closing the
+    panel (Esc, a click on empty space, or its ×) moves the camera back
+    the same way. While the panel is open, `0`, `f`, `+`, `-` and a
+    double-click on empty space work in the clear part. A pan can still
+    put nodes under the panel. `window.ursaShell.graph().room` gives the
+    pixels kept clear (`inset`: left, top, right, bottom, in canvas
+    pixels), whether the camera follows the layout, and whether a move is
+    waiting.
+
+    The panel shows:
     - **a node:** its key and label, its degree as drawn and how many
       neighbours it has in the whole graph, the values drawn (`SIZE BY`,
       `COLOR BY`, a hop's distance), and its row of the vertex table, read

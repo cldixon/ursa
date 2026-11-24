@@ -865,6 +865,8 @@ async function graphSettled(p: Page) {
     throw new Error(`the graph view did not settle: ${JSON.stringify(seen)}`, { cause: e });
   }
 }
+/** Wait until the camera has made room for the inspector's panel, or given it back (#493). */
+const roomSettled = (p: Page) => p.waitForFunction(() => (window as any).ursaShell.graph()?.room.waits === false, null, { timeout: 10_000, polling: 50 }).catch(() => {});
 /** The terminal's columns, once a resize has settled. */
 async function settledCols(p: Page) {
   let last = -1;
@@ -1546,7 +1548,7 @@ for (const scheme of ["light", "dark"] as const) {
       return squeezed(await after(line, s));
     };
     const status = async () => (await s.locator("#graph-status").textContent()) ?? "";
-    // The selection's box, in CSS pixels of the canvas, once the camera rests.
+    // The selection's box, in CSS pixels, once the camera rests.
     const fitted = async () => {
       await s.waitForFunction(() => !(window as any).ursaShell.graph()?.fitting, null, { timeout: 10_000 });
       await s.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
@@ -1557,7 +1559,10 @@ for (const scheme of ["light", "dark"] as const) {
         const xs = at.map((p: any) => p.x);
         const ys = at.map((p: any) => p.y);
         const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-        return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth, height: canvas.clientHeight, ids: shell.graph().selection.map((n: any) => String(n.id)) };
+        // In the part of the canvas the inspector's panel leaves clear (#493).
+        const ratio = shell.graph().width / canvas.clientWidth;
+        const [left, top, right, bottom] = shell.graph().room.inset.map((v: number) => v / ratio);
+        return { cx: (x0 + x1) / 2 - left, cy: (y0 + y1) / 2 - top, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth - left - right, height: canvas.clientHeight - top - bottom, ids: shell.graph().selection.map((n: any) => String(n.id)) };
       });
     };
     const centred = (b: any) => Math.abs(b.cx - b.width / 2) <= 2 && Math.abs(b.cy - b.height / 2) <= 2;
@@ -1699,7 +1704,9 @@ for (const scheme of ["light", "dark"] as const) {
       const status = (await s.locator("#graph-status").textContent()) ?? "";
       check(status.startsWith("Selected node 2: ") && status.includes("+4 not shown") && /not shown\s*\+4/.test(tip), "a node with neighbours not shown says +N, in the header and the tooltip", `${status} | ${tip}`);
     }
-    // The frame before: node 2 selected, the pointer off the canvas.
+    // The frame before: node 2 selected, the pointer off the canvas, and the
+    // camera at rest, having made room for the inspector's panel (#493).
+    await roomSettled(s);
     await away();
     await s.waitForFunction(() => (window as any).ursaShell.graph().hovered === null);
     const places = async (ids: number[]) => Promise.all(ids.map(place));
@@ -2376,6 +2383,9 @@ for (const scheme of ["light", "dark"] as const) {
       await known();
       // A node not yet expanded, with neighbours to add, the fewest first:
       // the hubs of this graph have thousands.
+      // With the inspector open, once the camera has made room for its
+      // panel (#493): any node in sight can be double-clicked.
+      await roomSettled(r);
       const all: any[] = await r.evaluate(() => (window as any).ursaShell.graphExpandable(100_000));
       const next = all.filter((c) => !commands.includes(`.expand ${c.id}`)).sort((a, b) => a.notShown - b.notShown)[0];
       if (!next) break;
@@ -2829,6 +2839,195 @@ for (const scheme of ["light", "dark"] as const) {
   check(g.grouped.open.length === 0 && g.nodes === g.grouped.groups && (await errors(r)) === 0, "GROUP BY on rmat: .undo closes the group again", `${g.nodes} nodes; open ${g.grouped.open}`);
   await gctx.close();
 }
+// #493: the inspector's panel never keeps a node from the pointer. With the
+// panel open the camera makes room for it, so a node that was under it can
+// be double-clicked and expands; closing it gives the view back; and the
+// panel opens at once on the side away from what was selected. On a desktop
+// (a column at the right, a mouse) and a phone (a sheet across the bottom,
+// fingers).
+for (const phone of [false, true]) {
+  const name = phone ? "a phone" : "a desktop";
+  const rctx = await watchedContext(phone ? { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true } : { viewport: { width: 1280, height: 800 } });
+  const p = await rctx.newPage();
+  await p.goto(`${base}/?dataset=karate`);
+  await ready(p);
+  await idle(p);
+  await p.click("#terminal");
+  await type(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')", p);
+  await graphSettled(p);
+  await p.waitForFunction(() => (window as any).ursaShell.graph()?.notShownKnown === true, null, { timeout: 30_000, polling: 50 }).catch(() => {});
+  const box = (await p.locator("#graph-stage canvas").boundingBox())!;
+  type At = { id: number; x: number; y: number };
+  /** Where every node drawn is, in CSS pixels of the canvas. */
+  const places = (): Promise<At[]> =>
+    p.evaluate(() => {
+      const shell = (window as any).ursaShell;
+      const out: { id: number; x: number; y: number }[] = [];
+      for (let id = 0; id < 34; id++) {
+        const at = shell.graphNodePlace(id);
+        if (at && !at.hidden) out.push({ id, x: at.x, y: at.y });
+      }
+      return out;
+    });
+  const inspector = (): Promise<any> => p.evaluate(() => (window as any).ursaShell.graphInspector());
+  const panel = () => p.locator("#graph-stage .graph-inspector").boundingBox();
+  const onCanvas = (at: { x: number; y: number }) => p.evaluate(([x, y]) => document.elementFromPoint(x, y)?.tagName === "CANVAS", [box.x + at.x, box.y + at.y]);
+  /** The camera has made room for the panel (`open`), or has given it back. */
+  const room = (open: boolean) =>
+    p
+      .waitForFunction(
+        (open) => {
+          const r = (window as any).ursaShell.graph()?.room;
+          return r && !r.waits && r.inset.some((v: number) => v > 0) === open;
+        },
+        open,
+        { timeout: 10_000, polling: 50 },
+      )
+      .then(() => true, () => false);
+  const cdp = phone ? await rctx.newCDPSession(p) : null;
+  const touch = (type: "touchStart" | "touchMove" | "touchEnd", at: { x: number; y: number }[]) => cdp!.send("Input.dispatchTouchEvent", { type, touchPoints: at.map((f, id) => ({ x: box.x + f.x, y: box.y + f.y, id })) });
+  const click = async (at: { x: number; y: number }) => {
+    if (!phone) return p.mouse.click(box.x + at.x, box.y + at.y);
+    await touch("touchStart", [at]);
+    await touch("touchEnd", []);
+  };
+  const dblclick = async (at: { x: number; y: number }) => {
+    if (!phone) return p.mouse.dblclick(box.x + at.x, box.y + at.y);
+    await click(at);
+    await p.waitForTimeout(60);
+    await click(at);
+  };
+  const drag = async (from: { x: number; y: number }, to: { x: number; y: number }) => {
+    const steps = 8;
+    const at = (i: number) => ({ x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps });
+    if (phone) {
+      await touch("touchStart", [from]);
+      for (let i = 1; i <= steps; i++) await touch("touchMove", [at(i)]);
+      await touch("touchEnd", []);
+    } else {
+      await p.mouse.move(box.x + from.x, box.y + from.y);
+      await p.mouse.down();
+      for (let i = 1; i <= steps; i++) await p.mouse.move(box.x + at(i).x, box.y + at(i).y);
+      await p.mouse.up();
+    }
+  };
+  const esc = async () => {
+    await p.focus("#graph-stage canvas");
+    await p.keyboard.press("Escape");
+  };
+  // Along the side the panel takes: across a desktop's view, down a phone's.
+  const along = (at: { x: number; y: number }) => (phone ? at.y : at.x);
+  const extent = phone ? box.height : box.width;
+  const within = (at: { x: number; y: number }) => at.x >= 0 && at.y >= 0 && at.x <= box.width && at.y <= box.height;
+  const find = (all: At[], id: number) => all.find((n) => n.id === id)!;
+
+  // A node to expand, drawn where the panel opens (a drag puts it there:
+  // the camera no longer follows the layout), and a node to select, far
+  // from that side.
+  const expandable: At[] = (await p.evaluate(() => (window as any).ursaShell.graphExpandable(100))).map((n: any) => ({ id: Number(n.id), x: n.x, y: n.y }));
+  const b0 = expandable.filter((n) => n.id !== 0).reduce((a, b) => (along(b) > along(a) ? b : a), expandable[0]);
+  const spot = phone ? { x: b0.x, y: box.height - 40 } : { x: box.width - 40, y: 60 };
+  await drag({ x: 5, y: 5 }, { x: 5 + spot.x - b0.x, y: 5 + spot.y - b0.y });
+  const before = await places();
+  const b = find(before, b0.id);
+  const a = before.filter((n) => n.id !== b.id && n.x > 20 && n.y > 20 && n.x < box.width - 20 && n.y < box.height - 20).reduce((a, b) => (along(b) < along(a) ? b : a));
+  check(Math.hypot(b.x - spot.x, b.y - spot.y) < 3 && along(a) < extent / 2 && !(await graphInfo(p)).room.following, `#493, ${name}: a node to expand is drawn where the panel opens, and one to select away from it`, `node ${b?.id} at ${Math.round(b.x)},${Math.round(b.y)}, node ${a?.id} at ${Math.round(a.x)},${Math.round(a.y)}, of ${Math.round(box.width)} x ${Math.round(box.height)}`);
+
+  // Selecting opens the panel at once, over the first node; then the
+  // camera makes room, and no node in sight is under the panel.
+  await click(a);
+  const opened = await inspector();
+  check(await room(true), `#493, ${name}: the camera makes room for the panel`, JSON.stringify((await graphInfo(p)).room));
+  const over = (await panel())!;
+  const wasUnder = box.x + b.x > over.x && box.x + b.x < over.x + over.width && box.y + b.y > over.y && box.y + b.y < over.y + over.height;
+  const made = await places();
+  const clearNow = await Promise.all(made.filter(within).map(onCanvas));
+  check(
+    opened?.kind === "node" && opened.side === "right" && wasUnder && before.filter(within).every((n) => within(find(made, n.id))) && clearNow.length >= before.filter(within).length && clearNow.every(Boolean),
+    `#493, ${name}: every node that was in sight is in sight still, and none is under the panel`,
+    `side ${opened?.side}; node ${b.id} was at ${Math.round(b.x)},${Math.round(b.y)}, the panel at ${JSON.stringify(over)}; ${clearNow.filter(Boolean).length} of the ${clearNow.length} in sight clear`,
+  );
+  if (shots) await p.screenshot({ path: `${shots}/graph-inspector-room-${phone ? "phone" : "desktop"}.png` });
+
+  // Closing the panel gives the view back as it was.
+  await esc();
+  const back = await room(false);
+  const restored = await places();
+  const moved = Math.max(...before.map((n) => Math.hypot(find(restored, n.id).x - n.x, find(restored, n.id).y - n.y)));
+  check(back && (await inspector()) === null && moved < 1, `#493, ${name}: closing the panel puts the view back where it was`, `${moved.toFixed(2)} px`);
+
+  // Under prefers-reduced-motion the camera moves in one step; otherwise over several frames.
+  const steps = async (reduced: boolean) => {
+    await p.emulateMedia({ reducedMotion: reduced ? "reduce" : "no-preference" });
+    await p.evaluate(() => {
+      const w = window as any;
+      w.__room = [];
+      const look = () => {
+        const now = JSON.stringify(w.ursaShell.graph()?.room.inset);
+        if (w.__room.at(-1) !== now) w.__room.push(now);
+      };
+      look();
+      w.__look = setInterval(look, 5);
+    });
+    await click(find(await places(), a.id));
+    await room(true);
+    const seen: string[] = await p.evaluate(() => {
+      clearInterval((window as any).__look);
+      return (window as any).__room;
+    });
+    return seen.length - 1;
+  };
+  const eased = await steps(false);
+  await esc();
+  await room(false);
+  const atOnce = await steps(true);
+  await p.emulateMedia({ reducedMotion: "no-preference" });
+  check(eased > 2 && atOnce === 1, `#493, ${name}: the camera eases to make room, and moves in one step under prefers-reduced-motion`, `${eased} steps, then ${atOnce}`);
+
+  // The acceptance: with the panel open, a double-click on the node that
+  // was under it expands it.
+  const nodes0 = (await graphInfo(p)).nodes;
+  const target = find(await places(), b.id);
+  const reached = await onCanvas(target);
+  await dblclick(target);
+  await idle(p);
+  await graphSettled(p);
+  const grown = await graphInfo(p);
+  const said = (await screen(p)).replace(/\s+/g, "");
+  check(
+    reached && grown.nodes > nodes0 && said.includes(`fromthegraphmemoryU.expand${b.id}`) && (await inspector())?.title === `node ${b.id}`,
+    `#493, ${name}: with the panel open, a double-click on a node that was under it expands the node`,
+    `${nodes0} -> ${grown.nodes} nodes; inspecting ${(await inspector())?.title}`,
+  );
+
+  // A fit is of the part the panel leaves clear, and follows the layout there.
+  await room(true);
+  await p.focus("#graph-stage canvas");
+  await p.keyboard.press("0");
+  await p.waitForTimeout(100);
+  const fit = await places();
+  const fitClear = await Promise.all(fit.map(onCanvas));
+  const info = await graphInfo(p);
+  check(info.room.following && fit.every(within) && fitClear.every(Boolean), `#493, ${name}: 0 fits the graph in the part of the view the panel leaves clear`, `${fitClear.filter(Boolean).length} of ${fit.length} clear; ${JSON.stringify(info.room)}`);
+  // The panel is still reached from the keys: i goes in, Esc comes back.
+  await p.keyboard.press("i");
+  const inPanel = (await inspector())?.focused;
+  await p.keyboard.press("Escape");
+  check(inPanel === true && (await p.evaluate(() => document.activeElement?.tagName)) === "CANVAS" && (await inspector()) !== null, `#493, ${name}: i still moves into the panel, and Esc back to the view`);
+
+  // The panel takes the other side when what is selected is drawn under
+  // its own: a second click or tap reaches the node at once.
+  await esc();
+  await room(false);
+  const last = (await places()).filter(within).reduce((a, b) => (along(b) > along(a) ? b : a));
+  await drag({ x: 5, y: 5 }, phone ? { x: 5, y: 5 + extent - 40 - along(last) } : { x: 5 + extent - 40 - along(last), y: 5 });
+  const low = find(await places(), last.id);
+  await click(low);
+  const flipped = await inspector();
+  check(flipped?.side === "left" && (await onCanvas(low)), `#493, ${name}: the panel opens on the other side when the node selected is drawn under its own`, `side ${flipped?.side}, node ${low.id} at ${Math.round(along(low))} of ${Math.round(extent)}`);
+  check((await errors(p)) === 0, `#493, ${name}: no error`, `${await errors(p)}`);
+  await rctx.close();
+}
 // #502: a phone (a coarse pointer and at most 4 GB of memory) starts at
 // 500,000 edges, and its refusal names the setting.
 {
@@ -2979,9 +3178,12 @@ for (const scheme of ["light", "dark"] as const) {
     await tap(panned[a.n]);
     const tapped = (await graphInfo(p)).picked;
     check(tapped?.index === a.n && /^Selected node \S+: /.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap selects the node under the finger", JSON.stringify(tapped));
-    await p.waitForTimeout(400);
+    // The camera makes room for the inspector's panel, and gives it back
+    // when the selection is cleared (#493).
+    await roomSettled(p);
     const empty = { x: 6, y: 6 };
     await tap(empty);
+    await roomSettled(p);
     check(off(pinched2, await spots(), [a.n], start, { x: start.x - 25, y: start.y + 35 }, 1) <= 2, "one tap beside the graph leaves the view where it is");
     await p.waitForTimeout(400);
     await tap(empty);
@@ -3000,10 +3202,12 @@ for (const scheme of ["light", "dark"] as const) {
       const text = await screen(p);
       check(id !== undefined && text.replace(/\s+/g, "").includes(`fromthegraphmemoryU.expand${id}`), "a double tap on a node runs .expand for it", text.split("\n").slice(-3).join(" | "));
     }
-    // One tap beside the graph: nothing is selected again.
+    // One tap beside the graph: nothing is selected again, and the camera
+    // gives back the room it made for the inspector's panel.
     await p.waitForTimeout(400);
     await tap(empty);
     await p.waitForTimeout(400);
+    await roomSettled(p);
 
     // A mouse still drags and zooms with its wheel on the same canvas, and the keys work.
     await p.mouse.move(box.x + 20, box.y + 20);

@@ -1155,7 +1155,10 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   rim of a radius in the layout's units, drawn under the edges:
   `LevelScene::open_discs`), which are members (points, drawn over the
   discs) and which are hidden. `setFitPadding(pixels, first)` leaves room
-  for the discs when the camera fits, and fits the groups alone;
+  for the discs when the camera fits, and fits the groups alone
+  (`setFitInset(left, top, right, bottom)` keeps part of the canvas clear
+  of a fit too: what a panel over the view covers, #493; `following()`
+  says whether the camera still follows the layout);
   `groupRadius(group)` is a disc's radius on the canvas now. The scene is
   the page's (`web/public/graph-groups.js`): the groups come from the
   engine, not from the layout's hierarchy.

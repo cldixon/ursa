@@ -281,7 +281,7 @@ So the open graph is a table. `SELECT club, count(*) FROM members JOIN explorer.
 
 ### The inspector
 
-A click selects a node or an edge and opens the inspector: a panel in the pane, on the right, or a sheet from the bottom on a phone.
+A click selects a node or an edge and opens the inspector: a panel in the pane, on the right, or a sheet from the bottom on a phone. The camera makes room for it, so no node in sight is under the panel (#493).
 
 - **A node:** its key and label; its row in the vertex table (`SELECT * FROM members WHERE id = 33`, 9 ms measured); the metrics drawn; its degree in the graph and in the view; buttons for expand, hide, pin and "path from here".
 - **An edge:** its ends; its row in the edge table, fetched by the edge's row number where the index has it, else by its ends.

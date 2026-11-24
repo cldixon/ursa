@@ -1012,6 +1012,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The graph view keeps clear of its inspector** (#493). The inspector's
+  panel is drawn over the web shell's Graph view, and the nodes under it
+  could not be clicked, double-clicked or expanded. Now the camera makes
+  room: 450 ms after a selection opens the panel (once a second click or
+  tap would no longer be a double one), what was in sight moves into the
+  part of the view the panel leaves clear, over 200 ms, or in one step
+  under `prefers-reduced-motion`. Closing the panel puts the view back.
+  While the panel is open, `0`, `f` and a double-click on empty space fit
+  into the clear part, and a camera that follows the layout follows it
+  there. The panel opens at once after a tap too (it waited 350 ms): on a
+  phone, where it is a sheet across the bottom, it opens across the top
+  when the node tapped is drawn low, as it opens on the left on a desktop
+  when the node is on the right. The sheet is at most 45% of the view's
+  height (it was 55%). `ursa-viz`: `GraphView.setFitInset(left, top,
+  right, bottom)` keeps part of the canvas clear when the camera fits,
+  and `following()` says whether the camera follows the layout.
 - **SQL: graph function parameters and columns renamed, one name per role**
   (breaking, #415). The old names are not accepted. Each one gets a "did
   you mean" with its new name, and so do `k`, `max_hops` and `depth`:

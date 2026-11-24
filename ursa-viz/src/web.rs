@@ -594,6 +594,21 @@ impl GraphView {
         self.view.set_fit_padding(pixels, first.map(|k| k as usize));
     }
 
+    /// Keep `left`, `top`, `right` and `bottom` pixels of the canvas clear
+    /// when the camera fits: what a panel over the view covers (#493). A
+    /// camera that follows the layout is fitted again at once; one that
+    /// does not stays where it is.
+    #[wasm_bindgen(js_name = setFitInset)]
+    pub fn set_fit_inset(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
+        self.view.set_fit_inset(left, top, right, bottom);
+    }
+
+    /// Whether the camera follows the layout (`fit`), as it does until a
+    /// pan or a zoom.
+    pub fn following(&self) -> bool {
+        self.view.following()
+    }
+
     /// A frame drawn offscreen: RGBA pixels, canvas-sized, row by row from
     /// the top (`new ImageData(new Uint8ClampedArray(px), width)`). Call no
     /// other method until it resolves.

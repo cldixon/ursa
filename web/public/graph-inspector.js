@@ -83,11 +83,13 @@ export function pathCommand(graph, from, to) {
  *   pin(index)            pin a node, or unpin it; returns whether it is pinned now
  *   select(index)         select a node alone (an edge's end)
  *   onLeave()             Esc was pressed in the panel: take the focus back
+ *   onClose()             the panel has closed
  *
  * It returns {element, show(subject), close(), focus(), state()}. `element`
  * is the panel, hidden until `show`. A subject may say which `side` of the
- * view the panel takes ("right", or "left" when what is selected is drawn on
- * the right, under where the panel would be). A subject is one of:
+ * view the panel takes: "right" (the right, or the bottom where it is a sheet
+ * across a narrow view), or "left" (the left, or the top) when what is
+ * selected is drawn under where the panel would be. A subject is one of:
  *
  *   {kind: "node", index, key, keyType, label, graph, command, degree, values,
  *    pinned, styled}: `graph` is the property graph drawn (or null), `command`
@@ -384,6 +386,7 @@ export function createInspector(host) {
     shown = null;
     body.replaceChildren();
     if (had) host.onLeave?.();
+    host.onClose?.();
   }
 
   return {
