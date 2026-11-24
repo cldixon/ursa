@@ -995,6 +995,28 @@ What this says and does not:
   hierarchy (there is none), so a moving frame's prefix is the hubs' edges;
   and the view has no coarse levels to draw.
 
+## `GROUP BY`
+
+`.graph rmat GROUP BY louvain` (#499) in the web shell: the R-MAT graph of
+46,318 nodes and a million edges, drawn as its 30 communities and the 231
+pairs of them with edges between. Headless Chromium, software WebGL2, this
+machine (4 shared cores, no GPU); from `web/tests/e2e.ts` and a script of
+the same commands.
+
+| | |
+|---|---|
+| The engine: `louvain`, the groups and the counted edges | 0.9–1.1 s |
+| First frame after the engine's answer (the target is 2 s) | 180–200 ms |
+| The groups' layout and packing done, after the engine's answer | about 340 ms |
+| `.expand group:0`, the largest community (4,794 members, 22,387 edges among them): the engine | about 0.76 s |
+| The page applying it (the delta, the scene, every member's place) | about 47 ms |
+
+The engine's time to open a group is one `induced_edges` over a list of
+its members' keys, and the group's own layout
+(`ursa_engine::graph::view::groups::disc_layout`), which takes a tenth of
+the work a graph's layout takes. On karate, `GROUP BY club` is drawn about
+300 ms after Enter.
+
 ## Caveats
 
 - **No GPU.** WebGL2 runs on SwiftShader, on the same 4 cores as the layout
