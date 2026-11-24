@@ -303,7 +303,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       `Graph of ${plural(nodes, "node")} and ${plural(edges, "edge")}${styled ? `, ${styled} (see the legend)` : ""}. ` +
         "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click empty space or press 0 to fit. " +
         "Click a node to select it, Shift+click to add another, click empty space or press Escape to clear the selection. " +
-        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection.",
+        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection. " +
+        "A large graph is drawn as groups of nodes once it is laid out, which open as the view zooms in: click a group to select its nodes, and press A for every node and edge.",
     );
   };
   describeCanvas(graph.n, graph.src.length);
