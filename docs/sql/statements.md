@@ -56,6 +56,8 @@ SELECT count(*) AS ties FROM 'ties.jsonl';
 
 `STORED AS CSV` (or `PARQUET`, `JSON`, `ARROW`) names the format when the extension does not, and `OPTIONS (...)` takes DataFusion's writer options. DuckDB's option list works too: `COPY … TO 'ties.txt' (FORMAT csv, HEADER false, DELIMITER '|')`, with `FORMAT`, `HEADER`, `DELIMITER` (or `DELIM`, `SEP`) and `COMPRESSION`; see [Differences from DuckDB](duckdb.md#what-is-different).
 
+In the [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) in the browser, which has no disk, `COPY … TO 'ties.parquet'` keeps the file in the session: `FROM 'ties.parquet'` reads it and `.files` lists it, until the page is closed. The name has no folder, and `PARTITIONED BY` and compressed CSV or JSON are not written there.
+
 !!! tip "Convert large CSV files to Parquet once"
 
     A view over a file reads the file each time a query uses it. For a CSV or JSON file, that means parsing all of it again, so a query that reads a large vertex table's attributes (a `JOIN` on its rows, `neighbors_agg`'s `attribute`, a `GRAPH_TABLE` property) pays for that every time. Parquet is much faster to read, and a query reads only the columns it needs. Convert the file once and define the view over the Parquet file:

@@ -1075,9 +1075,11 @@ async function drawGraph(text) {
   if (hint)
     await write(
       `Its layout's fine level takes about a minute. To draw it at once, lay it out once and draw from that:\r\n` +
+        `  ${hint.copy}\r\n` +
+        `  ${hint.draw}\r\n` +
+        `The file stays in this session (.files lists it). As a table instead:\r\n` +
         `  ${hint.here.join("\r\n  ")}\r\n` +
-        `or, in the ursa CLI (every core), ${hint.copy} then .files add here, and\r\n` +
-        `  ${hint.draw}\r\n`,
+        `The ursa CLI runs the same COPY on every core, and .files add brings its file here.\r\n`,
     );
   countNotShown();
   return true;
@@ -1311,7 +1313,11 @@ async function listFiles() {
   manifest ??= await (await fetch("/data/manifest.json")).json();
   const rows = manifest.datasets.flatMap((d) => d.files.map((f) => `('${f.name}', ${f.bytes}, '${d.title.replace(/'/g, "''")}')`));
   rows.push(...uploads.map((u) => `('${u.url.replace(/'/g, "''")}', ${u.bytes}, 'imported')`));
-  return quiet(`SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset = 'imported', name;`);
+  // The files COPY … TO 'name' wrote in this session (#517), read by name.
+  const { files } = await engine("files");
+  const imported = new Set(uploads.map((u) => u.url));
+  rows.push(...files.filter((f) => !imported.has(f.url)).map((f) => `('${f.name.replace(/'/g, "''")}', ${f.bytes}, 'written here')`));
+  return quiet(`SELECT name AS file, bytes, dataset FROM (VALUES ${rows.join(", ")}) AS t(name, bytes, dataset) ORDER BY dataset IN ('imported', 'written here'), dataset, name;`);
 }
 
 const EXTENSIONS = { csv: "csv", parquet: "parquet", json: "json", arrow: "arrows" };

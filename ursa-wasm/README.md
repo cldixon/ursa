@@ -56,6 +56,13 @@ drives the engine's futures. In the wasm32 build:
 - blocking work runs inline (`ursa_engine::run_blocking`);
 - plans have one partition (`ursa_engine::serial::SingleTask`), so DataFusion
   never spawns a task;
+- `COPY … TO` is written by the engine, not by DataFusion's file sinks, which
+  spawn tasks (`ursa_engine::session_files`). A `WebShell` keeps files in
+  memory at `memory://uploads/`: `COPY … TO 'name.parquet'` (or `.csv`,
+  `.json`, `.arrow`) writes one, `FROM 'name.parquet'` reads it, and
+  `WebShell.files()` lists them with the ones `addFile` added. Any other
+  target is refused, as is an `INSERT INTO` a table of files; a `Session`
+  keeps no files, so its `COPY` is refused: export a result instead;
 - `s3://`, `gs://`, `az://` and local paths are not available, nor is the
   `.ursa` database file.
 

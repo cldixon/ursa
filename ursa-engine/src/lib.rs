@@ -26,6 +26,7 @@ pub mod options;
 pub mod paths;
 pub mod read_functions;
 pub mod serial;
+pub mod session_files;
 pub mod stores;
 
 pub use blocking::{run_blocking, BlockingError};

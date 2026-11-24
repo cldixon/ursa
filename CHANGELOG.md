@@ -1742,6 +1742,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Web shell: `COPY … TO` writes a file in the session, and no longer ends
+  the engine** (#517). A browser has no disk, so `COPY … TO 'pos.parquet'`
+  (or `.csv`, `.json`, `.arrow`; `'memory://uploads/pos.parquet'` is the
+  same file) keeps the file in memory beside the imported ones:
+  `FROM 'pos.parquet'` reads it, a session file being found by its name
+  before the datasets' files, and `.files` lists it as `written here`. So a
+  layout is saved as the CLI saves it: `COPY (SELECT * FROM layout_fa2(g))
+  TO 'pos.parquet'`, then `.graph g POSITIONS (SELECT * FROM
+  'pos.parquet')`, which the terminal's hint for a large graph now gives
+  first. Before, a relative path failed with "relative URL without a base",
+  and a `memory://uploads/…` target ended the engine: DataFusion's file
+  sinks start tokio tasks, and the browser has no tokio runtime to start
+  them on. The engine now writes the file itself in such a session
+  (`ursa_engine::session_files`), with the serializers and options
+  DataFusion's sinks use. What it cannot write is refused with a message
+  that says what works: a name with a folder or other characters than ASCII
+  letters, digits, `.`, `_` and `-`; a URL elsewhere; `PARTITIONED BY`;
+  compressed CSV or JSON; and `INSERT INTO` a table of files or `EXPLAIN
+  ANALYZE` of a `COPY`, which ran the same sinks. An `.arrow` file is
+  written uncompressed. `WebShell.files()` lists the session's files. The
+  CLI's `COPY` is unchanged.
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
     a number column's separator ending in `:`, `NULL` for a null; a `|` in
