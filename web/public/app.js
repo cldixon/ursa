@@ -1010,8 +1010,8 @@ let graphTimes = null;
  * pane drew. The terminal keeps the focus: queries can still be typed.
  *
  * The pane opens with "Loading graph view…" as soon as the engine takes more
- * than a moment (at once, for a big graph; not at all, for a typo). The
- * graph view's code starts loading at Enter, while the engine works (#525).
+ * than a moment (at once, for a big graph; not at all, for a typo), and the
+ * graph view's code starts loading then, while the engine still works.
  */
 async function drawGraph(text) {
   const times = (graphTimes = { enter: performance.now(), command: `.graph ${text}`.trim() });
@@ -1026,11 +1026,6 @@ async function drawGraph(text) {
     status.textContent = "Loading graph view…";
     loadGraphModule().then((m) => m.preload(), () => {});
   };
-  // The graph view's code, here and in a layout worker, starts loading now,
-  // not when the pane opens: the engine answers for a large graph it has
-  // an index of in less time than the pane waits (#525). A typo loads it
-  // for nothing, once.
-  loadGraphModule().then((m) => m.preload(), () => {});
   const soon = setTimeout(open, 150);
   let graph;
   try {
