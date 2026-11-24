@@ -145,7 +145,7 @@ export BENCH_ACCOUNT=<account id>     # required; every command checks the profi
 ./bench-cloud.sh deploy               # the stack (add CreateGitHubOidcProvider=false if the
                                       # account already has GitHub's OIDC provider)
 ./bench-cloud.sh upload-data ~/Downloads/ICPSR_300499-V1.1
-./bench-cloud.sh push 0.10.0          # needs Docker; builds linux/arm64 (Fargate and the workflow)
+./bench-cloud.sh push 0.12.0          # needs Docker; builds linux/arm64 (Fargate and the workflow)
 ```
 
 `push` needs Docker, and Docker needs to reach `deb.debian.org` to build. EC2 runs don't need the image at all (see "Native runs on EC2").
@@ -168,7 +168,7 @@ This is how the full graph ran. The instance's first boot installs the released 
 ```bash
 BUCKET=$(./bench-cloud.sh outputs | awk '/ Bucket /{print $4}')
 aws s3 cp run.py s3://$BUCKET/data/tools/run.py       # first: the instance copies data/ when it boots
-URSA_VERSION=0.10.0 ./bench-cloud.sh ec2-up
+URSA_VERSION=0.12.0 ./bench-cloud.sh ec2-up
 # on the instance (ec2-connect, or `aws ssm send-command`), detached. The steps are the
 # full-graph run's: graph g only, since the edge-only ge would build a second 37 GiB index.
 sudo dnf install -y python3.11
@@ -185,8 +185,8 @@ aws s3 cp --recursive /work/full/out s3://$BUCKET/results/<run id>/
 ### A Fargate run
 
 ```bash
-URSA_VERSION=0.10.0 ./bench-cloud.sh run --before 2024-01-01     # the checked 95.7M-edge graph
-URSA_VERSION=0.10.0 ./bench-cloud.sh run --steps build_g,load_g,pagerank_g,wcc_g,scc_g,louvain_g   # the whole graph
+URSA_VERSION=0.12.0 ./bench-cloud.sh run --before 2024-01-01     # the checked 95.7M-edge graph
+URSA_VERSION=0.12.0 ./bench-cloud.sh run --steps build_g,load_g,pagerank_g,wcc_g,scc_g,louvain_g   # the whole graph
 ./bench-cloud.sh results                                          # the newest run's results
 ```
 
