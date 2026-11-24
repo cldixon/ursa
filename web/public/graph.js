@@ -169,6 +169,18 @@ const EDGE_REACH_PX = 4;
 const MAX_KEYS_NAMED = 5;
 /** Fitting the selection (`f`, .find) moves the camera over this long, in ms. */
 const FIT_MS = 200;
+// The inspector's panel (graph-inspector.css): under this width of window it
+// is a sheet across the view, at most this share of its height; and what it
+// keeps of the view is its own size and this much more, in CSS pixels.
+const SHEET_QUERY = "(max-width: 640px)";
+const SHEET_SHARE = 0.45;
+const PANEL_GAP = 24;
+/**
+ * The camera makes room for the inspector's panel this long after the
+ * selection last changed, in ms: once a second click or tap would no longer
+ * make a double one, so that the node is still under the pointer for it.
+ */
+const ROOM_WAIT_MS = 450;
 // A grouped drawing (#499): the most edges between groups that say their
 // count, and how long one is on the canvas to carry it, in CSS pixels.
 const COUNT_LABELS = 12;
@@ -1117,31 +1129,90 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
 
   // The selection is the view's: it is told what was clicked, and says what
   // is selected now.
-  // The inspector follows. After a tap (`byTouch`) it waits until a second
-  // tap would no longer be a double tap: its panel, under the view on a
-  // phone, would otherwise open over the node between the two taps and
-  // take the second, so a double tap never expanded (#443).
-  let inspectLater = 0;
-  const inspectNow = () => {
-    clearTimeout(inspectLater);
-    inspectLater = 0;
-    if (current === state) state.inspector.selectionChanged();
-  };
-  state.inspectNow = () => inspectLater && inspectNow();
-  state.cleanup.push(() => clearTimeout(inspectLater));
+  // The inspector follows, at once: its panel opens on the side away from
+  // what was selected, so a second click or tap still reaches the node.
   // `matched`: how many nodes the search that selected them matched.
-  const selectionChanged = (byTouch = false, matched = 0) => {
+  const selectionChanged = (matched = 0) => {
     state.matched = matched;
     state.selection = Array.from(view.selection());
     const edge = view.selectedEdge();
     state.edge = edge ? { edge: edge[0], src: edge[1], dst: edge[2] } : null;
     header();
     redraw();
-    if (!byTouch) return inspectNow();
-    clearTimeout(inspectLater);
-    inspectLater = setTimeout(inspectNow, DOUBLE_TAP_MS + 50);
+    state.inspector.selectionChanged();
   };
-  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw });
+
+  // Room for the inspector (#493). Its panel is over part of the view, and
+  // what is under it cannot be seen or clicked. So the part it covers is
+  // kept clear (`state.room`: canvas pixels at the left, top, right and
+  // bottom): a fit is of the rest of the canvas (the view's setFitInset),
+  // and when the panel opens, moves or closes the camera moves what was in
+  // sight into what is now clear, over FIT_MS (at once under
+  // prefers-reduced-motion). It waits ROOM_WAIT_MS first, and for the
+  // pointer to be up: nothing moves under a double-click.
+  state.room = [0, 0, 0, 0];
+  const clearOf = ([left, top, right, bottom]) => {
+    const [w, h] = [canvas.width - left - right, canvas.height - top - bottom];
+    return { x: left + w / 2, y: top + h / 2, w, h, share: Math.min(w / canvas.width, h / canvas.height) };
+  };
+  /** The part of the canvas no panel is over: its middle and its size, in canvas pixels. */
+  const clear = () => clearOf(state.room);
+  const setRoom = (room) => {
+    const was = state.room;
+    if (room.every((v, i) => v === was[i])) return;
+    state.room = room;
+    // A camera that follows the layout is fitted to what is clear; one the
+    // user has moved shows what it showed, as much smaller as the clear
+    // part is, in its middle.
+    const following = view.following();
+    view.setFitInset(...room);
+    if (!following) {
+      const [a, b] = [clearOf(was), clearOf(room)];
+      view.zoom(b.share / a.share, a.x, a.y);
+      view.pan(b.x - a.x, b.y - a.y);
+    }
+    redraw(false);
+    if (pointerAt) hoverSoon();
+  };
+  let roomTimer = 0;
+  let roomFrame = 0;
+  const roomStop = () => {
+    clearTimeout(roomTimer);
+    roomTimer = 0;
+    if (roomFrame) cancelAnimationFrame(roomFrame);
+    roomFrame = 0;
+  };
+  state.cleanup.push(roomStop);
+  /** Room for the panel as it is now, with no wait and no motion. */
+  const roomNow = () => {
+    roomStop();
+    setRoom(state.inspector.inset());
+  };
+  const roomMove = () => {
+    roomTimer = 0;
+    // A pointer is down: when it is up again (release).
+    if (current !== state || pointers.size) return;
+    const [from, to] = [state.room, state.inspector.inset()];
+    if (to.every((v, i) => v === from[i])) return;
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return setRoom(to);
+    const start = performance.now();
+    const tick = (now) => {
+      roomFrame = 0;
+      if (current !== state) return;
+      const t = Math.min(1, Math.max(0, (now - start) / FIT_MS));
+      const p = 1 - (1 - t) ** 3;
+      setRoom(t < 1 ? to.map((v, i) => from[i] + (v - from[i]) * p) : to);
+      if (t < 1) roomFrame = requestAnimationFrame(tick);
+    };
+    roomFrame = requestAnimationFrame(tick);
+  };
+  /** Room for the panel as it is now, once the pointer has rested. */
+  const roomSoon = () => {
+    roomStop();
+    roomTimer = setTimeout(roomMove, ROOM_WAIT_MS);
+  };
+  state.roomWaits = () => roomTimer !== 0 || roomFrame !== 0;
+  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved: roomSoon });
   state.clearSelection = () => {
     if (!view.clearSelection()) return false;
     selectionChanged();
@@ -1153,6 +1224,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     pointers.set(e.pointerId, at(e));
     // No hover while dragging.
     hoverSoon();
+    // The camera stops where it is, until the pointer is up.
+    if (state.roomWaits()) roomStop();
     // A second finger: what the first began is no tap. A third is ignored.
     if (pointers.size === 1) drag = { id: e.pointerId, moved: false, from: pointers.get(e.pointerId), slop: (e.pointerType === "mouse" ? 1.5 : TAP_SLOP_PX) * dpr };
     else if (drag) drag.moved = true;
@@ -1196,6 +1269,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       drag = null;
       // The pointer is over what the drag left under it.
       hoverAt(cancelled ? null : e);
+      roomSoon();
     }
     if (!tap) return;
     const { x, y } = at(e);
@@ -1210,7 +1284,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       }
     }
     timings.action("click", e.timeStamp);
-    if (!pick(x, y, e.shiftKey, e.pointerType !== "mouse")) shownSoon();
+    if (!pick(x, y, e.shiftKey)) shownSoon();
   };
   on(canvas, "pointerup", (e) => release(e, false));
   on(canvas, "pointercancel", (e) => release(e, true));
@@ -1241,7 +1315,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     }
     const step = 40 * dpr;
     const pan = { ArrowLeft: [step, 0], ArrowRight: [-step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] }[e.key];
-    const middle = [canvas.width / 2, canvas.height / 2];
+    // The middle of what no panel is over.
+    const middle = [clear().x, clear().y];
     if (pan) view.pan(...pan);
     else if (e.key === "+" || e.key === "=") view.zoom(1.25, ...middle);
     else if (e.key === "-" || e.key === "_") view.zoom(0.8, ...middle);
@@ -1255,7 +1330,6 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       return;
     } else if (e.key === "i") {
       // Into the inspector, if it is open; Esc there comes back.
-      state.inspectNow();
       if (state.inspector.focus()) e.preventDefault();
       return;
     } else return;
@@ -1267,7 +1341,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // A click at (x, y): the node there is selected (added to the selection,
   // or taken out of it, with Shift), and a click on empty space clears the
   // selection. Returns whether the selection changed, and so the frame.
-  function pick(x, y, extend, byTouch = false) {
+  function pick(x, y, extend) {
     const start = performance.now();
     // A cut is drawn (#498): the group there, for its nodes. A grouped
     // drawing's discs are its nodes, one each (#499).
@@ -1275,7 +1349,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       const group = view.pickGroup(x, y);
       timings.picked(performance.now() - start);
       const changed = view.selectGroup(group, extend);
-      if (changed) selectionChanged(byTouch);
+      if (changed) selectionChanged();
       return changed;
     }
     const node = view.pick(x, y);
@@ -1284,14 +1358,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const edge = node === undefined && !extend ? view.pickEdge(x, y, EDGE_REACH_PX * dpr) : undefined;
     timings.picked(performance.now() - start);
     const changed = edge === undefined ? view.select(node, extend) : view.selectEdge(edge);
-    if (changed) selectionChanged(byTouch);
+    if (changed) selectionChanged();
     return changed;
   }
 
   // Fit the selection (`f`, and a search's matches): the camera moves over
-  // FIT_MS so that the selected nodes fill FIT_MARGIN of the canvas, or at
-  // once under prefers-reduced-motion. One node (or nodes on one point) is
-  // centred at the zoom the view has. Returns whether there was a selection
+  // FIT_MS so that the selected nodes fill FIT_MARGIN of the canvas (of the
+  // part the inspector's panel is not over), or at once under
+  // prefers-reduced-motion. One node (or nodes on one point) is centred
+  // there at the zoom the view has. Returns whether there was a selection
   // to fit.
   let fitFrame = 0;
   const cancelFit = () => {
@@ -1304,6 +1379,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     cancelFit();
     const nodes = state.selection;
     if (!nodes.length || !state.positioned) return false;
+    // Into what the panel leaves clear, as the panel is now.
+    roomNow();
     if (state.pending) {
       view.setPositions(state.pending);
       state.pending = null;
@@ -1324,19 +1401,19 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       const [l, r, t, b] = sides.map((i) => view.nodePixel(i));
       return [(l[0] + r[0]) / 2, (t[1] + b[1]) / 2];
     };
-    const [w, h] = [canvas.width, canvas.height];
+    const { x: mx, y: my, w, h } = clear();
     const [bw, bh] = [x1 - x0, y1 - y0];
     const factor = bw < 1 && bh < 1 ? 1 : Math.min(MAX_FIT_ZOOM, FIT_MARGIN * Math.min(w / Math.max(bw, 1), h / Math.max(bh, 1)));
     const from = centre();
     let zoomed = 1;
-    // `p` of the way, 0 to 1: zoomed by factor^p about the canvas's middle,
-    // the box's centre that far towards it.
+    // `p` of the way, 0 to 1: zoomed by factor^p about the middle (of what
+    // is clear), the box's centre that far towards it.
     const moveTo = (p) => {
       const z = factor ** p;
-      view.zoom(z / zoomed, w / 2, h / 2);
+      view.zoom(z / zoomed, mx, my);
       zoomed = z;
       const [cx, cy] = centre();
-      view.pan(from[0] + (w / 2 - from[0]) * p - cx, from[1] + (h / 2 - from[1]) * p - cy);
+      view.pan(from[0] + (mx - from[0]) * p - cx, from[1] + (my - from[1]) * p - cy);
       redraw(false);
       if (pointerAt) hoverSoon();
     };
@@ -1379,7 +1456,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // yet): a node the view has not got is left out.
     const count = view.nodeCount;
     view.setSelection(nodes.every((i) => i < count) ? nodes : nodes.filter((i) => i < count));
-    selectionChanged(false, matched);
+    selectionChanged(matched);
     fitSelection();
   };
   // Expanding (#443). A double-click, a double tap or Enter asks the page
@@ -1637,6 +1714,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     canvas.height = h;
     view.resize(w, h);
     padFit();
+    // The panel's size follows the view's.
+    if (state.roomWaits()) roomSoon();
+    else setRoom(state.inspector.inset());
     redraw();
   });
   ro.observe(canvas);
@@ -1653,10 +1733,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
  * `stage`: it shows what is selected, each time the selection changes. This
  * says what is selected as the inspector's plain data, and does what its
  * buttons ask: `run` a command in the terminal, `inspect` a row in the
- * engine, pin a node, select an edge's end. Returns {selectionChanged(),
+ * engine, pin a node, select an edge's end. `moved` is called when the panel
+ * has opened, changed sides or closed. Returns {selectionChanged(), inset(),
  * focus(), state(), remove()}.
  */
-function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }) {
+function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved }) {
   const { view, graph, canvas } = state;
   // The pinned nodes: marked with a small ring (the highlight layer's).
   state.pinned = new Set();
@@ -1680,6 +1761,7 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
       if (view.select(index, false)) selectionChanged();
     },
     onLeave: () => canvas.focus(),
+    onClose: () => moved(),
   });
   stage.append(panel.element);
   const name = graph.name ?? null;
@@ -1693,13 +1775,25 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
     if (!g) return null;
     return !g.isGroup(i) ? "member" : g.open.includes(i) ? "open" : "closed";
   };
-  // The panel is over the right of the view, unless what is selected is drawn
-  // there: then over the left, so a click never hides what it selected.
+  // The panel is a column at the right of the view, or a sheet across its
+  // bottom in a narrow window; `depth` is how far in from that side it and
+  // the gap it keeps reach, in CSS pixels.
+  const sheet = () => matchMedia(SHEET_QUERY).matches;
+  const depth = () => (sheet() ? SHEET_SHARE * canvas.clientHeight : Math.min(280, canvas.clientWidth * 0.45) + PANEL_GAP);
+  // It takes the other side ("left": the left, or the top) when what is
+  // selected is drawn under it, so a click never hides what it selected,
+  // and a second click or tap still reaches it. While it is open it stays
+  // on its side if it can: the camera has made room for it there.
   const sideOf = (...nodes) => {
     const ratio = canvas.width / Math.max(1, canvas.clientWidth);
-    const width = canvas.clientWidth;
-    const edge = width - Math.min(280, width * 0.45) - 24;
-    return nodes.some((i) => view.nodePixel(i)[0] / ratio > edge) ? "left" : "right";
+    const across = sheet();
+    const extent = across ? canvas.clientHeight : canvas.clientWidth;
+    const reach = depth();
+    const at = nodes.map((i) => view.nodePixel(i)[across ? 1 : 0] / ratio);
+    const under = { right: at.some((v) => v > extent - reach), left: at.some((v) => v < reach) };
+    const keep = panel.state()?.side ?? "right";
+    const other = keep === "right" ? "left" : "right";
+    return under[keep] && !under[other] ? other : keep;
   };
   return {
     selectionChanged() {
@@ -1731,6 +1825,22 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
       } else {
         panel.close();
       }
+      moved();
+    },
+    /**
+     * What the panel keeps of the canvas: canvas pixels at its left, top,
+     * right and bottom (all 0 while it is closed, and where it would leave
+     * too little of the view to be worth clearing).
+     */
+    inset() {
+      const none = [0, 0, 0, 0];
+      if (panel.element.hidden) return none;
+      const ratio = canvas.width / Math.max(1, canvas.clientWidth);
+      const across = sheet();
+      const reach = depth();
+      if ((across ? canvas.clientHeight : canvas.clientWidth) - reach < 80) return none;
+      none[(across ? 1 : 0) + (panel.element.classList.contains("left") ? 0 : 2)] = Math.round(reach * ratio);
+      return none;
     },
     focus: () => panel.focus(),
     state: () => panel.state(),
@@ -2009,6 +2119,10 @@ export function info() {
       at: Array.from({ length: Math.min(current.view.nodeCount, 5000) }, (_, i) => [...current.view.nodePixel(i), current.graph.grouped.of[i]]),
     },
     camera: Array.from(current.view.camera()),
+    // What is kept clear for the inspector's panel: canvas pixels at the
+    // left, top, right and bottom, whether the camera follows the layout,
+    // and whether a move to make room is waiting or under way.
+    room: { inset: current.room, following: current.view.following(), waits: current.roomWaits() },
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
@@ -2183,7 +2297,8 @@ export function expandable(limit = 10) {
     // At a whole CSS pixel, as a mouse event gives its place.
     const [x, y] = Array.from(state.view.nodePixel(index), (v) => Math.round(v / ratio));
     if (x < 0 || y < 0 || x >= state.canvas.clientWidth || y >= state.canvas.clientHeight || state.view.pick(x * ratio, y * ratio) !== index) continue;
-    // Not one under the inspector's panel: a click there is the panel's.
+    // Not one under the inspector's panel, which a node can be until the
+    // camera has made room, or after a pan: a click there is the panel's.
     if (document.elementFromPoint(box.left + x, box.top + y) !== state.canvas) continue;
     out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
@@ -2207,7 +2322,6 @@ export function edgeAt(x, y) {
 
 /** For tests: what the inspector shows (graph-inspector.js's state()), or null. */
 export function inspected() {
-  current?.inspectNow?.();
   return current?.inspector?.state() ?? null;
 }
 
