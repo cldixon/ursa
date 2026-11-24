@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use datafusion::arrow::array::Array;
 use datafusion::prelude::SessionContext;
 use ursa_engine::graph::view::inspect::{graph_neighbours, inspect, Inspect, Inspected};
 use ursa_engine::graph::view::{of_command, GraphView, RunSql};
@@ -345,11 +346,17 @@ async fn graph_of_edges(create: &str) -> SessionContext {
     ctx
 }
 
-/// The `w` of each of an inspected edge's rows.
+/// The `w` of each of an inspected edge's rows: in the order given when the
+/// rows came through the index (the table's order), and sorted when a scan
+/// read them, which may have been of several partitions.
 fn ws(found: &Inspected) -> Vec<u64> {
-    (0..found.rows.len())
+    let mut ws: Vec<u64> = (0..found.rows.len())
         .map(|row| value(found, row, "w").unwrap().parse().unwrap())
-        .collect()
+        .collect();
+    if !found.indexed {
+        ws.sort_unstable();
+    }
+    ws
 }
 
 /// What the inspector says of the edges of `g` (see [`EDGES`]), whose rows
@@ -401,7 +408,13 @@ async fn check_edge_rows(ctx: &SessionContext, indexed: bool, what: &str) {
     // More than the inspector shows: the first twenty, and it says so.
     let many = edge_row(ctx, &whole, "7000", "7001").await;
     assert_eq!(many.indexed, indexed, "{what}");
-    assert_eq!(ws(&many), (2970..2990).collect::<Vec<_>>(), "{what}");
+    if indexed {
+        assert_eq!(ws(&many), (2970..2990).collect::<Vec<_>>(), "{what}");
+    } else {
+        // Twenty of the twenty-five, whichever the partitions gave first.
+        assert_eq!(many.rows.len(), 20);
+        assert!(ws(&many).iter().all(|w| (2970..2995).contains(w)));
+    }
     assert!(
         many.note
             .as_deref()
@@ -456,8 +469,8 @@ async fn check_edge_rows(ctx: &SessionContext, indexed: bool, what: &str) {
         (2995..3000).collect::<Vec<_>>()
     );
     assert_eq!(
-        ws(&edge_row(ctx, &turned, "50", "0").await),
-        (0..9).map(|k| 300 * k).collect::<Vec<_>>()
+        ws(&edge_row(ctx, &turned, "80", "0").await),
+        (0..9).map(|k| 150 + 300 * k).collect::<Vec<_>>()
     );
 
     // A drawing whose edges have their row numbers (induced_edges gives
@@ -477,7 +490,7 @@ async fn check_edge_rows(ctx: &SessionContext, indexed: bool, what: &str) {
         let row = r.edge_row(e).unwrap();
         assert_eq!(found.row, Some(row));
         assert_eq!(found.indexed, indexed, "{what}: row {row}");
-        if indexed || row >= 2700 && !(2970..2995).contains(&row) {
+        if indexed || (2700..2970).contains(&row) {
             // (Read as several partitions, a table's parallel edges cannot
             // be told apart by row: the scan gives them all, with a note.)
             assert_eq!(
@@ -531,17 +544,17 @@ async fn an_edges_rows_are_found_through_the_index_and_are_the_scans() {
     let writer = ursa_engine::new_session();
     Sql.run(
         &writer,
-        &format!(
-            "SET datafusion.execution.target_partitions = 1;
-             SET datafusion.execution.parquet.max_row_group_size = 500;
-             COPY ({EDGES}) TO '{}';
-             COPY ({EDGES}) TO '{}';",
-            file("edges.parquet"),
-            file("edges.csv")
-        ),
+        "SET datafusion.execution.target_partitions = 1;
+         SET datafusion.execution.parquet.max_row_group_size = 500;",
     )
     .await
     .unwrap();
+    for name in ["edges.parquet", "edges.csv"] {
+        Sql.run(&writer, &format!("COPY ({EDGES}) TO '{}'", file(name)))
+            .await
+            .unwrap();
+        assert!(dir.path().join(name).is_file(), "{name}");
+    }
 
     // Read as one partition, an edge's rows come through the index: from a
     // Parquet file by a row selection, from the others by passing over rows.
@@ -580,15 +593,27 @@ async fn an_edges_rows_are_found_through_the_index_and_are_the_scans() {
 
     // Read as several partitions, a row number finds nothing: the scan, and
     // the same rows.
-    let ctx = graph_of_edges(&parquet).await;
-    Sql.run(
-        &ctx,
-        "SET datafusion.execution.target_partitions = 4;
-         SET datafusion.optimizer.repartition_file_min_size = 1;",
-    )
-    .await
-    .unwrap();
-    check_edge_rows(&ctx, false, "parquet, as four partitions").await;
+    std::fs::create_dir(dir.path().join("parts")).unwrap();
+    for (name, rows) in [("a", "w < 1400"), ("b", "w >= 1400")] {
+        Sql.run(
+            &writer,
+            &format!(
+                "COPY (SELECT * FROM ({EDGES}) WHERE {rows} ORDER BY w) TO '{}'",
+                file(&format!("parts/{name}.parquet"))
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let ctx = graph_of_edges(&format!(
+        "CREATE VIEW edges AS SELECT * FROM '{}'",
+        file("parts/*.parquet")
+    ))
+    .await;
+    Sql.run(&ctx, "SET datafusion.execution.target_partitions = 4")
+        .await
+        .unwrap();
+    check_edge_rows(&ctx, false, "two files, as two partitions").await;
 
     // A graph with two edge tables has no one index: the scan.
     let ctx = graph_of_edges(&memory).await;
