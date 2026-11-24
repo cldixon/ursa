@@ -112,8 +112,14 @@ fn selected(
     let [file] = group.files() else {
         return None;
     };
-    // The whole file, every row: no filter in the scan, no limit, no range.
-    if config.limit.is_some() || file.range.is_some() || source.filter().is_some() {
+    // The whole file, every row: no filter in the scan, no limit, and no
+    // range but the whole file (a scan of a file over HTTP, as the browser
+    // reads a dataset, names the whole file as its range).
+    let whole = file
+        .range
+        .as_ref()
+        .is_none_or(|r| r.start <= 0 && r.end >= file.object_meta.size as i64);
+    if config.limit.is_some() || !whole || source.filter().is_some() {
         return None;
     }
     let Precision::Exact(total) = file.statistics.as_ref()?.num_rows else {
@@ -420,6 +426,25 @@ mod tests {
         let plan = plan_of(&ctx, &format!("SELECT j + 1 AS k, i FROM {table}")).await;
         let read = selected(&ctx, &plan, &[7, 640]).expect("a selection under a projection");
         assert_eq!(column(&ctx, read, 0).await, [15, 1281]);
+
+        // A scan that names the whole file as its range (as one of a file
+        // over HTTP does) is of every row; one of part of the file is not.
+        let ranged = |end: Option<i64>| {
+            let config = plan
+                .downcast_ref::<DataSourceExec>()
+                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                .expect("a scan of the file");
+            let file = config.file_groups[0].files()[0].clone();
+            let size = file.object_meta.size as i64;
+            let file = file.with_range(0, end.unwrap_or(size));
+            let config = FileScanConfigBuilder::from(config.clone())
+                .with_file_groups(vec![FileGroup::new(vec![file])])
+                .build();
+            DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
+        };
+        let read = selected(&ctx, &ranged(None), &[3, 640]).expect("the whole file's range");
+        assert_eq!(column(&ctx, read, 1).await, [3, 640]);
+        assert!(selected(&ctx, &ranged(Some(100)), &[3]).is_none());
 
         // A row past the file's end, no rows, a filter, a limit, and a file
         // of another format: no selection.

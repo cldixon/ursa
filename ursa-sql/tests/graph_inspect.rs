@@ -631,3 +631,133 @@ async fn an_edges_rows_are_found_through_the_index_and_are_the_scans() {
     assert!(!found.indexed);
     assert_eq!(ws(&found), [2800]);
 }
+
+/// Each of an inspected edge's rows as its `(src, dst)`.
+fn ends_of(found: &Inspected) -> Vec<(String, String)> {
+    (0..found.rows.len())
+        .map(|row| {
+            let at = |name| value(found, row, name).unwrap().to_string();
+            (at("src"), at("dst"))
+        })
+        .collect()
+}
+
+/// An edge table of its two key columns alone (rmat's) is not read: its
+/// rows are the ends the index gives, the rows the query by the ends gives,
+/// in the table's order; and the drawing's row number picks one of parallel
+/// edges among them.
+#[tokio::test]
+async fn an_edge_table_of_its_keys_alone_gives_the_rows_from_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("edges.parquet").display().to_string();
+    let writer = ursa_engine::new_session();
+    Sql.run(&writer, &format!("COPY ({EDGES}) TO '{file}'"))
+        .await
+        .unwrap();
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    for (what, create) in [
+        (
+            "parquet",
+            format!("CREATE VIEW edges AS SELECT src, dst FROM '{file}'"),
+        ),
+        (
+            "the keys the other way round",
+            format!("CREATE VIEW edges AS SELECT dst, src FROM '{file}'"),
+        ),
+        (
+            "memory",
+            format!("CREATE TABLE edges AS SELECT src, dst FROM ({EDGES})"),
+        ),
+    ] {
+        let ctx = graph_of_edges(&create).await;
+        let whole = draw(&ctx, "g").await;
+
+        let one = edge_row(&ctx, &whole, "3000", "7800").await;
+        assert!(one.indexed, "{what}");
+        assert_eq!(
+            (ends_of(&one), one.note.as_deref()),
+            (vec![pair("3000", "7800")], None),
+            "{what}"
+        );
+        let names: Vec<_> = one.columns.iter().map(|c| (&*c.name, c.numeric)).collect();
+        let keys = if what.contains("other way") {
+            [("dst", true), ("src", true)]
+        } else {
+            [("src", true), ("dst", true)]
+        };
+        assert_eq!(names, keys, "{what}");
+
+        let nine = edge_row(&ctx, &whole, "23", "53").await;
+        assert!(nine.indexed);
+        assert_eq!(ends_of(&nine), vec![pair("23", "53"); 9], "{what}");
+        assert!(
+            nine.note
+                .as_deref()
+                .unwrap()
+                .starts_with("9 rows of edges join"),
+            "{what}"
+        );
+
+        let many = edge_row(&ctx, &whole, "7000", "7001").await;
+        assert_eq!(ends_of(&many), vec![pair("7000", "7001"); 20], "{what}");
+        assert!(
+            many.note
+                .as_deref()
+                .unwrap()
+                .starts_with("more than 20 rows"),
+            "{what}"
+        );
+
+        // Both ways between two nodes: every row, in the table's order.
+        let both = edge_row(&ctx, &whole, "8000", "8001").await;
+        let (a, b) = (pair("8001", "8000"), pair("8000", "8001"));
+        assert_eq!(
+            ends_of(&both),
+            [a.clone(), b.clone(), a.clone(), b, a],
+            "{what}"
+        );
+
+        // With row numbers: a parallel edge's own row, and the query for it.
+        let rows = draw(&ctx, "SELECT * FROM degree(g, direction => 'both')").await;
+        let r = &rows.result;
+        for e in (0..r.n_edges()).step_by(97).chain(2990..3000) {
+            let keys = r.node_keys();
+            let (src, dst) = (keys.get(r.src()[e] as usize), keys.get(r.dst()[e] as usize));
+            let asked = Inspect::Edge {
+                edge: e as u32,
+                src,
+                dst,
+            };
+            let found = inspect(&ctx, &Sql, r, asked).await.unwrap();
+            let row = r.edge_row(e).unwrap();
+            assert!(found.indexed, "{what}: row {row}");
+            assert_eq!(
+                (ends_of(&found), found.note.as_deref()),
+                (vec![pair(src, dst)], None),
+                "{what}: row {row}"
+            );
+            let single = (2700..2970).contains(&row);
+            let sql = found.sql.as_deref().unwrap();
+            if single {
+                assert_eq!(
+                    sql,
+                    format!("SELECT * FROM edges WHERE src = {src} AND dst = {dst}")
+                );
+            } else {
+                assert_eq!(sql, format!("SELECT * FROM edges LIMIT 1 OFFSET {row}"));
+                // The query shown reads that row: the edge's ends.
+                let (_, batches) = Sql
+                    .run(&ctx, &format!("SELECT src || '-' || dst FROM ({sql})"))
+                    .await
+                    .unwrap();
+                let col = datafusion::arrow::compute::cast(
+                    batches[0].column(0),
+                    &datafusion::arrow::datatypes::DataType::Utf8,
+                )
+                .unwrap();
+                let col = datafusion::arrow::array::AsArray::as_string::<i32>(&col);
+                assert_eq!(col.value(0), format!("{src}-{dst}"), "{what}: {sql}");
+            }
+        }
+    }
+}

@@ -31,6 +31,9 @@
 //! row selection, which passes over the pages before them, and from any other
 //! table by passing over the rows before. The rows read are checked against the two
 //! ends, so they are the rows the query by the ends gives, in the same order.
+//! A table of the two key columns alone is not read at all: its rows are the
+//! ends the index gave. Among parallel edges, the drawing's row number picks
+//! one of the rows the index found.
 //! The scan stays for what the index cannot say: a graph with several edge
 //! tables, a table read as several partitions (its row numbers are then not
 //! the scan's order), ends the index does not hold, or a check that fails.
@@ -436,10 +439,11 @@ async fn inspect_edge(
             keys: [s_key, d_key],
             either_way,
         };
-        let (indexed, (columns, rows)) = match between(ctx, run, &graph, e, &ends).await {
-            Some(found) => (true, found),
+        // (With the rows' numbers, when the index gave them.)
+        let (numbers, (columns, rows)) = match between(ctx, run, &graph, e, &ends).await {
+            Some((numbers, found)) => (Some(numbers), found),
             None => (
-                false,
+                None,
                 read(ctx, &graph, &e.table, Some(filter), 0, MAX_ROWS + 1).await?,
             ),
         };
@@ -450,15 +454,20 @@ async fn inspect_edge(
             rows,
             row,
             note: None,
-            indexed,
+            indexed: numbers.is_some(),
         };
         if found.rows.len() > 1 {
             // Parallel edges: the one row, where its number finds it.
+            // Among those the index found, else read by its number.
+            let among = |row: u64| numbers.as_ref()?.iter().position(|&n| n == row);
             let one = match row {
-                Some(row) => read_rows(ctx, &graph, &e.table, &[row])
-                    .await?
-                    .filter(|(_, rows)| !rows.is_empty())
-                    .map(|(_, rows)| (row, rows)),
+                Some(row) => match among(row) {
+                    Some(i) => Some((row, vec![found.rows[i].clone()])),
+                    None => read_rows(ctx, &graph, &e.table, &[row])
+                        .await?
+                        .filter(|(_, rows)| !rows.is_empty())
+                        .map(|(_, rows)| (row, rows)),
+                },
                 None => None,
             };
             match one {
@@ -512,17 +521,19 @@ impl Ends<'_> {
 
 /// The rows of the edge table `e` between `ends`, found through the graph's
 /// index: the first `MAX_ROWS + 1` of them in the table's order, which is
-/// what the scan by the two ends gives. `None` when the index cannot say, and
-/// the scan must: the graph has several edge tables (an index is of one),
-/// the index has no edge between the ends, the table is read as several
-/// partitions, or a row read by its number does not join the ends.
+/// what the scan by the two ends gives, with their row numbers. A table of
+/// the two key columns alone is not read: its rows are the ends. `None` when
+/// the index cannot say, and the scan must: the graph has several edge
+/// tables (an index is of one), the index has no edge between the ends, the
+/// table is read as several partitions, or a row read by its number does
+/// not join the ends.
 async fn between(
     ctx: &SessionContext,
     run: &dyn RunSql,
     graph: &PropertyGraph,
     e: &crate::graph::EdgeTable,
     ends: &Ends<'_>,
-) -> Option<(Vec<InspectedColumn>, Vec<Vec<Option<String>>>)> {
+) -> Option<(Vec<u64>, (Vec<InspectedColumn>, Vec<Vec<Option<String>>>))> {
     if graph.pair(None, None).ok()?.edges.name != e.name {
         return None;
     }
@@ -538,33 +549,46 @@ async fn between(
         .await
         .ok()?;
     // The edges among the two nodes, by row: those between them (not a loop
-    // at one end), the way the drawing has them.
+    // at one end), the way the drawing has them, with their ends as text.
     let mut rows = Vec::new();
     for batch in &batches {
         let number = cast(batch.column(2), &DataType::UInt64).ok()?;
         let number = number.as_primitive::<UInt64Type>();
         let shown = rows_of(std::slice::from_ref(&batch.project(&[0, 1]).ok()?)).ok()?;
-        for (i, ends_of) in shown.iter().enumerate() {
+        for (i, ends_of) in shown.into_iter().enumerate() {
             if number.is_valid(i) && ends.joins(ends_of[0].as_deref(), ends_of[1].as_deref()) {
-                rows.push(number.value(i));
+                let ends_of: [Option<String>; 2] = ends_of.try_into().ok()?;
+                rows.push((number.value(i), ends_of));
             }
         }
     }
-    rows.sort_unstable();
-    rows.dedup();
+    rows.sort_unstable_by_key(|(row, _)| *row);
+    rows.dedup_by_key(|(row, _)| *row);
     rows.truncate(MAX_ROWS + 1);
     if rows.is_empty() {
         return None;
     }
-    let (columns, found) = read_rows(ctx, graph, &e.table, &rows).await.ok()??;
-    // The rows read are the rows asked for: each joins the two ends.
+    // A table of the two keys alone: its rows are the ends the index gave,
+    // and there is nothing more to read.
+    let frame = scan(ctx, graph, &e.table).await.ok()?;
+    let columns = columns_of(&frame);
     let at = |name: &str| columns.iter().position(|c| c.name == name);
     let (src, dst) = (at(&e.source)?, at(&e.destination)?);
-    let all = found.len() == rows.len()
+    let numbers: Vec<u64> = rows.iter().map(|(row, _)| *row).collect();
+    if columns.len() == 2 && src != dst {
+        let found = rows
+            .into_iter()
+            .map(|(_, [s, d])| if src == 0 { vec![s, d] } else { vec![d, s] })
+            .collect();
+        return Some((numbers, (columns, found)));
+    }
+    let found = rows_of(&take(ctx, frame, &numbers).await.ok()??).ok()?;
+    // The rows read are the rows asked for: each joins the two ends.
+    let all = found.len() == numbers.len()
         && found
             .iter()
             .all(|row| ends.joins(row[src].as_deref(), row[dst].as_deref()));
-    all.then_some((columns, found))
+    all.then_some((numbers, (columns, found)))
 }
 
 /// How many neighbours node `node` has in the whole graph `result` names,
