@@ -3,7 +3,7 @@ name = "ursa-sql"
 description = "Ursa's SQL dialect: DataFusion's parser plus Ursa's own statements, and running them on an engine session."
 # The SQL engine and CLI are versioned on their own: 0.6 is their first
 # release. The Python package (ursa-graph) follows the workspace version.
-version = "0.12.0"
+version = "0.13.0-dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ keywords = ["sql", "graph", "parser", "datafusion", "sql-pgq"]
 categories = ["database-implementations", "parser-implementations"]
 
 [dependencies]
-ursa-engine = { path = "../ursa-engine", version = "0.12.0" }
+ursa-engine = { path = "../ursa-engine", version = "0.13.0-dev" }
 datafusion = { workspace = true }
 # `Sql`, how `ursa_engine::graph::view` runs SQL text (already in the tree via
 # DataFusion).
@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["rt"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = "3"
 # The graph view's model, to read what graph::view returns (tests/graph_rules.rs).
-ursa-viz = { path = "../ursa-viz", version = "0.12.0", default-features = false }
+ursa-viz = { path = "../ursa-viz", version = "0.13.0-dev", default-features = false }
 # `statement error <regex>` in the conformance suite (tests/conformance.rs; already
 # in the tree via ursa-io).
 regex = "1"
