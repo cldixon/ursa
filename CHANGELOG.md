@@ -255,6 +255,37 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Graph view: a large graph is drawn aggregated, and opens as the view
+  zooms in** (#498). Zoomed out, a million edges are a blot. Once a graph
+  of 200,000 nodes and edges or more is laid out, the view draws a cut
+  through its layout's hierarchy in its place: a disc for each group of
+  nodes, the coarsest groups whose discs stand 20 pixels apart on screen,
+  with the merged edges between them, the largest groups labelled with how
+  many nodes they hold. The status line says so first: `aggregated: 92
+  groups of 46,318 nodes · 1,000,000 edges · …`. The layout worker makes
+  the cut again each time the camera comes to rest, opening only the groups
+  in view; meanwhile the last cut is drawn, moved as the camera is. Zooming
+  in reaches the graph's own nodes, and from there the drawing is the
+  graph's own, byte for byte. A click on a group selects its nodes (Shift
+  adds another group's), and a disc with a selected node in it carries a
+  ring, so `.find` shows where its matches are. `a` in the pane, or `.graph
+  detail on`, draws every node and edge as before; `.graph detail off`
+  aggregates again. On `.graph rmat` (headless Chromium with no GPU): 92
+  discs and 2,389 merged edges at the fitted zoom; a cut takes the layout
+  worker 10 to 12 ms at the median and 26 at most in two runs of three
+  (35 in the third; 30 are allowed), after 44 to 48 ms once to prepare;
+  the worker's memory is unchanged at 55.6 MB. Layouts are bit-identical.
+  - `ursa-core`: `Fa2Multilevel::level_members`; a layout keeps each
+    level's members when it comes down from it (under 1 MB at a million
+    edges).
+  - `ursa-viz`: `cut` (`Hierarchy`, `Cut`, `CutParams`);
+    `LiveLayout::cut`, `prepare_cut`, `has_cut` and `cut_bytes`;
+    `LevelScene::discs_by`, `pick` and `set_max_radius`; `View::set_cut`,
+    `draws_cut`, `pick_group`, `group_nodes`, `group_of`, `group_labels`
+    and `cut_info`. In the browser: `Layout.cut`, `prepareCut`, `hasCut`
+    and `cutBytes`; `GraphView.setCut`, `cutInfo`, `pickGroup`,
+    `groupNodes`, `groupOf`, `selectGroup`, `groupLabels` and `camera`.
+    The edges of a selection of more than 10,000 nodes are not drawn wide.
 - **Graph view: a large graph is first seen as the coarsest level of its
   layout, and refines level by level** (#497). The coarse-to-fine layout
   works down a pyramid of the graph; until it reaches the graph itself, the

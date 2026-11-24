@@ -764,6 +764,50 @@ positions, after every batch.
 coarsest levels of a 100K-edge R-MAT graph on WebGL2 (49, 99, 198 and 397
 discs).
 
+## The aggregated view
+
+Once a large graph is laid out, the shell draws a cut through its layout's
+hierarchy in place of the graph, made again by the layout worker each time
+the camera rests (#498;
+[README](README.md#the-aggregated-view-a-cut-through-the-hierarchy)).
+`.graph rmat` (46,318 nodes, 1,000,000 edges) at 1280 × 800, a pane of
+640 × 708, with `web/tests/graph-timing.ts`, on this container (no GPU:
+SwiftShader, 4 cores), 2026-11-24, three runs:
+
+| | |
+|---|---|
+| the cut at the fitted zoom | **92 discs** (89 of more than one node) and **2,389 merged edges**, all it has; #498 allows 20,000 and 100,000 |
+| the groups' members | 46,318: every node, once |
+| the hierarchy's forest, made once when the layout is done | 44 to 48 ms in the worker; 5.2 MB held |
+| that cut | 6.1 to 7.2 ms in the worker |
+| zooming in by 1.35 a step: discs / merged edges drawn | 397 / 14,873, then 2,391, 7,594, 14,570, 19,346, 16,548, 12,853 and 10,987 discs with the 16,384 heaviest edges, then the graph itself at the ninth step |
+| a cut, in the worker (39 of them) | median 10 to 12 ms; the slowest of each run 24, 35 and 26 ms; **one of the 39 was over the 30 ms #498 allows** |
+| a cut that says the graph itself | 3 ms: no edges are gathered |
+| a wheel zoom over cuts, 2 s: frame to frame | p50 21 to 22 ms, **p95 26 to 29 ms**, max 33 ms |
+| the layout worker's memory | 55.6 MB, as before (60 allowed) |
+| the view's memory | 18.7 MB, 17.9 MiB (20 MiB allowed) |
+
+The most merged edges the shell asks for is 16,384 (as many as a level's,
+#497), not the 100,000 a cut may give: with no GPU a frame at rest that
+draws 100,000 wide, long edges takes seconds. The cut itself has 300,000 to
+740,000 merged edges at the middle zooms: R-MAT's groups do not thin its
+edges.
+
+Natively (`cargo test -p ursa-viz --no-default-features --release --test
+cut_scale -- --ignored --nocapture`, one core, the scale-17 R-MAT graph:
+131,072 node slots, 54,000 of them with no edge, 1,000,000 edges): the
+forest is 8.1 MB and the first cut with it 43 ms; at the fitted zoom 263
+discs and 6,005 merged edges in 4.5 ms; zooming in by 1.5 a step, up to
+20,000 discs and the 100,000 heaviest of 346,000 to 800,000 merged edges
+in 11 to 15.5 ms each; the graph itself at the tenth step. Before the
+edges were kept in the forest's order, each once, the same cuts read
+every adjacency entry and took 25 to 29 ms natively and 28 to 41 ms in
+the browser.
+
+`tests/browser/view.ts` (`ONLY=cut`) reads frames back on WebGL2 at two
+zooms of a 100K-edge R-MAT graph (117 and 7,202 discs), and the graph's
+own frame once the cut is cleared: 0 bytes differ, zoomed in and fitted.
+
 ## Memory at a million edges
 
 What the two `ursa-viz` instances hold in the shell on `.graph rmat`
