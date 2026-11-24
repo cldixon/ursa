@@ -403,6 +403,7 @@ pub(crate) fn grouped(
         skipped: edges.skipped,
         positions: None,
         groups: Some(groups),
+        adjacency: None,
     })
 }
 

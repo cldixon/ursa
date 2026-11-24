@@ -85,6 +85,7 @@ pub use index::{
     IndexHeld, Weights,
 };
 pub use node::{GraphAlgorithmNode, GraphTraversalNode, Output};
+pub(crate) use exec::index_under;
 pub(crate) use session::{
     collapse_held_rule, edge_order_rule, query_planner, register_functions, with_algorithms,
 };

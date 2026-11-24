@@ -57,6 +57,8 @@ use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::SessionContext;
+/// An undirected adjacency: what [`GraphView::adjacency`] holds.
+pub use ursa_core::topology::UndirectedCsr;
 use ursa_viz::model::{
     Column as ModelColumn, ColumnRole, EdgeBatch, Encodings, GraphDelta, GraphResult, Highlights,
     KeyType, NodeBatch, NodeLabel, Op, Provenance, Role, Strings, Target, Values, NO_ROW, NULL,
@@ -100,6 +102,11 @@ pub const MAX_NODES: usize = 4_000_000;
 /// The most categories `COLOR BY` colours; the rest are drawn as "other". A
 /// front end's palette has as many colours, then other's.
 pub const MAX_CATEGORIES: usize = 8;
+
+/// A drawing of this many edges or more carries its undirected adjacency
+/// ([`GraphView::adjacency`]): below it a layout builds one in a few
+/// milliseconds, and the bytes are not worth sending.
+pub const ADJACENCY_FROM: usize = 100_000;
 
 /// What the colour column is called when `SIZE BY` and `COLOR BY` name the
 /// same thing: the name, then this. A result's node columns have distinct
@@ -229,6 +236,14 @@ pub struct GraphView {
     /// and moves them as the drawing grows. [`GraphView::placed`] is the
     /// result with them, for a front end that only shows it.
     pub positions: Option<Positions>,
+    /// The undirected adjacency of `result`'s edges, for a result large
+    /// enough that a front end's layout should not have to build it again
+    /// ([`ADJACENCY_FROM`] edges; #525): what
+    /// `GraphResult::to_bytes_with_adjacency` writes beside the edges.
+    /// `UndirectedCsr::from_edges` of the result's nodes and edges, bit for
+    /// bit. `None` for a smaller result, a grouped one, and one with
+    /// positions, which no layout runs on.
+    pub adjacency: Option<Arc<UndirectedCsr>>,
     /// With `GROUP BY` (#499): which of the drawing's nodes each group of
     /// `result` has. They are not in the result until a group is opened,
     /// which an explore session does with this ([`Session::grouped`]).
@@ -236,6 +251,15 @@ pub struct GraphView {
 }
 
 impl GraphView {
+    /// The result as one UGR buffer (`ursa-viz/UGR.md`), with its
+    /// adjacency beside the edges if it has one ([`Self::adjacency`]).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match &self.adjacency {
+            Some(adjacency) => self.result.to_bytes_with_adjacency(adjacency),
+            None => self.result.to_bytes(),
+        }
+    }
+
     /// The result with `POSITIONS`'s positions in it (UGR's `nodes.x` and
     /// `nodes.y`): a drawing that opens drawn. The result as it is when
     /// there are none.
@@ -456,8 +480,19 @@ pub async fn draw(
         notes: std::mem::take(&mut drawing.notes),
     };
     let graph = drawing.graph.as_ref().map(|g| g.name.clone());
+    // The adjacency a layout of the result will want, while the edges are
+    // here: without sorting, which the engine has the memory for.
+    let edges = &drawing.edges;
+    let adjacency = (saved.is_none() && edges.src.len() >= ADJACENCY_FROM).then(|| {
+        Arc::new(UndirectedCsr::from_edges_unsorted(
+            edges.n as usize,
+            &edges.src,
+            &edges.dst,
+        ))
+    });
     let mut view = to_view(drawing.edges, &drawing.index.key_type, graph, provenance)?;
     view.positions = saved;
+    view.adjacency = adjacency;
     Ok(view)
 }
 
@@ -1151,6 +1186,9 @@ async fn property_graph_indexed(
     graph: &PropertyGraph,
     max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
+    if let Some(drawn) = from_index(ctx, graph, max_edges).await {
+        return Ok(drawn);
+    }
     let state = ctx.state();
     let mut vertices = Vec::new();
     for v in &graph.vertex_tables {
@@ -1182,6 +1220,63 @@ async fn property_graph_indexed(
         ));
     }
     build_within(&vertices, &edges, max_edges)
+}
+
+/// [`property_graph_indexed`] from the session's index of `graph` (the
+/// topology and the id map its algorithms run over, `crate::graph::index`)
+/// and not from its rows (#525): with the index cached, as it is once any
+/// algorithm has run, nothing is scanned and no id is hashed. The drawing
+/// is the one the rows give, node for node and edge for edge.
+///
+/// For a graph that is one edge table and no vertex table, whose endpoint
+/// columns have one type: its index numbers the nodes as they are first
+/// seen in the rows, source before destination, and its edges by their
+/// rows, as [`build_within`] does. `None` for any other graph, and
+/// whenever the index cannot say what the rows would (it dropped a row, an
+/// endpoint is NULL, the graph is beyond `max_edges`, or it could not be
+/// planned or built): the rows are then read as ever, and say why.
+async fn from_index(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    max_edges: usize,
+) -> Option<(EdgeList, NodeIndex)> {
+    let [e] = &graph.edge_tables[..] else {
+        return None;
+    };
+    if !graph.vertex_tables.is_empty() {
+        return None;
+    }
+    let state = ctx.state();
+    let def = GraphDef {
+        name: graph.name.clone(),
+        edges: e.clone(),
+        vertices: None,
+    };
+    // The type the rows' ids are read as: the endpoint columns' own.
+    let plan = edges_plan(&state, &def).await.ok()?;
+    let schema = plan.schema();
+    let type_of = |column: &str| {
+        let i = schema.index_of_column_by_name(None, column)?;
+        Some(schema.field(i).data_type().clone())
+    };
+    let key_type = type_of(&e.source)?;
+    if type_of(&e.destination)? != key_type || !build::index_key(&key_type) {
+        return None;
+    }
+    // Any algorithm over the graph has its index under it.
+    let query = format!(
+        "SELECT id FROM degree(\"{}\")",
+        graph.name.replace('"', "\"\"")
+    );
+    let physical = ctx.sql(&query).await.ok()?.create_physical_plan().await.ok()?;
+    let index = crate::graph::index_under(&physical, &ctx.task_ctx())
+        .await
+        .ok()??;
+    let edges = index.topology.n_edges();
+    if index.n_dropped() > 0 || edges == 0 || edges > max_edges {
+        return None;
+    }
+    build::of_index(&index.topology, &index.ids.user_id_array(), key_type).ok()?
 }
 
 /// The columns `columns` of one of `graph`'s tables, every row.
@@ -1354,5 +1449,6 @@ fn to_view(
         skipped,
         positions: None,
         groups: None,
+        adjacency: None,
     })
 }

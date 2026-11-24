@@ -561,7 +561,7 @@ impl Adjacency {
 /// (the spec's own example) shares the single build instead of rebuilding a fresh
 /// `Vec<Vec<u32>>` per call, and the flat layout has far better locality than a
 /// vector-of-vectors.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct UndirectedCsr {
     /// Prefix-summed undirected degrees; length `n_nodes + 1`.
     pub offsets: Vec<u64>,
