@@ -296,6 +296,98 @@ the shell (46,318 nodes) and 3.8 to 5.4 s in the demo (131,072 nodes),
 which is what drawing it at once takes there, to a tenth more. It has not
 been measured on a GPU.
 
+## The first paint: a level of the hierarchy
+
+Coarse to fine lays out a pyramid of the graph from the top down: a few
+dozen nodes first, each standing for thousands, then twice as many, down to
+the graph itself. Until the layout reaches the graph, drawing the graph is
+the most expensive way to show the least: every edge, between points that
+coincide. So a view can draw **the level being laid out** in its place
+(#497):
+
+- **A disc for each node of the level**, its area in proportion to the
+  node's mass (the summed `degree + 1` of the nodes it stands for). The
+  discs of a level cover 6% of the canvas together, at every level, so a
+  node's disc is as large as its children's will be together.
+- **The level's heaviest merged edges**, each 1 to 5 pixels wide and as
+  dark as its weight says (the number of the graph's edges it stands for,
+  by the square root, against the level's heaviest).
+- **Within the frame budget**: a moving frame (and a running layout is
+  movement) draws the heaviest discs and the heaviest edges that fit, in
+  the budget's own units (a disc and a merged edge are a quad each, as a
+  node is).
+
+```js
+const layout = new Layout(n, src, dst);
+while (!layout.levelFinished) layout.stepLevel(1);   // the coarsest level, laid out
+let g = layout.levelGraph(16384);    // {level, levels, mass, parents, src, dst, weight, totalEdges}
+view.setLevel(g.level, g.levels, g.mass, g.src, g.dst, g.weight, g.totalEdges);
+view.setLevelPositions(layout.levelPositions());     // x then y, one per node of the level
+// … then, a batch at a time:
+const before = layout.level;
+layout.stepLevel(batch);             // comes down one level at most, and stops at its end
+if (layout.level === 0) { view.clearLevel(); view.setPositions(layout.positions()); }
+else if (layout.level !== before) { /* setLevel(layout.levelGraph(…)) again */ }
+else view.setLevelPositions(layout.levelPositions());
+view.levelInfo();                    // {level, levels, nodes, nodesDrawn, edges, edgesDrawn, totalEdges}
+```
+
+`Layout.stepLevel` is `step` a level at a time: it comes down a level only
+at the start of a call, from a level that has had all its iterations, and
+stops when the level it is at has had its own, so every level can be read
+before the hierarchy lets it go (`Fa2Multilevel::step_level`,
+`LiveLayout::step_level`). It does not prolong a coarse level's positions
+to the graph, which `step` does after every call and a caller that draws
+the level has no use for (`positions()` prolongs them when asked). **The
+layout ends on the same positions, bit for bit**, whichever way it is
+stepped and whatever is read on the way, on any thread count
+(`ursa-core/tests/determinism_threads.rs`).
+
+`levelGraph(mostEdges)` is the level as a graph of its own, in new typed
+arrays outside the module's memory, the caller's to transfer: each node's
+mass, its parent in the level above (if `stepLevel` came down to this
+level; given once), and the heaviest `mostEdges` merged edges, heaviest
+first. The heaviest are found by counting, not by sorting them all (a
+quarter of a megabyte, whatever the level's size), and a lean hierarchy's
+weights are made again for the level as its first iteration would have:
+the layout worker's memory at a million edges is what it was (55.6 MB,
+`web/tests/graph-timing.ts`). Level 0 has `parents` alone: its nodes,
+masses and edges are the graph's own. Level by level this is the
+hierarchy in each level's own numbering, which is what a cut through it
+(#498) is made of: some nodes of each level, found by going down
+`parents`.
+
+While a level is drawn the view fits the level (if the camera follows),
+picks nothing (the graph's nodes have no place yet), and draws nothing of
+the graph; `clearLevel()` draws the graph again, the same frame as ever.
+A level is never refined in slices: at rest a frame has all the view
+holds of it. The level's pipelines are a shader of their own
+(`level_render.rs`), made on the first `setLevel`, or, for a graph of
+200,000 nodes and edges or more, while the view is made, so that the frame
+a large graph is first seen in does not wait for a compile.
+
+**Moving between levels** is the page's: the shell's `graph-levels.js`
+keeps each level as it arrives and, for 150 ms after the layout comes down
+one, draws each node on its way out from its parent's place (at once under
+`prefers-reduced-motion`), by giving `setLevelPositions` (or, for the graph
+itself, `setPositions`) the positions between.
+
+`tests/browser/view.ts` (`ONLY=levels`) reads frames back on WebGL2 at the
+four coarsest levels of a 100K-edge R-MAT graph: every one of the heaviest
+discs is where its node is, the heaviest edge is drawn between its ends, a
+moving frame draws no more than the level has, nothing is picked, the frame
+after `clearLevel()` is the graph's own byte for byte, and the layout
+stepped a level at a time ends on the bits of one stepped whole.
+
+Measured on `.graph rmat` (1M edges) in the shell, in headless Chromium's
+software WebGL2 ([`BENCH.md`](BENCH.md#the-first-paint)): the first frame
+is shown 0.94 s after Enter where it was 1.13 to 1.23 s, and it is 27
+laid-out discs and their edges where it was the largest 270 of the graph's
+nodes at their groups' places; the frames of the coarse levels are 33 ms
+apart at the 95th percentile and 50 ms at most. The 0.6 s the issue asks
+for is not met here: the engine's answer takes 0.35 to 0.42 s of it and
+building the hierarchy 0.5 s more.
+
 ## Making a view
 
 Making a view costs an upload, not a graph build (#426). At 46K nodes and
@@ -920,6 +1012,23 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   over the picture the pan was showing, so a frame needed before it ends
   (that hover) has only what fits. A second target would keep the old
   picture until the new one is whole, at 4 bytes a pixel more.
+- **A first frame within 0.6 s of Enter at a million edges** (#497). It
+  comes at 0.94 s in CI: 0.35 to 0.42 s in the engine, then 0.5 s building
+  the adjacency (0.15 s) and the hierarchy (0.35 s) in the layout worker,
+  which nothing can be drawn before, then 40 ms to the pixels. An adjacency
+  handed over by the engine (`Layout.fromAdjacency`, which nothing emits
+  yet) would save the first; the hierarchy's rows are gathered without a
+  sort now, and what is left of it is reading two million entries a level
+  for five dense levels.
+- **A moving frame of a level draws its heaviest discs and its heaviest
+  edges, each chosen alone**: where the budget is small (software), an
+  edge's far end may be a disc that was left out. And a level's edges are
+  at most the 16,384 heaviest: a cut (#498) that wants a light edge
+  between two small groups does not have it.
+- **A step applied while a coarse level is drawn** (an `.expand` typed in
+  the first seconds of a large graph) leaves the level for the graph, whose
+  nodes the view has no positions for until the grown layout's first; an
+  undo of that step puts them at the origin.
 - **A 1M-edge R-MAT graph fully converged in seconds.** Coarse to fine
   draws its shape in 7.5 s, and it looks as flat ForceAtlas2 does after
   500 iterations; but by edge length it is where flat is after about 170, as

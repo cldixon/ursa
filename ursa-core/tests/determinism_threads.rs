@@ -543,6 +543,70 @@ fn layout_fa2_multilevel_is_thread_count_independent() {
     }
 }
 
+/// Coarse-to-fine ForceAtlas2 drawn a level at a time (#497), across thread
+/// counts: the final positions are those of one call, whatever is read of
+/// each level on the way down, and every level's nodes, masses, parents and
+/// heaviest merged edges are the same bits on any thread count. Lean, as
+/// the graph view's worker makes it, so the weights a level's edges are
+/// read from are made again on the way.
+#[test]
+fn layout_fa2_multilevel_by_level_is_thread_count_independent() {
+    // Dense enough that a lean hierarchy lets go of its first levels'
+    // weights.
+    let topo = seeded_graph(2500, 40_000);
+    let params = MultilevelParams {
+        coarsest_nodes: 40,
+        coarsest_iterations: 60,
+        max_iterations: 20,
+        fa2: Fa2Params {
+            seed: Some(11),
+            ..MultilevelParams::default().fa2
+        },
+        ..MultilevelParams::default()
+    };
+    type Level = (usize, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>);
+    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+    let run = || {
+        let adj = topo.undirected();
+        let mut ml = Fa2Multilevel::new_lean(adj, params);
+        assert!(ml.coarse_levels() >= 3, "levels {:?}", ml.level_sizes());
+        let mut levels: Vec<Level> = Vec::new();
+        let mut budgets = [0.5, 3.0, 0.05, 9.0].iter().cycle();
+        loop {
+            ml.step_level(adj, *budgets.next().unwrap());
+            // Each level at its last iteration, before it is let go.
+            if ml.level_finished() || ml.is_done() {
+                let (x, y) = ml.level_positions();
+                let xy = [bits(x), bits(y)].concat();
+                let mass = bits(&ml.level_mass(adj));
+                let parents = ml.parents_below().unwrap_or_default();
+                let e = ml.level_edges(adj, 500);
+                levels.push((
+                    ml.level(),
+                    xy,
+                    mass,
+                    parents,
+                    [e.src, e.dst].concat(),
+                    bits(&e.weight),
+                ));
+            }
+            if ml.is_done() {
+                break;
+            }
+        }
+        (levels, ml.into_positions())
+    };
+    let (levels, stepped) = on_pool(1, run);
+    let one = on_pool(1, || layout_fa2_multilevel(&topo, None, params));
+    assert_eq!(stepped, one, "a level at a time differs from one call");
+    assert_eq!(levels.len(), levels[0].0 + 1);
+    for threads in [2, 3, 4, 8] {
+        let (got, got_stepped) = on_pool(threads, run);
+        assert_eq!(got_stepped, one, "positions diverged on {threads} threads");
+        assert!(got == levels, "a level diverged on {threads} threads");
+    }
+}
+
 /// The edges of `seeded_graph(n, m)`, to build a graph that grows from it.
 fn seeded_edges(n: usize, m: usize) -> (Vec<u32>, Vec<u32>) {
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;

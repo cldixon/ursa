@@ -9,6 +9,7 @@
 //   {type: "start", module, n, src, dst, layout?}
 //   {type: "start", module, n, adjacency: {offsets, targets}, src, dst, layout?}
 //     -> {type: "positions", xy, iterations, level, levels, total} ..., then {type: "done", iterations}
+//     (a large graph: "level" and "levelPositions" first, see below)
 //     or {type: "error", message}
 //     The graph is its edges (src, dst), or, where the page was given it,
 //     its undirected adjacency (UGR's edges.adjacency.*), which the layout
@@ -30,6 +31,28 @@
 //     important first, a Uint32Array of edge indexes (transferred) for
 //     GraphView.setEdgeOrder, and the ms it took to compute. The layout has
 //     the hierarchy the order comes from (Layout.edgeOrder).
+//
+// A large graph is drawn a level at a time (#497): while the layout is at
+// a coarse level of its hierarchy, the page gets that level as a graph of
+// its own, not every node's position prolonged from it. `coarse` in
+// "start" says whether (by default, a graph of COARSE_FROM nodes and edges
+// or more), and `levelEdges` how many of a level's merged edges to send
+// (LEVEL_EDGES). In place of "positions", until the layout reaches the
+// graph itself:
+//   {type: "level", level, levels, n, mass, parents?, src, dst, weight, totalEdges, xy, ...}
+//     the layout came to `level` (first, the coarsest, with its iterations
+//     done): its `n` nodes' masses (the summed degree + 1 of the nodes
+//     each stands for), each node's parent in the level above (0xFFFFFFFF
+//     for none; absent for the coarsest), its heaviest merged edges
+//     (heaviest first: ends and weights) of the `totalEdges` it has, and
+//     its positions (x then y). Sent when the layout reaches the level,
+//     before the hierarchy lets anything of it go; all typed arrays,
+//     transferred. For level 0 it has only `parents` (the nodes are the
+//     graph's), and "positions" follow as ever.
+//   {type: "levelPositions", level, xy, ...}  the level's positions, after
+//     each batch.
+// Both carry `epoch`, `iterations`, `total` and `memory` as "positions"
+// does. The layout ends on the same positions, bit for bit.
 //
 // `layout` picks a fixed layout instead: {kind: "rings" | "layers", level},
 // `level` a Uint32Array of each node's distance from a seed (rings) or its
@@ -70,6 +93,14 @@ let running = false;
 let budgetMs = 100;
 // The cost of one unit of the layout's work, as the last batch measured it.
 let msPerUnit = null;
+// Whether the page is sent the level being laid out, while it is a coarse
+// one, and how many of its merged edges.
+let coarse = false;
+let levelEdges = 0;
+/** A graph of this many nodes and edges is drawn a level at a time: its layout takes a second or more. */
+const COARSE_FROM = 200_000;
+/** The most merged edges of a level sent to the page: the heaviest. */
+const LEVEL_EDGES = 1 << 14;
 
 // One message at a time, in order: a "grow" waits for the "start" before it
 // (which loads ursa-viz), but not for the layout to finish.
@@ -90,14 +121,29 @@ async function handle(data) {
       layout = make(Layout, data);
       times.hierarchy = performance.now();
       budgetMs = data.budgetMs ?? 100;
-      // Coarse to fine has a place for every node before any iteration, and a
-      // fixed layout has its last: draw it.
-      post();
+      levelEdges = data.levelEdges ?? LEVEL_EDGES;
+      coarse = layout.kind === "force" && layout.levels > 1 && (data.coarse ?? data.n + (data.src?.length ?? 0) >= COARSE_FROM);
+      if (coarse) {
+        // The coarsest level, laid out: a few dozen nodes, in a few
+        // milliseconds. The first picture is the drawing's shape, not
+        // where the seed put them.
+        const t = performance.now();
+        while (!layout.levelFinished && performance.now() - t < budgetMs) layout.stepLevel(1);
+        postLevel();
+      } else {
+        // Coarse to fine has a place for every node before any iteration, and a
+        // fixed layout has its last: draw it.
+        post();
+      }
+      // Before the layout comes down a level: the hierarchy the order is
+      // read from is let go level by level.
       postOrder(data);
       run();
     } else if (data.type === "grow") {
       if (!layout) throw new Error("no layout to grow");
       layout.grow(data.n, data.src, data.dst);
+      // A grown layout has no levels: every node has its place.
+      coarse = false;
       epoch = data.epoch;
       msPerUnit = null;
       // The new nodes beside their neighbours, before any iteration.
@@ -108,6 +154,7 @@ async function handle(data) {
       const placed = Layout.fromPositions(data.n, data.src, data.dst, data.xy);
       layout?.free();
       layout = placed;
+      coarse = false;
       epoch = data.epoch;
       if (!running) done();
     }
@@ -128,13 +175,43 @@ function make(Layout, { n, src, dst, adjacency, layout }) {
 function post() {
   // A new array, filled from the layout's memory: this message's to give.
   const xy = layout.positions();
-  const message = { type: "positions", epoch, xy, iterations: layout.iterations, level: layout.level, levels: layout.levels, total: layout.total, memory: wasm.memory.buffer.byteLength };
+  send({ type: "positions", xy }, [xy.buffer]);
+}
+
+/** Post `message`, with how far the layout is and what this worker holds; the first carries `times`. */
+function send(message, transfer) {
+  Object.assign(message, { epoch, iterations: layout.iterations, level: layout.level, levels: layout.levels, total: layout.total, memory: wasm.memory.buffer.byteLength });
   if (times) {
     message.times = times;
     message.origin = performance.timeOrigin;
     times = null;
   }
-  self.postMessage(message, [xy.buffer]);
+  self.postMessage(message, transfer);
+}
+
+/**
+ * The level the layout has come to, as a graph of its own (#497): read
+ * from the hierarchy now, before the layout steps on and lets it go. Level
+ * 0 is the graph itself: only its nodes' parents go, for the page to bring
+ * them out from, and the positions as ever.
+ */
+function postLevel() {
+  const g = layout.levelGraph(levelEdges);
+  if (g.level === 0) {
+    send({ type: "level", parents: g.parents }, g.parents ? [g.parents.buffer] : []);
+    return post();
+  }
+  const xy = layout.levelPositions();
+  const { mass, parents, src, dst, weight, totalEdges } = g;
+  const message = { type: "level", n: mass.length, mass, parents, src, dst, weight, totalEdges, xy };
+  send(message, [mass, parents, src, dst, weight, xy].filter(Boolean).map((a) => a.buffer));
+}
+
+/** The positions of the coarse level being laid out, or, at level 0, of the graph. */
+function postLevelPositions() {
+  if (layout.level === 0) return post();
+  const xy = layout.levelPositions();
+  send({ type: "levelPositions", xy }, [xy.buffer]);
 }
 
 /**
@@ -171,9 +248,21 @@ async function run() {
     while (!layout.done) {
       const batch = msPerUnit === null ? 1 : Math.max(1, Math.floor(budgetMs / Math.max(msPerUnit, 0.01)));
       const t = performance.now();
-      layout.step(batch);
-      msPerUnit = (performance.now() - t) / batch;
-      post();
+      if (coarse) {
+        // A level at a time: a batch ends where its level does, so what a
+        // unit costs is measured by the work done, not the work asked for.
+        const [level, work] = [layout.level, layout.work];
+        layout.stepLevel(batch);
+        const worked = layout.work - work;
+        if (worked > 0) msPerUnit = (performance.now() - t) / worked;
+        if (layout.level !== level) postLevel();
+        else postLevelPositions();
+        if (layout.level === 0) coarse = false;
+      } else {
+        layout.step(batch);
+        msPerUnit = (performance.now() - t) / batch;
+        post();
+      }
       await new Promise((r) => setTimeout(r, 0));
     }
     done();

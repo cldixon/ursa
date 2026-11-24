@@ -44,6 +44,9 @@
 pub mod budget;
 pub mod highlight;
 pub mod interact;
+#[cfg(feature = "render")]
+pub mod level_render;
+pub mod levels;
 pub mod live;
 pub mod model;
 pub mod order;

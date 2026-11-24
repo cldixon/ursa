@@ -2022,7 +2022,7 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(r);
   const timed: [number, string][] = await r.evaluate(() => (window as any).__timed);
   const first = timed[0];
-  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
+  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+( · [\d,]+ groups)?$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
   const doneAt = timed.findIndex(([, t]) => t.endsWith(" · Done"));
   const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
   check(
@@ -2030,6 +2030,30 @@ for (const scheme of ["light", "dark"] as const) {
     "a big graph: its status within a second, then its layout's levels, then Done",
     `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
   );
+  // #497: a graph this large is first drawn as the coarsest level of its
+  // layout's hierarchy, then each level the layout comes to, the status
+  // saying how many groups each has (more at every level), until the graph
+  // itself; nothing is picked meanwhile, and the frames of the levels are
+  // 50 ms apart at most (the 95th percentile; twice that is allowed here).
+  {
+    const groups = timed.map(([, t]) => t.match(/ · Laying out · level (\d+) of (\d+) · ([\d,]+) groups$/)).filter(Boolean).map((m) => [Number(m![1]), Number(m![2]), Number(m![3].replace(/,/g, ""))]);
+    const graph = await graphInfo(r);
+    const levels: [number, number][] = graph.hierarchy;
+    const rising = groups.every((g, i) => i === 0 || (g[0] > groups[i - 1][0] ? g[2] > groups[i - 1][2] : g[0] === groups[i - 1][0] && g[2] === groups[i - 1][2]));
+    const last = timed.findLast(([, t]) => / · Laying out · /.test(t))?.[1] ?? "";
+    check(
+      groups.length > 3 && groups[0][0] === 1 && groups[0][2] < 100 && rising && / · Laying out · level (\d+) of \1$/.test(last) && graph.coarse === null,
+      "a big graph: the status counts each level's groups, coarsest first, until the graph itself",
+      `${JSON.stringify(groups.slice(0, 4))}…; the last "${last}"; coarse ${JSON.stringify(graph.coarse)}`,
+    );
+    check(
+      levels.length === groups[0]?.[1] && levels[0][1] === groups[0]?.[2] && levels.at(-1)![0] === 0 && levels.every((l, i) => i === 0 || (l[0] === levels[i - 1][0] - 1 && l[1] > levels[i - 1][1])),
+      "a big graph: every level of the hierarchy reached the page, each larger than the one above",
+      JSON.stringify(levels),
+    );
+    const lf = graph.levelFrames;
+    check(lf.count > 5 && lf.p95 <= 100 && times.graphDrawn > times.firstDraw, "a big graph: the coarse levels' frames come 50 ms apart at most, before the graph itself is drawn", `${JSON.stringify(lf)}; first frame at ${Math.round(times.firstDraw)} ms, the graph itself at ${Math.round(times.graphDrawn)} ms`);
+  }
   // #495: the frame budget, on the million edges. The layout worker's order
   // of the edges is in the view; a wheel zoom, an event an animation frame,
   // is drawn in frames 50 ms apart at most (the 95th percentile; twice that

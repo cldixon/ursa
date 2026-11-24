@@ -169,6 +169,11 @@ impl Source for PageBytes {
     }
 }
 
+/// A graph of this many nodes and edges is drawn a level at a time while
+/// it is laid out (the shell's layout worker says which; this is its
+/// threshold): its view warms the level pipelines as it is made.
+const LEVELS_FROM: usize = 200_000;
+
 async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, JsValue> {
     let (width, height) = (canvas.width().max(1), canvas.height().max(1));
     let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
@@ -241,6 +246,14 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
                 .map_err(js_err)?
         }
     };
+    let mut view = view;
+    // A graph this large is first seen as a level of its layout's
+    // hierarchy (#497): what draws one is made now, not in that frame.
+    if view.n_nodes() + view.n_edges() >= LEVELS_FROM {
+        // In a task of its own: compiling is not quick everywhere.
+        crate::pace::yield_now().await;
+        view.warm_levels(&device, &queue, config.format);
+    }
     Ok(GraphView {
         view,
         _instance: instance,
@@ -1152,6 +1165,93 @@ impl GraphView {
         Ok(())
     }
 
+    /// Draw a level of the layout's hierarchy in place of the graph
+    /// (#497), until [`GraphView::clear_level`]: a disc for each of its
+    /// nodes, its area by the node's `mass`, and its merged edges
+    /// `(src[i], dst[i])`, each as wide and as dark as its `weight[i]`
+    /// says, heaviest first. What [`Layout::level_graph`] gives, for level
+    /// `level` of `levels`; `totalEdges` is how many merged edges the
+    /// level has, of which these are the heaviest.
+    ///
+    /// The level's nodes are at the origin until
+    /// [`GraphView::set_level_positions`]. While a level is drawn, a frame
+    /// is the level's alone, within the frame budget
+    /// ([`GraphView::render_frame`]: the heaviest discs and edges while
+    /// the view moves); the camera fits the level, if it follows; and
+    /// nothing is picked, the graph's nodes having no place yet.
+    #[wasm_bindgen(js_name = setLevel)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_level(
+        &mut self,
+        level: u32,
+        levels: u32,
+        mass: Vec<f32>,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        weight: Vec<f32>,
+        total_edges: Option<u32>,
+    ) -> Result<(), JsValue> {
+        let total = total_edges.map_or(src.len(), |t| t as usize);
+        let scene = crate::levels::LevelScene::new(
+            level as usize,
+            levels as usize,
+            mass,
+            src,
+            dst,
+            weight,
+            total,
+        )
+        .map_err(js_err)?;
+        self.view.set_level(&self.device, self.config.format, scene);
+        Ok(())
+    }
+
+    /// Put the nodes of the level being drawn at `xy`: `x` then `y`, one
+    /// per node of the level each, as [`Layout::level_positions`] gives
+    /// them.
+    #[wasm_bindgen(js_name = setLevelPositions)]
+    pub fn set_level_positions(&mut self, xy: &js_sys::Float32Array) -> Result<(), JsValue> {
+        let n = match self.view.level() {
+            Some(level) => level.n_nodes(),
+            None => return Err(js_err("no level is drawn")),
+        };
+        if xy.length() as usize != 2 * n {
+            return Err(js_err(format!(
+                "expected {} values (x then y) for a level of {n} nodes; got {}",
+                2 * n,
+                xy.length()
+            )));
+        }
+        let n = n as u32;
+        self.view.set_level_positions(|x, y| {
+            xy.subarray(0, n).copy_to(x);
+            xy.subarray(n, 2 * n).copy_to(y);
+        });
+        Ok(())
+    }
+
+    /// Draw the graph again, and let the level go.
+    #[wasm_bindgen(js_name = clearLevel)]
+    pub fn clear_level(&mut self) {
+        self.view.clear_level();
+    }
+
+    /// What is drawn of a level, or `undefined` when the graph is drawn:
+    ///
+    /// ```js
+    /// { level, levels,       // which level, of how many (the graph is level 0)
+    ///   nodes, nodesDrawn,   // its nodes, and how many the last frame drew
+    ///   edges, edgesDrawn,   // the merged edges held, and drawn
+    ///   totalEdges }         // the merged edges the level has
+    /// ```
+    #[wasm_bindgen(js_name = levelInfo)]
+    pub fn level_info(&self) -> Result<JsValue, JsValue> {
+        match self.view.level_info() {
+            Some(info) => js_sys::JSON::parse(&serde_json::to_string(&info).map_err(js_err)?),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
+
     /// The positions now: `x` then `y`, one per node each, in a new
     /// `Float32Array` (one copy, from the view's memory).
     pub fn positions(&self) -> js_sys::Float32Array {
@@ -1577,6 +1677,90 @@ impl Layout {
         self.layout.step(iterations);
     }
 
+    /// [`Layout::step`], a level at a time (#497), for a page that draws
+    /// the level being laid out ([`GraphView::set_level`]) and not every
+    /// node at its group's place. Coarse to fine, it comes down a level
+    /// only at the start of a call, from a level that has had all its
+    /// iterations, and stops when the level it is at has had its own, the
+    /// rest of the work it was given dropped: after each call
+    /// [`Layout::level_positions`] are that level's, and when
+    /// [`Layout::level`] has changed, [`Layout::level_graph`] is the new
+    /// level. The final positions are the same bits as [`Layout::step`]'s.
+    /// Any other layout steps as [`Layout::step`] does.
+    #[wasm_bindgen(js_name = stepLevel)]
+    pub fn step_level(&mut self, iterations: u32) {
+        self.layout.step_level(iterations);
+    }
+
+    /// Whether the level being laid out is a coarse one that has had all
+    /// its iterations: the next [`Layout::step_level`] comes down from it,
+    /// and the hierarchy above is then let go ([`Layout::edge_order`]).
+    #[wasm_bindgen(getter, js_name = levelFinished)]
+    pub fn level_finished(&self) -> bool {
+        self.layout.level_finished()
+    }
+
+    /// The work done so far, in iterations of the whole graph:
+    /// [`Layout::iterations`], not rounded.
+    #[wasm_bindgen(getter)]
+    pub fn work(&self) -> f64 {
+        self.layout.work()
+    }
+
+    /// The positions of the nodes of the level being laid out: `x` then
+    /// `y`, one per node of that level each, in a new `Float32Array`. At
+    /// level 0 they are [`Layout::positions`].
+    #[wasm_bindgen(js_name = levelPositions)]
+    pub fn level_positions(&self) -> js_sys::Float32Array {
+        let (x, y) = self.layout.level_positions();
+        positions_array(x, y)
+    }
+
+    /// The level being laid out, as a graph of its own, or `undefined`
+    /// for a layout that is not coarse to fine:
+    ///
+    /// ```js
+    /// { level, levels,   // which level, of how many (the graph is level 0)
+    ///   mass,            // Float32Array: each node's mass, the summed
+    ///                    // degree + 1 of the graph's nodes it stands for
+    ///   parents,         // Uint32Array: each node's parent in the level
+    ///                    // above (0xFFFFFFFF for none), if stepLevel came
+    ///                    // down to this level; given once
+    ///   src, dst,        // Uint32Array: the heaviest `mostEdges` merged
+    ///   weight,          // edges, heaviest first, and (Float32Array) how
+    ///                    // many of the graph's edges each stands for
+    ///   totalEdges }     // how many merged edges the level has
+    /// ```
+    ///
+    /// The arrays are new ones, outside this module's memory, the
+    /// caller's to transfer. At level 0 the nodes are the graph's, and
+    /// `mass` and the edges are empty: the caller has the graph's own
+    /// (a node's mass is its degree plus one). This is every
+    /// level's part of the hierarchy, in the level's own numbering: what a
+    /// cut through it (#498) is made of.
+    #[wasm_bindgen(js_name = levelGraph)]
+    pub fn level_graph(&mut self, most_edges: u32) -> Result<JsValue, JsValue> {
+        let Some(g) = self.layout.level_graph(most_edges as usize) else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let out = js_sys::Object::new();
+        let set = |key: &str, value: JsValue| js_sys::Reflect::set(&out, &key.into(), &value);
+        set("level", (g.level as u32).into())?;
+        set("levels", (g.levels as u32).into())?;
+        set("mass", js_sys::Float32Array::from(&g.mass[..]).into())?;
+        if let Some(parents) = &g.parents {
+            set("parents", js_sys::Uint32Array::from(&parents[..]).into())?;
+        }
+        set("src", js_sys::Uint32Array::from(&g.edges.src[..]).into())?;
+        set("dst", js_sys::Uint32Array::from(&g.edges.dst[..]).into())?;
+        set(
+            "weight",
+            js_sys::Float32Array::from(&g.edges.weight[..]).into(),
+        )?;
+        set("totalEdges", (g.edges.total as u32).into())?;
+        Ok(out.into())
+    }
+
     /// Iterations so far: coarse to fine, work done, in iterations of the
     /// whole graph.
     #[wasm_bindgen(getter)]
@@ -1680,8 +1864,11 @@ impl Layout {
     /// the array, which is the caller's to transfer to the page:
     /// `postMessage({xy}, [xy.buffer])`, then
     /// [`GraphView::set_positions`], which copies them once more. No other
-    /// copy is made on the way to the GPU.
-    pub fn positions(&self) -> js_sys::Float32Array {
+    /// copy is made on the way to the GPU. (After [`Layout::step_level`]
+    /// left a coarse level's positions unprolonged, they are prolonged
+    /// here first.)
+    pub fn positions(&mut self) -> js_sys::Float32Array {
+        self.layout.prolong();
         let (x, y) = self.layout.positions();
         positions_array(x, y)
     }
