@@ -388,7 +388,10 @@ mod tests {
         capped.set_max_radius(12.0);
         assert_eq!(capped.radius(1, w, h, 1.0), 12.0);
         assert_eq!(capped.radius(1, w, h, 1e6), 12.0);
-        assert_eq!(capped.radius(0, w, h, 1.0), s.radius(0, w, h, 1.0));
+        assert_eq!(
+            capped.radius(0, 100.0, 100.0, 1.0),
+            s.radius(0, 100.0, 100.0, 1.0)
+        );
         capped.set_max_radius(0.0);
         assert_eq!(capped.radius(1, w, h, 1.0), s.radius(1, w, h, 1.0));
     }

@@ -372,6 +372,48 @@ static assets and an R2 bucket.
     of 219 MiB for the page and its workers. On karate: frames 16.7 ms
     apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
 
+  - **The aggregated view** (#498): once a graph of 200,000 nodes and
+    edges or more is laid out, it is drawn as a cut through its layout's
+    hierarchy: a disc for each group of nodes (area by mass, the colour of
+    most of its nodes, at most 12 CSS pixels in radius), the coarsest
+    groups whose discs stand 20 CSS pixels apart on screen, and the 16,384
+    heaviest merged edges between them. The header says it first, where a
+    narrow pane does not cut it off: `aggregated: 92 groups of 46,318
+    nodes · 1,000,000 edges · …`; the largest groups carry their node
+    counts (`.graph-group` labels over the canvas, at most 24, none over
+    another). `graph.js` asks the layout worker for a cut when the layout
+    is done and whenever the camera has then been still for 150 ms
+    (`{type: "cut", id, camera}`; `graph-worker.js` answers with
+    `Layout.cut`'s typed arrays, transferred, and what it took), and draws
+    the answer (`setCut`); until it comes, the last cut is drawn, moved as
+    the camera is. Only the groups in view are opened, so zooming in
+    reaches the graph's own nodes: the worker's answer then says `detail`,
+    and the graph itself is drawn (`clearLevel`), the same frame as with no
+    cut. `graph-cut.js` (no DOM, no wasm) is which cut is asked for and
+    what is made of an answer.
+    - A click on a group selects its nodes (Shift+click adds another
+      group's, or takes a selected group's out), with the header and the
+      inspector as for any selection; a disc holding a selected node
+      carries a ring, so a `.find` shows where its matches are. A node or
+      an edge is picked once the view is zoomed in to the graph itself.
+    - `a` in the pane forces full detail, every node and edge as before
+      #498, and `a` again aggregates; `.graph detail on|off` is the same
+      from the terminal, and `.graph detail` says which. The choice is
+      kept from one drawing to the next.
+    - A step (`.expand`, `.hide`, `.undo`) ends the aggregation for that
+      drawing: the layout's hierarchy is of the graph before it.
+    - The worker keeps the hierarchy's members through the layout and
+      makes a forest of them when it is done (5.2 MB at a million edges,
+      in memory the layout has let go of: its WebAssembly memory stays at
+      55.6 MB).
+    `window.ursaShell.graph()` gives `cut` (what is drawn of the cut, or
+    null), `cuts` (`{on, large, detail, waiting, ms, last, prepared}`),
+    `groupLabels` and `camera`. On `.graph rmat` (headless Chromium,
+    software WebGL2, 2026-11-24): 92 discs and 2,389 merged edges at the
+    fitted zoom; a cut takes the worker 7 to 25 ms, after 41 to 46 ms once
+    for the forest; a wheel zoom over cuts is drawn in frames 24 to 26 ms
+    apart at the p95; nine zoom steps of 1.35 reach the graph itself.
+
   - **The first paint** (#497): a graph of 200,000 nodes and edges or more
     is first drawn as the coarsest level of its layout's hierarchy, laid
     out: a few dozen discs, each with area by the mass of the nodes it
@@ -611,7 +653,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; the aggregated view on rmat, #498: at most 20,000 discs and 100,000 merged edges at the fitted zoom, the status saying `aggregated: G groups of N nodes`, the groups holding every node and labelled with their counts, a cut within 60 ms in the worker, a click on a group selecting its nodes, `a` and `.graph detail on|off`, and zooming in reaching the graph's own nodes; the frame budget on rmat, in full detail, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

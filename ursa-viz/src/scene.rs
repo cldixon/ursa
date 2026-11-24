@@ -1660,6 +1660,82 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_layout_gives_cuts_until_it_grows() {
+        use crate::cut::CutParams;
+        // A ring of 600 with chords: several levels.
+        let n = 600u32;
+        let src: Vec<u32> = (0..n).chain((0..n).step_by(7)).collect();
+        let dst: Vec<u32> = (0..n)
+            .map(|i| (i + 1) % n)
+            .chain((0..n).step_by(7).map(|i| (i * 13 + 5) % n))
+            .collect();
+        let g = Graph::new(n as usize, src.clone(), dst.clone()).unwrap();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        // Everything in view, from far out.
+        let far = CutParams {
+            detail_nodes: 0,
+            ..CutParams::of_camera((0.0, 0.0), 1e-3, (1e9, 1e9))
+        };
+        let mut live = LiveLayout::multilevel(&g, params);
+        let mut whole = LiveLayout::multilevel(&g, params);
+        // Not while a coarse level is laid out: the view draws that level.
+        assert!(!live.has_cut() && !live.prepare_cut() && live.cut(&far).is_none());
+        assert_eq!(live.cut_bytes(), 0);
+        while live.level() > 0 {
+            live.step_level(3);
+        }
+        // From the graph itself on, while it is still laid out.
+        assert!(live.has_cut() && !live.is_done());
+        let early = live.cut(&far).unwrap();
+        assert!(live.cut_bytes() > 0);
+        while !live.is_done() {
+            live.step_level(3);
+        }
+        while !whole.is_done() {
+            whole.step(3);
+        }
+        // Cutting changed nothing of the layout.
+        assert_eq!(live.positions(), whole.positions());
+        // Far out, the coarsest level's nodes; the same cut each time, and
+        // the same from a layout that was never cut before.
+        let cut = live.cut(&far).unwrap();
+        assert!(!cut.detail);
+        assert_eq!(cut.nodes.len(), early.nodes.len());
+        assert_eq!(cut.nodes, early.nodes);
+        // The groups are where the nodes are now, not where they were.
+        assert_ne!((&cut.x, &cut.y), (&early.x, &early.y));
+        assert_eq!(cut.members.iter().sum::<u32>(), n);
+        assert_eq!(live.cut(&far).unwrap(), cut);
+        assert_eq!(whole.cut(&far).unwrap(), cut);
+        // Close in, the graph itself.
+        let near = CutParams::of_camera((0.0, 0.0), 1e6, (1e9, 1e9));
+        let all = live.cut(&near).unwrap();
+        assert!(all.detail);
+        assert_eq!(all.nodes, (0..n).collect::<Vec<_>>());
+        // Grown, the hierarchy is of a graph that is no more.
+        let (mut src, mut dst) = (src, dst);
+        src.push(0);
+        dst.push(n);
+        let grown = Graph::new(n as usize + 1, src, dst).unwrap();
+        let parents = [0u32];
+        let growth = Growth {
+            parents: Some(&parents),
+            pinned: &[],
+            params: ursa_core::algo::WarmParams::default(),
+        };
+        live.grow(&grown, growth).unwrap();
+        assert!(!live.has_cut() && live.cut(&far).is_none());
+        assert_eq!(live.cut_bytes(), 0);
+        // A flat layout has none to cut.
+        let mut flat = LiveLayout::new(&g, Fa2Params::default());
+        flat.step(2);
+        assert!(!flat.has_cut() && flat.cut(&far).is_none());
+    }
+
+    #[test]
     fn a_multilevel_live_layout_is_layout_fa2_multilevel() {
         // A grid big enough to coarsen, stepped in uneven budgets: the end is
         // the one-shot layout, uncentered.

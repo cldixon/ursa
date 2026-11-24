@@ -524,3 +524,24 @@ impl View {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_group_takes_the_category_of_most_of_its_nodes() {
+        // Groups 0, 1, 2 and 3 (which has no node).
+        let of = [0, 1, 0, 2, 0, 1, 2, 1, 1];
+        let categories = [5, 3, 5, 9, 2, 7, 1, 3, NO_CATEGORY];
+        // Group 0: two 5s and a 2. Group 1: two 3s, a 7 and one with no
+        // category. Group 2: a 9 and a 1, which tie: the lower.
+        assert_eq!(majority(&of, 4, &categories), vec![5, 3, 1, NO_CATEGORY]);
+        assert_eq!(majority(&[], 2, &[]), vec![NO_CATEGORY; 2]);
+        // No category is one too, when most have none.
+        assert_eq!(
+            majority(&[0, 0, 0], 1, &[NO_CATEGORY, 4, NO_CATEGORY]),
+            vec![NO_CATEGORY]
+        );
+    }
+}
