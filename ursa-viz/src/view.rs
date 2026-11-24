@@ -68,8 +68,10 @@ pub struct View {
     /// The camera's zoom when last fitted: nodes grow back toward full size
     /// as the user zooms in past it.
     fitted_zoom: f32,
-    /// Pixels a fit leaves free at each side ([`View::set_fit_padding`]).
+    /// Pixels a fit leaves free at each side ([`View::set_fit_padding`]),
+    /// and how many of the first nodes it fits, if not all of them.
     fit_padding: f32,
+    fit_first: Option<usize>,
     /// Draw nodes as well as edges.
     pub draw_nodes: bool,
     /// The result drawn, for a view made from one ([`View::from_result`]):
@@ -634,6 +636,7 @@ impl View {
             follow: true,
             fitted_zoom: 1.0,
             fit_padding: 0.0,
+            fit_first: None,
             draw_nodes: true,
             live,
             layout_stale: false,
@@ -1222,8 +1225,14 @@ impl View {
     /// ([`View::fit`], and while it follows): for what is drawn larger
     /// around a node than a node is, as the discs of `GROUP BY`'s groups
     /// are (#499). 0, the default, is the fit as it was.
-    pub fn set_fit_padding(&mut self, pixels: f32) {
+    ///
+    /// With `first`, a fit is of the first `first` nodes alone, whatever
+    /// nodes come after them: the groups of a grouped drawing, whose
+    /// members are drawn inside their groups' discs, so that a group that
+    /// opens does not move the camera.
+    pub fn set_fit_padding(&mut self, pixels: f32, first: Option<usize>) {
         self.fit_padding = if pixels > 0.0 { pixels } else { 0.0 };
+        self.fit_first = first;
         if self.follow {
             self.fit_camera();
         }
@@ -1234,7 +1243,8 @@ impl View {
         if let Some(b) = self.level_bounds() {
             return self.fit_to(b);
         }
-        let b = bounds(&self.x, &self.y);
+        let first = self.fit_first.map_or(self.x.len(), |k| k.min(self.x.len()));
+        let b = bounds(&self.x[..first], &self.y[..first]);
         self.fit_to(b);
         self.fitted = Some(Fitted {
             bounds: b,
@@ -1267,6 +1277,13 @@ impl View {
     /// the same whichever order its points are added in.
     fn refit(&mut self, changes: &Changes) {
         let (n0, n1) = changes.nodes;
+        // A fit of the first nodes alone is found again: it is cheap.
+        if self.fit_first.is_some() {
+            if self.follow {
+                self.fit_camera();
+            }
+            return;
+        }
         let fitted = match self.fitted.take() {
             Some(fitted) if self.follow && !changes.positions => fitted,
             _ => {

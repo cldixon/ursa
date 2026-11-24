@@ -577,10 +577,12 @@ impl GraphView {
 
     /// Leave `pixels` free at each side of the canvas when the camera
     /// fits: for discs drawn larger around a node than a node is
-    /// (`GROUP BY`'s groups, #499). 0 is the fit as it was.
+    /// (`GROUP BY`'s groups, #499). 0 is the fit as it was. With `first`,
+    /// a fit is of the first `first` nodes alone: the groups, whose
+    /// members are drawn inside their discs.
     #[wasm_bindgen(js_name = setFitPadding)]
-    pub fn set_fit_padding(&mut self, pixels: f32) {
-        self.view.set_fit_padding(pixels);
+    pub fn set_fit_padding(&mut self, pixels: f32, first: Option<u32>) {
+        self.view.set_fit_padding(pixels, first.map(|k| k as usize));
     }
 
     /// A frame drawn offscreen: RGBA pixels, canvas-sized, row by row from

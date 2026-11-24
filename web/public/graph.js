@@ -65,7 +65,7 @@ import { drawingOf } from "./graph-data.js";
 import { createInspector } from "./graph-inspector.js";
 import { createLevels } from "./graph-levels.js";
 import { DISC_RADIUS, LABEL_RADIUS, MAX_LABELS, REST_MS, SEPARATION, aggregatedText, countLabel, createCuts } from "./graph-cut.js";
-import { MEMBER_RADIUS, groupedText, idOf, place, sceneOf } from "./graph-groups.js";
+import { MEMBER_RADIUS, discRadii, groupedText, heaviest, idOf, pack, place, sceneOf } from "./graph-groups.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
@@ -169,6 +169,10 @@ const EDGE_REACH_PX = 4;
 const MAX_KEYS_NAMED = 5;
 /** Fitting the selection (`f`, .find) moves the camera over this long, in ms. */
 const FIT_MS = 200;
+// A grouped drawing (#499): the most edges between groups that say their
+// count, and how long one is on the canvas to carry it, in CSS pixels.
+const COUNT_LABELS = 12;
+const COUNT_SPAN = 60;
 /** It zooms in by no more than this at once, and leaves this share of the canvas around the selection. */
 const MAX_FIT_ZOOM = 8;
 const FIT_MARGIN = 0.8;
@@ -414,7 +418,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   if (placed) view.setPositions(sent.positions);
   // A group's disc is drawn around its node, up to the level renderer's
   // greatest radius (12% of the shorter side): a fit leaves room for it.
-  const padFit = () => graph.grouped && view.setFitPadding(0.12 * Math.min(canvas.width, canvas.height) + 8 * dpr);
+  // And it is a fit of the groups: a group that opens does not move the
+  // camera.
+  const padFit = () => graph.grouped && view.setFitPadding(0.12 * Math.min(canvas.width, canvas.height) + 8 * dpr, graph.grouped.groups);
   padFit();
   view.fit();
 
@@ -782,26 +788,42 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const placeLabels = () => {
     const g = graph.grouped;
     const found = state.cuts.shown || (g && state.positioned) ? view.groupLabels(LABEL_RADIUS * dpr, MAX_LABELS) : [];
-    const count = found.length / 5;
-    while (state.labels.length < count) {
+    // What to say and where, in CSS pixels, the most important first.
+    const wanted = [];
+    for (let i = 0; i < found.length; i += 5) {
+      const [group, x, y, radius, members] = found.slice(i, i + 5);
+      // A grouped drawing's disc says its group too; an open one's label
+      // is over its rim, clear of its members.
+      const text = g ? `${g.names.get(group)} · ${countLabel(members)}` : countLabel(members);
+      const above = g && g.open.includes(group) ? radius + 10 * dpr : 0;
+      wanted.push([text, x / dpr, (y - above) / dpr]);
+    }
+    if (g && state.positioned) {
+      // The heaviest edges between groups say their counts, halfway
+      // along, where they are long enough on the canvas to carry one.
+      graph.heaviest ??= heaviest(graph.result, g, COUNT_LABELS);
+      const [w, h] = [canvas.width, canvas.height];
+      for (const { src, dst, count } of graph.heaviest) {
+        const [a, b] = [view.nodePixel(src), view.nodePixel(dst)];
+        const [x, y] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        if (Math.hypot(a[0] - b[0], a[1] - b[1]) < COUNT_SPAN * dpr || x < 0 || x > w || y < 0 || y > h) continue;
+        wanted.push([number(count), x / dpr, y / dpr]);
+      }
+    }
+    while (state.labels.length < wanted.length) {
       const label = document.createElement("div");
       label.className = "graph-group";
       label.setAttribute("aria-hidden", "true");
       stage.append(label);
       state.labels.push(label);
     }
-    // Heaviest first: a label that would lie over one already placed is
-    // left out.
+    // A label that would lie over one already placed is left out.
     const placed = [];
     state.labels.forEach((label, i) => {
       label.hidden = true;
-      if (i >= count) return;
-      const [group, x, y, radius, members] = found.slice(5 * i, 5 * i + 5);
-      // A grouped drawing's disc says its group too; an open one's label
-      // is over its rim, clear of its members.
-      const text = g ? `${g.names.get(group)} · ${countLabel(members)}` : countLabel(members);
-      const above = g && g.open.includes(group) ? radius + 10 * dpr : 0;
-      const [cx, cy, w, h] = [x / dpr, (y - above) / dpr, 7 * text.length + 12, 18];
+      if (i >= wanted.length) return;
+      const [text, cx, cy] = wanted[i];
+      const [w, h] = [7 * text.length + 12, 18];
       if (placed.some((b) => Math.abs(b[0] - cx) < (b[2] + w) / 2 && Math.abs(b[1] - cy) < (b[3] + h) / 2)) return;
       placed.push([cx, cy, w, h]);
       if (label.textContent !== text) label.textContent = text;
@@ -903,15 +925,21 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // The radius an open group's disc has from here on, in the layout's
   // units: the one its closed disc is drawn with now. Once the layout has
   // a place for the groups, which the camera is fitted to.
-  const openRadii = () => {
-    const g = graph.grouped;
-    if (!state.positioned) return;
-    const ppu = view.camera()[2];
-    for (const group of g.open) {
-      if (state.radii.has(group)) continue;
-      const radius = view.groupRadius(group);
-      if (radius > 0 && ppu > 0) state.radii.set(group, radius / ppu);
+  const openRadii = (closed = closedRadii()) => {
+    for (const group of graph.grouped.open) {
+      if (!state.radii.has(group) && closed.get(group) > 0) state.radii.set(group, closed.get(group));
     }
+  };
+  // Each closed group's radius as it is drawn now, in the layout's units:
+  // none before the layout has a place for the groups.
+  const closedRadii = () => {
+    const closed = new Map();
+    const ppu = view.camera()[2];
+    if (!state.positioned || !(ppu > 0)) return closed;
+    for (let group = 0; group < graph.grouped.groups; group++) {
+      if (!state.radii.has(group)) closed.set(group, view.groupRadius(group) / ppu);
+    }
+    return closed;
   };
   // The layout of the groups: each new set of positions places every
   // node, the members with their groups.
@@ -920,8 +948,11 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       if (data.xy.length !== 2 * graph.grouped.groups) return;
       times.firstPositions ??= performance.now();
       times.graphDrawn ??= times.firstPositions;
-      state.groupXY = data.xy;
-      state.pending = place(graph.grouped, data.xy, state.radii, graph.n);
+      // The layout says which group is beside which; the discs are then
+      // moved apart until none covers another (graph-groups.js's pack).
+      // Their places are in pixels from here, about the origin.
+      state.groupXY = pack(data.xy, discRadii(graph.grouped, canvas.width, canvas.height), canvas.width, canvas.height);
+      state.pending = place(graph.grouped, state.groupXY, state.radii, graph.n);
       state.iterations = data.iterations;
       const first = !state.positioned;
       state.positioned = true;
@@ -1546,6 +1577,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       view.setLevelPositions(state.pending);
       state.pending = null;
     }
+    // The closed discs as they are drawn before the change: a group that
+    // opens keeps its disc.
+    const closed = closedRadii();
     const stats = view.applyDelta(bytes);
     const uploaded = stats.bytesUploaded;
     stats.free();
@@ -1562,12 +1596,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     state.drawnAs = graph.drawnAs;
     renderLegend(legend, graph);
     describeCanvas(state.nodes, state.edges);
-    // A group that opened takes the radius its closed disc has now; one
-    // with no member shown any more gives its up.
+    // A group that opened takes the radius its closed disc had; one with
+    // no member shown any more gives its up.
     for (const group of [...state.radii.keys()]) if (!graph.grouped.open.includes(group)) state.radii.delete(group);
-    openRadii();
+    openRadii(closed);
     setScene();
     state.selection = Array.from(view.selection());
+    // What the inspector says of a group that opened or closed is new.
+    if (state.selection.length) state.inspector.selectionChanged();
     state.hovered = null;
     canvas.classList.remove("over-node");
     if (pointerAt) hoverSoon();
@@ -1603,7 +1639,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   state.cleanup.push(() => legend.replaceChildren());
   state.cleanup.push(() => (legend.hidden = true));
 
-  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs, saved: placed, graph: graph.name };
+  const grouped = graph.grouped && { by: graph.grouped.by, groups: graph.grouped.groups, total: graph.grouped.total };
+  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs, saved: placed, graph: graph.name, grouped };
 }
 
 /**
@@ -1645,6 +1682,12 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
   // is the graph itself: there SIZE BY and COLOR BY read the vertex tables.
   const styled = name !== null && graph.provenance?.rule === "graph";
   const node = (i) => ({ index: i, key: key(i), id: idFor(i), keyType: state.graph.keyTypeOf(i) });
+  // In a grouped drawing: an open or a closed group, or a member.
+  const groupKind = (i) => {
+    const g = state.graph.grouped;
+    if (!g) return null;
+    return !g.isGroup(i) ? "member" : g.open.includes(i) ? "open" : "closed";
+  };
   // The panel is over the right of the view, unless what is selected is drawn
   // there: then over the left, so a click never hides what it selected.
   const sideOf = (...nodes) => {
@@ -1666,11 +1709,12 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw }
           kind: "node",
           side: sideOf(i),
           ...node(i),
-          label: graph.labelOf(i),
+          label: state.graph.labelOf(i),
+          group: groupKind(i),
           graph: name,
           command: state.times.command ?? ".graph",
           degree: state.degree[i],
-          values: i < graph.n ? graph.valuesOf(i) : [],
+          values: i < state.graph.n ? state.graph.valuesOf(i) : [],
           pinned: state.pinned.has(i),
           styled,
         });

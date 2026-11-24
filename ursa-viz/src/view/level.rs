@@ -485,17 +485,22 @@ impl View {
             let Some(scene) = &level.scene else {
                 return;
             };
-            let d = match (&level.cut, &selected) {
+            let (under, d) = match (&level.cut, &selected) {
                 (Some(cut), Some(selected)) => {
-                    scene.discs_at(discs, w, h, zoom, ppu, theme.background, |i| {
+                    let ink = |i: usize| {
                         (
                             theme.color(cut.category[i]),
                             selected[i].then_some(theme.selection),
                         )
-                    })
+                    };
+                    (
+                        scene.open_discs(ppu, theme.background, ink),
+                        scene.discs_by(discs, w, h, zoom, ink),
+                    )
                 }
-                _ => scene.discs(discs, w, h, zoom, color),
+                _ => (Vec::new(), scene.discs(discs, w, h, zoom, color)),
             };
+            level.gpu.set_under(device, queue, &under);
             let l = scene.links(links);
             level.gpu.set(device, queue, &d, &l);
             level.drew = (discs.min(scene.n_nodes()), l.len());

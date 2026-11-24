@@ -1059,7 +1059,17 @@ async function drawGraph(text) {
   const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
   const as = drawn.drawnAs ? ` as ${drawn.drawnAs}` : "";
   const at = drawn.saved ? " at its saved positions" : "";
-  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  const replacing = wasOpen ? "replacing the last drawing; " : "";
+  if (drawn.grouped) {
+    // A grouped drawing (#499) says its groups, and how one opens.
+    const g = drawn.grouped;
+    await write(
+      `Drawing ${drawn.drawnAs}: ${count(g.groups, "group")} of ${count(g.total, "node")} by ${g.by}, with ${count(drawn.edges, "edge")} between groups${skipped} ` +
+        `(double-click a group, or .expand group:N, to open it; ${replacing}Esc closes)\r\n`,
+    );
+    return true;
+  }
+  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${replacing}Esc closes)\r\n`);
   // A layout that will take a minute: how to run it once and draw from it (#502).
   const hint = drawn.saved ? null : graphLoaded?.positionsHint(drawn.edges, drawn.graph);
   if (hint)

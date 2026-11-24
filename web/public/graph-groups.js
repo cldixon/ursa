@@ -190,3 +190,136 @@ export function place(grouped, groupXY, radii, n) {
   }
   return xy;
 }
+
+/**
+ * The heaviest edges between the groups of a grouped `result` that are
+ * shown, at most `most`: [{src, dst, count}], heaviest first. What the
+ * view labels with their counts.
+ */
+export function heaviest(result, grouped, most) {
+  const { nodes, edges } = result;
+  const count = edges.columns.find((c) => c.name === COUNT)?.values;
+  if (!count) return [];
+  const between = [];
+  for (let e = 0; e < edges.count; e++) {
+    if (edges.flags[e] & 1) continue;
+    const [s, d] = [edges.src[e], edges.dst[e]];
+    if (!grouped.isGroup(s) || !grouped.isGroup(d) || (nodes.flags[s] & 1) || (nodes.flags[d] & 1) || count[e] === NULL) continue;
+    between.push(e);
+  }
+  between.sort((a, b) => count[b] - count[a] || a - b);
+  return between.slice(0, most).map((e) => ({ src: edges.src[e], dst: edges.dst[e], count: count[e] }));
+}
+
+// A disc's size on a fitted canvas, as the view draws it (ursa-viz's
+// levels.rs: COVERAGE, MIN_RADIUS and MAX_RADIUS_SHARE).
+const COVERAGE = 0.06;
+const MIN_RADIUS = 1.5;
+const MAX_RADIUS_SHARE = 0.12;
+/** The least room between two discs that are packed, in pixels, and the room as a share of their radii. */
+export const PACK_GAP = 8;
+export const PACK_GAP_SHARE = 0.35;
+
+/**
+ * Each group's radius on a fitted `width` x `height` canvas, in pixels: its
+ * area is its share of the nodes, of 6% of the canvas (LevelScene::radius
+ * at zoom 1).
+ */
+export function discRadii(grouped, width, height) {
+  const radii = new Float32Array(grouped.groups);
+  let total = 0;
+  const mass = (g) => (grouped.members[g] === NULL ? 0 : grouped.members[g]);
+  for (let g = 0; g < grouped.groups; g++) total += mass(g);
+  const most = Math.max(MIN_RADIUS, MAX_RADIUS_SHARE * Math.min(width, height));
+  for (let g = 0; g < grouped.groups; g++) {
+    const share = total > 0 ? mass(g) / total : 0;
+    radii[g] = Math.min(most, Math.max(MIN_RADIUS, Math.sqrt((COVERAGE * width * height * share) / Math.PI)));
+  }
+  return radii;
+}
+
+/**
+ * The groups where a layout put them (`xy`: x for each, then y), moved so
+ * that no two discs overlap: `radii[g]` is group g's radius in pixels, and
+ * the answer is in pixels too, about the origin, each two discs at least
+ * PACK_GAP apart (and PACK_GAP_SHARE of their radii).
+ *
+ * A layout by the edges alone knows nothing of the discs' sizes: twenty
+ * communities that all have edges to one another are laid out on one
+ * spot. So the layout is scaled to half the canvas, and then, `iterations`
+ * times, every disc is pulled toward the middle (less each time) and each
+ * two that are too close are pushed apart, the smaller the further. The
+ * layout says which group is beside which; the packing says how far.
+ * The same input gives the same answer.
+ */
+export function pack(xy, radii, width, height, iterations = 200) {
+  const n = radii.length;
+  const x = new Float64Array(n);
+  const y = new Float64Array(n);
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < n; i++) {
+    const [px, py] = [xy[i], xy[n + i]];
+    if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+    [x0, y0, x1, y1] = [Math.min(x0, px), Math.min(y0, py), Math.max(x1, px), Math.max(y1, py)];
+  }
+  const span = Math.max(x1 - x0, y1 - y0);
+  const scale = span > 0 ? (0.5 * Math.min(width, height)) / span : 1;
+  for (let i = 0; i < n; i++) {
+    const ok = Number.isFinite(xy[i]) && Number.isFinite(xy[n + i]);
+    x[i] = ok ? (xy[i] - (x0 + x1) / 2) * scale : 0;
+    y[i] = ok ? (xy[n + i] - (y0 + y1) / 2) * scale : 0;
+  }
+  let reach = 0;
+  for (let i = 0; i < n; i++) reach = Math.max(reach, radii[i]);
+  const room = (a, b) => radii[a] + radii[b] + Math.max(PACK_GAP, PACK_GAP_SHARE * (radii[a] + radii[b]));
+  const order = Array.from({ length: n }, (_, i) => i);
+  // Push apart each two discs that are too close: a sweep along x.
+  const collide = () => {
+    order.sort((a, b) => x[a] - radii[a] - (x[b] - radii[b]) || a - b);
+    let moved = false;
+    for (let i = 0; i < n; i++) {
+      const a = order[i];
+      // The furthest right a disc that touches a's room can start.
+      const right = x[a] + radii[a] + Math.max(PACK_GAP, PACK_GAP_SHARE * (radii[a] + reach));
+      for (let j = i + 1; j < n; j++) {
+        const b = order[j];
+        if (x[b] - radii[b] > right) break;
+        let [dx, dy] = [x[b] - x[a], y[b] - y[a]];
+        let d = Math.hypot(dx, dy);
+        const need = room(a, b);
+        if (d >= need) continue;
+        if (d < 1e-9) {
+          // On one spot: apart along a direction of their own.
+          const turn = (a * 0.618033988749895 + b * 0.381966011250105) % 1;
+          [dx, dy, d] = [Math.cos(2 * Math.PI * turn), Math.sin(2 * Math.PI * turn), 1];
+        }
+        const push = (need - d) / d;
+        // The smaller disc moves the further.
+        const [wa, wb] = [radii[a] ** 2, radii[b] ** 2];
+        const share = wa + wb > 0 ? wb / (wa + wb) : 0.5;
+        x[a] -= dx * push * share;
+        y[a] -= dy * push * share;
+        x[b] += dx * push * (1 - share);
+        y[b] += dy * push * (1 - share);
+        moved = true;
+      }
+    }
+    return moved;
+  };
+  for (let it = 0; it < iterations; it++) {
+    const pull = 0.06 * (1 - it / iterations);
+    for (let i = 0; i < n; i++) {
+      x[i] -= x[i] * pull;
+      y[i] -= y[i] * pull;
+    }
+    collide();
+  }
+  // Only apart, until none are too close.
+  for (let it = 0; it < 50 && collide(); it++);
+  const out = new Float32Array(2 * n);
+  for (let i = 0; i < n; i++) {
+    out[i] = x[i];
+    out[n + i] = y[i];
+  }
+  return out;
+}
