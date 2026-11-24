@@ -21,7 +21,9 @@
 // selected ("Selected node 33: …"). A click on an edge (within 4 px of it,
 // with no node under the pointer) selects the edge. Whatever is selected, the
 // inspector (graph-inspector.js) shows what is known of it, in a panel over
-// the right of the view: `i` moves the focus into it, and Esc back. A mouse or a pen over a node rings it and
+// the right of the view: `i` moves the focus into it, and Esc back. The
+// camera makes room for the panel, so no node in sight is under it (#493).
+// A mouse or a pen over a node rings it and
 // shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
 // On a touch screen one finger pans, two pinch to zoom (and pan), a tap
 // selects a node and a double tap expands it, or fits. `f` fits the selection,
