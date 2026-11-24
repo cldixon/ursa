@@ -480,7 +480,7 @@ impl WebShell {
     /// ```json
     /// {"table": "members", "sql": "SELECT * FROM members WHERE id = 33",
     ///  "columns": [{"name": "id", "numeric": true}, {"name": "club", "numeric": false}],
-    ///  "rows": [["33", "Officer"]], "row": null, "note": null}
+    ///  "rows": [["33", "Officer"]], "row": null, "note": null, "indexed": false}
     /// ```
     ///
     /// `rows` holds the node's row of its vertex table (one query by key),
@@ -511,7 +511,9 @@ impl WebShell {
     /// [`Self::inspect_node`]'s JSON, with the edge's row of its edge table.
     /// The row is found by its ends; where several rows join them, by the
     /// edge's row number (`row`) if the drawing knows it, and else every
-    /// such row is given, with a `note`.
+    /// such row is given, with a `note`. `indexed` says the rows were found
+    /// through the graph's index and read by their numbers (#489), not by a
+    /// scan of the edge table: the rows are the same either way.
     #[wasm_bindgen(js_name = inspectEdge)]
     pub fn inspect_edge(&self, edge: u32, src: String, dst: String) -> Promise {
         let shell = Rc::clone(&self.shell);
@@ -751,6 +753,7 @@ async fn inspect(
         "rows": found.rows,
         "row": found.row,
         "note": found.note,
+        "indexed": found.indexed,
     })
     .to_string())
 }
@@ -1358,6 +1361,7 @@ mod tests {
                 "rows": [["1", "<i>Ann</i>"]],
                 "row": null,
                 "note": null,
+                "indexed": false,
             })
         );
         let null = Inspect::Node { node: 1, key: "2" };
@@ -1375,6 +1379,8 @@ mod tests {
             serde_json::from_str(&inspect(edge, false).await.unwrap()).unwrap();
         assert_eq!(row["table"], "calls");
         assert_eq!(row["rows"], json!([["1", "2", "0.5"]]));
+        // Found through the graph's index, not by a scan of the edge table.
+        assert_eq!(row["indexed"], true);
 
         // The page's picture is not the engine's: an error, not another row.
         let stale = Inspect::Node { node: 0, key: "2" };

@@ -26,6 +26,8 @@ object_store = { workspace = true }
 url = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
+# The bytes a Parquet reader is handed (graph::view::rows); already in the tree.
+bytes = "1"
 # The glob type DataFusion's `ListingTableUrl` filters a listing with.
 glob = "0.3"
 # The lock type of `SessionContext::state_weak_ref` (already in the tree via DataFusion).

@@ -4647,6 +4647,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-smithy-http-client",
+ "bytes",
  "crc32fast",
  "datafusion",
  "futures",

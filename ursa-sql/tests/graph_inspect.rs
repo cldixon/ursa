@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use datafusion::arrow::array::Array;
 use datafusion::prelude::SessionContext;
 use ursa_engine::graph::view::inspect::{graph_neighbours, inspect, Inspect, Inspected};
 use ursa_engine::graph::view::{of_command, GraphView, RunSql};
@@ -66,7 +67,7 @@ async fn node_row(ctx: &SessionContext, view: &GraphView, key: &str) -> Inspecte
         node: node(view, key),
         key,
     };
-    inspect(ctx, &view.result, what).await.unwrap()
+    inspect(ctx, &Sql, &view.result, what).await.unwrap()
 }
 
 async fn edge_row(ctx: &SessionContext, view: &GraphView, a: &str, b: &str) -> Inspected {
@@ -77,7 +78,7 @@ async fn edge_row(ctx: &SessionContext, view: &GraphView, a: &str, b: &str) -> I
         src: keys.get(view.result.src()[at as usize] as usize),
         dst: keys.get(view.result.dst()[at as usize] as usize),
     };
-    inspect(ctx, &view.result, what).await.unwrap()
+    inspect(ctx, &Sql, &view.result, what).await.unwrap()
 }
 
 /// One row's value in the column `name`.
@@ -176,7 +177,7 @@ async fn an_edge_of_a_graph_shows_its_edge_table_row() {
             src,
             dst,
         };
-        let found = inspect(&ctx, r, what).await.unwrap();
+        let found = inspect(&ctx, &Sql, r, what).await.unwrap();
         assert_eq!(found.rows.len(), 1, "{src}-{dst}: {found:?}");
         let ends = [value(&found, 0, "src"), value(&found, 0, "dst")];
         assert!(
@@ -233,7 +234,7 @@ async fn parallel_edges_are_told_apart_by_row_or_all_given() {
             src: keys.get(r.src()[e] as usize),
             dst: keys.get(r.dst()[e] as usize),
         };
-        let found = inspect(&ctx, r, what).await.unwrap();
+        let found = inspect(&ctx, &Sql, r, what).await.unwrap();
         assert_eq!(found.rows.len(), 1, "{found:?}");
         assert_eq!(found.note, None);
         assert_eq!(found.row, r.edge_row(e));
@@ -301,7 +302,7 @@ async fn a_drawing_with_no_table_says_so_and_a_stale_index_is_an_error() {
         node: node(&view, "33"),
         key: "32",
     };
-    let e = inspect(&ctx, &view.result, stale).await.unwrap_err();
+    let e = inspect(&ctx, &Sql, &view.result, stale).await.unwrap_err();
     assert!(
         ursa_engine::user_message(&e).contains("the drawing has changed"),
         "{e}"
@@ -311,5 +312,452 @@ async fn a_drawing_with_no_table_says_so_and_a_stale_index_is_an_error() {
         src: "0",
         dst: "1",
     };
-    assert!(inspect(&ctx, &view.result, past).await.is_err());
+    assert!(inspect(&ctx, &Sql, &view.result, past).await.is_err());
+}
+
+/// 3,000 edges, each with its row number as `w`, written in that order:
+/// - rows 0..2700 are 300 pairs, each nine times over (parallel edges);
+/// - rows 2700..2970 are one edge each;
+/// - rows 2970..2995 all join 7000 to 7001 (more than the inspector shows);
+/// - rows 2995..3000 join 8000 and 8001, the even rows one way and the odd
+///   the other.
+const EDGES: &str = "SELECT \
+       CASE WHEN i < 2700 THEN i % 50 WHEN i < 2970 THEN 200 + i WHEN i < 2995 THEN 7000 \
+            ELSE 8000 + i % 2 END AS src, \
+       CASE WHEN i < 2700 THEN 50 + i % 60 WHEN i < 2970 THEN 5000 + i WHEN i < 2995 THEN 7001 \
+            ELSE 8001 - i % 2 END AS dst, \
+       i AS w, 'row ' || i AS name \
+     FROM (SELECT value AS i FROM range(0, 3000)) ORDER BY i";
+
+/// A session that reads a table as one partition (as the browser's does),
+/// with the graph `g` of the edge table `edges`, made by `create`.
+async fn graph_of_edges(create: &str) -> SessionContext {
+    let ctx = ursa_engine::new_session();
+    Sql.run(
+        &ctx,
+        &format!(
+            "SET datafusion.execution.target_partitions = 1;
+             {create};
+             CREATE PROPERTY GRAPH g EDGE TABLES (edges SOURCE KEY (src) DESTINATION KEY (dst));"
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{create}: {}", ursa_engine::user_message(&e)));
+    ctx
+}
+
+/// The `w` of each of an inspected edge's rows: in the order given when the
+/// rows came through the index (the table's order), and sorted when a scan
+/// read them, which may have been of several partitions.
+fn ws(found: &Inspected) -> Vec<u64> {
+    let mut ws: Vec<u64> = (0..found.rows.len())
+        .map(|row| value(found, row, "w").unwrap().parse().unwrap())
+        .collect();
+    if !found.indexed {
+        ws.sort_unstable();
+    }
+    ws
+}
+
+/// What the inspector says of the edges of `g` (see [`EDGES`]), whose rows
+/// are found through the index when `indexed`: the rows the query by the two
+/// ends gives, in the table's order.
+async fn check_edge_rows(ctx: &SessionContext, indexed: bool, what: &str) {
+    // `.graph g` knows no row numbers: every row between the two ends.
+    let whole = draw(ctx, "g").await;
+    assert!(whole.result.edge_rows().is_none());
+
+    // One row between two nodes: that row, and the query that reads it.
+    let one = edge_row(ctx, &whole, "3000", "7800").await;
+    assert_eq!(one.indexed, indexed, "{what}");
+    assert_eq!(
+        (ws(&one), one.note.as_deref()),
+        (vec![2800], None),
+        "{what}"
+    );
+    assert_eq!(value(&one, 0, "name"), Some("row 2800"));
+    assert_eq!(
+        one.sql.as_deref(),
+        Some(
+            "SELECT * FROM edges WHERE (src = 3000 AND dst = 7800) OR (src = 7800 AND dst = 3000)"
+        )
+    );
+    let names: Vec<_> = one.columns.iter().map(|c| (&*c.name, c.numeric)).collect();
+    assert_eq!(
+        names,
+        [("src", true), ("dst", true), ("w", true), ("name", false)]
+    );
+
+    // Parallel edges with no row number: all nine, in the table's order.
+    let nine = edge_row(ctx, &whole, "23", "53").await;
+    assert_eq!(nine.indexed, indexed, "{what}");
+    assert_eq!(
+        ws(&nine),
+        (0..9).map(|k| 123 + 300 * k).collect::<Vec<_>>(),
+        "{what}"
+    );
+    assert!(
+        nine.note
+            .as_deref()
+            .unwrap()
+            .starts_with("9 rows of edges join these two nodes"),
+        "{what}: {:?}",
+        nine.note
+    );
+
+    // More than the inspector shows: the first twenty, and it says so.
+    let many = edge_row(ctx, &whole, "7000", "7001").await;
+    assert_eq!(many.indexed, indexed, "{what}");
+    if indexed {
+        assert_eq!(ws(&many), (2970..2990).collect::<Vec<_>>(), "{what}");
+    } else {
+        // Twenty of the twenty-five, whichever the partitions gave first.
+        assert_eq!(many.rows.len(), 20);
+        assert!(ws(&many).iter().all(|w| (2970..2995).contains(w)));
+    }
+    assert!(
+        many.note
+            .as_deref()
+            .unwrap()
+            .starts_with("more than 20 rows of edges"),
+        "{what}: {:?}",
+        many.note
+    );
+
+    // Rows both ways between two nodes, with no row number: all five,
+    // whichever way the edge is asked for.
+    for (a, b) in [("8000", "8001"), ("8001", "8000")] {
+        let what = Inspect::Edge {
+            edge: edge(&whole, "8000", "8001"),
+            src: a,
+            dst: b,
+        };
+        // The drawing has the edge one way; asked the other way, the keys
+        // are not the drawing's.
+        let r = &whole.result;
+        let drawn = r
+            .node_keys()
+            .get(r.src()[edge(&whole, a, b) as usize] as usize)
+            == a;
+        let found = inspect(ctx, &Sql, r, what).await;
+        if drawn {
+            let found = found.unwrap();
+            assert_eq!(found.indexed, indexed);
+            assert_eq!(ws(&found), (2995..3000).collect::<Vec<_>>());
+        } else {
+            assert!(found.is_err());
+        }
+    }
+
+    // An edge drawn against the way the table stores it (a query's rows,
+    // with no row number): its row all the same.
+    let turned = draw(
+        ctx,
+        "SELECT dst AS src, src AS dst FROM edges WHERE w IN (2800, 2996, 150) ON g",
+    )
+    .await;
+    assert!(turned.result.edge_rows().is_none());
+    let back = edge_row(ctx, &turned, "7800", "3000").await;
+    assert_eq!(back.indexed, indexed, "{what}");
+    assert_eq!(ws(&back), [2800], "{what}");
+    assert_eq!(
+        (value(&back, 0, "src"), value(&back, 0, "dst")),
+        (Some("3000"), Some("7800"))
+    );
+    assert_eq!(
+        ws(&edge_row(ctx, &turned, "8001", "8000").await),
+        (2995..3000).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ws(&edge_row(ctx, &turned, "80", "0").await),
+        (0..9).map(|k| 150 + 300 * k).collect::<Vec<_>>()
+    );
+
+    // A drawing whose edges have their row numbers (induced_edges gives
+    // them): each edge's own row, parallel edges too, the way it is stored.
+    let rows = draw(ctx, "SELECT * FROM degree(g, direction => 'both')").await;
+    let r = &rows.result;
+    assert_eq!(r.n_edges(), 3000);
+    for e in (0..r.n_edges()).step_by(41).chain(2960..3000) {
+        let keys = r.node_keys();
+        let (src, dst) = (keys.get(r.src()[e] as usize), keys.get(r.dst()[e] as usize));
+        let asked = Inspect::Edge {
+            edge: e as u32,
+            src,
+            dst,
+        };
+        let found = inspect(ctx, &Sql, r, asked).await.unwrap();
+        let row = r.edge_row(e).unwrap();
+        assert_eq!(found.row, Some(row));
+        assert_eq!(found.indexed, indexed, "{what}: row {row}");
+        if indexed || (2700..2970).contains(&row) {
+            // (Read as several partitions, a table's parallel edges cannot
+            // be told apart by row: the scan gives them all, with a note.)
+            assert_eq!(
+                (ws(&found), found.note.as_deref()),
+                (vec![row], None),
+                "{what}"
+            );
+            assert_eq!(
+                (value(&found, 0, "src"), value(&found, 0, "dst")),
+                (Some(src), Some(dst))
+            );
+            let sql = found.sql.as_deref().unwrap();
+            let single = (2700..2970).contains(&row);
+            assert_eq!(
+                sql,
+                if single {
+                    format!("SELECT * FROM edges WHERE src = {src} AND dst = {dst}")
+                } else {
+                    format!("SELECT * FROM edges LIMIT 1 OFFSET {row}")
+                }
+            );
+            // The query shown reads the same row.
+            let (_, batches) = Sql
+                .run(ctx, &format!("SELECT w FROM ({sql})"))
+                .await
+                .unwrap();
+            let shown: Vec<String> = batches
+                .iter()
+                .flat_map(|b| {
+                    let w = datafusion::arrow::compute::cast(
+                        b.column(0),
+                        &datafusion::arrow::datatypes::DataType::Utf8,
+                    )
+                    .unwrap();
+                    let w = datafusion::arrow::array::AsArray::as_string::<i32>(&w).clone();
+                    (0..w.len())
+                        .map(|i| w.value(i).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(shown, [row.to_string()], "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_edges_rows_are_found_through_the_index_and_are_the_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str| dir.path().join(name).display().to_string();
+    // The edges as Parquet (six row groups), CSV, and a table in memory.
+    let writer = ursa_engine::new_session();
+    Sql.run(
+        &writer,
+        "SET datafusion.execution.target_partitions = 1;
+         SET datafusion.execution.parquet.max_row_group_size = 500;",
+    )
+    .await
+    .unwrap();
+    for name in ["edges.parquet", "edges.csv"] {
+        Sql.run(&writer, &format!("COPY ({EDGES}) TO '{}'", file(name)))
+            .await
+            .unwrap();
+        assert!(dir.path().join(name).is_file(), "{name}");
+    }
+
+    // Read as one partition, an edge's rows come through the index: from a
+    // Parquet file by a row selection, from the others by passing over rows.
+    let parquet = format!(
+        "CREATE VIEW edges AS SELECT * FROM '{}'",
+        file("edges.parquet")
+    );
+    let csv = format!("CREATE VIEW edges AS SELECT * FROM '{}'", file("edges.csv"));
+    let memory = format!("CREATE TABLE edges AS {EDGES}");
+    let narrowed = format!(
+        "CREATE VIEW edges AS SELECT src, dst, w, name FROM '{}'",
+        file("edges.parquet")
+    );
+    for (what, create) in [
+        ("parquet", &parquet),
+        ("csv", &csv),
+        ("memory", &memory),
+        ("a view's columns", &narrowed),
+    ] {
+        let ctx = graph_of_edges(create).await;
+        check_edge_rows(&ctx, true, what).await;
+    }
+
+    // A view that keeps some rows only: its rows are not the file's, and
+    // the rows read are still the view's.
+    let ctx = graph_of_edges(&format!(
+        "CREATE VIEW edges AS SELECT * FROM '{}' WHERE w >= 2700 OR w % 300 = 123",
+        file("edges.parquet")
+    ))
+    .await;
+    let whole = draw(&ctx, "g").await;
+    let nine = edge_row(&ctx, &whole, "23", "53").await;
+    assert!(nine.indexed);
+    assert_eq!(ws(&nine), (0..9).map(|k| 123 + 300 * k).collect::<Vec<_>>());
+    assert_eq!(ws(&edge_row(&ctx, &whole, "3000", "7800").await), [2800]);
+
+    // Read as several partitions, a row number finds nothing: the scan, and
+    // the same rows.
+    std::fs::create_dir(dir.path().join("parts")).unwrap();
+    for (name, rows) in [("a", "w < 1400"), ("b", "w >= 1400")] {
+        Sql.run(
+            &writer,
+            &format!(
+                "COPY (SELECT * FROM ({EDGES}) WHERE {rows} ORDER BY w) TO '{}'",
+                file(&format!("parts/{name}.parquet"))
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let ctx = graph_of_edges(&format!(
+        "CREATE VIEW edges AS SELECT * FROM '{}'",
+        file("parts/*.parquet")
+    ))
+    .await;
+    Sql.run(&ctx, "SET datafusion.execution.target_partitions = 4")
+        .await
+        .unwrap();
+    check_edge_rows(&ctx, false, "two files, as two partitions").await;
+
+    // A graph with two edge tables has no one index: the scan.
+    let ctx = graph_of_edges(&memory).await;
+    Sql.run(
+        &ctx,
+        "CREATE TABLE more AS SELECT 1 AS src, 2 AS dst;
+         CREATE PROPERTY GRAPH two EDGE TABLES (
+           edges SOURCE KEY (src) DESTINATION KEY (dst),
+           more SOURCE KEY (src) DESTINATION KEY (dst));",
+    )
+    .await
+    .unwrap();
+    let two = draw(&ctx, "SELECT src, dst FROM edges WHERE w = 2800 ON two").await;
+    let found = edge_row(&ctx, &two, "3000", "7800").await;
+    assert!(!found.indexed);
+    assert_eq!(ws(&found), [2800]);
+}
+
+/// Each of an inspected edge's rows as its `(src, dst)`.
+fn ends_of(found: &Inspected) -> Vec<(String, String)> {
+    (0..found.rows.len())
+        .map(|row| {
+            let at = |name| value(found, row, name).unwrap().to_string();
+            (at("src"), at("dst"))
+        })
+        .collect()
+}
+
+/// An edge table of its two key columns alone (rmat's) is not read: its
+/// rows are the ends the index gives, the rows the query by the ends gives,
+/// in the table's order; and the drawing's row number picks one of parallel
+/// edges among them.
+#[tokio::test]
+async fn an_edge_table_of_its_keys_alone_gives_the_rows_from_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("edges.parquet").display().to_string();
+    let writer = ursa_engine::new_session();
+    Sql.run(&writer, &format!("COPY ({EDGES}) TO '{file}'"))
+        .await
+        .unwrap();
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    for (what, create) in [
+        (
+            "parquet",
+            format!("CREATE VIEW edges AS SELECT src, dst FROM '{file}'"),
+        ),
+        (
+            "the keys the other way round",
+            format!("CREATE VIEW edges AS SELECT dst, src FROM '{file}'"),
+        ),
+        (
+            "memory",
+            format!("CREATE TABLE edges AS SELECT src, dst FROM ({EDGES})"),
+        ),
+    ] {
+        let ctx = graph_of_edges(&create).await;
+        let whole = draw(&ctx, "g").await;
+
+        let one = edge_row(&ctx, &whole, "3000", "7800").await;
+        assert!(one.indexed, "{what}");
+        assert_eq!(
+            (ends_of(&one), one.note.as_deref()),
+            (vec![pair("3000", "7800")], None),
+            "{what}"
+        );
+        let names: Vec<_> = one.columns.iter().map(|c| (&*c.name, c.numeric)).collect();
+        let keys = if what.contains("other way") {
+            [("dst", true), ("src", true)]
+        } else {
+            [("src", true), ("dst", true)]
+        };
+        assert_eq!(names, keys, "{what}");
+
+        let nine = edge_row(&ctx, &whole, "23", "53").await;
+        assert!(nine.indexed);
+        assert_eq!(ends_of(&nine), vec![pair("23", "53"); 9], "{what}");
+        assert!(
+            nine.note
+                .as_deref()
+                .unwrap()
+                .starts_with("9 rows of edges join"),
+            "{what}"
+        );
+
+        let many = edge_row(&ctx, &whole, "7000", "7001").await;
+        assert_eq!(ends_of(&many), vec![pair("7000", "7001"); 20], "{what}");
+        assert!(
+            many.note
+                .as_deref()
+                .unwrap()
+                .starts_with("more than 20 rows"),
+            "{what}"
+        );
+
+        // Both ways between two nodes: every row, in the table's order.
+        let both = edge_row(&ctx, &whole, "8000", "8001").await;
+        let (a, b) = (pair("8001", "8000"), pair("8000", "8001"));
+        assert_eq!(
+            ends_of(&both),
+            [a.clone(), b.clone(), a.clone(), b, a],
+            "{what}"
+        );
+
+        // With row numbers: a parallel edge's own row, and the query for it.
+        let rows = draw(&ctx, "SELECT * FROM degree(g, direction => 'both')").await;
+        let r = &rows.result;
+        for e in (0..r.n_edges()).step_by(97).chain(2990..3000) {
+            let keys = r.node_keys();
+            let (src, dst) = (keys.get(r.src()[e] as usize), keys.get(r.dst()[e] as usize));
+            let asked = Inspect::Edge {
+                edge: e as u32,
+                src,
+                dst,
+            };
+            let found = inspect(&ctx, &Sql, r, asked).await.unwrap();
+            let row = r.edge_row(e).unwrap();
+            assert!(found.indexed, "{what}: row {row}");
+            assert_eq!(
+                (ends_of(&found), found.note.as_deref()),
+                (vec![pair(src, dst)], None),
+                "{what}: row {row}"
+            );
+            let single = (2700..2970).contains(&row);
+            let sql = found.sql.as_deref().unwrap();
+            if single {
+                assert_eq!(
+                    sql,
+                    format!("SELECT * FROM edges WHERE src = {src} AND dst = {dst}")
+                );
+            } else {
+                assert_eq!(sql, format!("SELECT * FROM edges LIMIT 1 OFFSET {row}"));
+                // The query shown reads that row: the edge's ends.
+                let (_, batches) = Sql
+                    .run(&ctx, &format!("SELECT src || '-' || dst FROM ({sql})"))
+                    .await
+                    .unwrap();
+                let col = datafusion::arrow::compute::cast(
+                    batches[0].column(0),
+                    &datafusion::arrow::datatypes::DataType::Utf8,
+                )
+                .unwrap();
+                let col = datafusion::arrow::array::AsArray::as_string::<i32>(&col);
+                assert_eq!(col.value(0), format!("{src}-{dst}"), "{what}: {sql}");
+            }
+        }
+    }
 }

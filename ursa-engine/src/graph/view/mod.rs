@@ -74,6 +74,7 @@ pub mod find;
 pub mod groups;
 pub mod inspect;
 mod positions;
+pub mod rows;
 pub mod rules;
 pub mod session;
 mod style;
