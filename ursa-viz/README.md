@@ -1137,8 +1137,16 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   the centre of mass, and the cut opens them by how far apart their
   children's centres are, not by how far their nodes reach. On a clustered
   graph a group is a clump.
-- **Aggregation by a column** (`GROUP BY louvain`, the design's other half
-  of this) is not here: the cut is the layout's hierarchy only.
+- **Aggregation by a column** (`GROUP BY louvain`, #499) is drawn through
+  the same renderer, as one scene with a disc for each node of a grouped
+  result: `GraphView.setCut`'s `kinds` says which discs are open groups (a
+  rim of a radius in the layout's units, drawn under the edges:
+  `LevelScene::open_discs`), which are members (points, drawn over the
+  discs) and which are hidden. `setFitPadding(pixels, first)` leaves room
+  for the discs when the camera fits, and fits the groups alone;
+  `groupRadius(group)` is a disc's radius on the canvas now. The scene is
+  the page's (`web/public/graph-groups.js`): the groups come from the
+  engine, not from the layout's hierarchy.
 - **A step applied while a coarse level is drawn** (an `.expand` typed in
   the first seconds of a large graph) leaves the level for the graph, whose
   nodes the view has no positions for until the grown layout's first; an

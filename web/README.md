@@ -117,8 +117,8 @@ static assets and an R2 bucket.
   - **Saying what a result is** (#434): `.graph [SOURCE] [ON graph] [AS
     edges(src, dst [, weight]) | nodes(id) | path(nodes [, edges]) |
     hops(seed, id, distance)] [NODES (query)] [SIZE BY x] [COLOR BY y]
-    [LAYOUT force|rings|layers] [POSITIONS (query)]`, the clauses in any
-    order after the source.
+    [GROUP BY z] [LAYOUT force|rings|layers] [POSITIONS (query)]`, the
+    clauses in any order after the source.
     - **`AS …` is rule 0**: it says what the rows are and names the columns,
       and nothing is inferred, so a result whose columns have any names is
       drawn: `.graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)`.
@@ -148,6 +148,63 @@ static assets and an R2 bucket.
       karate LAYOUT spiral` is told what `LAYOUT` takes, not handed to SQL.
     - `.help graph` lists the clauses (the shell adds them to the page where
       the host has a `.graph` command).
+  - **`GROUP BY`** (#499): `.graph karate GROUP BY club` draws a disc for
+    each club in place of its members, and the ties between the clubs,
+    counted; `.graph rmat GROUP BY louvain` draws a million edges as their
+    communities.
+    - **What groups the nodes** is found as `COLOR BY` finds its values: a
+      column of `NODES (query)`, a column of the result's own rows, a
+      vertex column, `degree`, or an algorithm (`louvain`,
+      `connected_components`, `label_propagation`), run as `COLOR BY` runs
+      it (`direction => 'both'`, `seed => 1`). Nodes with no value are one
+      group, `NULL`, as SQL's `GROUP BY` has it.
+    - **The result** (`ursa-engine`'s `graph::view::groups`) has a node for
+      each group, of the label `group`, keyed `0`, `1`, … from the largest;
+      a column named as the clause names it (`club`) with the group's
+      value, `members` and `edges inside`; an edge for each two groups
+      with edges between them, with their `count`; and encodings that size
+      by `members` and group by the column. The members and the edges
+      inside a group are not in it. More than 2,000 groups: the largest
+      2,000 are drawn, and the rest as one, `other (N groups)`.
+    - **Drawing** (`graph-groups.js`): the whole result is one scene of
+      the view's level renderer (`setCut`, as the aggregated view's cuts,
+      with a disc for each node): a disc's area is its group's share of the
+      nodes, its colour the group's (the eight largest; the rest grey), an
+      edge's width and darkness its count. Each disc says its group and
+      its members (`Mr. Hi · 17`), and the twelve heaviest edges their
+      counts, where they are long enough. The layout worker lays out the
+      groups by the edges between them, and `pack` then moves the discs
+      apart until none covers another, each two at least 8 pixels (and 35%
+      of their radii) apart: the layout says which group is beside which,
+      the packing how far. The status line says `grouped by club: 2 groups
+      of 34 nodes`, and so does the legend, with the largest groups'
+      colours.
+    - **Opening a group**: a double-click on its disc (a double tap, or
+      Enter with it selected) runs `.expand group:N`, as a double-click on
+      a node runs `.expand ID`. The engine adds the group's members and the
+      graph's edges among the members of every open group (`induced_edges`),
+      each member with its place in the unit disc (`group x`, `group y`:
+      the group's own coarse-to-fine layout, spread to fill the disc). The
+      group's disc becomes a rim of the radius it had, fixed in the
+      layout's units from then on, so zooming in spreads its members; they
+      are points inside it, and their edges are drawn over its tint. The
+      camera does not move: it fits the groups. A double-click on an open
+      group, or `.collapse group:N`, closes it (its members are hidden,
+      and opening it again runs no query); `.undo` of the step that opened
+      it takes them away. A click selects a group or a member, and the
+      inspector says the group's values, with **expand** or **collapse**.
+    - `GROUP BY` is SQL's own at the end of a bare query. It is the clause
+      after a source that is one name, with no source, after another
+      clause, or after a query in parentheses: `.graph (SELECT * FROM
+      louvain(g)) GROUP BY louvain`. With `SIZE BY`, `COLOR BY`, `LAYOUT`
+      or `POSITIONS` it is refused: a disc is sized by its members and
+      coloured by its group, and the groups are laid out by their edges.
+    - `graph-groups.js` has no DOM, no wasm and no worker in it: `bun test
+      tests/graph-groups.test.ts` checks what a result's groups are, the
+      scene, each member's place and the packing.
+    - In a grouped drawing `.expand` opens groups only, a group of more
+      than 100,000 members is not opened, and a group opens only where the
+      drawing names a property graph to read the edges from.
   - **Saved positions and the edge cap** (#502):
     - **`POSITIONS (SELECT id, x, y …)`** draws the nodes where the query
       puts them, and no layout runs: `CREATE TABLE pos AS SELECT * FROM
@@ -710,7 +767,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; the aggregated view on rmat, #498: at most 20,000 discs and 100,000 merged edges at the fitted zoom, the status saying `aggregated: G groups of N nodes`, the groups holding every node and labelled with their counts, a cut within 60 ms in the worker, a click on a group selecting its nodes, `a` and `.graph detail on|off`, and zooming in reaching the graph's own nodes; the frame budget on rmat, in full detail, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; `GROUP BY`, #499: karate by club as two discs and one edge, their labels the counts SQL's `GROUP BY` gives, the frame read back (each disc its share of the canvas), a double-click running `.expand group:0` with every member inside its disc and the disc the size it was, `.undo` restoring the closed frame to the pixel count, both groups open with every tie drawn, `.collapse`, a click and Enter on a group, the refusal of `SIZE BY`, `GROUP BY louvain` and a query in parentheses, and on rmat the communities drawn within 2 s of the engine's answer, a disc for each, and the largest opened with its members in its disc; the aggregated view on rmat, #498: at most 20,000 discs and 100,000 merged edges at the fitted zoom, the status saying `aggregated: G groups of N nodes`, the groups holding every node and labelled with their counts, a cut within 60 ms in the worker, a click on a group selecting its nodes, `a` and `.graph detail on|off`, and zooming in reaching the graph's own nodes; the frame budget on rmat, in full detail, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

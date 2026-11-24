@@ -323,7 +323,7 @@ fn a_clause_that_does_not_fit_says_why() {
             "unexpected 'WITH' after the graph's source",
         ),
         (
-            "karate SIZE BY pagerank GROUP BY club",
+            "karate SIZE BY pagerank ORDER BY club",
             "[POSITIONS (SELECT id, x, y FROM …)]",
         ),
     ] {
@@ -500,7 +500,7 @@ fn a_misused_as_on_or_layout_says_what_to_write() {
         // In a query, a form typed nearly right is the clause it was meant as.
         ("SELECT s, i FROM t AS hop(s, i, d)", "AS hop is not a form; write AS hops(seed, id, distance)"),
         ("FROM t AS edge(a, b)", "AS edge is not a form; write AS edges(src, dst [, weight])"),
-        ("AS nodes(a) GROUP BY z", "unexpected 'GROUP' after the graph's source; the clauses are ON graph, AS …, NODES (…), SIZE BY x, COLOR BY y, LAYOUT l and POSITIONS (…)"),
+        ("AS nodes(a) ORDER BY z", "unexpected 'ORDER' after the graph's source; the clauses are ON graph, AS …, NODES (…), SIZE BY x, COLOR BY y, GROUP BY z, LAYOUT l and POSITIONS (…)"),
     ] {
         let err = parse(text).unwrap_err().to_string();
         assert!(err.contains(says), "{text}: {err}");

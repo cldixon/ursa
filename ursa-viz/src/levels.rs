@@ -450,10 +450,8 @@ impl LevelScene {
                         point = Some((d, i as u32));
                     }
                 }
-                Kind::Open(r) => {
-                    if far(i) <= r * r && open.is_none_or(|(best, _)| r < best) {
-                        open = Some((r, i as u32));
-                    }
+                Kind::Open(r) if far(i) <= r * r && open.is_none_or(|(best, _)| r < best) => {
+                    open = Some((r, i as u32));
                 }
                 _ => {}
             }
