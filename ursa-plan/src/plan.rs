@@ -1354,8 +1354,12 @@ pub fn verb_directions(verb: &str) -> Option<(&'static [&'static str], bool)> {
     // The verbs whose Python wrapper checks `direction=` at the call site; the
     // others (`degree`, `neighbors`) check it in the engine. The accepted
     // directions are the catalog's.
+    // SQL's `pagerank` and `betweenness` also take 'in' (#415); the Python
+    // API is on hold, so its verbs keep 'out' and 'both'.
+    const OUT_OR_BOTH: &[&str] = &["out", "both"];
     let stat = match verb {
-        "pagerank" | "betweenness" | "closeness" => false,
+        "pagerank" | "betweenness" => return Some((OUT_OR_BOTH, false)),
+        "closeness" => false,
         "describe" | "density" | "avg_path_length" | "diameter" => true,
         _ => return None,
     };

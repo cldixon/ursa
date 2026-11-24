@@ -230,9 +230,14 @@ async fn algorithms_errors() {
              parameters are: damping, max_iter, tol, weight, direction",
         ),
         (
-            "SELECT * FROM algorithms(karate, pagerank(direction => 'in'))",
-            "algorithms(): pagerank(direction => 'in') is not supported; use one of 'out', \
-             'both'",
+            "SELECT * FROM algorithms(karate, pagerank(direction => 'up'))",
+            "algorithms(): pagerank(direction => 'up') is not supported; use one of 'out', \
+             'in', 'both'",
+        ),
+        (
+            "SELECT * FROM algorithms(karate, connected_components(direction => 'both'))",
+            "algorithms(): connected_components() has no parameter 'direction'; use mode => \
+             'weak' or 'strong' ('weak' ignores edge direction, 'strong' needs a path each way)",
         ),
         (
             "SELECT * FROM algorithms(karate, degree)",
@@ -600,7 +605,7 @@ algorithms,combinator
         "\
 name,summary,networkx,directions
 pagerank,PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.,\
-\"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",out both
+\"nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))\",out in both
 "
     );
     // The list columns are lists and structs: unnest them in SQL.
@@ -626,8 +631,8 @@ direction,string,'out'
             "SELECT name FROM ursa_functions() WHERE array_has(directions, 'in') ORDER BY name"
         )
         .await,
-        "name\navg_path_length\ncloseness\ndegree\ndensity\ndescribe\ndiameter\nhop\n\
-         neighbors_agg\nshortest_path\n"
+        "name\navg_path_length\nbetweenness\ncloseness\ndegree\ndensity\ndescribe\ndiameter\n\
+         hop\nneighbors_agg\npagerank\nshortest_path\n"
     );
     // A traversal's node ids are required; its outputs have the graph's id
     // type.
@@ -642,16 +647,16 @@ direction,string,'out'
         "\
 name,param,type,default
 hop,seeds,node ids,required
-hop,n,integer,1
+hop,steps,integer,1
 hop,direction,string,'out'
 shortest_path,source,node id,required
 shortest_path,target,node id,required
 shortest_path,weight,expression,NULL
 shortest_path,direction,string,'out'
-random_walk,start,node ids,required
+random_walk,seeds,node ids,required
 random_walk,steps,integer,required
 random_walk,walks_per_node,integer,1
-random_walk,seed,integer or NULL,NULL
+random_walk,random_seed,integer or NULL,NULL
 induced_edges,nodes,node ids,required
 "
     );
@@ -670,11 +675,11 @@ hop,id,Int64 or Utf8
 hop,distance,Int64
 shortest_path,src,Int64 or Utf8
 shortest_path,dst,Int64 or Utf8
-shortest_path,hop,Int64
+shortest_path,step,Int64
 shortest_path,cost,Float64
 random_walk,walk_id,Int64
 random_walk,step,Int64
-random_walk,node,Int64 or Utf8
+random_walk,id,Int64 or Utf8
 induced_edges,src,Int64 or Utf8
 induced_edges,dst,Int64 or Utf8
 induced_edges,edge,Int64
@@ -738,11 +743,12 @@ async fn every_function_runs_on_an_empty_graph() {
     let weighted = "SELECT count(*) AS n FROM algorithms(empty, pagerank(weight => weight), \
                     louvain(weight => weight), closeness(weight => weight))";
     assert_eq!(csv(&ctx, weighted).await, "n\n0\n");
+    // Ids from a query: on an empty graph, none is a node (#416).
     for sql in [
-        "SELECT count(*) AS n FROM hop(empty, seeds => ['Valjean'], n => 2)",
-        "SELECT count(*) AS n FROM shortest_path(empty, source => 'Valjean', target => \
-         'Marius', weight => weight)",
-        "SELECT count(*) AS n FROM random_walk(empty, start => ['Valjean'], steps => 3)",
+        "SELECT count(*) AS n FROM hop(empty, seeds => (SELECT 'Valjean'), steps => 2)",
+        "SELECT count(*) AS n FROM shortest_path(empty, source => (SELECT 'Valjean'), target \
+         => (SELECT 'Marius'), weight => weight)",
+        "SELECT count(*) AS n FROM random_walk(empty, seeds => (SELECT 'Valjean'), steps => 3)",
     ] {
         assert_eq!(csv(&ctx, sql).await, "n\n0\n", "{sql}");
     }

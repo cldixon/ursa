@@ -317,6 +317,7 @@ fn plan_traversal(
                 vertices,
             },
             traversal: node.traversal,
+            from_query: node.from_query.clone(),
             display: node.display_call(),
             schema: Arc::new(node.schema().as_arrow().clone()),
         },
@@ -961,6 +962,9 @@ async fn verified_index(
 struct TraversalShape {
     edges: Edges,
     traversal: Traversal,
+    /// Whether each node-id input is a subquery (see
+    /// [`GraphTraversalNode::from_query`]).
+    from_query: Vec<bool>,
     /// The call as `EXPLAIN` shows it.
     display: String,
     schema: SchemaRef,
@@ -1097,9 +1101,13 @@ impl ExecutionPlan for GraphTraversalExec {
             };
             let spec = shape.traversal.spec();
             let mut nodes = Vec::with_capacity(node_plans.len());
-            for (param, plan) in spec.node_params().zip(&node_plans) {
+            for (i, (param, plan)) in spec.node_params().zip(&node_plans).enumerate() {
                 let batches = drain(plan, &[0], &context).await?;
-                nodes.push(node_ids(&shape, param, &index, batches)?);
+                let from_query = shape.from_query.get(i).copied().unwrap_or(true);
+                let notifier = Notifier::of(context.session_config());
+                nodes.push(node_ids(
+                    &shape, param, &index, batches, from_query, &notifier,
+                )?);
             }
             crate::run_blocking(move || {
                 let weights = weights.as_ref().map(|w| w[0].as_slice());
@@ -1125,11 +1133,18 @@ impl ExecutionPlan for GraphTraversalExec {
 
 /// The ids a node-id input produced, as dense indexes of `index` (`None` for a
 /// null or an id not in the graph), cast to the graph's id type first.
+///
+/// An id that is not a node of the graph (#416): from a literal, an error
+/// naming up to three of them and their count; from a subquery (`from_query`),
+/// skipped, and a notice says how many were. `induced_edges` skips them
+/// always ([`traversal::TraversalSpec::strict_ids`]). A NULL matches no node.
 fn node_ids(
     shape: &TraversalShape,
     param: &TraversalParam,
     index: &GraphIndex,
     batches: Vec<Vec<ArrayRef>>,
+    from_query: bool,
+    notifier: &Notifier,
 ) -> Result<Vec<Option<u32>>> {
     let (function, name, graph) = (shape.traversal.name(), param.name, &shape.edges.graph);
     let id_type = index.ids.user_type();
@@ -1170,10 +1185,55 @@ fn node_ids(
             ids.len()
         )));
     }
-    index
+    let dense = index
         .ids
         .dense_from_array(ids.as_ref())
-        .map_err(|e| DataFusionError::Execution(format!("{function}({name} =>): {e}")))
+        .map_err(|e| DataFusionError::Execution(format!("{function}({name} =>): {e}")))?;
+    let mut missing: Vec<String> = Vec::new();
+    for (row, d) in dense.iter().enumerate() {
+        if d.is_none() && ids.is_valid(row) {
+            let text = sql_text(&ids, row).unwrap_or_else(|| "?".into());
+            if !missing.contains(&text) {
+                missing.push(text);
+            }
+        }
+    }
+    if missing.is_empty() || !shape.traversal.spec().strict_ids {
+        return Ok(dense);
+    }
+    if from_query {
+        notifier.say(NoticeLevel::On, || {
+            let ids = match missing.len() {
+                1 => "1 id from the query that is not a node".to_string(),
+                n => format!("{n} ids from the query that are not nodes"),
+            };
+            format!("{function}({name} =>): skipped {ids} of graph '{graph}'")
+        });
+        return Ok(dense);
+    }
+    Err(DataFusionError::Execution(not_nodes(
+        function, name, graph, &missing,
+    )))
+}
+
+/// "hop(seeds =>): 99 is not a node of graph 'pg'", or for several, the first
+/// three and the count: "hop(seeds =>): 5 ids are not nodes of graph 'pg':
+/// 97, 98, 99 and 2 more".
+fn not_nodes(function: &str, name: &str, graph: &str, missing: &[String]) -> String {
+    match missing {
+        [one] => format!("{function}({name} =>): {one} is not a node of graph '{graph}'"),
+        _ => {
+            let shown = missing[..missing.len().min(3)].join(", ");
+            let more = match missing.len() {
+                n if n > 3 => format!(" and {} more", n - 3),
+                _ => String::new(),
+            };
+            format!(
+                "{function}({name} =>): {} ids are not nodes of graph '{graph}': {shown}{more}",
+                missing.len()
+            )
+        }
+    }
 }
 
 /// The first value of `values` that does not cast to `id_type`, as SQL writes

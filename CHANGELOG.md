@@ -943,6 +943,42 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: graph function parameters and columns renamed, one name per role**
+  (breaking, #415). The old names are not accepted. Each one gets a "did
+  you mean" with its new name, and so do `k`, `max_hops` and `depth`:
+  - `hop(n =>)` is `hop(steps =>)`, as in `random_walk`.
+  - `random_walk(start =>)` is `random_walk(seeds =>)`, as in `hop`.
+  - `random_walk(seed =>)` is `random_walk(random_seed =>)`.
+  - The `node` column of `random_walk` is `id`, so `USING (id)` joins it.
+  - The `hop` column of `shortest_path` is `step`, as in `random_walk`.
+
+  `shortest_path` keeps `source` and `target`. A "did you mean" now names
+  only a parameter that can take the value given:
+  `random_walk(seed => [0])` points to `seeds`, and `seed => 7` to
+  `random_seed`. The Python library's names are unchanged.
+- **SQL: a literal node id that is not in the graph is an error** (breaking,
+  #416). `hop(g, seeds => [99])`, `shortest_path(g, source => 0, target =>
+  99)` and `random_walk(g, seeds => [99], …)` returned no rows, which looked
+  the same as no path. They now fail and name the id: `hop(seeds =>): 99 is
+  not a node of graph 'pg'`. For a list, the error names up to three
+  missing ids and gives the count: `5 ids are not nodes of graph 'karate':
+  95, 96, 97 and 2 more`. Ids from a subquery (`seeds => (SELECT …)`) are
+  still skipped when they name no node. A notice on stderr says how many
+  were skipped. To probe for a node, use a subquery or `g.nodes`.
+  `induced_edges` still skips ids that are not nodes. `shortest_path` with
+  `source` equal to `target` still returns no rows, since a path of no
+  edges has no edge rows. Its reference entry now says so.
+- **SQL: graph functions accept more argument forms** (#415). `direction`
+  values are read in any case (`'BOTH'`, `'Out'`). `'undirected'` is
+  refused with a hint to use `'both'`. `pagerank` and `betweenness` take
+  `direction => 'in'`, which runs the same kernel on the reversed graph
+  (SQL only: the Python verbs still take `'out'` and `'both'`).
+  `connected_components(g, direction => …)` says to use `mode => 'weak'`
+  or `'strong'`. Named arguments may be written `name = value` or
+  `name := value` as well as `name => value`, as in `read_csv`, also inside
+  `algorithms(…)`. The reference entry for `diameter` now says that its
+  default (`approximate => true`) is a lower bound, and that
+  `approximate => false` gives the exact value.
 - **An empty `.parquet` file is an error naming it** (behaviour change: an
   empty Parquet file used to read as zero rows). DataFusion's listing
   skipped a 0-byte file before the footer check (#332) saw it, so

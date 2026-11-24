@@ -25,7 +25,17 @@
 //! - **Messages**, worded for SQL: `pagerank(damping =>) must be a number; got
 //!   'high'`, and for a number outside the parameter's range (#416, declared
 //!   once, in the catalog): `pagerank(damping =>) must be between 0 and 1; got
-//!   -1`.
+//!   -1`. An unknown parameter is answered with the one to use (#415): the
+//!   closest name, or the name Ursa gives a role others name differently
+//!   ([`OTHER_NAMES`]: `hop(n =>)` is `steps`), and never one whose type cannot
+//!   take the value given ([`Given`]).
+//! - **Direction values** are read in any case (`'BOTH'`); `'undirected'` is
+//!   refused with a pointer to `'both'` ([`direction_arg`]).
+//!
+//! Every role has one name across the graph functions (#415): the nodes to
+//! start from are `seeds`, a number of steps `steps`, and so on.
+//! [`OTHER_NAMES`] lists, for each name, what other systems call it; the
+//! registry test holds every parameter to it.
 
 use std::fmt;
 
@@ -153,6 +163,148 @@ pub fn sql_type(name: &str, ty: ParamType) -> &'static str {
     }
 }
 
+/// What an argument is, as written: what "did you mean" checks a suggested
+/// parameter can take (#415), so `random_walk(sed => [0])` points to `seeds`,
+/// not `random_seed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Given {
+    Integer,
+    /// A number that is not an integer.
+    Number,
+    String,
+    Boolean,
+    Null,
+    /// A list literal, `[0, 1]`.
+    List,
+    /// A subquery, `(SELECT ...)`.
+    Query,
+    /// Any other expression.
+    Expression,
+}
+
+impl Given {
+    /// The shape of a literal.
+    pub fn of_literal(literal: &Literal) -> Given {
+        match literal {
+            Literal::Number(n) if n.parse::<i128>().is_ok() => Given::Integer,
+            Literal::Number(_) => Given::Number,
+            Literal::String(_) => Given::String,
+            Literal::Boolean(_) => Given::Boolean,
+            Literal::Null => Given::Null,
+        }
+    }
+}
+
+/// Whether a parameter of type `ty`, called `name`, can take an argument
+/// shaped `given`.
+pub fn takes(name: &str, ty: ParamType, given: Given) -> bool {
+    use Given::*;
+    match ty {
+        ParamType::Float => matches!(given, Integer | Number),
+        ParamType::OptionalFloat => matches!(given, Integer | Number | Null),
+        ParamType::Count => given == Integer,
+        ParamType::OptionalCount | ParamType::Seed => matches!(given, Integer | Null),
+        ParamType::Bool => given == Boolean,
+        ParamType::Choice(_) | ParamType::Direction(_) | ParamType::Dtype => given == String,
+        ParamType::Attribute if name == VALUES.name => given == Query,
+        ParamType::Weight => matches!(given, Integer | Number | Null | Expression),
+        ParamType::Attribute => !matches!(given, List | Query),
+    }
+}
+
+/// The names other systems give a graph function's parameter, by the name
+/// Ursa gives it (#415): one name per role. "did you mean" answers each with
+/// Ursa's name, when the function has that parameter and it can take the value
+/// given; none is accepted. The registry test refuses a parameter named after
+/// another role's alternative.
+pub const OTHER_NAMES: &[(&str, &[&str])] = &[
+    (
+        "seeds",
+        &[
+            "start",
+            "starts",
+            "start_nodes",
+            "sources",
+            "seed_nodes",
+            "roots",
+        ],
+    ),
+    (
+        "steps",
+        &[
+            "n",
+            "k",
+            "hops",
+            "max_hops",
+            "depth",
+            "max_depth",
+            "length",
+            "walk_length",
+        ],
+    ),
+    ("random_seed", &["seed", "rng_seed", "random_state"]),
+    ("source", &["src", "start_node", "from"]),
+    ("target", &["dst", "end_node", "to"]),
+    ("walks_per_node", &["walks", "num_walks", "n_walks"]),
+    ("damping", &["alpha", "damping_factor"]),
+    ("direction", &["dir", "orientation"]),
+    ("weight", &["weights", "weight_column"]),
+];
+
+/// The name to suggest for the unknown parameter `name` of a function whose
+/// parameters are `params` (name, and whether it can take `given`): Ursa's
+/// name for the role (see [`OTHER_NAMES`]), else the closest name. Neither
+/// when no parameter that can take the value is close.
+pub fn suggest<'a>(
+    name: &str,
+    given: Option<Given>,
+    params: &[(&'a str, &dyn Fn(Given) -> bool)],
+) -> Option<&'a str> {
+    let fits = |takes: &dyn Fn(Given) -> bool| given.is_none_or(takes);
+    let fitting: Vec<&'a str> = params
+        .iter()
+        .filter(|(_, takes)| fits(*takes))
+        .map(|(n, _)| *n)
+        .collect();
+    OTHER_NAMES
+        .iter()
+        .filter(|(_, others)| others.contains(&name))
+        .find_map(|(ours, _)| fitting.iter().find(|n| *n == ours).copied())
+        .or_else(|| did_you_mean(name, fitting.iter().copied()))
+}
+
+/// The text after "has no parameter 'x'": the suggestion, then the list.
+pub fn unknown_param_text(
+    function: &str,
+    name: &str,
+    given: Option<Given>,
+    params: &[(&str, &dyn Fn(Given) -> bool)],
+) -> String {
+    let names: Vec<&str> = params.iter().map(|(n, _)| *n).collect();
+    let hint = suggest(name, given, params)
+        .map(|s| format!("; did you mean '{s}'?"))
+        .unwrap_or_else(|| ".".to_string());
+    format!(
+        "{function}() has no parameter '{name}'{hint} Its parameters are: {}",
+        names.join(", ")
+    )
+}
+
+/// A direction as written, read in any case (#415): `'BOTH'` is `'both'`.
+/// `'undirected'`, the word of NetworkX, igraph and DuckPGQ, is refused with
+/// a pointer to `'both'`, Ursa's one name for it.
+pub fn direction_arg(function: &str, param: &str, text: &str) -> Result<String> {
+    let lower = text.to_lowercase();
+    if lower == "undirected" {
+        return Err(plan(format!(
+            "{function}({param} => '{}') is not supported; use 'both', which reads every edge \
+             both ways (the undirected view)",
+            text.replace('\'', "''")
+        )));
+    }
+    Ok(lower)
+}
+
 /// A literal argument as written: a (possibly signed) number, a string, a
 /// boolean or `NULL`.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,7 +358,18 @@ pub fn resolve(spec: &'static FunctionSpec, args: &[(String, Literal)]) -> Resul
             )));
         }
     }
-    spec.resolve(args.iter().map(|(n, l)| (n.as_str(), l.to_arg())))
+    // A direction in any case (#415).
+    let mut read = Vec::with_capacity(args.len());
+    for (name, literal) in args {
+        let literal = match (spec.param(name).map(|p| p.ty), literal) {
+            (Some(ParamType::Direction(_)), Literal::String(text)) => {
+                Literal::String(direction_arg(spec.name, name, text)?)
+            }
+            (_, other) => other.clone(),
+        };
+        read.push((name.as_str(), literal));
+    }
+    spec.resolve(read.iter().map(|(n, l)| (*n, l.to_arg())))
         .map(|resolved| resolved.call)
         .map_err(|e| param_error(spec, &e, args))
 }
@@ -220,7 +383,13 @@ fn param_error(spec: &FunctionSpec, e: &ParamError, args: &[(String, Literal)]) 
             .map_or(Literal::Null, |(_, l)| l.clone())
     };
     match e.kind {
-        ParamErrorKind::Unknown => unknown_param(spec, p),
+        ParamErrorKind::Unknown => {
+            let given = args
+                .iter()
+                .find(|(n, _)| n == p)
+                .map(|(_, l)| Given::of_literal(l));
+            unknown_param(spec, p, given)
+        }
         ParamErrorKind::Duplicate => plan(format!("{f}() was given '{p}' more than once")),
         ParamErrorKind::Expected(want) => plan(format!(
             "{f}({p} =>) must be {}; got {}",
@@ -268,23 +437,41 @@ pub fn range_text(range: &Range) -> Option<String> {
     range.describe()
 }
 
-/// "pagerank() has no parameter 'dampng'; did you mean 'damping'? ...".
-pub fn unknown_param(spec: &FunctionSpec, name: &str) -> DataFusionError {
-    let names: Vec<&str> = sql_params(spec).map(|p| p.name).collect();
-    if names.is_empty() {
+/// "pagerank() has no parameter 'dampng'; did you mean 'damping'? ...":
+/// `given` is the argument's shape, if known, so the suggestion can take it.
+pub fn unknown_param(spec: &FunctionSpec, name: &str, given: Option<Given>) -> DataFusionError {
+    let params: Vec<&ParamSpec> = sql_params(spec).collect();
+    if params.is_empty() {
         return plan(format!(
             "{}() takes no parameters besides the graph; got '{name}'",
             spec.name
         ));
     }
-    let hint = did_you_mean(name, names.iter().copied())
-        .map(|s| format!("; did you mean '{s}'?"))
-        .unwrap_or_else(|| ".".to_string());
-    plan(format!(
-        "{}() has no parameter '{name}'{hint} Its parameters are: {}",
-        spec.name,
-        names.join(", ")
-    ))
+    // `connected_components` says which way edges count with `mode` (#415).
+    if name == "direction" {
+        if let Some(mode) = spec.param("mode") {
+            let choices: Vec<String> = mode.ty.choices().iter().map(|c| format!("'{c}'")).collect();
+            return plan(format!(
+                "{}() has no parameter 'direction'; use mode => {} ('weak' ignores edge \
+                 direction, 'strong' needs a path each way)",
+                spec.name,
+                choices.join(" or ")
+            ));
+        }
+    }
+    let takers: Vec<Box<dyn Fn(Given) -> bool>> = params
+        .iter()
+        .map(|p| {
+            let (n, ty) = (p.name, p.ty);
+            Box::new(move |g| takes(n, ty, g)) as Box<dyn Fn(Given) -> bool>
+        })
+        .collect();
+    let entries: Vec<(&str, &dyn Fn(Given) -> bool)> = params
+        .iter()
+        .zip(&takers)
+        .map(|(p, t)| (p.name, t.as_ref()))
+        .collect();
+    plan(unknown_param_text(spec.name, name, given, &entries))
 }
 
 /// A catalog value as SQL writes it: `NULL`, `'out'`, `30`, `0.85`, `1e-6`.
@@ -362,6 +549,7 @@ pub fn did_you_mean<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ursa_core::catalog::Value;
     use ursa_core::Direction;
 
     fn call(name: &str, args: &[(&str, Literal)]) -> Result<Call> {
@@ -581,8 +769,8 @@ mod tests {
             "diameter(approximate =>) must be a boolean; got 1"
         );
         assert_eq!(
-            message(call("pagerank", &[("direction", s("in"))])),
-            "pagerank(direction => 'in') is not supported; use one of 'out', 'both'"
+            message(call("pagerank", &[("direction", s("up"))])),
+            "pagerank(direction => 'up') is not supported; use one of 'out', 'in', 'both'"
         );
         assert_eq!(
             message(call("degree", &[("direction", s("sideways"))])),
@@ -601,6 +789,144 @@ mod tests {
             message(call("degree", &[("dtype", s("f32"))])),
             "degree() has no parameter 'dtype'. Its parameters are: direction"
         );
+    }
+
+    /// #415: a direction in any case; 'undirected' pointed to 'both'; 'in'
+    /// for pagerank and betweenness.
+    #[test]
+    fn directions_in_any_case() {
+        for (function, text, want) in [
+            ("pagerank", "BOTH", Direction::Both),
+            ("pagerank", "In", Direction::In),
+            ("betweenness", "in", Direction::In),
+            ("degree", "Out", Direction::Out),
+        ] {
+            let got = call(function, &[("direction", s(text))]).unwrap();
+            let direction = got
+                .values()
+                .into_iter()
+                .find(|(p, _)| p.name == "direction")
+                .map(|(_, v)| v);
+            assert_eq!(
+                direction,
+                Some(Value::Str(ursa_core::catalog::direction_name(want))),
+                "{function} {text}"
+            );
+        }
+        assert_eq!(
+            message(call("closeness", &[("direction", s("Undirected"))])),
+            "closeness(direction => 'Undirected') is not supported; use 'both', which reads \
+             every edge both ways (the undirected view)"
+        );
+        assert_eq!(
+            message(call("degree", &[("direction", s("Sideways"))])),
+            "degree(direction => 'Sideways') is not supported; use one of 'out', 'in', 'both'"
+        );
+    }
+
+    /// #415: "did you mean" names the parameter to use for a role others name
+    /// differently, and never one whose type cannot take the value.
+    #[test]
+    fn suggestions_fit_the_value() {
+        assert_eq!(
+            message(call("pagerank", &[("alpha", num("0.5"))])),
+            "pagerank() has no parameter 'alpha'; did you mean 'damping'? Its parameters are: \
+             damping, max_iter, tol, weight, direction"
+        );
+        // 'dampng' is close to 'damping', but a string is no damping factor.
+        assert_eq!(
+            message(call("pagerank", &[("dampng", s("high"))])),
+            "pagerank() has no parameter 'dampng'. Its parameters are: damping, max_iter, tol, \
+             weight, direction"
+        );
+        assert_eq!(
+            message(call("connected_components", &[("direction", s("both"))])),
+            "connected_components() has no parameter 'direction'; use mode => 'weak' or \
+             'strong' ('weak' ignores edge direction, 'strong' needs a path each way)"
+        );
+        let spec = lookup("louvain").unwrap();
+        assert_eq!(
+            crate::user_message(&unknown_param(spec, "sed", Some(Given::Integer))),
+            "louvain() has no parameter 'sed'; did you mean 'seed'? Its parameters are: weight, \
+             resolution, seed, parallel"
+        );
+        assert_eq!(
+            crate::user_message(&unknown_param(spec, "sed", Some(Given::List))),
+            "louvain() has no parameter 'sed'. Its parameters are: weight, resolution, seed, \
+             parallel"
+        );
+    }
+
+    /// #415, item 6: one name per role across the graph functions. A new
+    /// function that calls its start nodes `start`, its step count `n` or
+    /// `max_hops`, or uses a name for two kinds of value, fails here.
+    #[test]
+    fn one_name_per_role() {
+        use super::super::traversal::{TraversalParamType, TRAVERSALS};
+        // What a value of each parameter is, NULL aside.
+        let kind = |name: &str, ty: ParamType| sql_type(name, ty).trim_end_matches(" or NULL");
+        let mut params: Vec<(&str, &str, &str)> = Vec::new();
+        for spec in specs() {
+            for p in sql_params(spec) {
+                params.push((spec.name, p.name, kind(p.name, p.ty)));
+            }
+        }
+        for spec in TRAVERSALS {
+            for p in spec.params {
+                let k = match p.ty {
+                    TraversalParamType::Nodes => "node ids",
+                    TraversalParamType::Node => "node id",
+                    TraversalParamType::Param(ty) => kind(p.name, ty),
+                };
+                params.push((spec.name, p.name, k));
+            }
+        }
+        // `seed` (the algorithms' and layouts' random seed) and
+        // `random_walk`'s `random_seed`, renamed apart from `seeds` (#415), are
+        // one role under two names until the algorithms' name is decided.
+        const SPLIT: &[(&str, &str)] = &[("seed", "random_seed")];
+        // `describe(nodes => 'touched')` chooses which nodes to describe;
+        // `induced_edges(nodes => [...])` is the node set. Both are the nodes
+        // the call is about, given two ways.
+        const TWO_KINDS: &[&str] = &["nodes"];
+        // One kind of value per name.
+        for (f, name, k) in &params {
+            for (g, other, l) in &params {
+                assert!(
+                    name != other || k == l || TWO_KINDS.contains(name),
+                    "{f}({name}) takes {k} but {g}({other}) takes {l}"
+                );
+            }
+        }
+        for (ours, others) in OTHER_NAMES {
+            let kinds: Vec<&str> = params
+                .iter()
+                .filter(|(_, n, _)| n == ours)
+                .map(|(_, _, k)| *k)
+                .collect();
+            assert!(!kinds.is_empty(), "no function has a parameter '{ours}'");
+            // No parameter of the same kind goes by another name of the role.
+            for (f, name, k) in &params {
+                if SPLIT.contains(&(*name, *ours)) {
+                    continue;
+                }
+                assert!(
+                    !(others.contains(name) && kinds.contains(k)),
+                    "{f}({name}) is what the other functions call '{ours}'"
+                );
+            }
+        }
+        // Each role's alternatives point to one name.
+        for (i, (ours, others)) in OTHER_NAMES.iter().enumerate() {
+            for (theirs, alternatives) in &OTHER_NAMES[i + 1..] {
+                for name in *others {
+                    assert!(
+                        !alternatives.contains(name),
+                        "'{name}' points to both '{ours}' and '{theirs}'"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

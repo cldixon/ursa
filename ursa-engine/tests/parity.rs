@@ -223,8 +223,17 @@ async fn hidden_layout(
     (names, rows)
 }
 
-/// The traversals take the Python library's parameters, by name, with its
-/// defaults, the node ids first.
+/// The Python library's name for SQL's parameter or column `name` of
+/// `function`: SQL gave each role one name (#415), so a few differ.
+fn python_name<'a>(function: &str, name: &'a str) -> &'a str {
+    traversal::PYTHON_NAMES
+        .iter()
+        .find(|(f, sql, _)| *f == function && *sql == name)
+        .map_or(name, |(_, _, python)| python)
+}
+
+/// The traversals take the Python library's parameters, under their SQL
+/// names ([`python_name`]), with its defaults, the node ids first.
 #[test]
 fn traversal_parameters_match_python() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity.json");
@@ -252,7 +261,7 @@ fn traversal_parameters_match_python() {
                     Some(ursa_core::catalog::Value::Str(s)) => Value::from(s),
                     Some(other) => panic!("{}: unexpected default {other:?}", spec.name),
                 };
-                (p.name.to_string(), default)
+                (python_name(spec.name, p.name).to_string(), default)
             })
             .collect();
         assert_eq!(sql, python, "{}", spec.name);
@@ -416,7 +425,12 @@ async fn sql_matches_the_python_library() {
         let columns: Vec<(String, String)> = schema
             .fields()
             .iter()
-            .map(|f| (f.name().clone(), pyarrow_name(f.data_type()).to_string()))
+            .map(|f| {
+                (
+                    python_name(function, f.name()).to_string(),
+                    pyarrow_name(f.data_type()).to_string(),
+                )
+            })
             .collect();
         assert_eq!(columns, expected_columns, "{sql}: columns");
         let per_node = columns[0].0 == "id";

@@ -48,13 +48,13 @@ pagerank(graph, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, di
 | `max_iter` | integer | `30` | – | Iteration cap. Must be at least 1. |
 | `tol` | number | `1e-6` | – | Convergence tolerance on the L1 change. Must be at least 0. |
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
-| `direction` | string | `'out'` | `'out'`, `'both'` | Follow the rows as stored, or read the graph as undirected. |
+| `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 
-**Directions:** `'out'`, `'both'`
+**Directions:** `'out'`, `'in'`, `'both'`
 
 **Returns:** One row per node: `id` (the node), `pagerank` (Float64)
 
-**NetworkX:** `nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))`
+**NetworkX:** `nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))`
 
 ### connected_components
 
@@ -109,13 +109,13 @@ betweenness(graph, sample => NULL, weight => NULL, seed => NULL, direction => 'o
 | `sample` | number or NULL | `NULL` | – | Estimate from this fraction of the sources; null is exact. Must be above 0 and at most 1. |
 | `weight` | expression | `NULL` | – | A non-negative weight per edge; null is unweighted. |
 | `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
-| `direction` | string | `'out'` | `'out'`, `'both'` | Follow the rows as stored, or read the graph as undirected. |
+| `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 
-**Directions:** `'out'`, `'both'`
+**Directions:** `'out'`, `'in'`, `'both'`
 
 **Returns:** One row per node: `id` (the node), `betweenness` (Float64)
 
-**NetworkX:** `nx.betweenness_centrality(G, normalized=False, endpoints=False) (both: nx.betweenness_centrality(U, normalized=False))`
+**NetworkX:** `nx.betweenness_centrality(G, normalized=False, endpoints=False) (in: on G.reverse(), the same exact values; both: nx.betweenness_centrality(U, normalized=False))`
 
 ### closeness
 
@@ -216,7 +216,7 @@ avg_path_length(graph, sample => NULL, direction => 'out')
 
 ### diameter
 
-The longest shortest path over reachable ordered pairs.
+The longest shortest path over reachable ordered pairs. By default (approximate => true) it is a lower bound from a bounded sample of sources, which may be below the true diameter; approximate => false gives the exact value, at the cost of a search from every node.
 
 ```text
 diameter(graph, approximate => true, direction => 'out')
@@ -224,7 +224,7 @@ diameter(graph, approximate => true, direction => 'out')
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `approximate` | boolean | `true` | – | A lower bound from a bounded sample of sources. |
+| `approximate` | boolean | `true` | – | true (the default): a lower bound from a bounded sample of sources, which may be below the true diameter; false: the exact diameter. |
 | `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 
 **Directions:** `'out'`, `'in'`, `'both'`
@@ -325,27 +325,27 @@ layout_fr(graph, iterations => 300, k => 1.0, gravity => 0.02, seed => NULL)
 
 ### hop
 
-The nodes within n steps of each seed: one (seed, id, distance) row per seed and node reached, distance the fewest steps from the seed to it. A seed is not its own row; a repeated seed repeats its rows. The rows come in no particular order; use ORDER BY for one.
+The nodes within steps of each seed: one (seed, id, distance) row per seed and node reached, distance the fewest steps from the seed to it. A seed is not its own row; a repeated seed repeats its rows. The rows come in no particular order; use ORDER BY for one.
 
 ```text
-hop(graph, seeds => …, n => 1, direction => 'out')
+hop(graph, seeds => …, steps => 1, direction => 'out')
 ```
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
 | `seeds` | node ids | `required` | – | The nodes to start from: a list, a query of one column, or one id. |
-| `n` | integer | `1` | – | How many steps to take. |
+| `steps` | integer | `1` | – | How many steps to take. |
 | `direction` | string | `'out'` | `'out'`, `'in'`, `'both'` | Follow out-edges, in-edges, or both (the undirected view). |
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
 **Returns:** `seed` (Int64 or Utf8), `id` (Int64 or Utf8), `distance` (Int64)
 
-**NetworkX:** `nx.single_source_shortest_path_length(G, seed, cutoff=n), the seed left out (in: on G.reverse(); both: on U)`
+**NetworkX:** `nx.single_source_shortest_path_length(G, seed, cutoff=steps), the seed left out (in: on G.reverse(); both: on U)`
 
 ### shortest_path
 
-One shortest path from source to target: one row per edge, in order, with its 0-based position (hop) and the cost from source to its end. No path, no rows.
+One shortest path from source to target: one row per edge, in order, with its 0-based position (step) and the cost from source to its end. No path, no rows; nor when source is target, as a path of no edges has no edge rows (to ask whether a path exists, use GRAPH_TABLE and path_length(p)).
 
 ```text
 shortest_path(graph, source => …, target => …, weight => NULL, direction => 'out')
@@ -360,26 +360,26 @@ shortest_path(graph, source => …, target => …, weight => NULL, direction => 
 
 **Directions:** `'out'`, `'in'`, `'both'`
 
-**Returns:** `src` (Int64 or Utf8), `dst` (Int64 or Utf8), `hop` (Int64), `cost` (Float64)
+**Returns:** `src` (Int64 or Utf8), `dst` (Int64 or Utf8), `step` (Int64), `cost` (Float64)
 
 **NetworkX:** `nx.shortest_path(G, source, target) (weighted: nx.dijkstra_path(G, source, target, weight=...))`
 
 ### random_walk
 
-Random walks along out-edges from each start node: one (walk_id, step, node) row per step. A walk stops early at a node with no out-edges.
+Random walks along out-edges from each seed: one (walk_id, step, id) row per step. A walk stops early at a node with no out-edges.
 
 ```text
-random_walk(graph, start => …, steps => …, walks_per_node => 1, seed => NULL)
+random_walk(graph, seeds => …, steps => …, walks_per_node => 1, random_seed => NULL)
 ```
 
 | Parameter | Type | Default | Choices | Description |
 |---|---|---|---|---|
-| `start` | node ids | `required` | – | The nodes to start walks at: a list, a query of one column, or one id. |
+| `seeds` | node ids | `required` | – | The nodes to start walks at: a list, a query of one column, or one id. |
 | `steps` | integer | `required` | – | How many steps each walk takes at most. |
-| `walks_per_node` | integer | `1` | – | How many walks start at each start node. |
-| `seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
+| `walks_per_node` | integer | `1` | – | How many walks start at each seed. |
+| `random_seed` | integer or NULL | `NULL` | – | Seed for the deterministic random stream; null is a fixed default. |
 
-**Returns:** `walk_id` (Int64), `step` (Int64), `node` (Int64 or Utf8)
+**Returns:** `walk_id` (Int64), `step` (Int64), `id` (Int64 or Utf8)
 
 ### induced_edges
 

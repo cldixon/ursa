@@ -436,7 +436,7 @@ async fn one_partition(
 
 /// How many neighbours node `node` has in the whole graph `result` names,
 /// whichever way the edges run: `SELECT count(*) FROM hop(G, seeds => [key],
-/// n => 1, direction => 'both')`, run by `sql`. It reads the node's edges
+/// steps => 1, direction => 'both')`, run by `sql`. It reads the node's edges
 /// from the graph's index, not every edge, so it costs what the node's degree
 /// does. On a graph with no parallel edges and no loops it is the node's
 /// degree. `None` when the drawing names no graph.
@@ -459,7 +459,7 @@ pub async fn graph_neighbours(
         .run(
             ctx,
             &format!(
-                "SELECT count(*) FROM hop(\"{}\", seeds => [{key}], n => 1, direction => 'both')",
+                "SELECT count(*) FROM hop(\"{}\", seeds => [{key}], steps => 1, direction => 'both')",
                 graph.replace('"', "\"\"")
             ),
         )

@@ -354,7 +354,7 @@ async fn a_vertex_table_whose_key_repeats_or_is_null_is_refused_everywhere() {
         "SELECT * FROM degree(gs) ORDER BY id",
         "SELECT * FROM describe(gs)",
         "SELECT * FROM pagerank(gs)",
-        "SELECT * FROM hop(gs, seeds => [1], n => 1)",
+        "SELECT * FROM hop(gs, seeds => [1], steps => 1)",
         "SELECT * FROM gs.nodes",
         "SELECT count(*) FROM gs.nodes",
         "SELECT name FROM gs.nodes WHERE id = 2",

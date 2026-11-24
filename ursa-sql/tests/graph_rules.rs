@@ -132,7 +132,7 @@ async fn hop_is_rings_at_distance_1_and_2_with_the_real_edges() {
     let ctx = karate().await;
     let view = after(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')",
     )
     .await;
     let r = &view.result;
@@ -304,7 +304,7 @@ async fn shortest_path_is_the_same_edges_drawn_as_a_route() {
         "SELECT * FROM shortest_path(karate, source => 16, target => 26, direction => 'both')";
     let view = after(&ctx, sql).await;
     let r = &view.result;
-    assert_eq!(view.drawn_as(), "a path on karate (src, dst, hop)");
+    assert_eq!(view.drawn_as(), "a path on karate (src, dst, step)");
     // The same nodes and edges as rows-as-edges drew, in the same order…
     let edges = of_command(&ctx, &Sql, &format!("SELECT src, dst FROM ({sql})"), None)
         .await
@@ -326,7 +326,7 @@ async fn shortest_path_is_the_same_edges_drawn_as_a_route() {
         Values::F32(vec![1.0, 2.0, 3.0, 4.0, 5.0])
     );
     // Sorted another way, it is the same route: the steps say the order.
-    let reversed = after(&ctx, &format!("{sql} ORDER BY hop DESC")).await;
+    let reversed = after(&ctx, &format!("{sql} ORDER BY step DESC")).await;
     assert_eq!(ids(&reversed), ids(&view));
     assert_eq!(reversed.result.highlights().paths, r.highlights().paths);
 }
@@ -414,7 +414,7 @@ async fn as_overrides_what_a_graph_query_says_it_is() {
     let ctx = karate().await;
     // A hop result is rings by rule 2; as edges it is the star it was before
     // #433, and as nodes the reached nodes with the ties among them.
-    let hop = "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    let hop = "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')";
     let rows: usize = Sql
         .run(&ctx, hop)
         .await

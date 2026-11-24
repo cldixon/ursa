@@ -1156,7 +1156,7 @@ mod tests {
         // a hop's rings, with the graph's edges.
         run(
             &shell,
-            "SELECT * FROM hop(club, seeds => [3], n => 1, direction => 'both');",
+            "SELECT * FROM hop(club, seeds => [3], steps => 1, direction => 'both');",
         )
         .await;
         let g = graph_of(&shell.shell, "").await.unwrap();

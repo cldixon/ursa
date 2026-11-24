@@ -91,13 +91,13 @@ async fn error(ctx: &SessionContext, sql: &str) -> String {
 async fn traversals_match_getting_started() {
     let ctx = karate().await;
     // "Member 0 has 16 friends, so this returns 16 rows."
-    let sql = "SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')";
+    let sql = "SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')";
     assert_eq!(rows(&ctx, sql).await, 16);
     let out = table(
         &ctx,
         "SELECT * FROM hop(karate,
                            seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                           n => 2)",
+                           steps => 2)",
     )
     .await
     .unwrap();
@@ -157,12 +157,12 @@ async fn traversals_match_getting_started() {
     assert_eq!(
         out,
         "\
-+-----+-----+-----+------+
-| src | dst | hop | cost |
-+-----+-----+-----+------+
-| 0   | 8   | 0   | 1.0  |
-| 8   | 33  | 1   | 2.0  |
-+-----+-----+-----+------+"
++-----+-----+------+------+
+| src | dst | step | cost |
++-----+-----+------+------+
+| 0   | 8   | 0    | 1.0  |
+| 8   | 33  | 1    | 2.0  |
++-----+-----+------+------+"
     );
 }
 
@@ -172,31 +172,31 @@ async fn random_walk_matches_the_traversals_guide() {
     let ctx = karate().await;
     let out = table(
         &ctx,
-        "SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => 2, \
-         seed => 7) LIMIT 10",
+        "SELECT * FROM random_walk(karate, seeds => [0, 1], steps => 4, walks_per_node => 2, \
+         random_seed => 7) LIMIT 10",
     )
     .await
     .unwrap();
     assert_eq!(
         out,
         "\
-+---------+------+------+
-| walk_id | step | node |
-+---------+------+------+
-| 0       | 0    | 0    |
-| 0       | 1    | 13   |
-| 0       | 2    | 33   |
-| 1       | 0    | 0    |
-| 1       | 1    | 2    |
-| 1       | 2    | 9    |
-| 1       | 3    | 33   |
-| 2       | 0    | 1    |
-| 2       | 1    | 13   |
-| 2       | 2    | 33   |
-+---------+------+------+"
++---------+------+----+
+| walk_id | step | id |
++---------+------+----+
+| 0       | 0    | 0  |
+| 0       | 1    | 13 |
+| 0       | 2    | 33 |
+| 1       | 0    | 0  |
+| 1       | 1    | 2  |
+| 1       | 2    | 9  |
+| 1       | 3    | 33 |
+| 2       | 0    | 1  |
+| 2       | 1    | 13 |
+| 2       | 2    | 33 |
++---------+------+----+"
     );
-    let sql = "SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => \
-               2, seed => 7)";
+    let sql = "SELECT * FROM random_walk(karate, seeds => [0, 1], steps => 4, walks_per_node => \
+               2, random_seed => 7)";
     assert_eq!(rows(&ctx, sql).await, 15);
     // A fixed seed gives the same walks every time.
     assert_eq!(
@@ -247,27 +247,132 @@ async fn node_ids_three_ways() {
 /// An id that is not in the graph reaches nothing, as in the Python library
 /// (#225); so does a null, an empty list, or a subquery with no rows.
 #[tokio::test]
-async fn ids_not_in_the_graph_reach_nothing() {
+async fn no_ids_reach_nothing() {
     let ctx = karate_and_lesmis().await;
     for sql in [
-        "SELECT * FROM hop(karate, seeds => [99])",
         "SELECT * FROM hop(karate, seeds => [])",
         "SELECT * FROM hop(karate, seeds => NULL)",
         "SELECT * FROM hop(karate, seeds => (SELECT id FROM karate.nodes WHERE id < 0))",
-        "SELECT * FROM hop(lesmis, seeds => [0])",
-        "SELECT * FROM shortest_path(karate, source => 0, target => 99)",
+        "SELECT * FROM hop(karate, seeds => (SELECT 99))",
+        "SELECT * FROM shortest_path(karate, source => 0, target => (SELECT 99))",
         "SELECT * FROM shortest_path(karate, source => NULL, target => 33)",
+        // No path: 33 has no out-edge to 0.
         "SELECT * FROM shortest_path(karate, source => 33, target => 0)",
+        // A path of no edges has no edge rows (#416, documented).
         "SELECT * FROM shortest_path(karate, source => 0, target => 0)",
-        "SELECT * FROM random_walk(karate, start => [99], steps => 3)",
-        "SELECT * FROM hop(karate, seeds => [0], n => 0)",
+        "SELECT * FROM random_walk(karate, seeds => (SELECT 99), steps => 3)",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 0)",
     ] {
         assert_eq!(rows(&ctx, sql).await, 0, "{sql}");
     }
-    // A repeated seed repeats its rows; an unknown one adds none.
+    // A repeated seed repeats its rows; an unknown one from a query adds
+    // none.
     assert_eq!(
-        rows(&ctx, "SELECT * FROM hop(karate, seeds => [0, 99, 0])").await,
+        rows(
+            &ctx,
+            "SELECT * FROM hop(karate, seeds => (SELECT unnest([0, 99, 0])))"
+        )
+        .await,
         32
+    );
+}
+
+/// #416: a literal id that is not a node of the graph is an error naming it;
+/// for a list, up to three of them and how many. `induced_edges`, over a node
+/// set, skips them.
+#[tokio::test]
+async fn literal_ids_not_in_the_graph_are_errors() {
+    let ctx = karate_and_lesmis().await;
+    for (sql, message) in [
+        (
+            "SELECT * FROM hop(karate, seeds => [99])",
+            "hop(seeds =>): 99 is not a node of graph 'karate'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => 99)",
+            "hop(seeds =>): 99 is not a node of graph 'karate'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0, 99, 0, 99])",
+            "hop(seeds =>): 99 is not a node of graph 'karate'",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0, 97, 98])",
+            "hop(seeds =>): 2 ids are not nodes of graph 'karate': 97, 98",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [95, 96, 0, 97, 98, 99])",
+            "hop(seeds =>): 5 ids are not nodes of graph 'karate': 95, 96, 97 and 2 more",
+        ),
+        (
+            "SELECT * FROM hop(lesmis, seeds => [0])",
+            "hop(seeds =>): '0' is not a node of graph 'lesmis'",
+        ),
+        (
+            "SELECT * FROM hop(lesmis, seeds => ['Valjean', 'Javert2'])",
+            "hop(seeds =>): 'Javert2' is not a node of graph 'lesmis'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 0, target => 99)",
+            "shortest_path(target =>): 99 is not a node of graph 'karate'",
+        ),
+        (
+            "SELECT * FROM shortest_path(karate, source => 99, target => 98)",
+            "shortest_path(source =>): 99 is not a node of graph 'karate'",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seeds => [99], steps => 3)",
+            "random_walk(seeds =>): 99 is not a node of graph 'karate'",
+        ),
+    ] {
+        assert_eq!(error(&ctx, sql).await, message, "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT * FROM induced_edges(karate, nodes => [0, 1, 99])"
+        )
+        .await,
+        1
+    );
+}
+
+/// #416: ids from a query that are not nodes are skipped, and a notice on
+/// the session's sink says how many.
+#[tokio::test]
+async fn ids_from_a_query_are_skipped_with_a_notice() {
+    let ctx = karate_and_lesmis().await;
+    let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = std::sync::Arc::clone(&said);
+    ursa_engine::notices::set_sink(
+        &ctx.state(),
+        Some(std::sync::Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string())
+        })),
+    );
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT * FROM hop(karate, seeds => (SELECT unnest([0, 97, 98, 97])))"
+        )
+        .await,
+        16
+    );
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT * FROM shortest_path(karate, source => (SELECT 99), target => 33)"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        *said.lock().unwrap(),
+        [
+            "hop(seeds =>): skipped 2 ids from the query that are not nodes of graph 'karate'",
+            "shortest_path(source =>): skipped 1 id from the query that is not a node of graph \
+             'karate'"
+        ]
     );
 }
 
@@ -296,7 +401,7 @@ async fn schemas() {
         "{out}"
     );
     assert!(
-        out.contains("| hop         | Int64     | NO          |"),
+        out.contains("| step        | Int64     | NO          |"),
         "{out}"
     );
     assert!(
@@ -305,7 +410,7 @@ async fn schemas() {
     );
     let out = table(
         &ctx,
-        &describe("SELECT * FROM random_walk(lesmis, start => ['Valjean'], steps => 2)"),
+        &describe("SELECT * FROM random_walk(lesmis, seeds => ['Valjean'], steps => 2)"),
     )
     .await
     .unwrap();
@@ -318,7 +423,7 @@ async fn schemas() {
         "{out}"
     );
     assert!(
-        out.contains("| node        | Utf8      | NO          |"),
+        out.contains("| id          | Utf8      | NO          |"),
         "{out}"
     );
 }
@@ -332,14 +437,14 @@ async fn node_ids_are_a_child_plan() {
         &ctx,
         "EXPLAIN SELECT * FROM hop(karate,
                                    seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                                   n => 2)",
+                                   steps => 2)",
     )
     .await
     .unwrap();
     assert!(
         plan.contains(
             "GraphTraversal: graph=karate, edges=(ties.src, ties.dst), call=hop(seeds => \
-             (SELECT id FROM karate.nodes WHERE club = 'Officer'), n => 2, direction => 'out')"
+             (SELECT id FROM karate.nodes WHERE club = 'Officer'), steps => 2, direction => 'out')"
         ),
         "{plan}"
     );
@@ -412,7 +517,7 @@ async fn one_index_for_algorithms_and_traversals() {
         "SELECT * FROM degree(karate)",
         "SELECT * FROM hop(karate, seeds => [0])",
         "SELECT * FROM shortest_path(karate, source => 0, target => 33)",
-        "SELECT * FROM random_walk(karate, start => [0], steps => 3)",
+        "SELECT * FROM random_walk(karate, seeds => [0], steps => 3)",
     ] {
         rows(&ctx, sql).await;
     }
@@ -435,7 +540,7 @@ async fn traversals_compose() {
     let out = table(
         &ctx,
         "SELECT n.club, count(*) AS reached
-         FROM hop(karate, seeds => [0], n => 2, direction => 'both') AS h
+         FROM hop(karate, seeds => [0], steps => 2, direction => 'both') AS h
          JOIN karate.nodes AS n ON h.id = n.id
          GROUP BY n.club ORDER BY n.club",
     )
@@ -462,7 +567,7 @@ async fn traversals_compose() {
     );
     let out = table(
         &ctx,
-        "SELECT max(hop) AS hops, max(cost) AS cost
+        "SELECT max(step) AS hops, max(cost) AS cost
          FROM shortest_path(karate, source => 0, target => 26, direction => 'both')",
     )
     .await
@@ -489,13 +594,13 @@ async fn weighted_paths() {
     assert_eq!(
         out,
         "\
-+----------------+----------------+-----+------+
-| src            | dst            | hop | cost |
-+----------------+----------------+-----+------+
-| Valjean        | Gillenormand   | 0   | 2.0  |
-| Gillenormand   | LtGillenormand | 1   | 3.0  |
-| LtGillenormand | Marius         | 2   | 4.0  |
-+----------------+----------------+-----+------+"
++----------------+----------------+------+------+
+| src            | dst            | step | cost |
++----------------+----------------+------+------+
+| Valjean        | Gillenormand   | 0    | 2.0  |
+| Gillenormand   | LtGillenormand | 1    | 3.0  |
+| LtGillenormand | Marius         | 2    | 4.0  |
++----------------+----------------+------+------+"
     );
     assert_eq!(
         error(
@@ -514,25 +619,25 @@ async fn errors_are_for_people() {
     for (sql, expected) in [
         (
             "SELECT * FROM hop(karate)",
-            "hop() needs 'seeds': hop(<graph>, seeds => [<id>, ...], n => 1, direction => 'out')",
+            "hop() needs 'seeds': hop(<graph>, seeds => [<id>, ...], steps => 1, direction => 'out')",
         ),
         (
             "SELECT * FROM hop(karate, [0])",
             "hop() takes its parameters by name, as name => value; got [0]. Write \
-             hop(<graph>, seeds => [<id>, ...], n => 1, direction => 'out')",
+             hop(<graph>, seeds => [<id>, ...], steps => 1, direction => 'out')",
         ),
         (
             "SELECT * FROM hop(karate, seed => [0])",
             "hop() has no parameter 'seed'; did you mean 'seeds'? Its parameters are: seeds, \
-             n, direction",
+             steps, direction",
         ),
         (
             "SELECT * FROM hop(karate, seeds => [0], seeds => [1])",
             "hop() was given 'seeds' more than once",
         ),
         (
-            "SELECT * FROM hop(karate, seeds => [0], n => -1)",
-            "hop(n =>) must be a non-negative integer below 2^32; got -1",
+            "SELECT * FROM hop(karate, seeds => [0], steps => -1)",
+            "hop(steps =>) must be a non-negative integer below 2^32; got -1",
         ),
         (
             "SELECT * FROM hop(karate, seeds => [0], direction => 'up')",
@@ -540,7 +645,7 @@ async fn errors_are_for_people() {
         ),
         (
             "SELECT * FROM hop(karate, seeds => [0], weight => weight)",
-            "hop() has no parameter 'weight'. Its parameters are: seeds, n, direction",
+            "hop() has no parameter 'weight'. Its parameters are: seeds, steps, direction",
         ),
         (
             "SELECT * FROM hop(karate, seeds => (SELECT id, club FROM karate.nodes))",
@@ -571,23 +676,66 @@ async fn errors_are_for_people() {
              column of type Utf8 (a string or other non-numeric column cannot be a weight)",
         ),
         (
-            "SELECT * FROM random_walk(karate, start => [0])",
-            "random_walk() needs 'steps': random_walk(<graph>, start => [<id>, ...], steps => \
-             <integer>, walks_per_node => 1, seed => NULL)",
+            "SELECT * FROM random_walk(karate, seeds => [0])",
+            "random_walk() needs 'steps': random_walk(<graph>, seeds => [<id>, ...], steps => \
+             <integer>, walks_per_node => 1, random_seed => NULL)",
         ),
         (
-            "SELECT * FROM random_walk(karate, start => [0], steps => 2, seed => -1)",
-            "random_walk(seed =>) must be a non-negative integer or NULL; got -1",
+            "SELECT * FROM random_walk(karate, seeds => [0], steps => 2, random_seed => -1)",
+            "random_walk(random_seed =>) must be a non-negative integer or NULL; got -1",
         ),
         (
-            "SELECT * FROM random_walk(karate, start => [0], steps => 2, direction => 'both')",
-            "random_walk() has no parameter 'direction'. Its parameters are: start, steps, \
-             walks_per_node, seed",
+            "SELECT * FROM random_walk(karate, seeds => [0], steps => 2, direction => 'both')",
+            "random_walk() has no parameter 'direction'. Its parameters are: seeds, steps, \
+             walks_per_node, random_seed",
+        ),
+        // #415: the old names and other systems' are refused, pointing to
+        // Ursa's one name for the role, and only to a parameter that can take
+        // the value given.
+        (
+            "SELECT * FROM hop(karate, seeds => [0], n => 2)",
+            "hop() has no parameter 'n'; did you mean 'steps'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0], max_hops => 2)",
+            "hop() has no parameter 'max_hops'; did you mean 'steps'? Its parameters are: \
+             seeds, steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, seeds => [0], depth := 2)",
+            "hop() has no parameter 'depth'; did you mean 'steps'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM hop(karate, start => [0], k => 2)",
+            "hop() has no parameter 'start'; did you mean 'seeds'? Its parameters are: seeds, \
+             steps, direction",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, start => [0], steps => 2)",
+            "random_walk() has no parameter 'start'; did you mean 'seeds'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seeds => [0], steps => 2, seed => 7)",
+            "random_walk() has no parameter 'seed'; did you mean 'random_seed'? Its parameters \
+             are: seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seed => [0], steps => 2)",
+            "random_walk() has no parameter 'seed'; did you mean 'seeds'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
+        ),
+        (
+            "SELECT * FROM random_walk(karate, seeds => [0], n = 2)",
+            "random_walk() has no parameter 'n'; did you mean 'steps'? Its parameters are: \
+             seeds, steps, walks_per_node, random_seed",
         ),
         (
             "SELECT * FROM algorithms(karate, hop(seeds => [0]))",
             "algorithms(): hop() is a traversal, which returns rows of its own, not one per \
-             node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], n => \
+             node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], steps => \
              1, direction => 'out')",
         ),
         (
@@ -635,8 +783,8 @@ async fn node_id_type_errors_name_the_parameter() {
             "hop(seeds =>) must be node ids of graph 'karate', which are integers; got 'a'",
         ),
         (
-            "SELECT * FROM random_walk(karate, start => [1, 2, 'three'], steps => 2)",
-            "random_walk(start =>) must be node ids of graph 'karate', which are integers; got \
+            "SELECT * FROM random_walk(karate, seeds => [1, 2, 'three'], steps => 2)",
+            "random_walk(seeds =>) must be node ids of graph 'karate', which are integers; got \
              'three'",
         ),
         // One value.
@@ -672,8 +820,8 @@ async fn node_id_type_errors_name_the_parameter() {
              of type List(Int64)",
         ),
         (
-            "SELECT * FROM random_walk(lesmis, start => (SELECT {'a': 1}), steps => 2)",
-            "random_walk(start =>) must be node ids of graph 'lesmis', which are strings; got \
+            "SELECT * FROM random_walk(lesmis, seeds => (SELECT {'a': 1}), steps => 2)",
+            "random_walk(seeds =>) must be node ids of graph 'lesmis', which are strings; got \
              a query of type Struct(\"a\": Int64)",
         ),
         // Floats, booleans and dates would cast, but are refused (#271).
@@ -695,8 +843,8 @@ async fn node_id_type_errors_name_the_parameter() {
              integer; got DATE '2020-01-01'",
         ),
         (
-            "SELECT * FROM random_walk(karate, start => [CAST(1 AS DOUBLE)], steps => 2)",
-            "random_walk(start =>) must be node ids of graph 'karate', which are integers; got \
+            "SELECT * FROM random_walk(karate, seeds => [CAST(1 AS DOUBLE)], steps => 2)",
+            "random_walk(seeds =>) must be node ids of graph 'karate', which are integers; got \
              CAST(1 AS DOUBLE)",
         ),
         (
@@ -786,7 +934,10 @@ async fn node_id_type_errors_name_the_parameter() {
         ("SELECT * FROM hop(karate, seeds => [0, '0'])", 32),
         ("SELECT * FROM hop(karate, seeds => [NULL, 0])", 16),
         ("SELECT * FROM hop(karate, seeds => [-1 + 1])", 16),
-        ("SELECT * FROM hop(lesmis, seeds => [1])", 0),
+        (
+            "SELECT * FROM hop(lesmis, seeds => (SELECT unnest([1])))",
+            0,
+        ),
         ("SELECT * FROM hop(lesmis, seeds => (SELECT 1))", 0),
         (
             "SELECT * FROM hop(karate, seeds => [CAST(0 AS TINYINT)])",

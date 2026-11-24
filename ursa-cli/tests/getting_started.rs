@@ -259,7 +259,7 @@ fn the_getting_started_page_runs_as_written() {
             "--format",
             "csv",
             "-c",
-            "SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
+            "SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');",
         ],
     );
     assert_eq!(out.lines().count(), 1 + 16, "a header and 16 rows: {out}");
@@ -272,7 +272,7 @@ fn the_getting_started_page_runs_as_written() {
             "-c",
             "SELECT * FROM hop(karate,
                                seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                               n => 2);",
+                               steps => 2);",
         ],
     );
     assert_eq!(out.lines().count(), 1 + 39, "a header and 39 rows: {out}");
@@ -284,7 +284,7 @@ fn the_getting_started_page_runs_as_written() {
         out,
         table(&[
             "┌───────┬───────┬───────┬─────────┐",
-            "│  src  │  dst  │  hop  │  cost   │",
+            "│  src  │  dst  │ step  │  cost   │",
             "│ Int64 │ Int64 │ Int64 │ Float64 │",
             "├───────┼───────┼───────┼─────────┤",
             "│     0 │     8 │     0 │     1.0 │",
@@ -294,11 +294,11 @@ fn the_getting_started_page_runs_as_written() {
     );
     let (walk, _) = sql(
         cwd,
-        "SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => 2, seed => 7);",
+        "SELECT * FROM random_walk(karate, seeds => [0, 1], steps => 4, walks_per_node => 2, random_seed => 7);",
     );
     let (again, _) = sql(
         cwd,
-        "SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => 2, seed => 7);",
+        "SELECT * FROM random_walk(karate, seeds => [0, 1], steps => 4, walks_per_node => 2, random_seed => 7);",
     );
     assert_eq!(walk, again, "a seeded walk repeats");
 

@@ -194,7 +194,7 @@ const SCRIPT: [&str; 6] = [
 ];
 
 async fn play(host: &mut Host) -> Vec<(String, Vec<i64>, Vec<(i64, i64)>)> {
-    host.says("SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');")
+    host.says("SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');")
         .await;
     host.says(".graph").await;
     let mut steps = Vec::new();
@@ -208,7 +208,7 @@ async fn play(host: &mut Host) -> Vec<(String, Vec<i64>, Vec<(i64, i64)>)> {
 #[tokio::test]
 async fn a_script_of_expansions_a_hide_and_undos() {
     let mut host = Host::karate().await;
-    host.says("SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');")
+    host.says("SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');")
         .await;
     assert_eq!(host.says(".graph").await, "");
     host.shows(&AROUND_0).await;
@@ -302,7 +302,7 @@ async fn a_replayed_script_gives_the_same_sets_and_the_same_bytes() {
 #[tokio::test]
 async fn undoing_everything_restores_the_graph_bit_for_bit() {
     let mut host = Host::karate().await;
-    host.says("SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');")
+    host.says("SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');")
         .await;
     host.says(".graph").await;
     let base = host.session().result().to_bytes();
@@ -320,7 +320,7 @@ async fn undoing_everything_restores_the_graph_bit_for_bit() {
 #[tokio::test]
 async fn hidden_nodes_come_back_with_their_edges() {
     let mut host = Host::karate().await;
-    host.says(".graph SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')")
         .await;
     assert_eq!(host.says(".hide 2 8").await, "-2 nodes, -7 edges");
     // 32 is a neighbour of 2 and of 8, which are hidden when it arrives.
@@ -358,7 +358,7 @@ async fn hidden_nodes_come_back_with_their_edges() {
 #[tokio::test]
 async fn directions_and_what_is_left() {
     let mut host = Host::karate().await;
-    host.says(".graph SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')")
         .await;
     // Karate's ties are stored from the lower id: 31's out-edges go to 32
     // and 33, its in-edges come from 0, 24, 25 and 28.
@@ -381,13 +381,13 @@ async fn directions_and_what_is_left() {
 #[tokio::test]
 async fn sql_is_printed_instead() {
     let mut host = Host::karate().await;
-    host.says(".graph SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')")
         .await;
     let before = host.session().result().to_bytes();
     let sql = host.says(".expand 6 --sql LIMIT 2").await;
     assert_eq!(
         sql,
-        "SELECT h.id, count(*) OVER () AS neighbours FROM hop(\"karate\", seeds => [6], n => 1, \
+        "SELECT h.id, count(*) OVER () AS neighbours FROM hop(\"karate\", seeds => [6], steps => 1, \
          direction => 'both') AS h JOIN degree(\"karate\", direction => 'both') AS d ON d.id = \
          h.id WHERE h.id NOT IN (5, 6, 10, 16, 0) ORDER BY d.degree DESC, h.id LIMIT 2;\n\
          SELECT src, dst, edge FROM induced_edges(\"karate\", nodes => [5, 6, 10, 16, 0, 4]);"
@@ -399,7 +399,7 @@ async fn sql_is_printed_instead() {
         let (_, err) = host.run(&format!("{statement};")).await;
         assert_eq!(err, "", "{statement}");
     }
-    host.says(".graph SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')")
         .await;
     assert_eq!(host.says(".expand 6 LIMIT 2").await, "+1 node, +3 edges");
     let step = &host.session().steps()[0];
@@ -418,11 +418,11 @@ async fn sql_is_printed_instead() {
 #[tokio::test]
 async fn history_lists_the_steps() {
     let mut host = Host::karate().await;
-    host.says(".graph SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')")
         .await;
     assert_eq!(
         host.says(".graph history").await,
-        "Explored from: SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')\n\
+        "Explored from: SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')\n\
          No steps yet: .expand ID adds a node's neighbours\n\
          Shown: 5 nodes, 7 edges"
     );
@@ -431,7 +431,7 @@ async fn history_lists_the_steps() {
     }
     assert_eq!(
         host.says(".graph history").await,
-        "Explored from: SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')\n\
+        "Explored from: SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')\n\
          1  .expand 6  +1 node, +3 edges\n\
          2  .hide 0    -1 node, -4 edges\n\
          3  .hide 4    -1 node, -2 edges  (undone)\n\
@@ -459,7 +459,7 @@ async fn no_open_graph_and_ids_that_are_not_nodes_say_so() {
             "{line}"
         );
     }
-    host.says(".graph SELECT * FROM hop(karate, seeds => [5], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [5], steps => 1, direction => 'both')")
         .await;
     let base = host.session().result().to_bytes();
     for (line, want) in [
@@ -616,7 +616,7 @@ async fn text_keys_are_quoted() {
 async fn not_shown_counts_follow_the_steps() {
     let mut host = Host::karate().await;
     assert_eq!(host.shell.not_shown().await.unwrap(), Vec::<u32>::new());
-    host.says(".graph SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both')")
+    host.says(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')")
         .await;
     async fn of(host: &mut Host, key: i64) -> u32 {
         let counts = host.shell.not_shown().await.unwrap();
