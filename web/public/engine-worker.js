@@ -14,6 +14,9 @@
 //   highlight {text, alone?}   -> {text}         (typed text in ANSI colour, after
 //                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
+//   files     {}               -> {files}        (the session's files, added or
+//                                               written by COPY … TO 'name':
+//                                               [{name, url, bytes}])
 //   export    {format}         -> {bytes}        (the last result, every row)
 //   graph     {text}           -> {ugr, skipped, positions?}  (a graph to draw: the last
 //                                               result, a query's or a property
@@ -131,6 +134,8 @@ async function handle({ id, op, ...args }) {
     } else if (op === "addFile") {
       const url = await shell.addFile(args.name, new Uint8Array(args.bytes));
       postMessage({ id, ok: true, url });
+    } else if (op === "files") {
+      postMessage({ id, ok: true, files: JSON.parse(await shell.files()) });
     } else if (op === "export") {
       const bytes = shell.exportLast(args.format);
       postMessage({ id, ok: true, bytes }, [bytes.buffer]);

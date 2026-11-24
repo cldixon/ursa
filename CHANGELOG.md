@@ -1758,11 +1758,40 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   have no task over 50 ms (`ursa-viz/BENCH.md` has the spread); making
   the view takes up to six turns of the event loop longer, about 4 ms
   each. What is drawn is the same.
+
+- **Web shell: `COPY … TO` writes a file in the session, and no longer ends
+  the engine** (#517). A browser has no disk, so `COPY … TO 'pos.parquet'`
+  (or `.csv`, `.json`, `.arrow`; `'memory://uploads/pos.parquet'` is the
+  same file) keeps the file in memory beside the imported ones:
+  `FROM 'pos.parquet'` reads it, a session file being found by its name
+  before the datasets' files, and `.files` lists it as `written here`. So a
+  layout is saved as the CLI saves it: `COPY (SELECT * FROM layout_fa2(g))
+  TO 'pos.parquet'`, then `.graph g POSITIONS (SELECT * FROM
+  'pos.parquet')`, which the terminal's hint for a large graph now gives
+  first. Before, a relative path failed with "relative URL without a base",
+  and a `memory://uploads/…` target ended the engine: DataFusion's file
+  sinks start tokio tasks, and the browser has no tokio runtime to start
+  them on. The engine now writes the file itself in such a session
+  (`ursa_engine::session_files`), with the serializers and options
+  DataFusion's sinks use. What it cannot write is refused with a message
+  that says what works: a name with a folder or other characters than ASCII
+  letters, digits, `.`, `_` and `-`; a URL elsewhere; `PARTITIONED BY`;
+  compressed CSV or JSON; and `INSERT INTO` a table of files or `EXPLAIN
+  ANALYZE` of a `COPY`, which ran the same sinks. An `.arrow` file is
+  written uncompressed. `WebShell.files()` lists the session's files. The
+  CLI's `COPY` is unchanged.
+
 - **Graph view: a snapshot of a level, a cut or a grouped drawing is of the
   view as it is** (#499). `GraphView.snapshot()` drew the discs the last
   frame had given the GPU, so a read-back taken before the next frame
-  still showed a selection ring that had been cleared. It gives the GPU
-  the discs again first. On screen nothing changes: a frame always did.
+  still showed a selection ring that had been cleared.
+  `GraphView.refreshLevel()` gives the GPU the discs as they are now, and
+  the page's read-back calls it first. On screen nothing changes: a frame
+  always did. The snapshot borrows the view shared, as it did before (it
+  borrowed it to change it for a day, and every call made during a read-back
+  then threw and left the view unable to be freed, so the next `.graph`
+  failed to start); the pane's hover waits for a read-back, and a pane
+  closed or drawn again during one frees its view when the pixels have come.
 
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,

@@ -274,6 +274,32 @@ await type(".history 2");
 check((await after(".history 2")).includes(".files"), ".history");
 await type(".dataset");
 check(lastTable(await after(".dataset")).rows.length === datasets.length, ".dataset lists");
+// COPY … TO writes a file in the session, which a read finds by its name
+// (#517). A relative path was "relative URL without a base", and
+// memory://uploads/… ended the engine.
+await type("COPY (SELECT * FROM layout_fa2(karate)) TO 'pos.parquet';");
+check(lastTable(await after("COPY (SELECT * FROM layout_fa2(karate))")).rows[0]?.[0] === "34" && (await errors()) === errorsSoFar, "COPY … TO a relative path writes a session file", await after("COPY (SELECT * FROM layout_fa2(karate))"));
+await type("SELECT count(*) AS n, count(x) AS placed FROM 'pos.parquet';");
+check(JSON.stringify(lastTable(await after("SELECT count(*) AS n, count(x)")).rows[0]) === '["34","34"]', "a file COPY wrote reads back by its name", await after("SELECT count(*) AS n, count(x)"));
+await type("COPY (SELECT * FROM ties LIMIT 5) TO 'memory://uploads/ties.csv';");
+const tiesWritten = lastTable(await after("COPY (SELECT * FROM ties LIMIT 5)")).rows[0]?.[0];
+await type("SELECT count(*) AS n FROM 'memory://uploads/ties.csv';");
+const tiesByUrl = lastTable(await after("SELECT count(*) AS n FROM 'memory:")).rows[0]?.[0];
+await type("SELECT count(*) AS n FROM 'ties.csv';");
+const tiesByName = lastTable(await after("SELECT count(*) AS n FROM 'ties.csv'")).rows[0]?.[0];
+check(Number(tiesWritten) > 0 && tiesByUrl === tiesWritten && tiesByName === tiesWritten && !(await screen()).includes("the engine stopped"), "COPY … TO 'memory://uploads/…' writes the file, and the engine runs on", `${tiesWritten} written, ${tiesByUrl} by URL, ${tiesByName} by name`);
+for (const ext of ["json", "arrow"]) {
+  await type(`COPY (SELECT 7 AS seven) TO 'seven.${ext}';`);
+  await type(`SELECT seven + 1 AS eight FROM 'seven.${ext}';`);
+  check(lastTable(await after("SELECT seven + 1 AS eight")).rows[0]?.[0] === "8", `COPY … TO a .${ext} file round-trips`, await after("COPY (SELECT 7 AS seven)"));
+}
+await type(".files");
+t = lastTable(await after(".files"));
+check(
+  ["pos.parquet", "ties.csv", "seven.json", "seven.arrow"].every((f) => t.rows.some((r) => r[0] === f && Number(r[1]) > 0 && r[2] === "written here")) && t.rows.some((r) => r[0] === "karate_edges.parquet"),
+  ".files lists the files COPY wrote",
+  JSON.stringify(t.rows.filter((r) => r[2] === "written here")),
+);
 // The forms .help graph shows, on the karate graph: they must parse and run.
 for (const sql of [
   "FROM GRAPH_TABLE (karate MATCH (a)<-[e]-(b) WHERE a.id = 1 COLUMNS (b.id));",
@@ -285,6 +311,18 @@ for (const sql of [
 ])
   await type(sql);
 check((await errors()) === errorsSoFar, "no errors from the dot-commands and graph forms", `${(await errors()) - errorsSoFar} new`);
+// What cannot be written is refused, with what works; nothing stops.
+for (const [target, says] of [
+  ["https://example.com/pos.parquet", "writes only this session's files"],
+  ["out/pos.parquet", "with no folder"],
+  ["pos.txt", "names no format"],
+]) {
+  await type(`COPY (SELECT 1 AS a) TO '${target}';`);
+  const said = (await after("COPY (SELECT 1 AS a)")).replace(/\n/g, " ");
+  check(said.includes("Error: ") && said.replace(/\s+/g, " ").includes(says) && said.includes(`'${target}'`) && !said.includes("memory:") && said.includes("name.parquet") === (target !== "pos.txt"), `COPY … TO '${target}' is refused, saying what works`, said);
+}
+await type("SELECT 41 + 1 AS still;");
+check(lastTable(await after("SELECT 41 + 1 AS still;")).rows[0]?.[0] === "42" && !(await screen()).includes("the engine stopped"), "the engine runs on after the COPY refusals");
 
 // Type-ahead: keys pressed while a line runs are kept.
 await page.keyboard.type("SELECT 2 AS");
@@ -790,7 +828,16 @@ async function watchedContext(options: Parameters<typeof browser.newContext>[0])
   ctx.on("console", (m) => {
     if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
   });
-  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  ctx.on("page", (p) =>
+    p.on("pageerror", (e) => {
+      // Said at once too: a later step may stop the run before the end.
+      console.log(`FAIL page error: ${e.message}`);
+      failures.push(`page error: ${e.message}`);
+    }),
+  );
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /panicked|unreachable|recursive use|borrowed/i.test(m.text())) console.log(`CONSOLE ${m.text().slice(0, 600)}`);
+  });
   return ctx;
 }
 const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
@@ -2481,6 +2528,30 @@ for (const scheme of ["light", "dark"] as const) {
   const missing = Number(((await status()).match(/ · ([\d,]+) of 46,318 nodes had no saved position and were placed beside their neighbours · /)?.[1] ?? "0").replace(/,/g, ""));
   check(missing > 4_000 && partial.bad === 0 && partial.kept === 46_318 - missing && partial.moved === missing, "saved positions: the nodes without one are placed beside their neighbours, and the others do not move", `${await status()}; ${JSON.stringify(partial)}`);
 
+  // The positions as a file (#517): COPY writes it in the session, and the
+  // drawing from it is the drawing from the table.
+  await type("COPY (SELECT * FROM layout_fa2(rmat)) TO 'pos.parquet';", s);
+  const wrote = lastTable(await after("COPY (SELECT * FROM layout_fa2(rmat))", s)).rows[0]?.[0];
+  await type(".graph rmat POSITIONS (SELECT * FROM 'pos.parquet')", s);
+  await graphSettled(s);
+  const fromFile = await s.evaluate(() => {
+    const w = window as any;
+    const g = w.ursaShell.graphPlacement();
+    const n = g.ids.length;
+    let kept = 0;
+    for (let i = 0; i < n; i++) {
+      const a = w.__live.get(g.ids[i]);
+      if (Object.is(a[0], g.xy[i]) && Object.is(a[1], g.xy[n + i])) kept++;
+    }
+    return { n, kept };
+  });
+  const filed = await graphInfo(s);
+  check(
+    wrote === "46318" && filed.saved === true && filed.iterations === 0 && (await status()).includes(" · saved positions · Done") && fromFile.n === 46_318 && fromFile.kept === 46_318,
+    "saved positions: COPY … TO 'pos.parquet' saves a layout, and .graph … POSITIONS (SELECT * FROM 'pos.parquet') draws from it",
+    `${wrote} rows; ${await status()}; ${JSON.stringify(fromFile)}`,
+  );
+
   // A drawing at saved positions grows as any other: the layout worker is
   // at them, and places the new nodes.
   await type(".graph SELECT src, dst FROM rmat_edges LIMIT 300 ON rmat POSITIONS (SELECT * FROM pos)", s);
@@ -2515,7 +2586,8 @@ for (const scheme of ["light", "dark"] as const) {
     "over two million edges: the status line offers saved positions while the layout runs",
     offered.find((t) => t.includes("Laying out")) ?? (await status()),
   );
-  check(told.includes("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);") && told.includes(".graph g POSITIONS (SELECT * FROM pos)") && told.includes("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), "over two million edges: the terminal says how to save the positions", told);
+  const [copyAt, tableAt] = [told.indexOf("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), told.indexOf("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);")];
+  check(copyAt >= 0 && told.includes(".graph g POSITIONS (SELECT * FROM 'pos.parquet')") && tableAt > copyAt && told.includes(".graph g POSITIONS (SELECT * FROM pos)"), "over two million edges: the terminal says how to save the positions, COPY first", told);
   await sctx.close();
 }
 // #499: GROUP BY. `.graph karate GROUP BY club` draws a disc for each club
@@ -2675,6 +2747,44 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(k);
   g = await graphInfo(k);
   check(g.grouped?.groups === communities && g.cut.nodes === 34, "GROUP BY after a query in parentheses groups the query's rows", `${g.grouped?.groups} groups; ${await status()}`);
+  // A read-back borrows the view until its pixels come. What reads the
+  // view meanwhile still works (a call that found the view borrowed would
+  // throw, and leave it unable to be freed: the next .graph then failed
+  // with "attempted to take ownership of Rust value while it was borrowed").
+  const during = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    const threw: string[] = [];
+    for (let t = 0; t < 4; t++) {
+      await new Promise((r) => setTimeout(r, 0));
+      try {
+        w.ursaShell.graph();
+      } catch (e) {
+        threw.push(String(e));
+      }
+    }
+    return { threw, inked: (await ink)?.inked ?? 0 };
+  });
+  check(during.threw.length === 0 && during.inked > 0, "a read-back of the view does not keep what reads the view from it", `${during.threw[0] ?? "nothing threw"}; ${during.inked} px inked`);
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.by === "club" && (await errors(k)) === 1, "after a read-back with the view read meanwhile, the next drawing replaces it", (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "").slice(0, 160));
+  // And the pane closed while a read-back is on its way: the view is
+  // freed once the pixels have come, with no error.
+  const before = failures.length;
+  const shut = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    await new Promise((r) => setTimeout(r, 0));
+    document.getElementById("graph-close")!.click();
+    const open = w.ursaShell.graphOpen();
+    return { open, inked: (await ink)?.inked ?? 0 };
+  });
+  await k.waitForTimeout(200);
+  check(!shut.open && shut.inked > 0 && failures.length === before && !(await graphOpen(k)), "the pane closes while its view is read back: the view is freed afterwards, with no error", JSON.stringify(shut));
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.groups === 2, "and it is drawn again after that", await status());
   check((await errors(k)) === 1, "GROUP BY: the one error on the screen is the refusal", `${await errors(k)} errors`);
   await gctx.close();
 }

@@ -26,6 +26,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
+use futures::TryStreamExt;
 use js_sys::{Promise, Uint8Array};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -42,9 +43,11 @@ use crate::{encode, js_error, Stored};
 use ursa_engine::graph::view::inspect::Inspect;
 use ursa_engine::graph::view::GraphView;
 
-/// Where added files live: `memory://uploads/`.
+/// Where the session's files live: `memory://uploads/`. The engine reads a
+/// file there by its name, and `COPY … TO 'name'` writes one
+/// (`ursa_engine::session_files`).
 pub(crate) fn uploads_url() -> Url {
-    Url::parse("memory://uploads").expect("a valid URL")
+    Url::parse(ursa_engine::session_files::URL).expect("a valid URL")
 }
 
 /// Output the shell writes, kept until [`WebShell::feed`] takes it.
@@ -349,6 +352,19 @@ impl WebShell {
             add_upload(&uploads, &name, bytes)
                 .await
                 .map(|url| JsValue::from_str(&url))
+                .map_err(js_error)
+        })
+    }
+
+    /// The session's files, resolving to JSON: `[{"name", "url", "bytes"}]`
+    /// in name order. They are the files the page added ([`Self::add_file`])
+    /// and the ones `COPY … TO 'name'` wrote.
+    pub fn files(&self) -> Promise {
+        let uploads = Arc::clone(&self.uploads);
+        future_to_promise(async move {
+            list_uploads(&uploads)
+                .await
+                .map(|files| JsValue::from_str(&files.to_string()))
                 .map_err(js_error)
         })
     }
@@ -726,7 +742,28 @@ pub(crate) async fn add_upload(uploads: &InMemory, name: &str, bytes: Vec<u8>) -
         .put(&ObjectPath::from(key.as_str()), PutPayload::from(bytes))
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    Ok(format!("memory://uploads/{key}"))
+    Ok(format!("{}{key}", ursa_engine::session_files::URL))
+}
+
+/// The files in `uploads`, as [`WebShell::files`] gives them.
+pub(crate) async fn list_uploads(uploads: &InMemory) -> Result<serde_json::Value> {
+    let mut files: Vec<_> = uploads
+        .list(None)
+        .try_collect()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    files.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+    Ok(files
+        .iter()
+        .map(|f| {
+            let name = f.location.as_ref();
+            json!({
+                "name": name,
+                "url": format!("{}{name}", ursa_engine::session_files::URL),
+                "bytes": f.size,
+            })
+        })
+        .collect())
 }
 
 /// The name a file is kept under: its name with every character but ASCII
@@ -892,6 +929,191 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// #517: `COPY … TO` in a session with files writes one of them, which a
+    /// later read finds by its name.
+    #[tokio::test]
+    async fn copy_writes_a_session_file_that_reads_back_by_name() {
+        let shell = WebShell::new();
+        run(
+            &shell,
+            "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, NULL)) v(n, s);",
+        )
+        .await;
+        for (target, read) in [
+            ("t.parquet", "t.parquet"),
+            ("t.csv", "t.csv"),
+            ("t.json", "t.json"),
+            ("t.arrow", "t.arrow"),
+            ("memory://uploads/u.parquet", "u.parquet"),
+            ("./v.csv", "memory://uploads/v.csv"),
+        ] {
+            let out = run(&shell, &format!("COPY t TO '{target}';")).await;
+            assert_eq!(out["err"], "", "{target}");
+            assert!(out["out"].as_str().unwrap().contains("│      3 │"), "{out}");
+            let out = run(
+                &shell,
+                &format!("SELECT concat(count(*), '-', sum(n), '-', count(s)) AS r FROM '{read}';"),
+            )
+            .await;
+            assert_eq!(out["err"], "", "{read}");
+            assert!(
+                out["out"].as_str().unwrap().contains("3-6-2"),
+                "{read}: {out}"
+            );
+        }
+        let files = list_uploads(&shell.uploads).await.unwrap();
+        let names: Vec<_> = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "t.arrow",
+                "t.csv",
+                "t.json",
+                "t.parquet",
+                "u.parquet",
+                "v.csv"
+            ]
+        );
+        assert_eq!(files[3]["url"], "memory://uploads/t.parquet");
+        assert!(files[3]["bytes"].as_u64().unwrap() > 0);
+
+        // A query, options in both spellings, and a file written again.
+        let out = run(
+            &shell,
+            "COPY (SELECT n FROM t WHERE n > 1) TO 't.csv' (HEADER false, DELIMITER '|');",
+        )
+        .await;
+        assert_eq!(out["err"], "", "{out}");
+        let out = run(&shell, "SELECT * FROM read_csv('t.csv', header = false);").await;
+        let out = out["out"].as_str().unwrap();
+        assert!(
+            out.contains("column_1") && out.contains("│        3 │"),
+            "{out}"
+        );
+        let out = run(
+            &shell,
+            "COPY t TO 'z.parquet' OPTIONS ('format.compression' 'snappy');",
+        )
+        .await;
+        assert_eq!(out["err"], "", "{out}");
+        let out = run(&shell, "COPY (SELECT 1 AS x WHERE false) TO 'none.csv';").await;
+        assert_eq!(out["err"], "", "{out}");
+        let out = run(&shell, "COPY t TO 'out' STORED AS PARQUET;").await;
+        assert_eq!(out["err"], "", "{out}");
+        let out = run(&shell, "SELECT count(*) AS n FROM read_parquet('out');").await;
+        assert!(out["out"].as_str().unwrap().contains("│     3 │"), "{out}");
+        let out = run(&shell, "EXPLAIN COPY t TO 't.parquet';").await;
+        assert_eq!(out["err"], "", "{out}");
+    }
+
+    /// #517: the write starts no tokio task. A browser has no tokio runtime,
+    /// and DataFusion's file sinks, which spawn their writers, panic there:
+    /// that was the crash. Here the futures run with no runtime, as there.
+    #[test]
+    fn copy_needs_no_tokio_runtime() {
+        futures::executor::block_on(async {
+            let shell = WebShell::new();
+            run(&shell, "CREATE TABLE t AS SELECT 1 AS n, 'a' AS s;").await;
+            for file in ["t.parquet", "t.csv", "t.json", "t.arrow"] {
+                let out = run(&shell, &format!("COPY t TO 'memory://uploads/{file}';")).await;
+                assert_eq!(out["err"], "", "{file}");
+                let out = run(&shell, &format!("SELECT s FROM '{file}';")).await;
+                assert_eq!(out["err"], "", "{file}");
+            }
+        });
+    }
+
+    /// #517: what the session cannot write is refused, saying what works.
+    #[tokio::test]
+    async fn copy_refuses_what_a_session_file_cannot_be() {
+        let shell = WebShell::new();
+        run(&shell, "CREATE TABLE t AS SELECT 1 AS n, 'a' AS s;").await;
+        for (sql, says) in [
+            ("COPY t TO 'out/t.parquet';", "with no folder"),
+            ("COPY t TO '/tmp/t.parquet';", "with no folder"),
+            ("COPY t TO 'my file.csv';", "letters, digits"),
+            (
+                "COPY t TO 'https://example.com/t.parquet';",
+                "writes only this session's files",
+            ),
+            (
+                "COPY t TO 's3://bucket/t.parquet';",
+                "writes only this session's files",
+            ),
+            (
+                "COPY t TO 't.parquet' PARTITIONED BY (s);",
+                "PARTITIONED BY",
+            ),
+            ("COPY t TO 't.csv' (COMPRESSION gzip);", "compressed CSV"),
+            (
+                "COPY t TO 't.json' OPTIONS ('format.compression' 'gzip');",
+                "compressed JSON",
+            ),
+            (
+                "COPY t TO 't.avro';",
+                "end the name in .parquet, .csv, .json or .arrow",
+            ),
+            ("COPY t TO 't';", "or say STORED AS PARQUET"),
+            ("EXPLAIN ANALYZE COPY t TO 't.parquet';", "EXPLAIN ANALYZE"),
+        ] {
+            let out = run(&shell, sql).await;
+            let err = out["err"].as_str().unwrap();
+            assert!(!err.is_empty() && err.contains(says), "{sql}: {out}");
+        }
+        assert_eq!(list_uploads(&shell.uploads).await.unwrap(), json!([]));
+        // An INSERT into a table of files runs the same sinks: refused too,
+        // where one into a table in memory runs.
+        for sql in [
+            "CREATE EXTERNAL TABLE d (n BIGINT) STORED AS CSV LOCATION 'memory://uploads/d/';",
+            "CREATE TABLE m (n BIGINT);",
+            "INSERT INTO m VALUES (2);",
+        ] {
+            assert_eq!(run(&shell, sql).await["err"], "", "{sql}");
+        }
+        for sql in [
+            "INSERT INTO d VALUES (2);",
+            "EXPLAIN ANALYZE INSERT INTO d VALUES (2);",
+        ] {
+            let out = run(&shell, sql).await;
+            assert!(
+                out["err"]
+                    .as_str()
+                    .unwrap()
+                    .contains("d is a table of files"),
+                "{sql}: {out}"
+            );
+        }
+    }
+
+    /// #517 with #516: a layout saved with `COPY` draws from its file.
+    #[tokio::test]
+    async fn saved_positions_round_trip_through_a_session_file() {
+        let shell = WebShell::new();
+        let web = &shell.shell;
+        for sql in [
+            "CREATE TABLE e AS SELECT * FROM (VALUES (0, 1), (1, 2), (2, 0), (2, 3)) v(src, dst);",
+            "CREATE PROPERTY GRAPH g EDGE TABLES (e SOURCE KEY (src) DESTINATION KEY (dst));",
+        ] {
+            assert_eq!(run(&shell, sql).await["err"], "", "{sql}");
+        }
+        let out = run(
+            &shell,
+            "COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';",
+        )
+        .await;
+        assert_eq!(out["err"], "", "{out}");
+        let g = graph_of(web, "g POSITIONS (SELECT * FROM 'pos.parquet')")
+            .await
+            .unwrap();
+        assert_eq!(g.result.node_keys().len(), 4);
+        assert_eq!(g.positions.map(|p| p.x.len()), Some(4));
     }
 
     fn ids(g: &GraphView) -> Vec<&str> {
