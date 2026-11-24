@@ -272,7 +272,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   detail on`, draws every node and edge as before; `.graph detail off`
   aggregates again. On `.graph rmat` (headless Chromium with no GPU): 92
   discs and 2,389 merged edges at the fitted zoom; a cut takes the layout
-  worker 7 to 25 ms (30 are allowed), after 41 to 46 ms once to prepare;
+  worker 10 to 12 ms at the median and 26 at most in two runs of three
+  (35 in the third; 30 are allowed), after 44 to 48 ms once to prepare;
   the worker's memory is unchanged at 55.6 MB. Layouts are bit-identical.
   - `ursa-core`: `Fa2Multilevel::level_members`; a layout keeps each
     level's members when it comes down from it (under 1 MB at a million

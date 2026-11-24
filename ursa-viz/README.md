@@ -442,12 +442,12 @@ the forest (`cut::Hierarchy`): the children of each group, each group's
 mass, centre, spread and box, and the graph's edges once each, in the
 forest's order, so that a cut reads each edge between two of its nodes
 once and no other. That is four bytes an edge and about 60 a node: 5.2 MB
-for the shell's 46K-node, 1M-edge R-MAT graph, made in 41 to 46 ms in the
+for the shell's 46K-node, 1M-edge R-MAT graph, made in 44 to 48 ms in the
 browser, in memory the layout has let go of by then (the worker's
-WebAssembly memory stays at 55.6 MB). A cut then takes 7 to 25 ms there
-(13 to 16 ms natively for the 131K-node graph: `tests/cut_scale.rs`),
-against the 30 ms #498 allows; one with `detail` set gathers no edges and
-takes 3 ms.
+WebAssembly memory stays at 55.6 MB). A cut then takes 6 to 26 ms there,
+with a median of 10 to 12 (one of 39 measured took 35 ms; 11 to 16 ms
+natively for the 131K-node graph: `tests/cut_scale.rs`), against the
+30 ms #498 allows; one with `detail` set gathers no edges and takes 3 ms.
 
 **In the browser.** `Layout.hasCut`, `Layout.prepareCut()` and
 `Layout.cut(camera, separation?, maxNodes?, maxEdges?, detailNodes?)`, for
@@ -487,7 +487,7 @@ node, at every zoom and under its limits, and deterministic.
 In the shell on `.graph rmat` ([`BENCH.md`](BENCH.md#the-aggregated-view)):
 92 discs and 2,389 merged edges at the fitted zoom, where the graph is
 46,318 nodes and a million edges; a wheel zoom over cuts is drawn in frames
-24 to 26 ms apart at the 95th percentile, with no GPU.
+26 to 29 ms apart at the 95th percentile, with no GPU.
 
 ## Making a view
 

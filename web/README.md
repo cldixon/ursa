@@ -410,9 +410,9 @@ static assets and an R2 bucket.
     null), `cuts` (`{on, large, detail, waiting, ms, last, prepared}`),
     `groupLabels` and `camera`. On `.graph rmat` (headless Chromium,
     software WebGL2, 2026-11-24): 92 discs and 2,389 merged edges at the
-    fitted zoom; a cut takes the worker 7 to 25 ms, after 41 to 46 ms once
-    for the forest; a wheel zoom over cuts is drawn in frames 24 to 26 ms
-    apart at the p95; nine zoom steps of 1.35 reach the graph itself.
+    fitted zoom; a cut takes the worker 10 to 12 ms at the median (the
+    slowest of 39 took 35 ms), after 44 to 48 ms once for the forest; a
+    wheel zoom over cuts is drawn in frames 26 to 29 ms apart at the p95; nine zoom steps of 1.35 reach the graph itself.
 
   - **The first paint** (#497): a graph of 200,000 nodes and edges or more
     is first drawn as the coarsest level of its layout's hierarchy, laid
