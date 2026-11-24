@@ -507,6 +507,17 @@ impl View {
         }
     }
 
+    /// Everything of the level or the cut being drawn, to the GPU, as it
+    /// is now: its discs' places, colours and selection rings. A frame
+    /// does this for itself; a snapshot ([`View::snapshot`]) draws what the
+    /// GPU holds, which is the last frame's until this is called. Nothing,
+    /// when the graph itself is drawn.
+    pub fn refresh_level(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.draws_level() {
+            self.prepare_level(device, queue);
+        }
+    }
+
     /// Everything of the level, to the GPU: for a frame that draws it all.
     pub(super) fn prepare_level(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.gather_level(device, queue, usize::MAX, usize::MAX);

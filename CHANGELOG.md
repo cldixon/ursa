@@ -1742,6 +1742,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Graph view: a snapshot of a level, a cut or a grouped drawing is of the
+  view as it is** (#499). `GraphView.snapshot()` drew the discs the last
+  frame had given the GPU, so a read-back taken before the next frame
+  still showed a selection ring that had been cleared. It gives the GPU
+  the discs again first. On screen nothing changes: a frame always did.
+
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
     a number column's separator ending in `:`, `NULL` for a null; a `|` in
