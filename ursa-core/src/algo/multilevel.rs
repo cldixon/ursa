@@ -201,8 +201,11 @@ impl Coarse {
         group
     }
 
-    /// Let go of everything but the counts: the layout is past this level,
-    /// and nothing reads it again.
+    /// Let go of everything but the counts and the members: the layout is
+    /// past this level, and nothing lays it out again. The members stay
+    /// (four bytes for each node of this level and of the one below): they
+    /// are the hierarchy itself, which a cut through it reads after the
+    /// layout is done ([`Fa2Multilevel::level_members`]).
     fn release(&mut self) {
         self.adj = UndirectedCsr {
             offsets: Vec::new(),
@@ -210,8 +213,6 @@ impl Coarse {
         };
         self.weights = Vec::new();
         self.mass = Vec::new();
-        self.member_offsets = Vec::new();
-        self.members = Vec::new();
         self.dropped = Vec::new();
     }
 
@@ -1033,6 +1034,21 @@ impl Fa2Multilevel {
             0 => degree_mass(adj),
             l => self.coarse[l - 1].mass.clone(),
         }
+    }
+
+    /// The nodes of level `level - 1` that each node of level `level`
+    /// stands for (`1..=coarse_levels()`; level 0 is the input graph), as
+    /// a CSR: node `c`'s are `members[offsets[c]..offsets[c + 1]]`, in
+    /// index order. A node of the level below that is in no node's
+    /// members left the hierarchy there (an isolated node, or a whole
+    /// component merged into one node). `None` for a level there is not.
+    ///
+    /// Held for as long as the layout is, whichever level it is laying
+    /// out: the hierarchy is a pure function of the graph, and this is
+    /// all of it that outlasts the layout.
+    pub fn level_members(&self, level: usize) -> Option<(&[u32], &[u32])> {
+        let c = self.coarse.get(level.checked_sub(1)?)?;
+        Some((&c.member_offsets, &c.members))
     }
 
     /// For each node of the level below the one being laid out, the node

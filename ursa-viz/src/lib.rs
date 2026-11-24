@@ -27,6 +27,8 @@
 //!   or WebGL2 in the browser, Vulkan, Metal or DX12 natively. Edges are a
 //!   line list over the node positions, so a layout step uploads 8 bytes a
 //!   node and never the edges.
+//! - [`cut`]: the aggregated view (#498): a cut through the layout's
+//!   hierarchy, chosen by the camera. No GPU.
 //! - [`refine`]: the frame at rest, where it does not fit in a frame: how
 //!   large the slices are that draw it into a texture, and what a change
 //!   of flags asks of that texture. No GPU.
@@ -36,12 +38,13 @@
 //!
 //! With `default-features = false` the crate is [`model`], [`scene`],
 //! [`highlight`], [`interact`], [`spatial`], [`live`], [`budget`],
-//! [`order`] and [`refine`] alone: no GPU and no browser, which is how the engine depends
+//! [`order`], [`cut`] and [`refine`] alone: no GPU and no browser, which is how the engine depends
 //! on it.
 //!
 //! [`Fa2State`]: ursa_core::algo::Fa2State
 
 pub mod budget;
+pub mod cut;
 pub mod highlight;
 pub mod interact;
 #[cfg(feature = "render")]

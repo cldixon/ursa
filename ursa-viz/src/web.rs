@@ -169,6 +169,10 @@ impl Source for PageBytes {
     }
 }
 
+/// The most selected nodes whose edges are drawn wide: a larger selection
+/// (a group of the aggregated view, #498) is its nodes' rings alone.
+const SELECTION_EDGES_MOST_NODES: usize = 10_000;
+
 /// A graph of this many nodes and edges is drawn a level at a time while
 /// it is laid out (the shell's layout worker says which; this is its
 /// threshold): its view warms the level pipelines as it is made.
@@ -944,7 +948,13 @@ impl GraphView {
         let edges = match self.interact.edge() {
             // A selected edge is drawn wide itself; no node is selected.
             Some(e) => vec![e.src, e.dst],
-            None if self.selection_edges => {
+            // Not under a cut, which draws none of the graph's edges, nor
+            // for more nodes than a search selects (a group of a cut can
+            // be half the graph): rings alone.
+            None if self.selection_edges
+                && !self.view.draws_cut()
+                && nodes.len() <= SELECTION_EDGES_MOST_NODES =>
+            {
                 let (src, dst) = self.view.edges();
                 selection.incident_edges(src, dst)
             }
@@ -1230,10 +1240,175 @@ impl GraphView {
         Ok(())
     }
 
-    /// Draw the graph again, and let the level go.
+    /// Draw the graph again, and let the level go (or the cut:
+    /// [`GraphView::set_cut`]).
     #[wasm_bindgen(js_name = clearLevel)]
-    pub fn clear_level(&mut self) {
+    pub fn clear_level(&mut self) -> Result<(), JsValue> {
+        let cut = self.view.draws_cut();
         self.view.clear_level();
+        // The selected nodes' edges, which a cut does not draw.
+        if cut && !self.interact.selection().nodes().is_empty() {
+            self.draw_selection()?;
+        }
+        Ok(())
+    }
+
+    /// Draw a cut through the layout's hierarchy in place of the graph
+    /// (#498), until [`GraphView::clear_level`]: what [`Layout::cut`]
+    /// gives. A disc for each of the cut's groups, at `xy` (`x` then `y`,
+    /// one per group each), its area by the group's `mass`; `members[i]`
+    /// is how many of the graph's nodes group `i` stands for, and `of[v]`
+    /// the group node `v` of the graph is in; the merged edges
+    /// `(src[i], dst[i])` between groups, heaviest first, each as wide and
+    /// as dark as its `weight[i]` says, of the `totalEdges` the cut has.
+    ///
+    /// The camera is not moved: the cut is the graph's own drawing,
+    /// coarser. A group's disc takes the colour of most of its nodes
+    /// ([`GraphView::color_by`]) and carries a ring in the selection
+    /// colour when any of them is selected. While a cut is drawn the
+    /// graph's nodes and edges are not picked: [`GraphView::pick_group`]
+    /// finds a group, and [`GraphView::select_group`] selects its nodes.
+    #[wasm_bindgen(js_name = setCut)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_cut(
+        &mut self,
+        xy: &js_sys::Float32Array,
+        mass: Vec<f32>,
+        members: Vec<u32>,
+        of: Vec<u32>,
+        src: Vec<u32>,
+        dst: Vec<u32>,
+        weight: Vec<f32>,
+        total_edges: Option<u32>,
+    ) -> Result<(), JsValue> {
+        let groups = mass.len();
+        if xy.length() as usize != 2 * groups {
+            return Err(js_err(format!(
+                "expected {} values (x then y) for a cut of {groups} groups; got {}",
+                2 * groups,
+                xy.length()
+            )));
+        }
+        let total = total_edges.map_or(src.len(), |t| t as usize);
+        let mut scene =
+            crate::levels::LevelScene::new(0, 1, mass, src, dst, weight, total).map_err(js_err)?;
+        let (x, y) = scene.positions_mut();
+        let n = groups as u32;
+        xy.subarray(0, n).copy_to(x);
+        xy.subarray(n, 2 * n).copy_to(y);
+        let was = self.view.draws_cut();
+        self.view
+            .set_cut(&self.device, self.config.format, scene, members, of)
+            .map_err(js_err)?;
+        // A cut draws no edges of the graph's: the selection's are let go.
+        if !was && !self.interact.selection().nodes().is_empty() {
+            self.draw_selection()?;
+        }
+        Ok(())
+    }
+
+    /// What is drawn of a cut, or `undefined` when none is:
+    ///
+    /// ```js
+    /// { groups, merged,      // its discs, and those of more than one node
+    ///   nodes,               // the graph's nodes under them: all of them
+    ///   groupsDrawn,         // the discs the last frame drew
+    ///   edges, edgesDrawn,   // the merged edges held, and drawn
+    ///   totalEdges }         // the merged edges the cut has
+    /// ```
+    #[wasm_bindgen(js_name = cutInfo)]
+    pub fn cut_info(&self) -> Result<JsValue, JsValue> {
+        match self.view.cut_info() {
+            Some(info) => js_sys::JSON::parse(&serde_json::to_string(&info).map_err(js_err)?),
+            None => Ok(JsValue::UNDEFINED),
+        }
+    }
+
+    /// The group of the cut drawn under the pixel `(x, y)`, or
+    /// `undefined`: the heaviest of those whose disc covers it.
+    #[wasm_bindgen(js_name = pickGroup)]
+    pub fn pick_group(&self, x: f32, y: f32) -> Option<u32> {
+        self.view.pick_group(x, y)
+    }
+
+    /// The graph's nodes that group `group` of the cut drawn stands for,
+    /// ascending.
+    #[wasm_bindgen(js_name = groupNodes)]
+    pub fn group_nodes(&self, group: u32) -> Vec<u32> {
+        self.view.group_nodes(group)
+    }
+
+    /// The group of the cut drawn that node `node` is in, or `undefined`.
+    #[wasm_bindgen(js_name = groupOf)]
+    pub fn group_of(&self, node: u32) -> Option<u32> {
+        self.view.group_of(node)
+    }
+
+    /// A click, for the selection, while a cut is drawn: on `group` (as
+    /// [`GraphView::pick_group`] gave it) or on empty space
+    /// (`undefined`), with Shift held (`extend`) or not. As
+    /// [`GraphView::select`], with a group's nodes for the node: a plain
+    /// click on a group selects its nodes alone, and on empty space
+    /// clears the selection; with `extend`, a click on a group adds its
+    /// nodes (or takes them out, if all were selected). Returns whether
+    /// the selection changed.
+    #[wasm_bindgen(js_name = selectGroup)]
+    pub fn select_group(&mut self, group: Option<u32>, extend: bool) -> Result<bool, JsValue> {
+        let Some(group) = group else {
+            return self.select(None, extend);
+        };
+        let nodes = self.view.group_nodes(group);
+        if nodes.is_empty() {
+            return Ok(false);
+        }
+        let edge = self.interact.select_edge(None);
+        let selection = self.interact.selection_mut();
+        let changed = if !extend {
+            selection.set(&nodes)
+        } else {
+            let mut all: Vec<u32> = selection.nodes().to_vec();
+            let has: std::collections::HashSet<u32> = all.iter().copied().collect();
+            if nodes.iter().all(|v| has.contains(v)) {
+                let out: std::collections::HashSet<u32> = nodes.iter().copied().collect();
+                all.retain(|v| !out.contains(v));
+            } else {
+                all.extend(nodes.iter().filter(|v| !has.contains(v)));
+            }
+            selection.set(&all)
+        };
+        if changed || edge {
+            self.draw_selection()?;
+        }
+        Ok(changed || edge)
+    }
+
+    /// The labels of the groups of the cut drawn that are large enough on
+    /// the canvas to carry one: for each of the at most `most` heaviest
+    /// groups of more than one node whose disc is in view with a radius of
+    /// at least `minRadius` pixels, `[group, x, y, radius, members]` (in
+    /// canvas pixels from the top left), flat, heaviest first.
+    #[wasm_bindgen(js_name = groupLabels)]
+    pub fn group_labels(&self, min_radius: f32, most: u32) -> Vec<f32> {
+        self.view
+            .group_labels(min_radius, most as usize)
+            .iter()
+            .flat_map(|l| [l.group as f32, l.x, l.y, l.radius, l.members as f32])
+            .collect()
+    }
+
+    /// The camera: `[x, y, pixelsPerUnit, width, height]`, the point of
+    /// the layout at the middle of the canvas, how many canvas pixels a
+    /// unit of the layout spans, and the canvas's size in pixels. What
+    /// [`Layout::cut`] is asked with.
+    pub fn camera(&self) -> Vec<f32> {
+        let c = self.view.camera();
+        vec![
+            c.center.0,
+            c.center.1,
+            c.pixels_per_unit,
+            c.viewport.0,
+            c.viewport.1,
+        ]
     }
 
     /// What is drawn of a level, or `undefined` when the graph is drawn:
@@ -1758,6 +1933,80 @@ impl Layout {
             js_sys::Float32Array::from(&g.edges.weight[..]).into(),
         )?;
         set("totalEdges", (g.edges.total as u32).into())?;
+        Ok(out.into())
+    }
+
+    /// Whether [`Layout::cut`] has a hierarchy to cut: coarse to fine,
+    /// once the layout has reached the graph itself, until it grows.
+    #[wasm_bindgen(getter, js_name = hasCut)]
+    pub fn has_cut(&self) -> bool {
+        self.layout.has_cut()
+    }
+
+    /// A cut through the layout's hierarchy for a camera (#498,
+    /// `ursa_viz::cut`): the groups to draw in place of the graph, where
+    /// its nodes are now. `camera` is [`GraphView::camera`]'s
+    /// `[x, y, pixelsPerUnit, width, height]`; `separation` (pixels),
+    /// `maxNodes`, `maxEdges` and `detailNodes` default to
+    /// `ursa_viz::cut`'s. `undefined` unless [`Layout::has_cut`].
+    ///
+    /// ```js
+    /// { detail,            // the graph itself is to be drawn: what is in
+    ///                      // view is its own nodes (no edges are given)
+    ///   xy,                // Float32Array: x then y, one per group each
+    ///   mass,              // Float32Array: the summed degree + 1
+    ///   members,           // Uint32Array: the graph's nodes in each group
+    ///   of,                // Uint32Array: each node's group
+    ///   src, dst, weight,  // the merged edges, heaviest first
+    ///   totalEdges,        // how many merged edges the cut has
+    ///   inView, membersInView }
+    /// ```
+    ///
+    /// The arrays are new ones, outside this module's memory, the
+    /// caller's to transfer.
+    pub fn cut(
+        &mut self,
+        camera: &[f32],
+        separation: Option<f32>,
+        max_nodes: Option<u32>,
+        max_edges: Option<u32>,
+        detail_nodes: Option<u32>,
+    ) -> Result<JsValue, JsValue> {
+        let &[x, y, ppu, w, h] = camera else {
+            return Err(js_err("a camera is [x, y, pixelsPerUnit, width, height]"));
+        };
+        let mut params = crate::cut::CutParams::of_camera((x, y), ppu, (w, h));
+        if let Some(s) = separation {
+            params.separation = s;
+        }
+        if let Some(n) = max_nodes {
+            params.max_nodes = n as usize;
+        }
+        if let Some(m) = max_edges {
+            params.max_edges = m as usize;
+        }
+        if let Some(d) = detail_nodes {
+            params.detail_nodes = d as usize;
+        }
+        let Some(cut) = self.layout.cut(&params) else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let out = js_sys::Object::new();
+        let set = |key: &str, value: JsValue| js_sys::Reflect::set(&out, &key.into(), &value);
+        set("detail", cut.detail.into())?;
+        set("xy", positions_array(&cut.x, &cut.y).into())?;
+        set("mass", js_sys::Float32Array::from(&cut.mass[..]).into())?;
+        set(
+            "members",
+            js_sys::Uint32Array::from(&cut.members[..]).into(),
+        )?;
+        set("of", js_sys::Uint32Array::from(&cut.of[..]).into())?;
+        set("src", js_sys::Uint32Array::from(&cut.src[..]).into())?;
+        set("dst", js_sys::Uint32Array::from(&cut.dst[..]).into())?;
+        set("weight", js_sys::Float32Array::from(&cut.weight[..]).into())?;
+        set("totalEdges", (cut.total_edges as u32).into())?;
+        set("inView", (cut.in_view as u32).into())?;
+        set("membersInView", (cut.members_in_view as u32).into())?;
         Ok(out.into())
     }
 

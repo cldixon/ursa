@@ -373,6 +373,11 @@ pub struct LiveLayout {
     /// above it came from: kept by [`LiveLayout::step_level`] as it comes
     /// down a level, for [`LiveLayout::level_graph`] to give away.
     parents: Option<Vec<u32>>,
+    /// The hierarchy as a forest, for [`LiveLayout::cut`]: made by the
+    /// first cut, and whether its groups are where the positions now put
+    /// them.
+    hierarchy: Option<crate::cut::Hierarchy>,
+    hierarchy_placed: bool,
 }
 
 #[derive(Debug)]
@@ -506,6 +511,8 @@ impl LiveLayout {
             adjacency,
             engine: Engine::Flat(state),
             parents: None,
+            hierarchy: None,
+            hierarchy_placed: false,
         }
     }
 
@@ -526,6 +533,8 @@ impl LiveLayout {
             adjacency,
             engine: Engine::Multilevel(Box::new(state)),
             parents: None,
+            hierarchy: None,
+            hierarchy_placed: false,
         }
     }
 
@@ -566,6 +575,8 @@ impl LiveLayout {
                 total: 0,
             },
             parents: None,
+            hierarchy: None,
+            hierarchy_placed: false,
         })
     }
 
@@ -631,6 +642,8 @@ impl LiveLayout {
             adjacency,
             engine: Engine::Fixed { kind, x, y },
             parents: None,
+            hierarchy: None,
+            hierarchy_placed: false,
         })
     }
 
@@ -705,6 +718,8 @@ impl LiveLayout {
         };
         self.adjacency = adjacency;
         self.parents = None;
+        // The hierarchy was of the graph before.
+        self.hierarchy = None;
         let total = fa2_grow(
             &mut state,
             &self.adjacency,
@@ -746,6 +761,7 @@ impl LiveLayout {
     /// the current level as it buys. A grown layout runs no more than its
     /// warm schedule has left.
     pub fn step(&mut self, iterations: u32) {
+        self.hierarchy_placed = false;
         let adj = &*self.adjacency;
         match &mut self.engine {
             Engine::Flat(s) => s.step(adj, iterations),
@@ -773,6 +789,7 @@ impl LiveLayout {
     /// brought up to date: [`LiveLayout::prolong`] does that. Any other
     /// layout steps as [`LiveLayout::step`] does.
     pub fn step_level(&mut self, iterations: u32) {
+        self.hierarchy_placed = false;
         match &mut self.engine {
             Engine::Multilevel(s) => {
                 if s.level_finished() {
@@ -842,6 +859,49 @@ impl LiveLayout {
             parents: self.parents.take(),
             edges: s.level_edges(adj, most_edges),
         })
+    }
+
+    /// Whether [`LiveLayout::cut`] has a hierarchy to cut: the layout is
+    /// coarse to fine, with a coarse level, and has reached the graph
+    /// itself (until then the view draws the level being laid out).
+    pub fn has_cut(&self) -> bool {
+        matches!(&self.engine, Engine::Multilevel(s) if s.level() == 0 && s.coarse_levels() > 0)
+    }
+
+    /// A cut through the layout's hierarchy for `params`
+    /// ([`crate::cut`], #498): the groups to draw in place of the graph
+    /// where the nodes are now, and the merged edges between them. `None`
+    /// unless [`LiveLayout::has_cut`].
+    ///
+    /// The first call makes the hierarchy's forest from what the layout
+    /// kept of it (`Fa2Multilevel::level_members`), and each call after
+    /// the positions moved puts its groups where the nodes now are; both
+    /// are held until the layout grows.
+    pub fn cut(&mut self, params: &crate::cut::CutParams) -> Option<crate::cut::Cut> {
+        if !self.has_cut() {
+            return None;
+        }
+        let Engine::Multilevel(s) = &self.engine else {
+            return None;
+        };
+        let adj = &*self.adjacency;
+        if self.hierarchy.is_none() {
+            self.hierarchy = Some(crate::cut::Hierarchy::of_layout(s, adj)?);
+            self.hierarchy_placed = false;
+        }
+        let hierarchy = self.hierarchy.as_mut()?;
+        let (x, y) = s.positions();
+        if !std::mem::replace(&mut self.hierarchy_placed, true) {
+            hierarchy.place(x, y, |v| 1.0 + adj.degree(v) as f32);
+        }
+        Some(hierarchy.cut(adj, x, y, params))
+    }
+
+    /// The bytes [`LiveLayout::cut`] holds between calls: the forest.
+    pub fn cut_bytes(&self) -> usize {
+        self.hierarchy
+            .as_ref()
+            .map_or(0, crate::cut::Hierarchy::bytes)
     }
 
     /// Iterations run so far: for coarse to fine, the work done, in
