@@ -1162,3 +1162,233 @@ async fn find_asks_the_vertex_table_and_splits_the_view_from_the_graph() {
         .unwrap_err();
     assert!(user_message(&e).contains("rank"), "{}", user_message(&e));
 }
+
+/// A ring of `n` nodes with a chord every seventh: something a layout
+/// spreads out, as the edge table `ring` and the property graph `ringed`.
+async fn ringed(ctx: &SessionContext, n: i64) {
+    run(
+        ctx,
+        &format!(
+            "CREATE TABLE ring AS SELECT i AS src, (i + 1) % {n} AS dst FROM \
+             (SELECT unnest(range(0, {n})) AS i) UNION ALL SELECT i AS src, (i + 7) % {n} AS dst \
+             FROM (SELECT unnest(range(0, {n}, 7)) AS i)"
+        ),
+    )
+    .await;
+    create_graph(
+        ctx,
+        def("ringed", ("ring", "src", "dst"), None),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+/// Each node's id and where it is, sorted by id.
+fn placed(view: &GraphView) -> Vec<(String, u32, u32)> {
+    let p = view.positions.as_ref().expect("positions");
+    let mut out: Vec<(String, u32, u32)> = ids(view)
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.to_string(), p.x[i].to_bits(), p.y[i].to_bits()))
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn positions_place_the_nodes_and_no_layout_is_asked_for() {
+    let ctx = new_session();
+    ringed(&ctx, 40).await;
+    // Without the clause a view has no positions: a front end lays it out.
+    assert!(draw(&ctx, "ringed", None).await.positions.is_none());
+
+    run(&ctx, "CREATE TABLE pos AS SELECT * FROM layout_fa2(ringed)").await;
+    let g = draw(&ctx, "ringed POSITIONS (SELECT * FROM pos)", None).await;
+    // Every node is where layout_fa2 put the node with its id, to the bit,
+    // whatever order the drawing numbers its nodes in.
+    let (_, batches) = DataFusionSql
+        .run(&ctx, "SELECT CAST(id AS VARCHAR), x, y FROM pos")
+        .await
+        .unwrap();
+    let mut saved = Vec::new();
+    for b in &batches {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Float32Type;
+        let id = datafusion::arrow::compute::cast(
+            b.column(0),
+            &datafusion::arrow::datatypes::DataType::Utf8,
+        )
+        .unwrap();
+        let (id, x, y) = (
+            id.as_string::<i32>(),
+            b.column(1).as_primitive::<Float32Type>(),
+            b.column(2).as_primitive::<Float32Type>(),
+        );
+        for i in 0..b.num_rows() {
+            saved.push((
+                id.value(i).to_string(),
+                x.value(i).to_bits(),
+                y.value(i).to_bits(),
+            ));
+        }
+    }
+    saved.sort();
+    assert_eq!(saved.len(), 40);
+    assert_eq!(placed(&g), saved);
+    // The result itself has none (an explore session's deltas are of a
+    // result without them); `placed` is the result with them in.
+    assert!(g.result.positions().is_none());
+    assert_eq!(g.result.provenance().notes, Vec::<String>::new());
+    let with = g.placed();
+    assert_eq!(with.positions(), g.positions.as_ref());
+    let back = GraphResult::from_bytes(&with.to_bytes()).unwrap();
+    assert_eq!(back.positions(), g.positions.as_ref());
+
+    // The same rows give the same bits; the columns are found by name, in
+    // any order, or else by position, and x and y may be any numbers.
+    let again = draw(&ctx, "ringed POSITIONS (SELECT * FROM pos)", None).await;
+    assert_eq!(placed(&again), saved);
+    let named = draw(
+        &ctx,
+        "ringed POSITIONS (SELECT y, x, id, 1 AS extra FROM pos)",
+        None,
+    )
+    .await;
+    assert_eq!(placed(&named), saved);
+    let by_place = draw(
+        &ctx,
+        "ringed POSITIONS (SELECT id AS node, x AS a, y AS b FROM pos)",
+        None,
+    )
+    .await;
+    assert_eq!(placed(&by_place), saved);
+    let doubles = draw(
+        &ctx,
+        "ringed POSITIONS (SELECT id, CAST(x AS DOUBLE) AS x, CAST(y AS DOUBLE) AS y FROM pos)",
+        None,
+    )
+    .await;
+    assert_eq!(placed(&doubles), saved);
+    // A query's rows are placed as a graph's are, and SIZE BY still applies.
+    let rows = draw(
+        &ctx,
+        "SELECT src, dst FROM ring POSITIONS (SELECT * FROM pos) SIZE BY degree",
+        None,
+    )
+    .await;
+    assert_eq!(placed(&rows), saved);
+    assert_eq!(rows.result.encodings().size_by.as_deref(), Some("degree"));
+}
+
+#[tokio::test]
+async fn nodes_without_a_saved_position_are_placed_beside_their_neighbours() {
+    let ctx = new_session();
+    ringed(&ctx, 40).await;
+    run(&ctx, "CREATE TABLE pos AS SELECT * FROM layout_fa2(ringed)").await;
+    let whole = draw(&ctx, "ringed POSITIONS (SELECT * FROM pos)", None).await;
+    // Three nodes with no row, one with a NULL x, one with a NaN, and rows
+    // of no node.
+    let partial = "ringed POSITIONS (SELECT id, CASE WHEN id = 11 THEN NULL WHEN id = 12 THEN \
+                   CAST('NaN' AS FLOAT) ELSE x END AS x, y FROM pos WHERE id NOT IN (3, 4, 20) \
+                   UNION ALL SELECT 1000 + id, x, y FROM pos WHERE id < 2)";
+    let g = draw(&ctx, partial, None).await;
+    let (all, some) = (placed(&whole), placed(&g));
+    let missing = ["11", "12", "20", "3", "4"];
+    let p = g.positions.as_ref().unwrap();
+    let w = whole.positions.as_ref().unwrap();
+    let span = w.x.iter().fold(0f32, |m, v| m.max(v.abs())) * 2.0;
+    for ((id, x, y), (_, wx, wy)) in some.iter().zip(&all) {
+        if missing.contains(&id.as_str()) {
+            continue;
+        }
+        // The placed nodes have not moved by a bit.
+        assert_eq!((x, y), (wx, wy), "node {id}");
+    }
+    let at = |id: &str| {
+        let i = ids(&g).iter().position(|k| *k == id).unwrap();
+        (p.x[i], p.y[i])
+    };
+    for id in missing {
+        let (x, y) = at(id);
+        assert!(x.is_finite() && y.is_finite(), "node {id}");
+        // Beside a neighbour that had a place: within a fifth of the
+        // drawing of the nearest ring neighbour.
+        let n: i64 = id.parse().unwrap();
+        let near = [(n + 39) % 40, (n + 1) % 40, (n + 38) % 40, (n + 2) % 40]
+            .iter()
+            .map(|m| {
+                let (mx, my) = at(&m.to_string());
+                ((x - mx).powi(2) + (y - my).powi(2)).sqrt()
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            near < span / 5.0,
+            "node {id} is {near} from its neighbours, of {span}"
+        );
+    }
+    assert_eq!(
+        g.result.provenance().notes,
+        [
+            "5 of 40 nodes had no saved position and were placed beside their neighbours",
+            "2 of POSITIONS's rows are of no node drawn"
+        ]
+    );
+    assert!(g.drawn_as().contains("5 of 40 nodes had no saved position"));
+    // The same rows, the same bits.
+    assert_eq!(placed(&draw(&ctx, partial, None).await), some);
+}
+
+#[tokio::test]
+async fn positions_that_cannot_place_the_nodes_say_why() {
+    let ctx = new_session();
+    ringed(&ctx, 12).await;
+    run(&ctx, "CREATE TABLE pos AS SELECT * FROM layout_fa2(ringed)").await;
+    for (text, says) in [
+        (
+            "ringed POSITIONS (SELECT id, x FROM pos)",
+            "POSITIONS (…) needs three columns, each node's id and its x and y; got 2",
+        ),
+        (
+            "ringed POSITIONS (SELECT id, 'a' AS x, y FROM pos)",
+            "the column 'x' is read as each node's x, and it is Utf8",
+        ),
+        (
+            "ringed POSITIONS (SELECT id + 100 AS id, x, y FROM pos)",
+            "places none of the drawing's 12 nodes: its 12 rows have no id that is a node of it",
+        ),
+        (
+            "ringed POSITIONS (SELECT * FROM pos) LAYOUT force",
+            "POSITIONS (…) and LAYOUT force both say where the nodes go; give one",
+        ),
+        ("ringed POSITIONS (SELECT * FROM nowhere)", "nowhere"),
+    ] {
+        let err = refusal(&ctx, text, None).await;
+        assert!(err.contains(says), "{text}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn the_edge_cap_is_a_setting_and_its_refusal_names_it() {
+    let ctx = new_session();
+    ringed(&ctx, 40).await;
+    assert_eq!(draw(&ctx, "ringed", None).await.result.n_edges(), 46);
+    run(&ctx, "SET ursa.graph_max_edges = 45").await;
+    for text in ["ringed", "SELECT src, dst FROM ring", "ring"] {
+        let err = refusal(&ctx, text, None).await;
+        assert!(
+            err.contains("46 edges; the graph view draws at most 45 (ursa.graph_max_edges)"),
+            "{text}: {err}"
+        );
+        assert!(
+            err.contains("SET ursa.graph_max_edges = 1000000"),
+            "{text}: {err}"
+        );
+    }
+    // Raised, or 0 for no limit, it is drawn.
+    run(&ctx, "SET ursa.graph_max_edges = 46").await;
+    assert_eq!(draw(&ctx, "ringed", None).await.result.n_edges(), 46);
+    run(&ctx, "SET ursa.graph_max_edges = 0").await;
+    assert_eq!(draw(&ctx, "ringed", None).await.result.n_edges(), 46);
+}

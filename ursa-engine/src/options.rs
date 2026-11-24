@@ -309,6 +309,11 @@ extensions_options! {
         /// an eighth of the memory available. 0 reads the partitions one
         /// after another.
         pub build_read_ahead: ReadAhead, default = ReadAhead::Auto
+        /// The most edges the graph view draws (`.graph`): a result or a
+        /// graph with more is refused, with a message that names this
+        /// setting. 0 for no limit. Default 5000000, which a desktop
+        /// browser draws; the web shell sets 500000 on a phone.
+        pub graph_max_edges: usize, default = crate::graph::view::MAX_EDGES
     }
 }
 
@@ -344,6 +349,21 @@ pub fn max_paths(config: &SessionConfig) -> Option<usize> {
         .get::<UrsaOptions>()
         .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths);
     (n > 0).then_some(n)
+}
+
+/// The session's `ursa.graph_max_edges`: the most edges the graph view
+/// draws; `usize::MAX` when it is 0, no limit.
+pub fn graph_max_edges(config: &SessionConfig) -> usize {
+    let n = config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .map_or(crate::graph::view::MAX_EDGES, |o| o.graph_max_edges);
+    if n == 0 {
+        usize::MAX
+    } else {
+        n
+    }
 }
 
 /// The session's `ursa.build_read_ahead`, if it was `SET`; `None` when it

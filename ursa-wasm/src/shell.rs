@@ -87,6 +87,8 @@ pub struct WebShell {
 pub struct GraphData {
     ugr: Vec<u8>,
     skipped: u32,
+    /// `POSITIONS (query)`'s place for each node: every `x`, then every `y`.
+    positions: Option<Vec<f32>>,
 }
 
 impl From<GraphView> for GraphData {
@@ -94,6 +96,10 @@ impl From<GraphView> for GraphData {
         GraphData {
             ugr: view.result.to_bytes(),
             skipped: view.skipped as u32,
+            positions: view.positions.map(|mut p| {
+                p.x.append(&mut p.y);
+                p.x
+            }),
         }
     }
 }
@@ -116,6 +122,15 @@ impl GraphData {
     #[wasm_bindgen(getter)]
     pub fn skipped(&self) -> u32 {
         self.skipped
+    }
+
+    /// Where `POSITIONS (query)` puts the nodes (#502): `x` then `y`, one
+    /// per node each, in a `Float32Array` with a buffer of its own, to
+    /// transfer; `undefined` without the clause. The page draws the graph
+    /// there and runs no layout. It gives them once.
+    #[wasm_bindgen(js_name = takePositions)]
+    pub fn take_positions(&mut self) -> Option<Vec<f32>> {
+        self.positions.take()
     }
 }
 
@@ -596,11 +611,12 @@ fn busy() -> DataFusionError {
 )]
 async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphView> {
     let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
-    let skipped = shell.open_graph(text).await?;
+    let (skipped, positions) = shell.open_graph_placed(text).await?;
     let result = shell.explorer().expect("a graph was opened").result();
     Ok(GraphView {
         result: result.clone(),
         skipped,
+        positions,
     })
 }
 

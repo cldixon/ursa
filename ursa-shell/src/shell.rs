@@ -347,9 +347,19 @@ impl<O: Write, E: Write> Shell<O, E> {
     ///
     /// An error is returned, not printed, and leaves the graph that was open.
     pub async fn open_graph(&mut self, text: &str) -> Result<usize> {
+        Ok(self.open_graph_placed(text).await?.0)
+    }
+
+    /// [`Self::open_graph`], and where `POSITIONS (query)` puts the graph's
+    /// nodes, if `text` has the clause (`GraphView::positions`): a host
+    /// draws them there and runs no layout.
+    pub async fn open_graph_placed(
+        &mut self,
+        text: &str,
+    ) -> Result<(usize, Option<view::Positions>)> {
         let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, self.last.clone()).await?;
         self.explorer = Some(ExploreSession::new(drawn.result));
-        Ok(drawn.skipped)
+        Ok((drawn.skipped, drawn.positions))
     }
 
     /// Close the graph: the explore commands have nothing to act on.
