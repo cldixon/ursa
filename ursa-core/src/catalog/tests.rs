@@ -218,9 +218,9 @@ fn weights_directions_and_dtypes_are_where_python_has_them() {
         ]
     );
     assert_eq!(with(|s| s.reads_attribute()), ["neighbors_agg"]);
-    assert_eq!(lookup("pagerank").unwrap().directions(), OUT_OR_BOTH);
-    assert_eq!(lookup("betweenness").unwrap().directions(), OUT_OR_BOTH);
     for name in [
+        "pagerank",
+        "betweenness",
         "degree",
         "closeness",
         "neighbors_agg",
@@ -561,8 +561,8 @@ fn reports_bad_arguments_structurally() {
         ("approximate".into(), Expected(super::Expected::Bool))
     );
     assert_eq!(
-        kind(call("pagerank", &[("direction", s("in"))])),
-        ("direction".into(), NotOneOf(OUT_OR_BOTH))
+        kind(call("pagerank", &[("direction", s("up"))])),
+        ("direction".into(), NotOneOf(ALL_DIRECTIONS))
     );
     assert_eq!(
         kind(call("degree", &[("direction", Arg::Int(1))])),
@@ -604,10 +604,10 @@ fn the_first_bad_argument_in_the_order_given_is_reported() {
 
 #[test]
 fn param_errors_have_a_plain_message() {
-    let e = call("pagerank", &[("direction", s("in"))]).unwrap_err();
+    let e = call("pagerank", &[("direction", s("up"))]).unwrap_err();
     assert_eq!(
         e.to_string(),
-        "pagerank(): 'direction' must be one of 'out', 'both'"
+        "pagerank(): 'direction' must be one of 'out', 'in', 'both'"
     );
 }
 
@@ -808,6 +808,65 @@ fn both_directions_read_the_symmetric_view() {
     let full = betweenness(t.symmetric(), None, None, None);
     let halved: Vec<f64> = full.into_iter().map(|x| x * 0.5).collect();
     assert_eq!(f64s(&bc[0]), halved);
+}
+
+/// `direction => 'in'` of `pagerank` and `betweenness` (#415) is the
+/// out-direction kernel over the reversed rows, weighted, masked or not.
+#[test]
+fn in_reads_the_reversed_graph() {
+    let (src, dst) = ([0, 1, 2, 0, 1, 3], [1, 2, 0, 3, 3, 2]);
+    let t = topo(4, &src, &dst);
+    let reversed = topo(4, &dst, &src);
+    let weights = vec![1.0, 2.0, 1.0, 3.0, 1.0, 5.0];
+    let mask = EdgeMask::from_bools(&[true, true, false, true, true, true]);
+    let pagerank_call = |direction| Call::PageRank {
+        damping: 0.85,
+        max_iter: 100,
+        tol: 1e-12,
+        direction,
+    };
+    let betweenness_call = |direction| Call::Betweenness {
+        sample: None,
+        seed: None,
+        direction,
+    };
+    for mask in [None, Some(&mask)] {
+        for weights in [None, Some(weights.as_slice())] {
+            let inputs = Inputs {
+                weights,
+                attribute: None,
+            };
+            for call in [pagerank_call, betweenness_call] {
+                let got = Evaluator::new(&t, mask)
+                    .evaluate(&call(Direction::In), inputs)
+                    .unwrap();
+                let want = Evaluator::new(&reversed, mask)
+                    .evaluate(&call(Direction::Out), inputs)
+                    .unwrap();
+                let (got, want) = (f64s(&got[0]), f64s(&want[0]));
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(
+                        (g - w).abs() < 1e-12,
+                        "{:?}: {got:?} {want:?}",
+                        call(Direction::In)
+                    );
+                }
+            }
+        }
+    }
+    // Reversing every shortest path keeps exact betweenness.
+    let out = Evaluator::new(&t, None)
+        .evaluate(&betweenness_call(Direction::Out), Inputs::default())
+        .unwrap();
+    let inn = Evaluator::new(&t, None)
+        .evaluate(&betweenness_call(Direction::In), Inputs::default())
+        .unwrap();
+    for (o, i) in f64s(&out[0]).iter().zip(f64s(&inn[0])) {
+        assert!((o - i).abs() < 1e-12);
+    }
+    assert!(call("pagerank", &[("direction", s("in"))]).is_ok());
+    assert!(call("betweenness", &[("direction", s("in"))]).is_ok());
 }
 
 #[test]

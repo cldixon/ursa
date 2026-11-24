@@ -422,7 +422,7 @@ async fn views_encode_to_the_fixtures_the_page_reads() {
     // rows come in no particular order (#452), so the fixture sorts them.
     let last = rows(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both') \
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both') \
          ORDER BY seed, distance, id",
     )
     .await;
@@ -526,7 +526,7 @@ async fn a_hop_result_is_rings_with_the_graphs_real_edges() {
     let ctx = karate().await;
     let view = interpreted(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')",
     )
     .await;
     let r = &view.result;
@@ -562,7 +562,7 @@ async fn a_hop_result_is_rings_with_the_graphs_real_edges() {
     // otherwise.
     let last = rows(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0, 33], n => 1, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0, 33], steps => 1, direction => 'both')",
     )
     .await;
     let view = draw(&ctx, "COLOR BY club", last).await;
@@ -606,7 +606,7 @@ async fn a_hop_result_is_rings_with_the_graphs_real_edges() {
     // A hop result without its distance: edges seed–id, with a note.
     let view = interpreted(
         &ctx,
-        "SELECT seed, id FROM hop(karate, seeds => [0], n => 1, direction => 'both')",
+        "SELECT seed, id FROM hop(karate, seeds => [0], steps => 1, direction => 'both')",
     )
     .await;
     assert_eq!(view.result.provenance().rule.as_deref(), Some("edges"));
@@ -890,7 +890,7 @@ async fn as_on_and_layout_override_the_rules() {
     // Hops: computed columns carry no metadata, and by the rules their
     // first two are edges.
     let hops = "SELECT seed + 0 AS s, id + 0 AS i, CAST(distance AS INT) AS far \
-                FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+                FROM hop(karate, seeds => [0], steps => 2, direction => 'both')";
     assert_eq!(
         interpreted(&ctx, hops)
             .await
@@ -906,7 +906,7 @@ async fn as_on_and_layout_override_the_rules() {
     // What the hop result itself draws: 26 nodes, the 59 real edges.
     let own = interpreted(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')",
     )
     .await;
     assert_eq!((r.n_nodes(), r.n_edges()), (26, 59));
@@ -931,7 +931,7 @@ async fn as_on_and_layout_override_the_rules() {
     }
     // On a result the rules read too.
     let view = drawn(
-        "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both')",
         "LAYOUT layers",
     )
     .await;
@@ -1017,7 +1017,7 @@ async fn an_expansion_is_capped_by_degree_then_key_and_is_the_same_every_time() 
     let ctx = karate().await;
     let base = interpreted(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [16], n => 1, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [16], steps => 1, direction => 'both')",
     )
     .await
     .result;
@@ -1095,7 +1095,7 @@ async fn find_asks_the_vertex_table_and_splits_the_view_from_the_graph() {
     let ctx = karate().await;
     let base = interpreted(
         &ctx,
-        "SELECT * FROM hop(karate, seeds => [16], n => 1, direction => 'both')",
+        "SELECT * FROM hop(karate, seeds => [16], steps => 1, direction => 'both')",
     )
     .await
     .result;

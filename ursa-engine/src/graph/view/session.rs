@@ -856,7 +856,7 @@ impl Session {
         // 1. The neighbours that are not shown, the highest degree first.
         let neighbours = format!(
             "SELECT h.id, count(*) OVER () AS neighbours \
-             FROM hop({graph}, seeds => [{seed}], n => 1, direction => '{}') AS h \
+             FROM hop({graph}, seeds => [{seed}], steps => 1, direction => '{}') AS h \
              JOIN degree({graph}, direction => 'both') AS d ON d.id = h.id \
              WHERE h.id NOT IN ({}) \
              ORDER BY d.degree DESC, h.id LIMIT {limit}",

@@ -85,8 +85,8 @@ const QUERIES: &[&str] = &[
     "SELECT * FROM louvain(g_sum, seed => 1, weight => weight)",
     "SELECT id, arrow_cast(pagerank, 'Utf8') AS bits FROM pagerank(g_sum, weight => weight)",
     "SELECT * FROM louvain(g_union, seed => 1)",
-    "SELECT * FROM hop(g_file, seeds => (SELECT src FROM ties GROUP BY src), n => 1)",
-    "SELECT * FROM hop(g_join, seeds => (SELECT dst FROM joined GROUP BY dst), n => 1)",
+    "SELECT * FROM hop(g_file, seeds => (SELECT src FROM ties GROUP BY src), steps => 1)",
+    "SELECT * FROM hop(g_join, seeds => (SELECT dst FROM joined GROUP BY dst), steps => 1)",
 ];
 
 #[tokio::test]
@@ -152,7 +152,7 @@ async fn explain_shows_the_sort_only_where_order_is_not_preserved() {
     // Over the file (and a view that filters it), no sort.
     for sql in [
         "SELECT * FROM pagerank(g_file)",
-        "SELECT * FROM hop(g_file, seeds => [0], n => 1)",
+        "SELECT * FROM hop(g_file, seeds => [0], steps => 1)",
     ] {
         let plan = physical_plan(&ctx, sql).await;
         assert!(!plan.contains("SortExec"), "{plan}");

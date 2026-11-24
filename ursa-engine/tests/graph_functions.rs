@@ -443,8 +443,8 @@ async fn planning_errors() {
             "algorithms(): pagerank(damping =>) must be between 0 and 1; got -1",
         ),
         (
-            "SELECT * FROM pagerank(karate, direction => 'in')",
-            "pagerank(direction => 'in') is not supported; use one of 'out', 'both'",
+            "SELECT * FROM pagerank(karate, direction => 'up')",
+            "pagerank(direction => 'up') is not supported; use one of 'out', 'in', 'both'",
         ),
         (
             "SELECT * FROM pagerank(karate, damping => 1 - 0.1)",
@@ -532,5 +532,108 @@ async fn an_empty_edge_set_has_no_nodes() {
             .await
             .unwrap();
         assert!(out.contains("| 0 |"), "{f}: {out}");
+    }
+}
+
+/// #415: `name = value` and `name := value` are `name => value`, at the top
+/// level and inside `algorithms()`.
+#[tokio::test]
+async fn named_arguments_take_any_operator() {
+    let ctx = karate().await;
+    let arrow = table(
+        &ctx,
+        "SELECT * FROM pagerank(karate, damping => 0.5, direction => 'both') ORDER BY id LIMIT 3",
+    )
+    .await
+    .unwrap();
+    for sql in [
+        "SELECT * FROM pagerank(karate, damping = 0.5, direction = 'both') ORDER BY id LIMIT 3",
+        "SELECT * FROM pagerank(karate, damping := 0.5, direction := 'both') ORDER BY id LIMIT 3",
+        "SELECT * FROM pagerank(karate, damping = 0.5, direction => 'both') ORDER BY id LIMIT 3",
+    ] {
+        assert_eq!(table(&ctx, sql).await.unwrap(), arrow, "{sql}");
+    }
+    let nested = table(
+        &ctx,
+        "SELECT * FROM algorithms(karate, c => louvain(seed => 1), degree(direction => 'in')) \
+         ORDER BY id LIMIT 3",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        table(
+            &ctx,
+            "SELECT * FROM algorithms(karate, c = louvain(seed := 1), degree(direction = 'in')) \
+             ORDER BY id LIMIT 3",
+        )
+        .await
+        .unwrap(),
+        nested
+    );
+    let hop = "SELECT * FROM hop(karate, seeds => [0], steps => 2) ORDER BY seed, id";
+    assert_eq!(
+        table(
+            &ctx,
+            "SELECT * FROM hop(karate, seeds = [0], steps := 2) ORDER BY seed, id"
+        )
+        .await
+        .unwrap(),
+        table(&ctx, hop).await.unwrap()
+    );
+    assert_eq!(
+        error(&ctx, "SELECT * FROM pagerank(karate, dampng = 0.5)").await,
+        "pagerank() has no parameter 'dampng'; did you mean 'damping'? Its parameters are: \
+         damping, max_iter, tol, weight, direction"
+    );
+}
+
+/// #415: a direction in any case; 'undirected' is pointed to 'both';
+/// `pagerank` and `betweenness` take 'in', the reversed graph.
+#[tokio::test]
+async fn directions_in_any_case_and_in_for_pagerank() {
+    let ctx = karate().await;
+    let both = table(
+        &ctx,
+        "SELECT * FROM degree(karate, direction => 'both') ORDER BY id",
+    )
+    .await
+    .unwrap();
+    for text in ["BOTH", "Both"] {
+        let sql = format!("SELECT * FROM degree(karate, direction => '{text}') ORDER BY id");
+        assert_eq!(table(&ctx, &sql).await.unwrap(), both, "{text}");
+    }
+    assert_eq!(
+        error(
+            &ctx,
+            "SELECT * FROM degree(karate, direction => 'undirected')"
+        )
+        .await,
+        "degree(direction => 'undirected') is not supported; use 'both', which reads every \
+         edge both ways (the undirected view)"
+    );
+    // 'in' is the stored rows reversed.
+    ctx.sql("CREATE VIEW reversed AS SELECT dst AS src, src AS dst FROM ties")
+        .await
+        .unwrap();
+    registry_of(&ctx).put(GraphDef {
+        name: "reversed".into(),
+        edges: EdgeTable::new(TableReference::bare("reversed"), "src", "dst"),
+        vertices: None,
+    });
+    for (function, args) in [
+        ("pagerank", "max_iter => 200, tol => 1e-12"),
+        ("betweenness", "seed => 1"),
+    ] {
+        let rows = |graph: &str, direction: &str| {
+            format!(
+                "SELECT id, round({function}, 9) AS v FROM {function}({graph}, {args}, \
+                 direction => '{direction}') ORDER BY id"
+            )
+        };
+        assert_eq!(
+            table(&ctx, &rows("karate", "in")).await.unwrap(),
+            table(&ctx, &rows("reversed", "out")).await.unwrap(),
+            "{function}"
+        );
     }
 }

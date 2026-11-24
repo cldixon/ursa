@@ -222,16 +222,17 @@ async fn a_node_on_no_edge_reaches_nothing() {
     assert_eq!(
         ok(
             &ctx,
-            "SELECT * FROM random_walk(g, start => [5], steps => 3, seed => 1)"
+            "SELECT * FROM random_walk(g, seeds => [5], steps => 3, random_seed => 1)"
         )
         .await,
         ["0,0,5"]
     );
-    // 9 is no node: a seed of 9 reaches nothing either.
+    // 9 is no node: from a query, a seed of 9 is skipped and reaches
+    // nothing; written as a literal, it is an error (#416).
     assert_eq!(
         ok(
             &ctx,
-            "SELECT * FROM hop(g, seeds => [9], direction => 'both')"
+            "SELECT * FROM hop(g, seeds => (SELECT 9), direction => 'both')"
         )
         .await,
         Vec::<String>::new()

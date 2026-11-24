@@ -190,6 +190,13 @@ def sql_list(values: list[Any]) -> str:
     return "[" + ", ".join(sql_literal(v) for v in values) + "]"
 
 
+def sql_query(values: list[Any]) -> str:
+    """``values`` as a query of one column, in order. Python skips an id that
+    is not a node (#225); SQL skips one from a query, where a literal one is an
+    error (#416), so ids that include one not in the graph go as a query."""
+    return f"(SELECT unnest({sql_list(values)}))"
+
+
 def hop(n: int, direction: str, seeds: Any) -> Callable[[Any], Any]:
     return lambda edges: ur.hop(edges, n=n, direction=direction).from_(seeds)
 
@@ -205,7 +212,7 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
             cases.append(
                 (
                     "hop",
-                    f"seeds => {sql_list(seeds)}, n => {n}, direction => '{direction}'",
+                    f"seeds => {sql_list(seeds)}, steps => {n}, direction => '{direction}'",
                     hop(n, direction, seeds),
                 )
             )
@@ -216,7 +223,7 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
     cases.append(
         (
             "hop",
-            f"seeds => {sql_list(repeated)}, direction => 'both'",
+            f"seeds => {sql_query(repeated)}, direction => 'both'",
             hop(1, "both", repeated),
         )
     )
@@ -224,7 +231,7 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
     if dataset == "karate":
         _, members = ur.datasets.load_karate(with_nodes=True)
         officers = members.filter(ur.col("club") == "Officer")
-        cases.append(("hop", f"seeds => {OFFICERS_SQL}, n => 2", hop(2, "out", officers)))
+        cases.append(("hop", f"seeds => {OFFICERS_SQL}, steps => 2", hop(2, "out", officers)))
 
     for direction in ("out", "in", "both"):
         cases.append(
@@ -246,7 +253,7 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
     cases.append(
         (
             "shortest_path",
-            f"source => {sql_literal(source)}, target => {sql_literal(missing)}",
+            f"source => {sql_literal(source)}, target => (SELECT {sql_literal(missing)})",
             lambda edges: ur.shortest_path(edges, source, missing),
         )
     )
@@ -267,14 +274,14 @@ def traversal_cases(dataset: str) -> list[tuple[str, str, Callable[[Any], Any]]]
     cases.append(
         (
             "random_walk",
-            f"start => {sql_list(starts)}, steps => 4, walks_per_node => 2, seed => 7",
+            f"seeds => {sql_query(starts)}, steps => 4, walks_per_node => 2, random_seed => 7",
             lambda edges: ur.random_walk(edges, starts, 4, walks_per_node=2, seed=7),
         )
     )
     cases.append(
         (
             "random_walk",
-            f"start => {sql_literal(seeds[1])}, steps => 10",
+            f"seeds => {sql_literal(seeds[1])}, steps => 10",
             lambda edges: ur.random_walk(edges, [seeds[1]], 10),
         )
     )

@@ -144,7 +144,7 @@ async fn find_selects_by_key_then_label_and_by_a_condition() {
 #[tokio::test]
 async fn matches_outside_the_view_are_named_not_selected() {
     let mut host = Host::karate().await;
-    host.says("SELECT * FROM hop(karate, seeds => [16], n => 1, direction => 'both');")
+    host.says("SELECT * FROM hop(karate, seeds => [16], steps => 1, direction => 'both');")
         .await;
     host.says(".graph").await;
 
@@ -266,7 +266,7 @@ async fn find_matches_keys_where_there_is_no_vertex_table() {
     assert_eq!(host.selected(), ["Ann", "anna"]);
 
     // Part of it: the rest of the graph is asked for.
-    host.says(".graph SELECT * FROM hop(social, seeds => ['bob'], n => 1)")
+    host.says(".graph SELECT * FROM hop(social, seeds => ['bob'], steps => 1)")
         .await;
     assert_eq!(
         host.says(".find an").await,
