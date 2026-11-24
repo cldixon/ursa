@@ -222,7 +222,10 @@ export function createInspector(host) {
   };
 
   const showNode = (subject, mine, started) => {
-    title.textContent = `node ${subject.key}`;
+    // In a grouped drawing (#499) a node is a group ("open" or "closed")
+    // or a member of an open one ("member").
+    const isGroup = subject.group === "open" || subject.group === "closed";
+    title.textContent = `${isGroup ? "group" : "node"} ${subject.key}`;
     const facts = [];
     if (subject.label) facts.push(["label", subject.label]);
     const degree = el("span", "value", number(subject.degree));
@@ -249,11 +252,12 @@ export function createInspector(host) {
     if (subject.values.length) top.append(properties(subject.values));
 
     const actions = el("div", "inspector-actions");
-    const key = subject.key;
-    actions.append(
-      button("expand", `Add this node's neighbours (.expand ${key})`, () => host.run(`.expand ${key}`)),
-      button("hide", `Take this node out of the view (.hide ${key})`, () => host.run(`.hide ${key}`)),
-    );
+    // What a command names it by: its key, or a group's "group:3".
+    const key = subject.id ?? subject.key;
+    if (subject.group === "open") actions.append(button("collapse", `Close this group (.collapse ${key})`, () => host.run(`.collapse ${key}`)));
+    else if (isGroup) actions.append(button("expand", `Open this group: its members, in its disc (.expand ${key})`, () => host.run(`.expand ${key}`)));
+    else if (!subject.group) actions.append(button("expand", `Add this node's neighbours (.expand ${key})`, () => host.run(`.expand ${key}`)));
+    actions.append(button("hide", `Take this ${isGroup ? "group" : "node"} out of the view (.hide ${key})`, () => host.run(`.hide ${key}`)));
     const pin = button(subject.pinned ? "unpin" : "pin", "Mark this node with a pin", () => {
       const on = host.pin(subject.index);
       pin.textContent = on ? "unpin" : "pin";
@@ -262,7 +266,7 @@ export function createInspector(host) {
     });
     pin.setAttribute("aria-pressed", String(!!subject.pinned));
     actions.append(pin);
-    if (subject.graph !== null) {
+    if (subject.graph !== null && !isGroup) {
       const here = { key, type: subject.keyType, graph: subject.graph };
       if (pathFrom && pathFrom.graph === subject.graph && pathFrom.key !== key) {
         const from = pathFrom;
@@ -323,7 +327,7 @@ export function createInspector(host) {
       ]),
     );
     const actions = el("div", "inspector-actions");
-    const keys = nodes.map((n) => n.key).join(" ");
+    const keys = nodes.map((n) => n.id ?? n.key).join(" ");
     actions.append(button("hide", "Take these nodes out of the view", () => host.run(`.hide ${keys}`)));
     if (nodes.length === 2 && subject.graph !== null) {
       const [a, b] = nodes.map((n) => ({ key: n.key, type: n.keyType }));

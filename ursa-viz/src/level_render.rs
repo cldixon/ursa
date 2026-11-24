@@ -197,6 +197,8 @@ pub struct LevelRenderer {
     bind_group: wgpu::BindGroup,
     disc: Instances,
     link: Instances,
+    /// Discs drawn under the links ([`LevelRenderer::set_under`]).
+    under: Instances,
 }
 
 impl LevelRenderer {
@@ -311,6 +313,7 @@ impl LevelRenderer {
             bind_group,
             disc: Instances::new(device, "level nodes", DISC_STRIDE),
             link: Instances::new(device, "level edges", LINK_STRIDE),
+            under: Instances::new(device, "level open nodes", DISC_STRIDE),
         }
     }
 
@@ -325,6 +328,13 @@ impl LevelRenderer {
     ) {
         self.disc.set(device, queue, discs);
         self.link.set(device, queue, links);
+    }
+
+    /// Hold these discs to draw under the links, in this order: the open
+    /// discs of a scene (`LevelScene::open_discs`), whose members' edges
+    /// are drawn over them. None, until set.
+    pub fn set_under(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, discs: &[Disc]) {
+        self.under.set(device, queue, discs);
     }
 
     /// Draw the level into `target` as `camera` sees it, on `background`:
@@ -369,6 +379,11 @@ impl LevelRenderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
+            if self.under.len > 0 {
+                pass.set_pipeline(&self.discs);
+                pass.set_vertex_buffer(0, self.under.slice());
+                pass.draw(0..6, 0..self.under.len);
+            }
             if self.link.len > 0 {
                 pass.set_pipeline(&self.links);
                 pass.set_vertex_buffer(0, self.link.slice());

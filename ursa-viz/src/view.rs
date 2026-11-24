@@ -68,6 +68,10 @@ pub struct View {
     /// The camera's zoom when last fitted: nodes grow back toward full size
     /// as the user zooms in past it.
     fitted_zoom: f32,
+    /// Pixels a fit leaves free at each side ([`View::set_fit_padding`]),
+    /// and how many of the first nodes it fits, if not all of them.
+    fit_padding: f32,
+    fit_first: Option<usize>,
     /// Draw nodes as well as edges.
     pub draw_nodes: bool,
     /// The result drawn, for a view made from one ([`View::from_result`]):
@@ -631,6 +635,8 @@ impl View {
             renderer,
             follow: true,
             fitted_zoom: 1.0,
+            fit_padding: 0.0,
+            fit_first: None,
             draw_nodes: true,
             live,
             layout_stale: false,
@@ -1215,12 +1221,30 @@ impl View {
         self.fit_camera();
     }
 
+    /// Leave `pixels` free at each side of the canvas when the camera fits
+    /// ([`View::fit`], and while it follows): for what is drawn larger
+    /// around a node than a node is, as the discs of `GROUP BY`'s groups
+    /// are (#499). 0, the default, is the fit as it was.
+    ///
+    /// With `first`, a fit is of the first `first` nodes alone, whatever
+    /// nodes come after them: the groups of a grouped drawing, whose
+    /// members are drawn inside their groups' discs, so that a group that
+    /// opens does not move the camera.
+    pub fn set_fit_padding(&mut self, pixels: f32, first: Option<usize>) {
+        self.fit_padding = if pixels > 0.0 { pixels } else { 0.0 };
+        self.fit_first = first;
+        if self.follow {
+            self.fit_camera();
+        }
+    }
+
     fn fit_camera(&mut self) {
         // A level's nodes, while one is drawn: the graph's have no place yet.
         if let Some(b) = self.level_bounds() {
             return self.fit_to(b);
         }
-        let b = bounds(&self.x, &self.y);
+        let first = self.fit_first.map_or(self.x.len(), |k| k.min(self.x.len()));
+        let b = bounds(&self.x[..first], &self.y[..first]);
         self.fit_to(b);
         self.fitted = Some(Fitted {
             bounds: b,
@@ -1232,6 +1256,15 @@ impl View {
         if let Some(b) = bounds {
             self.moved();
             self.camera.fit(b);
+            if self.fit_padding > 0.0 {
+                // As if the canvas were that much smaller at each side.
+                let (w, h) = self.camera.viewport;
+                let room = |side: f32| ((side - 2.0 * self.fit_padding) / side).max(0.1);
+                let (x0, y0, x1, y1) = b;
+                let (bw, bh) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
+                let padded = (w * room(w) / bw).min(h * room(h) / bh) * 0.92;
+                self.camera.pixels_per_unit = self.camera.pixels_per_unit.min(padded);
+            }
             self.fitted_zoom = self.camera.pixels_per_unit;
             self.uncull();
         }
@@ -1244,6 +1277,13 @@ impl View {
     /// the same whichever order its points are added in.
     fn refit(&mut self, changes: &Changes) {
         let (n0, n1) = changes.nodes;
+        // A fit of the first nodes alone is found again: it is cheap.
+        if self.fit_first.is_some() {
+            if self.follow {
+                self.fit_camera();
+            }
+            return;
+        }
         let fitted = match self.fitted.take() {
             Some(fitted) if self.follow && !changes.positions => fitted,
             _ => {

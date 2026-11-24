@@ -255,6 +255,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   with shared memory would need. Every resource was same-origin already, so
   datasets (by range), Import, downloads, Share links, fonts and the Graph
   view work as before.
+- **Web shell: `GROUP BY` draws a graph as its groups, and a group opens in
+  place** (#499). `.graph karate GROUP BY club` draws a disc for each club
+  and the ties between the clubs, counted; `.graph rmat GROUP BY louvain`
+  draws a million edges as their communities, within a quarter of a second
+  of the algorithm's result. What groups the nodes is a column of `NODES
+  (query)`, of the result's rows or of the graph's vertex tables, `degree`,
+  or an algorithm, found as `COLOR BY` finds it. A disc's area is its share
+  of the nodes, an edge's width its count, and each says its number; more
+  than 2,000 groups are the 2,000 largest and one "other". A double-click on
+  a disc (or `.expand group:N`) adds the group's members and the edges among
+  the members of the open groups (`induced_edges`), laid out inside the
+  disc; `.collapse group:N` closes it, and `.undo` takes the members away.
+  After a query, `GROUP BY` is the clause when the query is in parentheses.
+  `ursa_engine::graph::view` has a `groups` module, `Style::group`,
+  `GraphView::groups` and `Session::grouped`; `ursa-viz`'s level scene draws
+  open discs and points (`LevelScene::set_kinds`), and a view's fit can
+  leave room for discs (`View::set_fit_padding`).
 - **Web shell: a graph is drawn from saved positions, and the edge cap is a
   setting, 5,000,000 by default** (#502). `.graph … POSITIONS (SELECT id, x,
   y …)` draws each node where the query puts it and runs no layout, so a

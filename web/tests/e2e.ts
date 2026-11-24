@@ -2518,6 +2518,195 @@ for (const scheme of ["light", "dark"] as const) {
   check(told.includes("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);") && told.includes(".graph g POSITIONS (SELECT * FROM pos)") && told.includes("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), "over two million edges: the terminal says how to save the positions", told);
   await sctx.close();
 }
+// #499: GROUP BY. `.graph karate GROUP BY club` draws a disc for each club
+// and the ties between the two, counted as SQL counts them; a double-click
+// opens a group, its members inside its disc; .undo is the closed drawing
+// again, to the pixel (a read-back of the frame); and .collapse closes one.
+{
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const k = await gctx.newPage();
+  await k.goto(`${base}/?dataset=karate`);
+  await ready(k);
+  await idle(k);
+  await k.click("#terminal");
+  const status = () => k.evaluate(() => document.getElementById("graph-status")!.textContent ?? "");
+  const ink = () => k.evaluate(() => (window as any).ursaShell.graphInked());
+  const openIs = (groups: number[]) =>
+    k.waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g?.grouped && g.grouped.open.join() === want && !(window as any).ursaShell.busy(); }, groups.join(), { timeout: 30_000, polling: 50 }).catch(() => {});
+  // What SQL says of the clubs: their sizes, and the ties between them.
+  await type("SELECT club, count(*) AS n FROM members GROUP BY club ORDER BY n DESC, club;", k);
+  const clubs = lastTable(await screen(k)).rows;
+  await type("SELECT count(*) AS n FROM ties t JOIN members a ON a.id = t.src JOIN members b ON b.id = t.dst WHERE a.club <> b.club;", k);
+  const between = lastTable(await screen(k)).rows[0]?.[0];
+  await type("SELECT a.club, count(*) AS n FROM ties t JOIN members a ON a.id = t.src JOIN members b ON b.id = t.dst WHERE a.club = b.club GROUP BY a.club ORDER BY a.club;", k);
+  const inside = Object.fromEntries(lastTable(await screen(k)).rows);
+
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  let g = await graphInfo(k);
+  const said = (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "");
+  check(
+    g.grouped?.groups === 2 && g.grouped.total === 34 && g.nodes === 2 && g.edges === 1 && g.cut?.groups === 2 && g.cut.groupsDrawn === 2 && g.cut.edgesDrawn === 1,
+    "GROUP BY: karate by club is two discs and the one edge between them",
+    JSON.stringify({ grouped: g.grouped && { groups: g.grouped.groups, total: g.grouped.total }, cut: g.cut }),
+  );
+  check(
+    clubs.length === 2 && g.groupLabels.includes(`${clubs[0][0]} · ${clubs[0][1]}`) && g.groupLabels.includes(`${clubs[1][0]} · ${clubs[1][1]}`) && Number(between) > 0 && g.groupLabels.includes(String(between)),
+    "GROUP BY: each disc says its club and its members, and the edge its ties, as SQL's GROUP BY counts them",
+    `${JSON.stringify(g.groupLabels)}; SQL: ${JSON.stringify(clubs)}, ${between} between`,
+  );
+  const legend = await k.evaluate(() => document.getElementById("graph-legend")!.textContent ?? "");
+  check(
+    /^grouped by club: 2 groups of 34 nodes · drawn as groups of karate · Done$/.test(await status()) && legend.startsWith("grouped by club: 2 groups") && said.includes("Drawing groups of karate: 2 groups of 34 nodes by club, with 1 edge between groups"),
+    "GROUP BY: the status line, the legend and the terminal say grouped by club: 2 groups",
+    `${await status()} | ${legend} | ${said}`,
+  );
+  // The frame, read back: two discs of the first two colours, each the
+  // size 17 of 34 nodes gives (3% of the canvas), and neither over the other.
+  const closed = await ink();
+  const disc = Math.min(0.12 * Math.min(closed.width, closed.height), Math.sqrt((0.06 * closed.width * closed.height * 0.5) / Math.PI));
+  const area = Math.PI * disc * disc;
+  const apart = Math.hypot(g.grouped.at[0][0] - g.grouped.at[1][0], g.grouped.at[0][1] - g.grouped.at[1][1]);
+  check(
+    Math.abs(closed.palette[0] - area) < 0.1 * area && Math.abs(closed.palette[1] - area) < 0.1 * area && apart > 2 * disc,
+    "GROUP BY: the frame read back has the two clubs' discs, each its share of the canvas, apart",
+    `${closed.palette[0]} and ${closed.palette[1]} px for ${Math.round(area)}; centres ${Math.round(apart)} px apart, radius ${Math.round(disc)}`,
+  );
+
+  // A double-click on the first club's disc opens it.
+  const box = (await k.locator("#graph-stage canvas").boundingBox())!;
+  const ratio = g.width / box.width;
+  const at = (i: number) => [box.x + g.grouped.at[i][0] / ratio, box.y + g.grouped.at[i][1] / ratio] as const;
+  await k.mouse.dblclick(...at(0));
+  await openIs([0]);
+  await idle(k);
+  g = await graphInfo(k);
+  const within = (info: any, group: number) => {
+    const reach = info.grouped.radii[group] * info.camera[2];
+    const [cx, cy] = info.grouped.at[group];
+    const members = info.grouped.at.slice(info.grouped.groups).filter((m: number[]) => m[2] === group);
+    return { members: members.length, outside: members.filter((m: number[]) => Math.hypot(m[0] - cx, m[1] - cy) > reach + 0.5).length, reach };
+  };
+  const first = within(g, 0);
+  const opened = (await screen(k)).replace(/\n/g, "");
+  check(
+    g.grouped.open.join() === "0" && g.slots === 2 + Number(clubs[0][1]) && first.members === Number(clubs[0][1]) && first.outside === 0 && Math.abs(first.reach - disc) < 1,
+    "GROUP BY: a double-click opens a group: its members are in its disc, which keeps its size",
+    `${first.members} members, ${first.outside} outside a disc of ${first.reach.toFixed(1)} px (closed: ${disc.toFixed(1)}); open ${g.grouped.open}`,
+  );
+  check(
+    opened.includes(".expand group:0") && opened.includes(`+${clubs[0][1]} nodes, +${inside[clubs[0][0]]} edges`) && g.edges === 1 + Number(inside[clubs[0][0]]) && (await status()).includes(" · 1 open"),
+    "GROUP BY: opening ran .expand group:0, which added the club's members and the ties among them, as SQL counts them",
+    `${opened.slice(-160)}; ${g.edges} edges; ${await status()}`,
+  );
+  const open = await ink();
+  check(open.inked > 0 && open.palette[0] > 17 * 4 && open.palette[0] < 0.5 * closed.palette[0] && Math.abs(open.palette[1] - closed.palette[1]) < 0.02 * area, "GROUP BY: read back, the open disc is a rim with its members inside, and the other is as it was", `${JSON.stringify(open.palette.slice(0, 2))} after ${JSON.stringify(closed.palette.slice(0, 2))}`);
+  if (shots) await k.screenshot({ path: `${shots}/graph-group-open.png` });
+
+  // .undo is the closed drawing again: the same frame, to the pixel count.
+  await k.click("#terminal");
+  await type(".undo", k);
+  await openIs([]);
+  // (Nothing selected, as when the closed frame was read: no ring.)
+  await k.mouse.click(box.x + 6, box.y + 6);
+  g = await graphInfo(k);
+  const undone = await ink();
+  check(
+    g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
+    "GROUP BY: .undo restores the closed drawing, read back",
+    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}`,
+  );
+
+  // Both open: every tie is drawn. .collapse closes one, and opening it
+  // again needs no query.
+  await k.click("#terminal");
+  await type(".expand group:0", k);
+  await type(".expand group:1", k);
+  await openIs([0, 1]);
+  g = await graphInfo(k);
+  const both = [within(g, 0), within(g, 1)];
+  await type("SELECT count(*) AS n FROM ties;", k);
+  const ties = Number(lastTable(await screen(k)).rows[0]?.[0]);
+  check(g.nodes === 36 && g.edges === 1 + ties && both.every((b) => b.members === 17 && b.outside === 0), "GROUP BY: with both clubs open every member is in its own club's disc, and every tie is drawn", `${g.nodes} nodes, ${g.edges} edges for ${ties} ties; ${JSON.stringify(both)}`);
+  await type(".collapse group:0", k);
+  await openIs([1]);
+  g = await graphInfo(k);
+  const collapsed = (await after(".collapse group:0", k)).replace(/\n/g, "");
+  check(g.grouped.open.join() === "1" && g.nodes === 19 && collapsed.includes("-17 nodes"), ".collapse group:0 closes the group", `${collapsed}; open ${g.grouped.open}; ${g.nodes} nodes`);
+
+  // A click selects a group, and the status says what it is.
+  await k.mouse.click(...at(0));
+  g = await graphInfo(k);
+  const selected = await status();
+  check(
+    g.selection.length === 1 && g.selection[0].index === 0 && selected.startsWith(`Selected group:0: club ${clubs[0][0]}, members ${clubs[0][1]}, edges inside ${inside[clubs[0][0]]} · grouped by club: 2 groups of 34 nodes`),
+    "GROUP BY: a click selects a group, and the status says its club, its members and the ties inside it",
+    selected,
+  );
+  await k.keyboard.press("Enter");
+  await openIs([0, 1]);
+  check((await graphInfo(k)).grouped.open.join() === "0,1", "GROUP BY: Enter opens the selected group", JSON.stringify((await graphInfo(k)).grouped.open));
+
+  // What does not go with GROUP BY is refused, and the drawing stays; an
+  // algorithm groups too, and a query's rows, in parentheses.
+  await k.click("#terminal");
+  await type(".graph karate GROUP BY club SIZE BY pagerank", k);
+  const refused = (await after(".graph karate GROUP BY club SIZE", k)).replace(/\n/g, "");
+  check(refused.includes("SIZE BY pagerank is of the nodes") && (await graphInfo(k)).grouped?.by === "club", "GROUP BY with SIZE BY is refused, and says why", refused);
+  await type("SELECT count(DISTINCT louvain) AS n FROM louvain(karate, seed => 1);", k);
+  const communities = Number(lastTable(await screen(k)).rows[0]?.[0]);
+  await type(".graph karate GROUP BY louvain", k);
+  await graphSettled(k);
+  g = await graphInfo(k);
+  check(communities > 2 && g.grouped?.by === "louvain" && g.grouped.groups === communities && g.cut.nodes === 34 && (await status()).startsWith(`grouped by louvain: ${communities} groups of 34 nodes`), "GROUP BY louvain: a disc for each community louvain finds", `${g.grouped?.groups} groups for ${communities} communities; ${await status()}`);
+  await type(".graph (SELECT * FROM louvain(karate, seed => 1)) GROUP BY louvain", k);
+  await graphSettled(k);
+  g = await graphInfo(k);
+  check(g.grouped?.groups === communities && g.cut.nodes === 34, "GROUP BY after a query in parentheses groups the query's rows", `${g.grouped?.groups} groups; ${await status()}`);
+  check((await errors(k)) === 1, "GROUP BY: the one error on the screen is the refusal", `${await errors(k)} errors`);
+  await gctx.close();
+}
+// #499 on rmat: the communities of a million edges are drawn within 2 s of
+// the algorithm's result, a disc for each community of more than one node,
+// and the largest opens with its members in its disc.
+{
+  const gctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const r = await gctx.newPage();
+  await r.goto(`${base}/?dataset=rmat`);
+  await ready(r);
+  await idle(r);
+  await r.click("#terminal");
+  await type("SELECT count(*) AS n, count(*) FILTER (WHERE members > 1) AS over_one, max(members) AS largest FROM (SELECT louvain, count(*) AS members FROM louvain(rmat, seed => 1) GROUP BY louvain);", r);
+  const [found, overOne, largest] = lastTable(await screen(r)).rows[0].map(Number);
+  await type(".graph rmat GROUP BY louvain", r);
+  await graphSettled(r);
+  let g = await graphInfo(r);
+  const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
+  const drawn = times.firstDraw - times.engine;
+  check(drawn > 0 && drawn <= 2_000, "GROUP BY louvain on rmat is drawn within 2 s of the algorithm's result", `${Math.round(drawn)} ms after the engine's answer (${Math.round(times.engine)} ms after Enter)`);
+  check(
+    found > 1 && g.grouped?.groups === Math.min(found, 2000) + (found > 2000 ? 1 : 0) && g.cut.merged === overOne && g.cut.nodes === 46_318 && g.cut.groupsDrawn === g.grouped.groups,
+    "GROUP BY louvain on rmat: a disc for each community, every one of more than one node among them, and the groups hold every node",
+    `${g.grouped?.groups} discs, ${g.cut?.merged} of more than one node, for ${found} communities (${overOne} over one); ${g.cut?.nodes} nodes`,
+  );
+  await type(".expand group:0", r);
+  await r.waitForFunction(() => (window as any).ursaShell.graph()?.grouped?.open.length === 1, null, { timeout: 60_000, polling: 100 }).catch(() => {});
+  g = await graphInfo(r);
+  const reach = g.grouped.radii[0] * g.camera[2];
+  const [cx, cy] = g.grouped.at[0];
+  const members = g.grouped.at.slice(g.grouped.groups).filter((m: number[]) => m[2] === 0);
+  const outside = members.filter((m: number[]) => Math.hypot(m[0] - cx, m[1] - cy) > reach + 0.5).length;
+  check(
+    g.nodes === g.grouped.groups + largest && members.length === Math.min(largest, 5000 - g.grouped.groups) && outside === 0 && reach > 5,
+    "GROUP BY on rmat: the largest group opens, its members within its disc",
+    `${g.nodes - g.grouped.groups} members shown for ${largest}; ${outside} of ${members.length} outside a disc of ${reach.toFixed(1)} px`,
+  );
+  if (shots) await r.screenshot({ path: `${shots}/graph-group-rmat.png` });
+  await type(".undo", r);
+  g = await graphInfo(r);
+  check(g.grouped.open.length === 0 && g.nodes === g.grouped.groups && (await errors(r)) === 0, "GROUP BY on rmat: .undo closes the group again", `${g.nodes} nodes; open ${g.grouped.open}`);
+  await gctx.close();
+}
 // #502: a phone (a coarse pointer and at most 4 GB of memory) starts at
 // 500,000 edges, and its refusal names the setting.
 {

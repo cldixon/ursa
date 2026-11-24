@@ -68,6 +68,7 @@ use crate::graph::{edges_plan, registry_of, GraphDef, PropertyGraph};
 mod build;
 pub mod clauses;
 pub mod find;
+pub mod groups;
 pub mod inspect;
 mod positions;
 pub mod rules;
@@ -79,6 +80,7 @@ mod tests;
 
 use build::{build_within, EdgeList, NodeIndex};
 pub use clauses::{identifier, parse, As, Name, Style, USAGE};
+pub use groups::Grouping;
 pub use rules::Rule;
 use rules::{MatchEdge, Shape};
 pub use session::{Command, Outcome, Session, Step};
@@ -227,6 +229,10 @@ pub struct GraphView {
     /// and moves them as the drawing grows. [`GraphView::placed`] is the
     /// result with them, for a front end that only shows it.
     pub positions: Option<Positions>,
+    /// With `GROUP BY` (#499): which of the drawing's nodes each group of
+    /// `result` has. They are not in the result until a group is opened,
+    /// which an explore session does with this ([`Session::grouped`]).
+    pub groups: Option<Grouping>,
 }
 
 impl GraphView {
@@ -247,6 +253,13 @@ impl GraphView {
     /// The legend of `COLOR BY`, if it was asked.
     pub fn legend(&self) -> Option<Legend> {
         Legend::of(&self.result)
+    }
+
+    /// The legend of `GROUP BY`, if it was asked: `grouped by louvain: 12
+    /// groups`.
+    pub fn grouped_by(&self) -> Option<String> {
+        let groups = self.groups.as_ref()?;
+        groups::legend(&self.result, groups.by())
     }
 
     /// What the result was drawn as, for a status line (see [`drawn_as`]).
@@ -274,6 +287,7 @@ pub fn drawn_as(result: &GraphResult) -> String {
         "rings" => ("rings".to_string(), " on "),
         "pattern" => ("pattern matches".to_string(), " on "),
         "nodes" => ("nodes".to_string(), " of "),
+        groups::RULE => ("groups".to_string(), " of "),
         other => (other.to_string(), " on "),
     };
     let mut out = what;
@@ -413,6 +427,9 @@ pub async fn draw(
             text,
         ),
     };
+    if let Some(by) = &style.group {
+        return group(ctx, sql, drawing, style, by, text).await;
+    }
     apply_style(ctx, sql, &mut drawing, style).await?;
     if let Some(layout) = style.layout {
         set_layout(&mut drawing, layout)?;
@@ -442,6 +459,84 @@ pub async fn draw(
     let mut view = to_view(drawing.edges, &drawing.index.key_type, graph, provenance)?;
     view.positions = saved;
     Ok(view)
+}
+
+/// `GROUP BY by` on `drawing` ([`groups`], #499): its nodes grouped by a
+/// column of `NODES (query)`, of the result's own rows or of the graph's
+/// vertex tables, by degree, or by an algorithm, found as `COLOR BY` finds
+/// its values.
+async fn group(
+    ctx: &SessionContext,
+    sql: &dyn RunSql,
+    mut drawing: Drawing,
+    style: &Style,
+    by: &Name,
+    text: Option<String>,
+) -> Result<GraphView> {
+    let shown = &by.shown;
+    for (clause, given) in [
+        ("SIZE BY", style.size.as_ref().map(|n| n.shown.clone())),
+        ("COLOR BY", style.color.as_ref().map(|n| n.shown.clone())),
+        (
+            "LAYOUT",
+            style.layout.map(|layout| layout_name(layout).to_string()),
+        ),
+        (
+            "POSITIONS",
+            style.positions.as_ref().map(|_| "(…)".to_string()),
+        ),
+    ] {
+        if let Some(given) = given {
+            let why = match clause {
+                "SIZE BY" => "a group's disc is sized by how many members it has",
+                "COLOR BY" => "a group's disc takes its group's colour",
+                _ => "the groups are laid out by the edges between them",
+            };
+            return plan_err(format!(
+                "GROUP BY {shown} draws a disc for each group, and {clause} {given} is of the \
+                 nodes: {why}. Leave {clause} out, or GROUP BY"
+            ));
+        }
+    }
+    let graph = drawing.graph.clone();
+    let graph = graph.as_deref();
+    let nodes = match &style.nodes {
+        Some(query) => Some(NodeValues::of_query(ctx, sql, query).await?),
+        None => None,
+    };
+    let own = drawing.own.as_ref();
+    let found = resolve(ctx, graph, nodes.as_ref(), own, "GROUP BY", by).await?;
+    let column = match found {
+        Found::Nodes(i) => nodes.as_ref().expect("NODES was given").column(i),
+        Found::Own(i) => own.expect("the result's rows").column(i),
+        Found::Vertex => vertex_column(ctx, graph.expect("a graph"), &by.ident).await?,
+        Found::Algorithm(algorithm) => {
+            let graph = graph.expect("an algorithm has a graph");
+            run_algorithms(ctx, sql, graph, &[algorithm])
+                .await?
+                .column_named(algorithm)
+        }
+        Found::Degree => degree_column(&drawing.edges),
+    };
+    let values = column.per_node(&drawing.index, drawing.edges.n as usize)?;
+    let provenance = Provenance {
+        sql: text,
+        rule: None,
+        roles: drawing
+            .roles
+            .iter()
+            .map(|(column, role)| ColumnRole::new(column, role))
+            .collect(),
+        notes: std::mem::take(&mut drawing.notes),
+    };
+    groups::grouped(
+        drawing.edges,
+        &drawing.index.key_type,
+        graph.map(|g| g.name.clone()),
+        provenance,
+        shown,
+        &values,
+    )
 }
 
 fn layout_name(layout: ursa_viz::model::Layout) -> &'static str {
@@ -1258,5 +1353,6 @@ fn to_view(
         result,
         skipped,
         positions: None,
+        groups: None,
     })
 }

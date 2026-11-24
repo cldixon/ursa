@@ -876,7 +876,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); AS edges(x, y) says what the columns are, and .help graph lists every clause; the pane says what it was drawn as; click a node or an edge to select it (Shift+click adds a node) and the inspector shows its row; i moves to the inspector; / in the pane finds nodes (.find) and f fits the selection in view; a large graph is drawn aggregated once it is laid out, a disc for each group of nodes, opened as the view zooms in (a in the pane, or .graph detail on|off, draws every node and edge instead); double-click a node, or press Enter with nodes selected, to add its neighbours (it runs .expand ID here; Shift adds up to 5,000; .graph echo off stops showing those commands); Esc clears the selection, then closes it"],
+  [".graph", "?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y? ?GROUP BY z?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); AS edges(x, y) says what the columns are, and .help graph lists every clause; the pane says what it was drawn as; click a node or an edge to select it (Shift+click adds a node) and the inspector shows its row; i moves to the inspector; / in the pane finds nodes (.find) and f fits the selection in view; GROUP BY z draws a disc for each group in place of its nodes (.graph karate GROUP BY club, .graph g GROUP BY louvain), and a double-click on a disc opens the group where it is (.expand group:N; again, or .collapse group:N, closes it); a large graph is drawn aggregated once it is laid out, a disc for each group of nodes, opened as the view zooms in (a in the pane, or .graph detail on|off, draws every node and edge instead); double-click a node, or press Enter with nodes selected, to add its neighbours (it runs .expand ID here; Shift adds up to 5,000; .graph echo off stops showing those commands); Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
@@ -923,6 +923,7 @@ async function hostCommand(line) {
     case ".find":
       return find(line);
     case ".expand":
+    case ".collapse":
     case ".hide":
     case ".show":
     case ".undo":
@@ -1058,7 +1059,17 @@ async function drawGraph(text) {
   const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
   const as = drawn.drawnAs ? ` as ${drawn.drawnAs}` : "";
   const at = drawn.saved ? " at its saved positions" : "";
-  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  const replacing = wasOpen ? "replacing the last drawing; " : "";
+  if (drawn.grouped) {
+    // A grouped drawing (#499) says its groups, and how one opens.
+    const g = drawn.grouped;
+    await write(
+      `Drawing ${drawn.drawnAs}: ${count(g.groups, "group")} of ${count(g.total, "node")} by ${g.by}, with ${count(drawn.edges, "edge")} between groups${skipped} ` +
+        `(double-click a group, or .expand group:N, to open it; ${replacing}Esc closes)\r\n`,
+    );
+    return true;
+  }
+  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${replacing}Esc closes)\r\n`);
   // A layout that will take a minute: how to run it once and draw from it (#502).
   const hint = drawn.saved ? null : graphLoaded?.positionsHint(drawn.edges, drawn.graph);
   if (hint)

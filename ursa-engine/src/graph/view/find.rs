@@ -273,7 +273,10 @@ impl Matches<'_> {
             .label
             .as_ref()
             .and_then(|name| labels.iter().position(|l| &l.name == name));
-        let node = own.and_then(of).or_else(|| (0..labels.len()).find_map(of));
+        // (A grouped drawing's groups are no table's rows.)
+        let node = own
+            .and_then(of)
+            .or_else(|| (super::groups::own_labels(self.r)..labels.len()).find_map(of));
         match node {
             Some(i) => self.node(i),
             None => {

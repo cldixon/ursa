@@ -3,8 +3,8 @@
 //! ```text
 //! [SOURCE] [ON graph]
 //!          [AS edges(src, dst [, weight]) | nodes(id) | path(nodes [, edges]) | hops(seed, id, distance)]
-//!          [NODES (query)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers]
-//!          [POSITIONS (query)]
+//!          [NODES (query)] [SIZE BY x] [COLOR BY y] [GROUP BY z]
+//!          [LAYOUT force|rings|layers] [POSITIONS (query)]
 //! ```
 //!
 //! [`parse`] splits it into the source and a [`Style`]; [`identifier`] says
@@ -32,6 +32,9 @@ pub struct Style {
     /// `POSITIONS (query)`: the query that says where each node is (#502).
     /// With it, no layout runs.
     pub positions: Option<String>,
+    /// `GROUP BY z`: what the nodes are grouped by (#499). With it, a disc
+    /// is drawn for each group, and the edges between groups, counted.
+    pub group: Option<Name>,
 }
 
 /// An `AS …` clause: the shape of a result's rows, and its columns by name.
@@ -177,8 +180,8 @@ fn tokens(text: &str) -> Vec<(Tok, usize, usize)> {
 /// `.graph`'s clauses, as a message that goes wrong shows them.
 pub const USAGE: &str = ".graph [SOURCE] [ON graph] [AS edges(src, dst [, weight]) | nodes(id) | \
                          path(nodes [, edges]) | hops(seed, id, distance)] [NODES (SELECT id, … \
-                         FROM …)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers] \
-                         [POSITIONS (SELECT id, x, y FROM …)]";
+                         FROM …)] [SIZE BY x] [COLOR BY y] [GROUP BY z] [LAYOUT \
+                         force|rings|layers] [POSITIONS (SELECT id, x, y FROM …)]";
 
 /// The words a statement begins with: a source that begins with one is a
 /// query, not a name with clauses after it.
@@ -240,8 +243,8 @@ fn layout_of(word: &str) -> Option<Layout> {
 
 /// Split `.graph`'s text into its source (empty for the last result) and
 /// the clauses after it: `ON graph`, `AS shape(columns)`, `NODES (query)`,
-/// `SIZE BY x`, `COLOR BY y`, `LAYOUT l` and `POSITIONS (query)`, in any
-/// order, each at most once. The clauses start at the first of these outside parentheses,
+/// `SIZE BY x`, `COLOR BY y`, `GROUP BY z`, `LAYOUT l` and `POSITIONS
+/// (query)`, in any order, each at most once. The clauses start at the first of these outside parentheses,
 /// strings and comments:
 ///
 /// - `SIZE BY`, `COLOR BY` (or `COLOUR BY`), `NODES (`, `POSITIONS (`;
@@ -249,6 +252,11 @@ fn layout_of(word: &str) -> Option<Layout> {
 ///   `FROM t AS edges(a, b)`, a table alias with column names, is read as the
 ///   clause: give such an alias another name.)
 /// - `LAYOUT force`, `LAYOUT rings` or `LAYOUT layers`;
+/// - `GROUP BY`, where it is not SQL's own: after a source that is one name
+///   (`karate GROUP BY club`), with no source (`GROUP BY club`, of the last
+///   result), after a query in parentheses (`(SELECT …) GROUP BY club`),
+///   or after another clause. A `GROUP BY` at the end of a bare query is
+///   the query's;
 /// - `ON name` followed by nothing or by another clause, unless it is the
 ///   `ON` of a `JOIN`.
 ///
@@ -275,7 +283,7 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
         n: usize,
     ) -> bool {
         match word(i).as_deref() {
-            Some("SIZE" | "COLOR" | "COLOUR") => word(i + 1).as_deref() == Some("BY"),
+            Some("SIZE" | "COLOR" | "COLOUR" | "GROUP") => word(i + 1).as_deref() == Some("BY"),
             Some("NODES" | "POSITIONS") => kind(i + 1) == Some(Tok::Open),
             Some("AS") => {
                 i == 0
@@ -297,6 +305,24 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
         }
     }
     let is_clause = |i: usize| starts(i, &word, &kind, toks.len());
+    // Whether the tokens before token `i` are one parenthesis, opened at
+    // the first and closed at the last.
+    let whole = |i: usize| -> bool {
+        let mut depth = 0i32;
+        for (j, t) in toks[..i].iter().enumerate() {
+            match t.0 {
+                Tok::Open => depth += 1,
+                Tok::Close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1 == i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    };
     let mut depth = 0i32;
     // After a source that is one name (`karate`, not a statement), whatever
     // follows is clauses: a word that is none is told so, not handed to SQL.
@@ -330,6 +356,12 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
                         joins += 1
                     }
                     "ON" | "USING" if joins > 0 => joins -= 1,
+                    // SQL's own GROUP BY, unless the query before it is
+                    // in parentheses, whole.
+                    "GROUP"
+                        if i > 0
+                            && word(i + 1).as_deref() == Some("BY")
+                            && !(kind(0) == Some(Tok::Open) && whole(i)) => {}
                     _ if is_clause(i) => {
                         first = Some(i);
                         break;
@@ -429,6 +461,19 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
                     return plan_err(format!("{clause} is given twice; give it once: {USAGE}"));
                 }
                 *slot = Some(name);
+                i += 3;
+            }
+            "GROUP" if word(i + 1).as_deref() == Some("BY") => {
+                let Some(name) = name_of(text, toks.get(i + 2)) else {
+                    return plan_err(
+                        "GROUP BY needs a column of categories or an algorithm, as GROUP BY \
+                         louvain",
+                    );
+                };
+                if style.group.is_some() {
+                    return plan_err(format!("GROUP BY is given twice; give it once: {USAGE}"));
+                }
+                style.group = Some(name);
                 i += 3;
             }
             "AS" => {
@@ -587,7 +632,8 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
             _ => {
                 return plan_err(format!(
                     "unexpected '{shown}' after the graph's source; the clauses are ON graph, \
-                     AS …, NODES (…), SIZE BY x, COLOR BY y, LAYOUT l and POSITIONS (…): {USAGE}"
+                     AS …, NODES (…), SIZE BY x, COLOR BY y, GROUP BY z, LAYOUT l and POSITIONS (…): \
+                     {USAGE}"
                 ));
             }
         }

@@ -617,6 +617,7 @@ async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<
         result: result.clone(),
         skipped,
         positions,
+        groups: None,
     })
 }
 
