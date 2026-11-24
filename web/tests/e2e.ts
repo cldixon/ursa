@@ -2274,6 +2274,162 @@ for (const scheme of ["light", "dark"] as const) {
   }
   await rctx.close();
 }
+// #502: saved positions, and the edge cap as a setting. rmat's million edges
+// are laid out once (layout_fa2) and drawn from that with no layout: the
+// picture is the live layout's end state, read back; its first frame comes
+// well within 2 s of the engine's answer; nodes with no saved position are
+// placed; a drawing at saved positions still grows; the cap's refusal names
+// ursa.graph_max_edges; and a drawing of more than two million edges says how
+// to save its positions.
+{
+  const sctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  const s = await sctx.newPage();
+  await s.goto(`${base}/?dataset=rmat`);
+  await ready(s);
+  await idle(s);
+  await s.click("#terminal");
+  const status = () => s.evaluate(() => document.getElementById("graph-status")!.textContent ?? "");
+  await type("SHOW ursa.graph_max_edges;", s);
+  check(lastTable(await after("SHOW ursa.graph_max_edges;", s)).rows[0]?.[1] === "5000000", "the edge cap is ursa.graph_max_edges, 5,000,000 on a desktop", await after("SHOW ursa.graph_max_edges;", s));
+
+  // The live layout, to its end: each node's place by its key, centred on
+  // the origin as layout_fa2 centres what it returns (in f32, in node
+  // order: ursa-core's `center`), and the frame's inked pixels.
+  await type(".graph rmat", s);
+  await graphSettled(s);
+  await s.evaluate(() => {
+    const w = window as any;
+    const g = w.ursaShell.graphPlacement();
+    const n = g.ids.length;
+    const f = Math.fround;
+    let [sx, sy] = [0, 0];
+    for (let i = 0; i < n; i++) {
+      sx = f(sx + g.xy[i]);
+      sy = f(sy + g.xy[n + i]);
+    }
+    const [mx, my] = [f(sx / f(n)), f(sy / f(n))];
+    w.__live = new Map();
+    for (let i = 0; i < n; i++) w.__live.set(g.ids[i], [f(g.xy[i] - mx), f(g.xy[n + i] - my)]);
+  });
+  const inkLive = await s.evaluate(() => (window as any).ursaShell.graphInked());
+
+  await type("CREATE TABLE pos AS SELECT * FROM layout_fa2(rmat);", s);
+  await s.evaluate(() => {
+    const w = window as any;
+    const el = document.getElementById("graph-status")!;
+    w.__timed = [];
+    new MutationObserver(() => w.__timed.push(el.textContent)).observe(el, { childList: true, characterData: true, subtree: true });
+  });
+  await type(".graph rmat POSITIONS (SELECT * FROM pos)", s);
+  await graphSettled(s);
+  const saved = await graphInfo(s);
+  const times = await s.evaluate(() => (window as any).ursaShell.graphTimings());
+  const seen: string[] = await s.evaluate(() => (window as any).__timed);
+  check(
+    saved.saved === true && saved.layoutDone && saved.iterations === 0 && (await status()).includes(" · saved positions · Done") && !seen.some((t) => t.includes("Laying out")),
+    "saved positions: rmat is drawn where POSITIONS puts it, and no layout runs",
+    `${await status()}; ${JSON.stringify({ saved: saved.saved, iterations: saved.iterations })}`,
+  );
+  check((await after(".graph rmat POSITIONS", s)).replace(/\n/g, "").includes("at its saved positions"), "saved positions: the terminal says so", await after(".graph rmat POSITIONS", s));
+  const firstFrame = times.firstDraw - times.engine;
+  check(firstFrame > 0 && firstFrame <= 2_000, "saved positions: the first frame comes within 2 s of the engine's answer", `${Math.round(firstFrame)} ms after the engine (${Math.round(times.engine)} ms), ${Math.round(times.firstDraw)} ms after Enter`);
+  const same = await s.evaluate(() => {
+    const w = window as any;
+    const g = w.ursaShell.graphPlacement();
+    const n = g.ids.length;
+    let [same, differ, missing, worst] = [0, 0, 0, 0];
+    for (let i = 0; i < n; i++) {
+      const a = w.__live.get(g.ids[i]);
+      if (!a) missing++;
+      else if (Object.is(a[0], g.xy[i]) && Object.is(a[1], g.xy[n + i])) same++;
+      else {
+        differ++;
+        worst = Math.max(worst, Math.abs(a[0] - g.xy[i]), Math.abs(a[1] - g.xy[n + i]));
+      }
+    }
+    return { nodes: n, live: w.__live.size, same, differ, missing, worst };
+  });
+  check(same.nodes === 46_318 && same.same === same.nodes && same.live === same.nodes, "saved positions: layout_fa2's positions are the live layout's end state, node for node, to the bit", JSON.stringify(same));
+  const inkSaved = await s.evaluate(() => (window as any).ursaShell.graphInked());
+  check(inkLive.inked > 10_000 && JSON.stringify(inkSaved) === JSON.stringify(inkLive), "saved positions: the frame read back is the live layout's, pixel count for pixel count", `${JSON.stringify(inkLive)} | ${JSON.stringify(inkSaved)}`);
+  // The edges' order still comes (by degree: there is no hierarchy), and a
+  // frame with every edge.
+  const ordered = await s.waitForFunction(() => { const f = (window as any).ursaShell.graph()?.frame; return f?.ordered === 1_000_000 && f.partial === false; }, null, { timeout: 60_000, polling: 100 }).then(() => true, () => false);
+  check(ordered, "saved positions: the edges are ordered for the frame budget, and a frame has them all", JSON.stringify((await graphInfo(s)).frame));
+
+  // A tenth of the nodes have no saved position: placed, and said.
+  await type(".graph rmat POSITIONS (SELECT * FROM pos WHERE id % 10 <> 0)", s);
+  await graphSettled(s);
+  const partial = await s.evaluate(() => {
+    const w = window as any;
+    const g = w.ursaShell.graphPlacement();
+    const n = g.ids.length;
+    let [kept, moved, bad] = [0, 0, 0];
+    for (let i = 0; i < n; i++) {
+      const a = w.__live.get(g.ids[i]);
+      if (!Number.isFinite(g.xy[i]) || !Number.isFinite(g.xy[n + i])) bad++;
+      else if (Object.is(a[0], g.xy[i]) && Object.is(a[1], g.xy[n + i])) kept++;
+      else moved++;
+    }
+    return { kept, moved, bad };
+  });
+  const missing = Number(((await status()).match(/ · ([\d,]+) of 46,318 nodes had no saved position and were placed beside their neighbours · /)?.[1] ?? "0").replace(/,/g, ""));
+  check(missing > 4_000 && partial.bad === 0 && partial.kept === 46_318 - missing && partial.moved === missing, "saved positions: the nodes without one are placed beside their neighbours, and the others do not move", `${await status()}; ${JSON.stringify(partial)}`);
+
+  // A drawing at saved positions grows as any other: the layout worker is
+  // at them, and places the new nodes.
+  await type(".graph SELECT src, dst FROM rmat_edges LIMIT 300 ON rmat POSITIONS (SELECT * FROM pos)", s);
+  await graphSettled(s);
+  const small = await graphInfo(s);
+  await type(".expand 49956", s);
+  await s.waitForFunction((n) => { const g = (window as any).ursaShell.graph(); return g && g.nodes > n && g.layoutDone && g.epoch > 0; }, small.nodes, { timeout: 60_000, polling: 100 }).catch(() => {});
+  const grown = await graphInfo(s);
+  check(small.saved && grown.nodes === small.nodes + 100 && grown.layoutDone && grown.epoch === 1, "saved positions: .expand adds nodes to the drawing, placed by the layout", `${small.nodes} nodes, then ${grown.nodes}; ${JSON.stringify({ epoch: grown.epoch, done: grown.layoutDone })}`);
+
+  // The cap: a SET, and a refusal that names it and leaves the drawing.
+  await type("SET ursa.graph_max_edges = 500000;", s);
+  await type(".graph rmat", s);
+  const refused = (await after(".graph rmat", s)).replace(/\n/g, "");
+  check(
+    refused.includes("1,000,000 edges; the graph view draws at most 500,000 (ursa.graph_max_edges)") && refused.includes("SET ursa.graph_max_edges = 1000000") && (await graphInfo(s)).nodes === grown.nodes,
+    "the edge cap: a graph over ursa.graph_max_edges is refused, by name, and the drawing stays",
+    refused,
+  );
+  await type("RESET ursa.graph_max_edges;", s);
+
+  // Over two million edges, laid out: the status line and the terminal
+  // offer saved positions. (Few nodes, so the layout itself is quick.)
+  await type("CREATE TABLE big AS SELECT i % 3000 AS src, (i % 3000 + 1 + (i / 3000) % 5) % 3000 AS dst FROM (SELECT unnest(range(0, 2100000)) AS i);", s);
+  await s.evaluate(() => ((window as any).__timed.length = 0));
+  await type(".graph big", s);
+  await graphSettled(s);
+  const offered: string[] = await s.evaluate(() => (window as any).__timed);
+  const told = (await after(".graph big", s)).replace(/\n/g, "");
+  check(
+    offered.some((t) => / · Laying out · .* · the fine level takes about a minute; saved positions draw at once: COPY \(SELECT \* FROM layout_fa2\(g\)\) TO 'pos\.parquet'$/.test(t)) && (await status()).endsWith(" · Done"),
+    "over two million edges: the status line offers saved positions while the layout runs",
+    offered.find((t) => t.includes("Laying out")) ?? (await status()),
+  );
+  check(told.includes("CREATE TABLE pos AS SELECT * FROM layout_fa2(g);") && told.includes(".graph g POSITIONS (SELECT * FROM pos)") && told.includes("COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';"), "over two million edges: the terminal says how to save the positions", told);
+  await sctx.close();
+}
+// #502: a phone (a coarse pointer and at most 4 GB of memory) starts at
+// 500,000 edges, and its refusal names the setting.
+{
+  const pctx = await watchedContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+  await pctx.addInitScript(() => Object.defineProperty(Navigator.prototype, "deviceMemory", { get: () => 4, configurable: true }));
+  const ph = await pctx.newPage();
+  await ph.goto(`${base}/?dataset=rmat`);
+  await ready(ph);
+  await idle(ph);
+  await ph.click("#terminal");
+  const coarse = await ph.evaluate(() => matchMedia("(pointer: coarse)").matches);
+  await type("SHOW ursa.graph_max_edges;", ph);
+  await type(".graph rmat", ph);
+  const text = (await screen(ph)).replace(/\n/g, "");
+  check(coarse && text.includes("500000") && text.includes("draws at most 500,000 (ursa.graph_max_edges)"), "a phone: the edge cap starts at 500,000, and rmat's million edges are refused by its name", text.slice(-400));
+  await pctx.close();
+}
 
 // A phone: the pane goes under the terminal, which refits to its new height.
 {
