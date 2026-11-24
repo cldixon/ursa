@@ -1025,9 +1025,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   are the ones the query by the two ends gives, in the same order, and
   the scan remains for what the index cannot say: a graph of several edge
   tables, or a table read as several partitions. `WebShell.inspectEdge`'s
-  JSON says `indexed`. On rmat in headless Chromium the median from click
-  to row is 27 to 41 ms after the first click of a session; the first is
-  69 to 83 ms, of which the engine's part is 24 to 41 ms (see
+  JSON says `indexed`. On rmat in headless Chromium (medians of three
+  sessions of 5 to 7 runs, under a load of 2 to 7 on 4 cores) an edge's
+  row comes 21 to 41 ms after the click, 13 to 31 ms of it in the engine;
+  the first click of a page takes 54 to 83 ms, of which the engine's part
+  is 17 to 41 ms and the rest the page's first panel. Where the row is
+  read (a view of rmat with a third column) it is 31 to 35 ms, and 77 to
+  112 ms on the first click, which fetches the file's column chunks (see
   `web/tests/inspector-timing.ts`). `inspect` takes a `RunSql`.
 - **SQL: graph function parameters and columns renamed, one name per role**
   (breaking, #415). The old names are not accepted. Each one gets a "did
