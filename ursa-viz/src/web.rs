@@ -597,7 +597,13 @@ impl GraphView {
     /// A frame drawn offscreen: RGBA pixels, canvas-sized, row by row from
     /// the top (`new ImageData(new Uint8ClampedArray(px), width)`). Call no
     /// other method until it resolves.
-    pub async fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
+    ///
+    /// It is the view as it is now, whether or not a frame has been drawn
+    /// since it last changed: a level's or a cut's discs (#497, #498,
+    /// #499) are given to the GPU by a frame, so they are given again
+    /// here, with the selection's rings as they are now.
+    pub async fn snapshot(&mut self) -> Result<Vec<u8>, JsValue> {
+        self.view.refresh_level(&self.device, &self.queue);
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pixels = self
             .view
