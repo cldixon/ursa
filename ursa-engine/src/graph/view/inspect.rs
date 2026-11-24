@@ -23,6 +23,18 @@
 //! path, and any name, reads the same; [`Inspected::sql`] is the query as a
 //! user would type it. Nothing here changes the session or its last result.
 //!
+//! **An edge's rows are found through the graph's index** (#489), where they
+//! can be: scanning a million edges for two ends took 90 to 160 ms in the
+//! browser. `induced_edges(G, nodes => [a, b])` reads the two nodes'
+//! adjacency and gives the row number of each edge between them, and those
+//! rows are then read by number ([`take`]): from a Parquet file with a row
+//! selection, which skips the pages before them, and from any other table by
+//! passing over the rows before. The rows read are checked against the two
+//! ends, so they are the rows the query by the ends gives, in the same order.
+//! The scan stays for what the index cannot say: a graph with several edge
+//! tables, a table read as several partitions (its row numbers are then not
+//! the scan's order), ends the index does not hold, or a check that fails.
+//!
 //! [`graph_neighbours`] is how many neighbours a node has in the whole graph,
 //! for "9 drawn, 17 neighbours in karate".
 
@@ -30,13 +42,23 @@ use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, UInt64Type};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::common::stats::Precision;
 use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::physical_plan::parquet::ParquetRowSelection;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::provider_as_source;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
-use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::parquet::arrow::arrow_reader::RowSelection;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::{
+    replace_children_if_necessary, ExecutionPlan, ExecutionPlanProperties,
+};
 use datafusion::prelude::{ident, lit, SessionContext};
+use futures::StreamExt;
+use std::sync::Arc;
 use ursa_viz::model::{GraphResult, KeyType};
 
 use super::{plan_err, RunSql};
@@ -92,6 +114,10 @@ pub struct Inspected {
     /// What a reader should know: why there is no row, or that the rows are
     /// several edges'.
     pub note: Option<String>,
+    /// Whether an edge's rows were found through the graph's index and read
+    /// by their numbers, not by a scan of the edge table (see the
+    /// [module](self)). The rows are the same either way.
+    pub indexed: bool,
 }
 
 impl Inspected {
@@ -151,7 +177,14 @@ async fn read(
         Some(filter) => frame.filter(filter)?,
         None => frame,
     };
-    let columns = frame
+    let columns = columns_of(&frame);
+    let batches = frame.limit(skip, Some(limit))?.collect().await?;
+    Ok((columns, rows_of(&batches)?))
+}
+
+/// The columns of `frame`, as the inspector names them.
+fn columns_of(frame: &DataFrame) -> Vec<InspectedColumn> {
+    frame
         .schema()
         .fields()
         .iter()
@@ -159,9 +192,95 @@ async fn read(
             name: f.name().clone(),
             numeric: f.data_type().is_numeric(),
         })
-        .collect();
-    let batches = frame.limit(skip, Some(limit))?.collect().await?;
-    Ok((columns, rows_of(&batches)?))
+        .collect()
+}
+
+/// The rows of `table` numbered `rows` (ascending, each once), in that
+/// order: fewer when the table ends before one of them. `None` when the
+/// table is read as several partitions: its rows then come in no one order,
+/// and a row number finds nothing.
+///
+/// A Parquet file is read with a row selection ([`selected`]), which reads
+/// the pages the rows are in. Any other table is read from its start, up to
+/// the last of the rows.
+async fn take(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    table: &TableReference,
+    rows: &[u64],
+) -> Result<Option<(Vec<InspectedColumn>, Vec<Vec<Option<String>>>)>> {
+    let frame = scan(ctx, graph, table).await?;
+    let columns = columns_of(&frame);
+    let plan = frame.create_physical_plan().await?;
+    if plan.output_partitioning().partition_count() != 1 {
+        return Ok(None);
+    }
+    let mut taken = Vec::with_capacity(rows.len());
+    if let Some(plan) = selected(&plan, rows) {
+        let mut stream = plan.execute(0, ctx.task_ctx())?;
+        while let Some(batch) = stream.next().await {
+            taken.push(batch?);
+        }
+    } else {
+        let mut stream = plan.execute(0, ctx.task_ctx())?;
+        let (mut wanted, mut passed) = (rows.iter().copied().peekable(), 0u64);
+        while wanted.peek().is_some() {
+            let Some(batch) = stream.next().await else {
+                break;
+            };
+            let batch = batch?;
+            let end = passed + batch.num_rows() as u64;
+            while let Some(row) = wanted.next_if(|&row| row < end) {
+                taken.push(batch.slice((row - passed) as usize, 1));
+            }
+            passed = end;
+        }
+    }
+    Ok(Some((columns, rows_of(&taken)?)))
+}
+
+/// `plan` reading only its rows numbered `rows` (ascending), when it is a
+/// scan of one whole Parquet file with a known number of rows, under nothing
+/// but projections: the file's scan with a row selection, so the reader
+/// passes over the row groups and pages before a row without decoding them.
+fn selected(plan: &Arc<dyn ExecutionPlan>, rows: &[u64]) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let input = selected(projection.input(), rows)?;
+        return replace_children_if_necessary(Arc::clone(plan), vec![input]).ok();
+    }
+    let config = plan
+        .downcast_ref::<DataSourceExec>()?
+        .data_source()
+        .downcast_ref::<FileScanConfig>()?;
+    let [group] = config.file_groups.as_slice() else {
+        return None;
+    };
+    let [file] = group.files() else {
+        return None;
+    };
+    if config.limit.is_some()
+        || file.range.is_some()
+        || config.file_source().file_type() != "parquet"
+    {
+        return None;
+    }
+    let Precision::Exact(total) = file.statistics.as_ref()?.num_rows else {
+        return None;
+    };
+    if rows.last().is_none_or(|&last| last >= total as u64) {
+        return None;
+    }
+    let selection = RowSelection::from_consecutive_ranges(
+        rows.iter().map(|&row| row as usize..row as usize + 1),
+        total,
+    );
+    let file = file
+        .clone()
+        .with_extension(ParquetRowSelection::new(selection));
+    let config = FileScanConfigBuilder::from(config.clone())
+        .with_file_groups(vec![FileGroup::new(vec![file])])
+        .build();
+    Some(DataSourceExec::from_data_source(config))
 }
 
 async fn scan(
@@ -232,6 +351,7 @@ fn graph_of(
 /// drawing's is an error.
 pub async fn inspect(
     ctx: &SessionContext,
+    sql: &dyn RunSql,
     result: &GraphResult,
     what: Inspect<'_>,
 ) -> Result<Inspected> {
@@ -258,7 +378,7 @@ pub async fn inspect(
                      '{dst}'; draw it again (.graph)"
                 ));
             }
-            inspect_edge(ctx, result, at).await
+            inspect_edge(ctx, sql, result, at).await
         }
     }
 }
@@ -317,6 +437,7 @@ async fn inspect_node(
             rows,
             row: None,
             note: None,
+            indexed: false,
         };
         if !found.rows.is_empty() {
             return Ok(found);
@@ -333,6 +454,7 @@ async fn inspect_node(
 
 async fn inspect_edge(
     ctx: &SessionContext,
+    run: &dyn RunSql,
     result: &GraphResult,
     edge: usize,
 ) -> Result<Inspected> {
@@ -351,10 +473,13 @@ async fn inspect_edge(
     let end = |node: u32| {
         let at = node as usize;
         let ty = result.node_labels()[result.node_label()[at] as usize].key;
-        literal(result.node_keys().get(at), ty)
+        (
+            result.node_keys().get(at),
+            literal(result.node_keys().get(at), ty),
+        )
     };
-    let (s, s_shown) = end(result.src()[edge]);
-    let (d, d_shown) = end(result.dst()[edge]);
+    let (s_key, (s, s_shown)) = end(result.src()[edge]);
+    let (d_key, (d, d_shown)) = end(result.dst()[edge]);
     let tables: Vec<_> = graph
         .edge_tables
         .iter()
@@ -378,14 +503,27 @@ async fn inspect_edge(
         let mut sql =
             format!("SELECT * FROM {table} WHERE {from} = {s_shown} AND {to} = {d_shown}");
         // With no row number, the drawing may have it the other way round.
-        if row.is_none() && s_shown != d_shown {
+        let either_way = row.is_none() && s_shown != d_shown;
+        if either_way {
             filter = filter.or(source.eq(d.clone()).and(destination.eq(s.clone())));
             sql = format!(
                 "SELECT * FROM {table} WHERE ({from} = {s_shown} AND {to} = {d_shown}) OR \
                  ({from} = {d_shown} AND {to} = {s_shown})"
             );
         }
-        let (columns, rows) = read(ctx, &graph, &e.table, Some(filter), 0, MAX_ROWS + 1).await?;
+        // Through the index, where it finds them; else by a scan.
+        let ends = Ends {
+            literals: [&s_shown, &d_shown],
+            keys: [s_key, d_key],
+            either_way,
+        };
+        let (indexed, (columns, rows)) = match between(ctx, run, &graph, e, &ends).await {
+            Some(found) => (true, found),
+            None => (
+                false,
+                read(ctx, &graph, &e.table, Some(filter), 0, MAX_ROWS + 1).await?,
+            ),
+        };
         let mut found = Inspected {
             table: Some(e.name.clone()),
             sql: Some(sql),
@@ -393,15 +531,16 @@ async fn inspect_edge(
             rows,
             row,
             note: None,
+            indexed,
         };
         if found.rows.len() > 1 {
             // Parallel edges: the one row, where its number finds it.
             let one = match row {
-                Some(row) if one_partition(ctx, &graph, &e.table).await? => {
-                    let (_, rows) = read(ctx, &graph, &e.table, None, row as usize, 1).await?;
-                    (!rows.is_empty()).then_some((row, rows))
-                }
-                _ => None,
+                Some(row) => take(ctx, &graph, &e.table, &[row])
+                    .await?
+                    .filter(|(_, rows)| !rows.is_empty())
+                    .map(|(_, rows)| (row, rows)),
+                None => None,
             };
             match one {
                 Some((row, rows)) => {
@@ -434,18 +573,79 @@ async fn inspect_edge(
     Ok(none)
 }
 
-/// Whether `table` is read as one partition: then its rows come in the order
-/// the edge index numbered them.
-async fn one_partition(
+/// The two ends of an edge, to find its rows by.
+struct Ends<'a> {
+    /// The ends as SQL literals, source first.
+    literals: [&'a str; 2],
+    /// The ends as the drawing's keys: how a value of the table prints.
+    keys: [&'a str; 2],
+    /// Whether a row from the second end to the first is the edge's too.
+    either_way: bool,
+}
+
+impl Ends<'_> {
+    /// Whether a row from `src` to `dst` (as they print) joins the ends.
+    fn joins(&self, src: Option<&str>, dst: Option<&str>) -> bool {
+        let [s, d] = self.keys.map(Some);
+        (src, dst) == (s, d) || (self.either_way && (src, dst) == (d, s))
+    }
+}
+
+/// The rows of the edge table `e` between `ends`, found through the graph's
+/// index: the first `MAX_ROWS + 1` of them in the table's order, which is
+/// what the scan by the two ends gives. `None` when the index cannot say, and
+/// the scan must: the graph has several edge tables (an index is of one),
+/// the index has no edge between the ends, the table is read as several
+/// partitions, or a row read by its number does not join the ends.
+async fn between(
     ctx: &SessionContext,
+    run: &dyn RunSql,
     graph: &PropertyGraph,
-    table: &TableReference,
-) -> Result<bool> {
-    let plan = scan(ctx, graph, table)
-        .await?
-        .create_physical_plan()
-        .await?;
-    Ok(plan.output_partitioning().partition_count() == 1)
+    e: &crate::graph::EdgeTable,
+    ends: &Ends<'_>,
+) -> Option<(Vec<InspectedColumn>, Vec<Vec<Option<String>>>)> {
+    if graph.pair(None, None).ok()?.edges.name != e.name {
+        return None;
+    }
+    let [s, d] = ends.literals;
+    let (_, batches) = run
+        .run(
+            ctx,
+            &format!(
+                "SELECT src, dst, edge FROM induced_edges(\"{}\", nodes => [{s}, {d}])",
+                graph.name.replace('"', "\"\"")
+            ),
+        )
+        .await
+        .ok()?;
+    // The edges among the two nodes, by row: those between them (not a loop
+    // at one end), the way the drawing has them.
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let number = cast(batch.column(2), &DataType::UInt64).ok()?;
+        let number = number.as_primitive::<UInt64Type>();
+        let shown = rows_of(std::slice::from_ref(&batch.project(&[0, 1]).ok()?)).ok()?;
+        for (i, ends_of) in shown.iter().enumerate() {
+            if number.is_valid(i) && ends.joins(ends_of[0].as_deref(), ends_of[1].as_deref()) {
+                rows.push(number.value(i));
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    rows.truncate(MAX_ROWS + 1);
+    if rows.is_empty() {
+        return None;
+    }
+    let (columns, found) = take(ctx, graph, &e.table, &rows).await.ok()??;
+    // The rows read are the rows asked for: each joins the two ends.
+    let at = |name: &str| columns.iter().position(|c| c.name == name);
+    let (src, dst) = (at(&e.source)?, at(&e.destination)?);
+    let all = found.len() == rows.len()
+        && found
+            .iter()
+            .all(|row| ends.joins(row[src].as_deref(), row[dst].as_deref()));
+    all.then_some((columns, found))
 }
 
 /// How many neighbours node `node` has in the whole graph `result` names,
