@@ -790,7 +790,16 @@ async function watchedContext(options: Parameters<typeof browser.newContext>[0])
   ctx.on("console", (m) => {
     if (m.type() === "error" && /Content Security Policy|CSP violation/i.test(m.text())) violations.push(m.text());
   });
-  ctx.on("page", (p) => p.on("pageerror", (e) => failures.push(`page error: ${e.message}`)));
+  ctx.on("page", (p) =>
+    p.on("pageerror", (e) => {
+      // Said at once too: a later step may stop the run before the end.
+      console.log(`FAIL page error: ${e.message}`);
+      failures.push(`page error: ${e.message}`);
+    }),
+  );
+  ctx.on("console", (m) => {
+    if (m.type() === "error" && /panicked|unreachable|recursive use|borrowed/i.test(m.text())) console.log(`CONSOLE ${m.text().slice(0, 600)}`);
+  });
   return ctx;
 }
 const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
@@ -2675,6 +2684,44 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(k);
   g = await graphInfo(k);
   check(g.grouped?.groups === communities && g.cut.nodes === 34, "GROUP BY after a query in parentheses groups the query's rows", `${g.grouped?.groups} groups; ${await status()}`);
+  // A read-back borrows the view until its pixels come. What reads the
+  // view meanwhile still works (a call that found the view borrowed would
+  // throw, and leave it unable to be freed: the next .graph then failed
+  // with "attempted to take ownership of Rust value while it was borrowed").
+  const during = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    const threw: string[] = [];
+    for (let t = 0; t < 4; t++) {
+      await new Promise((r) => setTimeout(r, 0));
+      try {
+        w.ursaShell.graph();
+      } catch (e) {
+        threw.push(String(e));
+      }
+    }
+    return { threw, inked: (await ink)?.inked ?? 0 };
+  });
+  check(during.threw.length === 0 && during.inked > 0, "a read-back of the view does not keep what reads the view from it", `${during.threw[0] ?? "nothing threw"}; ${during.inked} px inked`);
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.by === "club" && (await errors(k)) === 1, "after a read-back with the view read meanwhile, the next drawing replaces it", (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "").slice(0, 160));
+  // And the pane closed while a read-back is on its way: the view is
+  // freed once the pixels have come, with no error.
+  const before = failures.length;
+  const shut = await k.evaluate(async () => {
+    const w = window as any;
+    const ink = w.ursaShell.graphInked();
+    await new Promise((r) => setTimeout(r, 0));
+    document.getElementById("graph-close")!.click();
+    const open = w.ursaShell.graphOpen();
+    return { open, inked: (await ink)?.inked ?? 0 };
+  });
+  await k.waitForTimeout(200);
+  check(!shut.open && shut.inked > 0 && failures.length === before && !(await graphOpen(k)), "the pane closes while its view is read back: the view is freed afterwards, with no error", JSON.stringify(shut));
+  await type(".graph karate GROUP BY club", k);
+  await graphSettled(k);
+  check((await graphInfo(k)).grouped?.groups === 2, "and it is drawn again after that", await status());
   check((await errors(k)) === 1, "GROUP BY: the one error on the screen is the refusal", `${await errors(k)} errors`);
   await gctx.close();
 }

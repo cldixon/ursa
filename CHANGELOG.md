@@ -1745,8 +1745,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 - **Graph view: a snapshot of a level, a cut or a grouped drawing is of the
   view as it is** (#499). `GraphView.snapshot()` drew the discs the last
   frame had given the GPU, so a read-back taken before the next frame
-  still showed a selection ring that had been cleared. It gives the GPU
-  the discs again first. On screen nothing changes: a frame always did.
+  still showed a selection ring that had been cleared.
+  `GraphView.refreshLevel()` gives the GPU the discs as they are now, and
+  the page's read-back calls it first. On screen nothing changes: a frame
+  always did. The snapshot borrows the view shared, as it did before (it
+  borrowed it to change it for a day, and every call made during a read-back
+  then threw and left the view unable to be freed, so the next `.graph`
+  failed to start); the pane's hover waits for a read-back, and a pane
+  closed or drawn again during one frees its view when the pixels have come.
 
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
