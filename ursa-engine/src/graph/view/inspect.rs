@@ -27,9 +27,9 @@
 //! can be: scanning a million edges for two ends took 90 to 160 ms in the
 //! browser. `induced_edges(G, nodes => [a, b])` reads the two nodes'
 //! adjacency and gives the row number of each edge between them, and those
-//! rows are then read by number ([`take`]): from a Parquet file with a row
-//! selection, which skips the pages before them, and from any other table by
-//! passing over the rows before. The rows read are checked against the two
+//! rows are then read by number ([`super::rows`]): from a Parquet file with a
+//! row selection, which passes over the pages before them, and from any other
+//! table by passing over the rows before. The rows read are checked against the two
 //! ends, so they are the rows the query by the ends gives, in the same order.
 //! The scan stays for what the index cannot say: a graph with several edge
 //! tables, a table read as several partitions (its row numbers are then not
@@ -42,25 +42,15 @@ use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, UInt64Type};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::common::stats::Precision;
 use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::physical_plan::parquet::ParquetRowSelection;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::provider_as_source;
-use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
-use datafusion::parquet::arrow::arrow_reader::RowSelection;
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{
-    replace_children_if_necessary, ExecutionPlan, ExecutionPlanProperties,
-};
 use datafusion::prelude::{ident, lit, SessionContext};
-use futures::StreamExt;
-use std::sync::Arc;
 use ursa_viz::model::{GraphResult, KeyType};
 
+use super::rows::take;
 use super::{plan_err, RunSql};
 use crate::graph::schema::graph_table;
 use crate::graph::{registry_of, PropertyGraph};
@@ -196,14 +186,9 @@ fn columns_of(frame: &DataFrame) -> Vec<InspectedColumn> {
 }
 
 /// The rows of `table` numbered `rows` (ascending, each once), in that
-/// order: fewer when the table ends before one of them. `None` when the
-/// table is read as several partitions: its rows then come in no one order,
-/// and a row number finds nothing.
-///
-/// A Parquet file is read with a row selection ([`selected`]), which reads
-/// the pages the rows are in. Any other table is read from its start, up to
-/// the last of the rows.
-async fn take(
+/// order, as text: fewer when the table ends before one of them. `None` when
+/// the table is read as several partitions ([`take`]).
+async fn read_rows(
     ctx: &SessionContext,
     graph: &PropertyGraph,
     table: &TableReference,
@@ -211,76 +196,10 @@ async fn take(
 ) -> Result<Option<(Vec<InspectedColumn>, Vec<Vec<Option<String>>>)>> {
     let frame = scan(ctx, graph, table).await?;
     let columns = columns_of(&frame);
-    let plan = frame.create_physical_plan().await?;
-    if plan.output_partitioning().partition_count() != 1 {
-        return Ok(None);
+    match take(ctx, frame, rows).await? {
+        Some(taken) => Ok(Some((columns, rows_of(&taken)?))),
+        None => Ok(None),
     }
-    let mut taken = Vec::with_capacity(rows.len());
-    if let Some(plan) = selected(&plan, rows) {
-        let mut stream = plan.execute(0, ctx.task_ctx())?;
-        while let Some(batch) = stream.next().await {
-            taken.push(batch?);
-        }
-    } else {
-        let mut stream = plan.execute(0, ctx.task_ctx())?;
-        let (mut wanted, mut passed) = (rows.iter().copied().peekable(), 0u64);
-        while wanted.peek().is_some() {
-            let Some(batch) = stream.next().await else {
-                break;
-            };
-            let batch = batch?;
-            let end = passed + batch.num_rows() as u64;
-            while let Some(row) = wanted.next_if(|&row| row < end) {
-                taken.push(batch.slice((row - passed) as usize, 1));
-            }
-            passed = end;
-        }
-    }
-    Ok(Some((columns, rows_of(&taken)?)))
-}
-
-/// `plan` reading only its rows numbered `rows` (ascending), when it is a
-/// scan of one whole Parquet file with a known number of rows, under nothing
-/// but projections: the file's scan with a row selection, so the reader
-/// passes over the row groups and pages before a row without decoding them.
-fn selected(plan: &Arc<dyn ExecutionPlan>, rows: &[u64]) -> Option<Arc<dyn ExecutionPlan>> {
-    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        let input = selected(projection.input(), rows)?;
-        return replace_children_if_necessary(Arc::clone(plan), vec![input]).ok();
-    }
-    let config = plan
-        .downcast_ref::<DataSourceExec>()?
-        .data_source()
-        .downcast_ref::<FileScanConfig>()?;
-    let [group] = config.file_groups.as_slice() else {
-        return None;
-    };
-    let [file] = group.files() else {
-        return None;
-    };
-    if config.limit.is_some()
-        || file.range.is_some()
-        || config.file_source().file_type() != "parquet"
-    {
-        return None;
-    }
-    let Precision::Exact(total) = file.statistics.as_ref()?.num_rows else {
-        return None;
-    };
-    if rows.last().is_none_or(|&last| last >= total as u64) {
-        return None;
-    }
-    let selection = RowSelection::from_consecutive_ranges(
-        rows.iter().map(|&row| row as usize..row as usize + 1),
-        total,
-    );
-    let file = file
-        .clone()
-        .with_extension(ParquetRowSelection::new(selection));
-    let config = FileScanConfigBuilder::from(config.clone())
-        .with_file_groups(vec![FileGroup::new(vec![file])])
-        .build();
-    Some(DataSourceExec::from_data_source(config))
 }
 
 async fn scan(
@@ -536,7 +455,7 @@ async fn inspect_edge(
         if found.rows.len() > 1 {
             // Parallel edges: the one row, where its number finds it.
             let one = match row {
-                Some(row) => take(ctx, &graph, &e.table, &[row])
+                Some(row) => read_rows(ctx, &graph, &e.table, &[row])
                     .await?
                     .filter(|(_, rows)| !rows.is_empty())
                     .map(|(_, rows)| (row, rows)),
@@ -637,7 +556,7 @@ async fn between(
     if rows.is_empty() {
         return None;
     }
-    let (columns, found) = take(ctx, graph, &e.table, &rows).await.ok()??;
+    let (columns, found) = read_rows(ctx, graph, &e.table, &rows).await.ok()??;
     // The rows read are the rows asked for: each joins the two ends.
     let at = |name: &str| columns.iter().position(|c| c.name == name);
     let (src, dst) = (at(&e.source)?, at(&e.destination)?);
