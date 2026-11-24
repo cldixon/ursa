@@ -878,23 +878,41 @@ impl LiveLayout {
     /// the positions moved puts its groups where the nodes now are; both
     /// are held until the layout grows.
     pub fn cut(&mut self, params: &crate::cut::CutParams) -> Option<crate::cut::Cut> {
-        if !self.has_cut() {
+        if !self.prepare_cut() {
             return None;
         }
         let Engine::Multilevel(s) = &self.engine else {
             return None;
         };
+        let (x, y) = s.positions();
+        let hierarchy = self.hierarchy.as_ref()?;
+        Some(hierarchy.cut(&self.adjacency, x, y, params))
+    }
+
+    /// Make what [`LiveLayout::cut`] reads, if it is not made: the
+    /// hierarchy's forest (once), and its groups' places where the nodes
+    /// now are. A cut after this is the cut alone. Returns
+    /// [`LiveLayout::has_cut`].
+    pub fn prepare_cut(&mut self) -> bool {
+        if !self.has_cut() {
+            return false;
+        }
+        let Engine::Multilevel(s) = &self.engine else {
+            return false;
+        };
         let adj = &*self.adjacency;
         if self.hierarchy.is_none() {
-            self.hierarchy = Some(crate::cut::Hierarchy::of_layout(s, adj)?);
+            self.hierarchy = crate::cut::Hierarchy::of_layout(s, adj);
             self.hierarchy_placed = false;
         }
-        let hierarchy = self.hierarchy.as_mut()?;
-        let (x, y) = s.positions();
+        let Some(hierarchy) = self.hierarchy.as_mut() else {
+            return false;
+        };
         if !std::mem::replace(&mut self.hierarchy_placed, true) {
-            hierarchy.place(x, y, |v| 1.0 + adj.degree(v) as f32);
+            let (x, y) = s.positions();
+            hierarchy.place(adj, x, y);
         }
-        Some(hierarchy.cut(adj, x, y, params))
+        true
     }
 
     /// The bytes [`LiveLayout::cut`] holds between calls: the forest.

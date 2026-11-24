@@ -533,6 +533,22 @@ html, .dropdown-menu, .xterm-viewport { scrollbar-color: var(--scrollbar) transp
 .graph-tip div { overflow: hidden; text-overflow: ellipsis; }
 .graph-tip .key { color: var(--muted); }
 .graph-tip .id { font-weight: 600; }
+/* A group's label in the aggregated view: how many nodes its disc stands for. */
+.graph-group {
+  position: absolute;
+  z-index: 1;
+  transform: translate(-50%, -50%);
+  padding: 0 4px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  color: var(--fg);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.graph-group[hidden] { display: none; }
 /* The busy ring: over a node whose command (.expand) is running or queued. */
 .graph-busy {
   position: absolute;

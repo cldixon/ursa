@@ -402,9 +402,10 @@ impl View {
         self.level.as_ref().and_then(|l| l.scene.as_ref())
     }
 
-    /// What is being drawn of a level, if one is set.
+    /// What is being drawn of a level, if one is set (not a cut:
+    /// [`View::cut_info`]).
     pub fn level_info(&self) -> Option<LevelInfo> {
-        let level = self.level.as_ref()?;
+        let level = self.level.as_ref().filter(|l| l.cut.is_none())?;
         let scene = level.scene.as_ref()?;
         Some(LevelInfo {
             level: scene.level(),

@@ -1261,6 +1261,8 @@ impl GraphView {
     /// the group node `v` of the graph is in; the merged edges
     /// `(src[i], dst[i])` between groups, heaviest first, each as wide and
     /// as dark as its `weight[i]` says, of the `totalEdges` the cut has.
+    /// No disc is drawn with a radius over `maxRadius` pixels, if given:
+    /// the discs of a cut stand a known distance apart.
     ///
     /// The camera is not moved: the cut is the graph's own drawing,
     /// coarser. A group's disc takes the colour of most of its nodes
@@ -1280,6 +1282,7 @@ impl GraphView {
         dst: Vec<u32>,
         weight: Vec<f32>,
         total_edges: Option<u32>,
+        max_radius: Option<f32>,
     ) -> Result<(), JsValue> {
         let groups = mass.len();
         if xy.length() as usize != 2 * groups {
@@ -1292,6 +1295,7 @@ impl GraphView {
         let total = total_edges.map_or(src.len(), |t| t as usize);
         let mut scene =
             crate::levels::LevelScene::new(0, 1, mass, src, dst, weight, total).map_err(js_err)?;
+        scene.set_max_radius(max_radius.unwrap_or(0.0));
         let (x, y) = scene.positions_mut();
         let n = groups as u32;
         xy.subarray(0, n).copy_to(x);
@@ -1941,6 +1945,21 @@ impl Layout {
     #[wasm_bindgen(getter, js_name = hasCut)]
     pub fn has_cut(&self) -> bool {
         self.layout.has_cut()
+    }
+
+    /// Make what [`Layout::cut`] reads, ahead of the first one: the
+    /// hierarchy as a forest, with the graph's edges in its order (once),
+    /// and its groups where the nodes now are. Returns
+    /// [`Layout::has_cut`].
+    #[wasm_bindgen(js_name = prepareCut)]
+    pub fn prepare_cut(&mut self) -> bool {
+        self.layout.prepare_cut()
+    }
+
+    /// The bytes [`Layout::cut`] holds between calls.
+    #[wasm_bindgen(getter, js_name = cutBytes)]
+    pub fn cut_bytes(&self) -> f64 {
+        self.layout.cut_bytes() as f64
     }
 
     /// A cut through the layout's hierarchy for a camera (#498,

@@ -110,6 +110,9 @@ pub struct LevelScene {
     weight: Vec<f32>,
     /// How many merged edges the level has: `src.len()` of them are held.
     total_edges: usize,
+    /// The greatest radius a disc is drawn with, in pixels, if less than
+    /// [`MAX_RADIUS_SHARE`] allows ([`LevelScene::set_max_radius`]).
+    max_radius: f32,
 }
 
 impl LevelScene {
@@ -154,6 +157,7 @@ impl LevelScene {
             by_mass,
             total_mass,
             total_edges: total_edges.max(src.len()),
+            max_radius: f32::INFINITY,
             src,
             dst,
             weight,
@@ -183,6 +187,13 @@ impl LevelScene {
     /// How many merged edges the level has.
     pub fn total_edges(&self) -> usize {
         self.total_edges
+    }
+
+    /// Draw no disc with a radius over `pixels`, however heavy and however
+    /// far the view is zoomed in: for discs that stand a known distance
+    /// apart (a cut's, `crate::cut`), which larger ones would cover.
+    pub fn set_max_radius(&mut self, pixels: f32) {
+        self.max_radius = if pixels > 0.0 { pixels } else { f32::INFINITY };
     }
 
     /// The nodes' positions, to write: `x` and `y`, one per node each.
@@ -222,7 +233,9 @@ impl LevelScene {
             0.0
         };
         let area = COVERAGE * width * height * share;
-        let most = (MAX_RADIUS_SHARE * width.min(height)).max(MIN_RADIUS);
+        let most = (MAX_RADIUS_SHARE * width.min(height))
+            .min(self.max_radius)
+            .max(MIN_RADIUS);
         ((area / std::f32::consts::PI).sqrt() * zoom).clamp(MIN_RADIUS, most)
     }
 
@@ -370,6 +383,14 @@ mod tests {
         assert!(s.radius(1, w, h, 2.0) > s.radius(1, w, h, 1.0));
         assert_eq!(s.radius(1, w, h, 1e6), MAX_RADIUS_SHARE * h);
         assert_eq!(s.radius(0, 10.0, 10.0, 1.0), MIN_RADIUS);
+        // Nor over a most of its own.
+        let mut capped = scene();
+        capped.set_max_radius(12.0);
+        assert_eq!(capped.radius(1, w, h, 1.0), 12.0);
+        assert_eq!(capped.radius(1, w, h, 1e6), 12.0);
+        assert_eq!(capped.radius(0, w, h, 1.0), s.radius(0, w, h, 1.0));
+        capped.set_max_radius(0.0);
+        assert_eq!(capped.radius(1, w, h, 1.0), s.radius(1, w, h, 1.0));
     }
 
     #[test]

@@ -17,6 +17,13 @@
 //   layout's hierarchy, was shown, against the 600 ms asked for; the levels
 //   that were drawn; and what their frames cost, each to the next animation
 //   frame. The run fails if the 95th percentile of those is over 50 ms;
+// - the aggregated view (#498), on rmat: the cut through the layout's
+//   hierarchy drawn once the layout is done (its discs and merged edges at
+//   the fitted zoom, which fail the run over 20,000 and 100,000), what the
+//   cuts take in the layout worker (the run fails if their median is over
+//   30 ms), the frames of a wheel zoom over cuts (over 50 ms at the 95th
+//   percentile fails), and that zooming in reaches the graph's own nodes.
+//   Then `.graph detail on`: what follows is of the graph in full detail;
 // - the page's long tasks since Enter;
 // - the longest task while the view was made (#426), which fails the run if
 //   it is over 60 ms: the view builds no adjacency, and is made in pieces;
@@ -124,6 +131,91 @@ for (let r = 0; r < runs; r++) {
     if (lf.p95 > 50) slow.push(`run ${r + 1}: the frames of the coarse levels cost ${lf.p95} ms at the 95th percentile; at most 50 ms are allowed`);
     rel.levelFrameP95 = lf.p95;
     rel.levelFrameMax = lf.max;
+  }
+  // The aggregated view (#498): once the layout is done the graph is drawn
+  // as a cut through its hierarchy, made by the layout worker for the
+  // camera at rest. What the fitted cut is (at most 20,000 discs and
+  // 100,000 merged edges, or the run fails) and what it took; the frames of
+  // a wheel zoom over cuts, in and back out for 2 s (the run fails over
+  // 50 ms at the 95th percentile); then zooming in a step at a time until
+  // the cut is the graph's own nodes, and what each cut took in the worker
+  // (the run fails if their median is over 30 ms, or if the graph itself
+  // is not reached). Then full detail is forced (`.graph detail on`):
+  // everything below is of the million edges themselves, as before #498.
+  if (dataset === "rmat") {
+    const graph = () => p.evaluate(() => (window as any).ursaShell.graph());
+    const cutAtRest = () => p.waitForFunction(() => { const g = (window as any).ursaShell.graph(); return g && !g.cuts.waiting; }, null, { timeout: 60_000, polling: 50 });
+    await p.waitForFunction(() => (window as any).ursaShell.graph()?.cut, null, { timeout: 60_000, polling: 50 });
+    await cutAtRest();
+    const fitted = await graph();
+    const statusNow = await p.evaluate(() => document.getElementById("graph-status")?.textContent ?? "");
+    console.log(
+      `  aggregated: ${fitted.cut.groups} discs (${fitted.cut.merged} of more than one node) of ${fitted.cut.nodes} nodes and ${fitted.cut.edges} of ${fitted.cut.totalEdges} merged edges at the fitted zoom; ` +
+        `the cut took ${fitted.cuts.last?.toFixed(1)} ms in the layout worker, after ${fitted.cuts.prepared?.ms?.toFixed(1)} ms once for the hierarchy's forest (${Math.round(fitted.cuts.prepared?.bytes / 1024)} KB held); ` +
+        `labels ${JSON.stringify(fitted.groupLabels.slice(0, 5))}; status ${JSON.stringify(statusNow.slice(0, 70))}`,
+    );
+    if (fitted.cut.groups > 20_000 || fitted.cut.edges > 100_000 || fitted.cut.nodes !== fitted.nodes) slow.push(`run ${r + 1}: the fitted cut has ${fitted.cut.groups} discs of ${fitted.cut.nodes} nodes and ${fitted.cut.edges} merged edges; at most 20,000 and 100,000 are allowed, of every node`);
+    if (!statusNow.startsWith("aggregated: ")) slow.push(`run ${r + 1}: the status line of an aggregated view says ${JSON.stringify(statusNow)}`);
+    const box = (await p.locator("#graph-stage canvas").boundingBox())!;
+    const middle = [box.x + box.width / 2, box.y + box.height / 2];
+    await p.evaluate(() => (window as any).ursaShell.graphTimingsReset());
+    await p.evaluate(
+      ([x, y]) =>
+        new Promise<void>((done) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          const began = performance.now();
+          const step = () => {
+            const t = performance.now() - began;
+            if (t >= 2000) return done();
+            canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: t < 1000 ? -30 : 30, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+            requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+        }),
+      middle,
+    );
+    const moved = (await timings()).frames;
+    await cutAtRest();
+    const during = await graph();
+    console.log(`  aggregated, a wheel zoom for 2 s: ${moved.interval.count} frame intervals, p50 ${moved.interval.p50} ms, p95 ${moved.interval.p95} ms, max ${moved.interval.max} ms; ${during.cuts.ms.count} cuts so far`);
+    if (moved.interval.p95 > 50) slow.push(`run ${r + 1}: the aggregated view's frames were ${moved.interval.p95} ms apart at the 95th percentile during a wheel zoom; at most 50 ms are allowed`);
+    rel.cutFrameP95 = moved.interval.p95;
+    // In, a step at a time, to the graph's own nodes.
+    const fit = () => p.evaluate(() => document.querySelector("#graph-stage canvas")!.dispatchEvent(new KeyboardEvent("keydown", { key: "0", bubbles: true, cancelable: true })));
+    await fit();
+    await p.waitForTimeout(300);
+    await cutAtRest();
+    const steps: string[] = [];
+    let reached = false;
+    for (let step = 0; step < 20 && !reached; step++) {
+      await p.evaluate(
+        ([x, y]) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          for (let i = 0; i < 2; i++) canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+        },
+        middle,
+      );
+      await p.waitForTimeout(300);
+      await cutAtRest();
+      const now = await graph();
+      reached = now.cut === null;
+      steps.push(reached ? `the graph itself (${now.cuts.last?.toFixed(1)} ms)` : `${now.cut.groups}/${now.cut.edges} (${now.cuts.last?.toFixed(1)} ms)`);
+    }
+    const cuts = (await graph()).cuts;
+    console.log(`  aggregated, zooming in by 1.35x a step, discs/merged edges (the cut's ms in the worker): ${steps.join(", ")}`);
+    console.log(`  cuts: ${cuts.ms.count}, in the layout worker p50 ${cuts.ms.p50} ms, p95 ${cuts.ms.p95} ms, max ${cuts.ms.max} ms`);
+    if (!reached) slow.push(`run ${r + 1}: zooming in did not reach the graph's own nodes: ${steps.join(", ")}`);
+    if (cuts.ms.p50 > 30) slow.push(`run ${r + 1}: a cut took ${cuts.ms.p50} ms in the layout worker (the median of ${cuts.ms.count}); at most 30 ms are allowed`);
+    rel.cutMs = cuts.ms.p50;
+    rel.cutMaxMs = cuts.ms.max;
+    rel.cutPrepareMs = Math.round(fitted.cuts.prepared?.ms);
+    rel.cutDiscs = fitted.cut.groups;
+    rel.cutEdges = fitted.cut.edges;
+    // Fitted again, and in full detail from here.
+    await fit();
+    await p.keyboard.type(".graph detail on");
+    await p.keyboard.press("Enter");
+    await p.waitForFunction(() => { const g = (window as any).ursaShell.graph(); return g && g.cut === null && g.cuts.detail; }, null, { timeout: 60_000, polling: 50 });
   }
   console.log("  main-thread tasks over 50 ms since Enter [start, ms]:", JSON.stringify(t.longTasks.filter((l: any) => l.start + l.duration > 0).map((l: any) => [l.start, l.duration])));
 
@@ -262,7 +354,7 @@ for (let r = 0; r < runs; r++) {
   await ctx.close();
 }
 const median = (xs: number[]) => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-const steps = ["viewLongestTask", "shown", "levelFrameP95", "levelFrameMax", "wheelEdges", "wheelFrameP95", "wheelRenderP95", "refinedAfter", "refineMs", "refineSlices", "refineLongestTask", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
+const steps = ["viewLongestTask", "shown", "levelFrameP95", "levelFrameMax", "cutDiscs", "cutEdges", "cutPrepareMs", "cutMs", "cutMaxMs", "cutFrameP95", "wheelEdges", "wheelFrameP95", "wheelRenderP95", "refinedAfter", "refineMs", "refineSlices", "refineLongestTask", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
 const keys = Object.keys(all[0]).filter((k) => !steps.includes(k)).sort((a, b) => all[0][a] - all[0][b]);
 console.log("median ms from Enter:");
 for (const k of keys) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);

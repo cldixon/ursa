@@ -74,6 +74,11 @@
 // Then a level of the layout's hierarchy drawn in place of the graph
 // (#497), on WebGL2: frames read back at the four coarsest levels of the
 // 100K-edge R-MAT graph. ONLY=levels runs these alone.
+//
+// Then a cut through that hierarchy drawn in place of the graph (#498):
+// frames read back at two zooms, a group picked for its nodes, and the
+// graph's own frame, byte for byte, once the cut is cleared. ONLY=cut runs
+// these alone.
 import { chromium, type Page } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -1871,6 +1876,171 @@ if (!ONLY || "levels".startsWith(ONLY)) {
   console.log(
     `${name}: ${r.backend} · ${r.count} levels · read back ${r.levels.map((l: any) => `level ${l.level}: ${l.nodes} discs, ${l.edges} of ${l.totalEdges} edges, ${l.ink} px inked (moving: ${l.movingNodes} discs, ${l.movingEdges} edges)`).join("; ")} · ` +
       `cleared, ${r.afterClear} bytes differ from the graph's frame · a level at a time ends on the same bits: ${r.sameBits}`,
+  );
+  await gl.close();
+}
+// A cut through the layout's hierarchy drawn in place of the graph (#498),
+// on WebGL2: the 100K-edge R-MAT graph, laid out, and cut for the camera
+// fitted to it and for cameras zoomed in. The groups' members sum to the
+// node count, every node is in one group, and the same camera gives the
+// same cut; the frames read back at two zooms have the heaviest discs
+// where their groups are, with the camera where it was; a group is picked
+// for its nodes, and selecting it rings its disc; zooming in reaches the
+// graph's own nodes; and with the cut cleared the frame is the graph's
+// own, byte for byte, fitted and zoomed in. ONLY=cut runs this alone.
+if (!ONLY || "cut".startsWith(ONLY)) {
+  const name = "cut rmat 100K";
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+  page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+  page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+  await page.goto(`${base}?graph=rmat&scale=14&edges=100000&result=1`);
+  await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+  await page.waitForTimeout(500);
+  const r: any = await page.evaluate(async () => {
+    const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+    const canvas = document.getElementById("view") as HTMLCanvasElement;
+    const [W, H] = [canvas.width, canvas.height];
+    w.pauseFrames(true);
+    await new Promise((r) => setTimeout(r, 200));
+    const out: any = { backend: view.backend, problems: [] as string[], cuts: [] as any[] };
+    const problem = (what: string) => out.problems.push(what);
+    const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+    const at = (px: Uint8Array, x: number, y: number) => { const i = 4 * (Math.round(y) * W + Math.round(x)); return [px[i], px[i + 1], px[i + 2]]; };
+    const frame = async (): Promise<Uint8Array> => { view.render(); return view.snapshot(); };
+    const same = (a: ArrayLike<number>, b: ArrayLike<number>) => a.length === b.length && Array.prototype.every.call(a, (v: number, i: number) => v === b[i]);
+
+    // The layout, in this thread, to its end: the view's nodes are its.
+    const layout = new viz.Layout(g.n, g.src, g.dst);
+    if (layout.hasCut || layout.cut(view.camera()) !== undefined) problem("a layout that has not reached the graph gave a cut");
+    while (!layout.done) layout.stepLevel(8);
+    if (!layout.hasCut) problem("a finished layout has no cut");
+    view.setPositions(layout.positions());
+    const n = g.n;
+    // The cameras: fitted, then zoomed in on the middle until the cut is
+    // the graph itself. And the graph's own frames at the first and last,
+    // before any cut is drawn.
+    const zoomTo = (steps: number) => { view.fit(); for (let i = 0; i < steps; i++) view.zoom(1.5, W / 2, H / 2); };
+    view.fit();
+    const fitted = Array.from(view.camera() as Float32Array);
+    const graphFitted = await frame();
+    let reached = -1;
+    const sizes: number[] = [];
+    for (let steps = 0; steps <= 30 && reached < 0; steps++) {
+      zoomTo(steps);
+      const cut = layout.cut(view.camera());
+      sizes.push(cut.mass.length);
+      if (cut.detail) reached = steps;
+    }
+    out.reached = reached;
+    out.sizes = sizes;
+    if (reached < 1) problem(`zooming in did not reach the graph's own nodes: ${sizes}`);
+    const graphNear = await frame();
+    const near = Array.from(view.camera() as Float32Array);
+
+    const draw = async (steps: number) => {
+      zoomTo(steps);
+      const camera = Array.from(view.camera() as Float32Array);
+      const cut = layout.cut(camera);
+      const tag = `cut at zoom step ${steps}`;
+      const groups = cut.mass.length;
+      if (cut.detail) return problem(`${tag}: the graph itself`);
+      // Its groups hold every node once.
+      const counts = new Uint32Array(groups);
+      for (const group of cut.of) counts[group]++;
+      if (cut.of.length !== n || !same(counts, cut.members)) problem(`${tag}: the groups' members are not the nodes in them`);
+      if (Array.prototype.reduce.call(cut.members, (a: number, b: number) => a + b, 0) !== n) problem(`${tag}: the groups' members do not sum to ${n}`);
+      if (cut.src.length !== cut.dst.length || cut.src.length !== cut.weight.length || cut.totalEdges < cut.src.length) problem(`${tag}: ${cut.src.length} edges of ${cut.totalEdges}`);
+      if (cut.weight.some((x: number, i: number) => i > 0 && x > cut.weight[i - 1])) problem(`${tag}: the edges are not heaviest first`);
+      if (cut.src.some((a: number, i: number) => a >= cut.dst[i] || cut.dst[i] >= groups)) problem(`${tag}: an edge does not join two groups`);
+      // The same camera, the same cut.
+      const again = layout.cut(camera);
+      for (const key of ["xy", "mass", "members", "of", "src", "dst", "weight"]) if (!same(cut[key], again[key])) problem(`${tag}: asked twice, ${key} differs`);
+      view.setCut(cut.xy, cut.mass, cut.members, cut.of, cut.src, cut.dst, cut.weight, cut.totalEdges, 12);
+      if (!same(view.camera(), camera)) problem(`${tag}: the camera moved`);
+      const px = await frame();
+      const info = view.cutInfo();
+      if (info?.groups !== groups || info.nodes !== n || info.groupsDrawn !== groups || info.edges !== cut.src.length || info.edgesDrawn !== cut.src.length || info.totalEdges !== cut.totalEdges) problem(`${tag}: cutInfo ${JSON.stringify(info)}`);
+      if (view.levelInfo() !== undefined) problem(`${tag}: levelInfo says a level is drawn`);
+      // The heaviest groups in view: a disc where each is, picked as itself
+      // or as a heavier one over it.
+      const [cx, cy, ppu] = camera;
+      const to = (i: number) => [W / 2 + (cut.xy[i] - cx) * ppu, H / 2 - (cut.xy[groups + i] - cy) * ppu];
+      const inView = Array.from(cut.mass as Float32Array, (m, i) => [m, i]).filter(([, i]) => { const [x, y] = to(i); return x > 20 && x < W - 20 && y > 20 && y < H - 20; }).sort((a, b) => b[0] - a[0]);
+      let disc: number[] | null = null;
+      for (const [mass, i] of inView.slice(0, 5)) {
+        const [x, y] = to(i);
+        const c = at(px, x, y);
+        disc ??= c;
+        if (c.some((v, k) => Math.abs(v - disc![k]) > 2) || c.every((v) => v > 235)) problem(`${tag}: group ${i} at ${Math.round(x)},${Math.round(y)} is ${c}, not a disc (${disc})`);
+        const picked = view.pickGroup(x, y);
+        if (picked === undefined || cut.mass[picked] < mass) problem(`${tag}: group ${i} is picked as ${picked}`);
+      }
+      if (!differ(px, steps === 0 ? graphFitted : graphNear)) problem(`${tag}: the frame is the graph's`);
+      if (view.pick(W / 2, H / 2) !== undefined || view.pickEdge(W / 2, H / 2, 4) !== undefined) problem(`${tag}: a node or an edge of the graph was picked`);
+      // A group of more than one node, picked for its nodes: they are
+      // selected, and its disc carries a ring.
+      const [, big] = inView.find(([, i]) => cut.members[i] > 1) ?? [0, -1];
+      if (big < 0) return problem(`${tag}: no group of more than one node is in view`);
+      const [bx, by] = to(big);
+      const group = view.pickGroup(bx, by);
+      const nodes: Uint32Array = view.groupNodes(group);
+      if (nodes.length !== cut.members[group] || nodes.some((v) => cut.of[v] !== group) || view.groupOf(nodes[0]) !== group) problem(`${tag}: group ${group}'s nodes are not its ${cut.members[group]} members`);
+      if (!view.selectGroup(group, false) || !same(view.selection(), nodes)) problem(`${tag}: picking group ${group} did not select its nodes`);
+      const ringed = differ(await frame(), px);
+      if (!ringed) problem(`${tag}: a selected group's disc is drawn as before`);
+      // Shift on another group adds its nodes; on the first again, takes its out.
+      const [, other] = inView.find(([, i]) => i !== group && view.pickGroup(...to(i)) === i) ?? [0, -1];
+      if (other >= 0) {
+        view.selectGroup(other, true);
+        if (view.selection().length !== cut.members[group] + cut.members[other]) problem(`${tag}: Shift on a second group selected ${view.selection().length} nodes`);
+        view.selectGroup(group, true);
+        if (view.selection().length !== cut.members[other]) problem(`${tag}: Shift on a selected group left ${view.selection().length} nodes`);
+      }
+      // Empty space clears.
+      view.selectGroup(undefined, false);
+      if (view.selection().length || differ(await frame(), px)) problem(`${tag}: the selection was not cleared`);
+      const labels: Float32Array = view.groupLabels(6, 10);
+      if (labels.length % 5 || labels.length > 50) problem(`${tag}: ${labels.length} label values`);
+      for (let k = 0; k < labels.length; k += 5) if (labels[k + 4] !== cut.members[labels[k]] || labels[k + 3] < 6) problem(`${tag}: the label of group ${labels[k]} says ${labels[k + 4]}`);
+      out.cuts.push({ steps, groups, merged: info.merged, edges: cut.src.length, totalEdges: cut.totalEdges, ringed, labels: labels.length / 5 });
+    };
+    await draw(0);
+    await draw(Math.max(1, reached - 2));
+    if (out.cuts.length === 2 && !(out.cuts[1].groups > out.cuts[0].groups)) problem(`zoomed in, the cut has ${out.cuts[1].groups} groups, and fitted ${out.cuts[0].groups}`);
+    // A cut of another graph is refused, and the one drawn stays.
+    const held = view.cutInfo();
+    try { view.setCut(new Float32Array(2), new Float32Array(1), new Uint32Array([n]), new Uint32Array(n - 1), new Uint32Array(0), new Uint32Array(0), new Float32Array(0)); problem("a cut of fewer nodes was taken"); } catch { /* refused */ }
+    if (JSON.stringify(view.cutInfo()) !== JSON.stringify(held)) problem("a refused cut changed the one drawn");
+    // Zoomed in to the graph's own nodes, the cut cleared: the graph's
+    // frame, byte for byte; and fitted again.
+    zoomTo(reached);
+    if (!same(view.camera(), near)) problem("the same zooms gave another camera");
+    if (!layout.cut(view.camera()).detail) problem("the cut zoomed in is not the graph itself");
+    view.clearLevel();
+    out.nearDiffer = differ(await frame(), graphNear);
+    if (view.cutInfo() !== undefined) problem("a cleared cut is still drawn");
+    view.fit();
+    if (!same(view.camera(), fitted)) problem("fitted again, the camera is elsewhere");
+    out.fittedDiffer = differ(await frame(), graphFitted);
+    if (out.nearDiffer || out.fittedDiffer) problem(`with the cut cleared, ${out.nearDiffer} bytes of the frame zoomed in and ${out.fittedDiffer} fitted differ from the graph's`);
+    // A cut drawn again, and cleared again: the pipelines were kept.
+    const cut = layout.cut(view.camera());
+    view.setCut(cut.xy, cut.mass, cut.members, cut.of, cut.src, cut.dst, cut.weight, cut.totalEdges);
+    await frame();
+    view.clearLevel();
+    out.againDiffer = differ(await frame(), graphFitted);
+    if (out.againDiffer) problem(`after a second cut, ${out.againDiffer} bytes differ from the graph's`);
+    // What the layout holds for its cuts.
+    out.bytes = layout.cutBytes;
+    layout.free();
+    w.pauseFrames(false);
+    return out;
+  });
+  for (const problem of r.problems) failures.push(`${name}: ${problem}`);
+  console.log(
+    `${name}: ${r.backend} · groups by zoom step ${JSON.stringify(r.sizes)}, the graph itself at step ${r.reached} · read back ${r.cuts.map((c: any) => `step ${c.steps}: ${c.groups} discs (${c.merged} of more than one node), ${c.edges} of ${c.totalEdges} edges, ${c.labels} labels, a selected group changed ${c.ringed} bytes`).join("; ")} · ` +
+      `cleared, ${r.nearDiffer} bytes differ from the graph's frame zoomed in and ${r.fittedDiffer} fitted · the layout holds ${Math.round(r.bytes / 1024)} KB for its cuts`,
   );
   await gl.close();
 }

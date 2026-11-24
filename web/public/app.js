@@ -912,6 +912,7 @@ async function hostCommand(line) {
     case ".graph": {
       if (/^history\b/i.test(arg)) return explore(line);
       if (/^echo\b/i.test(arg)) return graphEcho(rest.slice(1));
+      if (/^detail\b/i.test(arg)) return graphDetail(rest.slice(1));
       // The query as typed: its spaces may be in a string.
       const drawn = await drawGraph(line.trim().slice(name.length).trim());
       // A drawing is part of the session a link replays: what is explored
@@ -1089,6 +1090,27 @@ async function graphEcho(words) {
     graphEchoes
       ? "The graph view's commands are shown here as they run (.graph echo off hides them).\r\n"
       : "The graph view's commands run without being shown here; .history still lists them (.graph echo on shows them again).\r\n",
+  );
+  return true;
+}
+
+/**
+ * `.graph detail ?on|off?`: draw a large graph in full detail, or
+ * aggregated again (#498); with no word, say which. The view's `a` does
+ * the same.
+ */
+async function graphDetail(words) {
+  const word = (words[0] ?? "").toLowerCase();
+  if (words.length > 1 || !["", "on", "off"].includes(word)) return errorLine("usage: .graph detail on|off");
+  const graph = await loadGraphModule();
+  const { detail, large } = graph.detail(word ? word === "on" : undefined);
+  const small = large === false ? " The graph drawn now is small enough to be drawn whole either way." : "";
+  await write(
+    (detail
+      ? "A large graph is drawn in full detail, every node and edge (.graph detail off aggregates it again)."
+      : "A large graph is drawn aggregated once it is laid out: a disc for each group of nodes, opened as the view zooms in (.graph detail on draws every node and edge).") +
+      small +
+      "\r\n",
   );
   return true;
 }

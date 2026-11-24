@@ -54,6 +54,26 @@
 // Both carry `epoch`, `iterations`, `total` and `memory` as "positions"
 // does. The layout ends on the same positions, bit for bit.
 //
+// The aggregated view (#498): once the layout has reached the graph
+// itself, the page asks for a cut through its hierarchy when its camera
+// comes to rest, and draws that in place of the graph (GraphView.setCut).
+//   {type: "cut", id, camera, separation?, maxNodes?, maxEdges?, detailNodes?}
+//     `camera` is GraphView.camera()'s [x, y, pixelsPerUnit, width, height].
+//     -> {type: "cut", id, epoch, ms, memory, available: false}  no hierarchy
+//        to cut: the layout is flat or fixed, has not reached the graph, or
+//        the graph grew; or
+//     -> {type: "cut", id, epoch, ms, memory, available: true, detail, xy,
+//         mass, members, of, src, dst, weight, totalEdges, inView,
+//         membersInView}: Layout.cut's answer, its typed arrays
+//        transferred, and the ms it took. `detail` says the graph itself is
+//        to be drawn: what is in view is its own nodes.
+// The hierarchy is the layout's own: it keeps each level's members when
+// it comes down from it (under 1 MB at a million edges). When the layout
+// is done, after "done" is posted, a forest is made of them, with the
+// graph's edges in its order (Layout.prepareCut: 5 MB there, in memory
+// the layout has let go of, held until the graph grows): every answer
+// carries `prepareMs`, what that took, and `bytes`, what it holds.
+//
 // `layout` picks a fixed layout instead: {kind: "rings" | "layers", level},
 // `level` a Uint32Array of each node's distance from a seed (rings) or its
 // layer (layers), 0xFFFFFFFF for none. A fixed layout is done as it is made:
@@ -119,6 +139,7 @@ async function handle(data) {
       const { Layout } = await load(data.module);
       times.workerLoaded = performance.now();
       layout = make(Layout, data);
+      prepareMs = null;
       times.hierarchy = performance.now();
       budgetMs = data.budgetMs ?? 100;
       levelEdges = data.levelEdges ?? LEVEL_EDGES;
@@ -139,6 +160,8 @@ async function handle(data) {
       // read from is let go level by level.
       postOrder(data);
       run();
+    } else if (data.type === "cut") {
+      postCut(data);
     } else if (data.type === "grow") {
       if (!layout) throw new Error("no layout to grow");
       layout.grow(data.n, data.src, data.dst);
@@ -228,8 +251,34 @@ function postOrder({ src, dst }) {
   self.postMessage({ type: "order", order, ms: performance.now() - t }, [order.buffer]);
 }
 
+/**
+ * A cut through the layout's hierarchy for the page's camera (#498): the
+ * groups to draw in place of the graph, where its nodes are now, or that
+ * there is none to give.
+ */
+function postCut({ id, camera, separation, maxNodes, maxEdges, detailNodes }) {
+  // (Made already, unless the page asked before the layout was done.)
+  prepareCut();
+  const t = performance.now();
+  const cut = layout?.hasCut ? layout.cut(camera, separation, maxNodes, maxEdges, detailNodes) : undefined;
+  const message = { type: "cut", id, epoch, ms: performance.now() - t, prepareMs, bytes: layout?.cutBytes, memory: wasm?.memory.buffer.byteLength, available: Boolean(cut), ...cut };
+  self.postMessage(message, cut ? [cut.xy, cut.mass, cut.members, cut.of, cut.src, cut.dst, cut.weight].map((a) => a.buffer) : []);
+}
+
+// What making the hierarchy's forest took, in ms, once it is made.
+let prepareMs = null;
+/** The forest a cut is made from, if the layout has a hierarchy and has reached the graph: once. */
+function prepareCut() {
+  if (prepareMs !== null || !layout?.hasCut) return;
+  const t = performance.now();
+  layout.prepareCut();
+  prepareMs = performance.now() - t;
+}
+
 function done() {
   self.postMessage({ type: "done", epoch, iterations: layout.iterations, memory: wasm.memory.buffer.byteLength });
+  // For the cuts the page will ask for (#498): after the page is told.
+  prepareCut();
 }
 
 /**

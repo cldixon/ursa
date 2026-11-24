@@ -72,7 +72,7 @@ pub const FAN: usize = 4;
 /// Its nodes are numbered level by level: the graph's own `0..n`, then
 /// level 1's, and so on; after the last level's, the groups of what the
 /// hierarchy left out. For the 131K-node, 1M-edge R-MAT graph it holds
-/// under two megabytes.
+/// nine megabytes: four bytes an edge, and the rest by node.
 #[derive(Debug, Clone)]
 pub struct Hierarchy {
     /// The graph's nodes: the forest's leaves.
@@ -103,6 +103,13 @@ pub struct Hierarchy {
     y: Vec<f32>,
     spread: Vec<f32>,
     bounds: Vec<[f32; 4]>,
+    /// Each leaf's number in the forest's order, and each edge of the
+    /// graph once, at its earlier end, as its later end's number: row
+    /// `r`'s are `later[later_offsets[r]..later_offsets[r + 1]]`,
+    /// ascending ([`Hierarchy::index_edges`]).
+    rank: Vec<u32>,
+    later_offsets: Vec<u32>,
+    later: Vec<u32>,
 }
 
 /// What a cut is asked for: the camera, and the limits.
@@ -163,9 +170,10 @@ pub struct Cut {
     /// For each node of the graph, the node of the cut it is under: an
     /// index into `nodes`.
     pub of: Vec<u32>,
-    /// The merged edges, heaviest first (then by `src`, then `dst`): edge
-    /// `i` joins the cut's nodes `src[i] < dst[i]` and stands for
-    /// `weight[i]` of the graph's edges. At most
+    /// The merged edges, heaviest first (those as heavy, in the order of
+    /// their earlier ends in the forest): edge `i` joins the cut's nodes
+    /// `src[i] < dst[i]` and stands for `weight[i]` of the graph's edges.
+    /// At most
     /// [`CutParams::max_edges`] of the `total_edges` the cut has.
     pub src: Vec<u32>,
     pub dst: Vec<u32>,
@@ -213,21 +221,22 @@ impl Hierarchy {
         let members: Vec<(&[u32], &[u32])> = (1..=levels)
             .map(|l| layout.level_members(l))
             .collect::<Option<_>>()?;
-        let n = adj.offsets.len() - 1;
-        let mass = |v: u32| 1.0 + adj.degree(v) as f32;
-        Some(Self::new(n, &members, mass))
+        Some(Self::new(adj, &members))
     }
 
-    /// The forest over `n` leaves whose level `l + 1` groups level `l`'s
-    /// nodes as `levels[l]` says: `(offsets, members)`, a CSR of the
-    /// members of each node (level 0 is the leaves). `leaf_mass(v)` is
-    /// leaf `v`'s mass.
+    /// The forest over the nodes of the graph with adjacency `adj`, whose
+    /// level `l + 1` groups level `l`'s nodes as `levels[l]` says:
+    /// `(offsets, members)`, a CSR of the members of each node (level 0
+    /// is the graph's nodes, the leaves). A leaf's mass is its degree
+    /// plus one, as the layout has it.
     ///
     /// # Panics
     ///
     /// If a level names a node the level below does not have, or names
     /// one twice.
-    pub fn new(n: usize, levels: &[(&[u32], &[u32])], leaf_mass: impl Fn(u32) -> f32) -> Self {
+    pub fn new(adj: &UndirectedCsr, levels: &[(&[u32], &[u32])]) -> Self {
+        let n = adj.offsets.len() - 1;
+        let leaf_mass = |v: u32| 1.0 + adj.degree(v) as f32;
         let mut base = vec![0u32, n as u32];
         for (offsets, _) in levels {
             let last = *base.last().unwrap();
@@ -278,6 +287,9 @@ impl Hierarchy {
             y: vec![0.0; groups],
             spread: vec![0.0; groups],
             bounds: vec![[0.0; 4]; groups],
+            rank: Vec::new(),
+            later_offsets: Vec::new(),
+            later: Vec::new(),
         };
         // A group's children are numbered below it: one pass, ascending.
         for g in 0..groups {
@@ -294,6 +306,7 @@ impl Hierarchy {
             this.count[g] = count;
             this.mass[g] = mass;
         }
+        this.index_edges(adj);
         this
     }
 
@@ -359,19 +372,22 @@ impl Hierarchy {
             + self.top.len()
             + self.orphans.len()
             + self.roots.len();
-        4 * ids + 36 * self.count.len()
+        let index = self.rank.len() + self.later_offsets.len() + self.later.len();
+        4 * (ids + index) + 36 * self.count.len()
     }
 
     /// Put every group at the centre of mass of the leaves under it, the
     /// graph's nodes being at `x`, `y` (one per node each), with the box
-    /// around them and its children's spread about it. `leaf_mass` as in
-    /// [`Hierarchy::new`].
+    /// around them and its children's spread about it. `adj` is the
+    /// graph's adjacency, as [`Hierarchy::new`] had it.
     ///
     /// What the layout's hierarchy left out is grouped again here, by
     /// where it is now (the module docs): the groups made by the last
     /// call are let go.
-    pub fn place(&mut self, x: &[f32], y: &[f32], leaf_mass: impl Fn(u32) -> f32) {
+    pub fn place(&mut self, adj: &UndirectedCsr, x: &[f32], y: &[f32]) {
         assert_eq!((x.len(), y.len()), (self.n, self.n), "one place per node");
+        assert_eq!(adj.offsets.len() - 1, self.n, "the adjacency of the graph");
+        let leaf_mass = |v: u32| 1.0 + adj.degree(v) as f32;
         let n = self.n;
         // The layout's own groups first: the others are made of them.
         let own = self.n_layout_nodes() - n;
@@ -571,26 +587,21 @@ impl Hierarchy {
         let mut nodes = kept;
         nodes.sort_unstable();
 
-        // Each leaf's node of the cut, and the leaves in the order of the
-        // cut's nodes: `leaves[starts[i]..starts[i + 1]]` are under node `i`.
-        let mut of = vec![0u32; n];
-        let mut leaves = Vec::with_capacity(n);
-        let mut starts = Vec::with_capacity(nodes.len() + 1);
+        // Each leaf's node of the cut.
+        let mut of = vec![u32::MAX; n];
         let mut stack = Vec::new();
         for (i, &v) in nodes.iter().enumerate() {
-            starts.push(leaves.len() as u32);
             stack.push(v);
             while let Some(u) = stack.pop() {
                 if (u as usize) < n {
+                    debug_assert_eq!(of[u as usize], u32::MAX, "a cut covers a node once");
                     of[u as usize] = i as u32;
-                    leaves.push(u);
                 } else {
-                    stack.extend(self.children(u).iter().rev());
+                    stack.extend(self.children(u));
                 }
             }
         }
-        starts.push(leaves.len() as u32);
-        debug_assert_eq!(leaves.len(), n, "a cut covers every node once");
+        debug_assert!(!of.contains(&u32::MAX), "a cut covers every node");
 
         let (mut cx, mut cy) = (Vec::with_capacity(nodes.len()), Vec::new());
         let (mut mass, mut members) = (Vec::with_capacity(nodes.len()), Vec::new());
@@ -627,75 +638,145 @@ impl Hierarchy {
             members_in_view: seen_members,
         };
         if !detail {
-            merged_edges(&mut cut, adj, &leaves, &starts, params.max_edges);
+            self.merged_edges(&mut cut, params.max_edges);
         }
         cut
     }
 }
 
-/// A merged edge: its weight, then its ends.
-type Merged = (f32, u32, u32);
+/// A merged edge: its weight, when it was found, and its ends.
+type Merged = (f32, u32, u32, u32);
 
-/// Heaviest first, then by the ends: a total order.
+/// Heaviest first, then in the order found: a total order.
 fn heavier(a: &Merged, b: &Merged) -> Ordering {
-    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
 }
 
-/// The edges between the nodes of `cut`, each weighted by the edges of
-/// `adj` it stands for, the heaviest `most` of them into `cut`. One pass
-/// over the adjacency, a node of the cut at a time: the edges from its
-/// leaves to leaves of a later node are counted in a slot per node. Of
-/// the edges found so far only the heaviest `2 * most` are held.
-fn merged_edges(cut: &mut Cut, adj: &UndirectedCsr, leaves: &[u32], starts: &[u32], most: usize) {
-    let of = &cut.of;
-    let groups = cut.nodes.len();
-    let mut slot = vec![0.0f32; groups];
-    let mut touched: Vec<u32> = Vec::new();
-    let mut best: Vec<Merged> = Vec::new();
-    // Once `most` edges are held, the lightest of them: an edge found
-    // later is among the heaviest only if it is heavier, since of two as
-    // heavy the one found first comes first.
-    let mut least = 0.0f32;
-    let mut total = 0usize;
-    for i in 0..groups {
-        for &u in &leaves[starts[i] as usize..starts[i + 1] as usize] {
-            for &v in adj.neighbors(u) {
-                let j = of[v as usize];
-                if j as usize > i {
-                    if slot[j as usize] == 0.0 {
-                        touched.push(j);
-                    }
-                    slot[j as usize] += 1.0;
+impl Hierarchy {
+    /// Number the leaves in the forest's order (a walk from each of the
+    /// layout's own roots, a group's leaves together), and keep each
+    /// edge of `adj` once, at its earlier end, as the later end's number:
+    /// what [`Hierarchy::merged_edges`] reads. Four bytes an edge and
+    /// eight a node.
+    fn index_edges(&mut self, adj: &UndirectedCsr) {
+        let n = self.n;
+        let mut order = Vec::with_capacity(n);
+        let mut stack: Vec<u32> = Vec::new();
+        for &root in self.top.iter().chain(&self.orphans) {
+            stack.push(root);
+            while let Some(u) = stack.pop() {
+                if (u as usize) < n {
+                    order.push(u);
+                } else {
+                    stack.extend(self.children(u).iter().rev());
                 }
             }
         }
-        total += touched.len();
-        for &j in &touched {
-            let w = std::mem::take(&mut slot[j as usize]);
-            if w > least {
-                best.push((w, i as u32, j));
-            }
+        debug_assert_eq!(order.len(), n, "every node is under one root");
+        let mut rank = vec![0u32; n];
+        for (r, &u) in order.iter().enumerate() {
+            rank[u as usize] = r as u32;
         }
-        touched.clear();
-        // Between two nodes of the cut, so that every edge held is of an
-        // earlier node than any found after.
-        if best.len() >= 2 * most.max(1) {
-            if most == 0 {
-                best.clear();
-                least = f32::INFINITY;
-                continue;
-            }
-            best.select_nth_unstable_by(most - 1, heavier);
-            best.truncate(most);
-            least = best[most - 1].0;
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut later = Vec::with_capacity(adj.targets.len() / 2);
+        offsets.push(0);
+        for (r, &u) in order.iter().enumerate() {
+            let start = later.len();
+            later.extend(
+                (adj.neighbors(u).iter())
+                    .map(|&v| rank[v as usize])
+                    .filter(|&q| q as usize > r),
+            );
+            later[start..].sort_unstable();
+            offsets.push(later.len() as u32);
         }
+        later.shrink_to_fit();
+        self.rank = rank;
+        self.later_offsets = offsets;
+        self.later = later;
     }
-    best.sort_unstable_by(heavier);
-    best.truncate(most);
-    cut.total_edges = total;
-    cut.src = best.iter().map(|e| e.1).collect();
-    cut.dst = best.iter().map(|e| e.2).collect();
-    cut.weight = best.iter().map(|e| e.0).collect();
+
+    /// The edges between the nodes of `cut`, each weighted by the edges
+    /// of the graph it stands for, the heaviest `most` of them into
+    /// `cut`.
+    ///
+    /// The leaves under a node of the layout's hierarchy are numbered
+    /// together ([`Hierarchy::index_edges`]), so the cut's nodes are runs
+    /// of the leaves in that order, and an edge between two of them is
+    /// kept at a leaf of the earlier run and leads past its end. One pass
+    /// over the runs reads those edges alone, each once (a row is sorted:
+    /// from its far end back to the run's), and counts them in a slot per
+    /// node of the cut. Of the merged edges found so far only the
+    /// heaviest `2 * most` are held.
+    fn merged_edges(&self, cut: &mut Cut, most: usize) {
+        let n = self.n;
+        let groups = cut.nodes.len();
+        // Each leaf's node of the cut, in the forest's order.
+        let mut of = vec![0u32; n];
+        for (u, &i) in cut.of.iter().enumerate() {
+            of[self.rank[u] as usize] = i;
+        }
+        let mut slot = vec![0u32; groups];
+        let mut touched: Vec<u32> = Vec::new();
+        let mut best: Vec<Merged> = Vec::new();
+        // Once `most` edges are held, the lightest of them: an edge found
+        // later is among the heaviest only if it is heavier, since of two
+        // as heavy the one found first comes first.
+        let mut least = 0.0f32;
+        let mut total = 0usize;
+        let mut start = 0;
+        while start < n {
+            let i = of[start];
+            let mut end = start + 1;
+            while end < n && of[end] == i {
+                end += 1;
+            }
+            for r in start..end {
+                let row =
+                    &self.later[self.later_offsets[r] as usize..self.later_offsets[r + 1] as usize];
+                for &q in row.iter().rev() {
+                    if (q as usize) < end {
+                        break;
+                    }
+                    let j = of[q as usize];
+                    // (Another run of the same node: what the hierarchy
+                    // left out, grouped by place, has runs apart.)
+                    if j != i {
+                        let count = &mut slot[j as usize];
+                        if *count == 0 {
+                            touched.push(j);
+                        }
+                        *count += 1;
+                    }
+                }
+            }
+            for &j in &touched {
+                let w = std::mem::take(&mut slot[j as usize]) as f32;
+                if w > least {
+                    best.push((w, total as u32, i.min(j), i.max(j)));
+                }
+                total += 1;
+            }
+            touched.clear();
+            if best.len() >= 2 * most.max(1) {
+                if most == 0 {
+                    best.clear();
+                    least = f32::INFINITY;
+                } else {
+                    best.select_nth_unstable_by(most - 1, heavier);
+                    best.truncate(most);
+                    least = best[most - 1].0;
+                }
+            }
+            start = end;
+        }
+        best.sort_unstable_by(heavier);
+        best.truncate(most);
+        cut.total_edges = total;
+        cut.src = best.iter().map(|e| e.2).collect();
+        cut.dst = best.iter().map(|e| e.3).collect();
+        cut.weight = best.iter().map(|e| e.0).collect();
+    }
 }
 
 #[cfg(test)]
@@ -732,7 +813,7 @@ mod tests {
     fn placed(adj: &UndirectedCsr, layout: &Fa2Multilevel) -> Hierarchy {
         let mut h = Hierarchy::of_layout(layout, adj).unwrap();
         let (x, y) = layout.positions();
-        h.place(x, y, |v| 1.0 + adj.degree(v) as f32);
+        h.place(adj, x, y);
         h
     }
 
@@ -935,12 +1016,12 @@ mod tests {
             // The level above has one node, of the first triangle alone.
             (&[0, 1], &[0]),
         ];
-        let mut h = Hierarchy::new(8, &levels, |v| 1.0 + adj.degree(v) as f32);
+        let mut h = Hierarchy::new(&adj, &levels);
         assert_eq!(h.roots(), &[10, 9, 6, 7]);
         assert_eq!((h.members(10), h.members(9), h.members(6)), (3, 3, 1));
         let x = [0.0, 2.0, 1.0, 10.0, 12.0, 11.0, 50.0, 60.0];
         let y = [0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0];
-        h.place(&x, &y, |v| 1.0 + adj.degree(v) as f32);
+        h.place(&adj, &x, &y);
         let cut = h.cut(&adj, &x, &y, &whole(1e-3));
         assert_antichain_cover(&h, &cut);
         assert_eq!(cut.nodes, vec![6, 7, 9, 10]);
@@ -958,8 +1039,7 @@ mod tests {
         const N: u32 = 67;
         let adj = adjacency(N, &[0, 1, 2], &[1, 2, 0]);
         let levels: [(&[u32], &[u32]); 1] = [(&[0, 3], &[0, 1, 2])];
-        let mass = |v: u32| 1.0 + adj.degree(v) as f32;
-        let mut h = Hierarchy::new(N as usize, &levels, mass);
+        let mut h = Hierarchy::new(&adj, &levels);
         assert_eq!(h.roots().len(), 65);
         let (mut x, mut y) = (vec![0.0, 2.0, 1.0], vec![0.0, 0.0, 2.0]);
         for i in 0..64 {
@@ -968,7 +1048,7 @@ mod tests {
             x.push(1000.0 + 100.0 * (j % 8) as f32);
             y.push(1000.0 + 100.0 * (j / 8) as f32);
         }
-        h.place(&x, &y, mass);
+        h.place(&adj, &x, &y);
         // The triangle's group, and at most FAN groups of the rest.
         assert_eq!(h.roots()[0], N);
         assert_eq!(h.roots().len(), 1 + FAN);
@@ -994,13 +1074,13 @@ mod tests {
         // Placed again, the same groups, and no more of them.
         let nodes = h.n_nodes();
         let again = {
-            h.place(&x, &y, mass);
+            h.place(&adj, &x, &y);
             h.cut(&adj, &x, &y, &whole(1e-4))
         };
         assert_eq!((h.n_nodes(), &again), (nodes, &far));
         // Moved, they are grouped where they now are.
         x[3..].reverse();
-        h.place(&x, &y, mass);
+        h.place(&adj, &x, &y);
         assert_antichain_cover(&h, &h.cut(&adj, &x, &y, &whole(1e-2)));
     }
 }
