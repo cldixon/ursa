@@ -264,7 +264,8 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
             .await;
     }
     // What the caller does with the view is a task of its own, not the
-    // tail of the last piece here.
+    // tail of the last piece here (the level's first draw, or the last
+    // run of edges): on the shell's page that is 12 to 27 ms more (#520).
     crate::pace::yield_now().await;
     Ok(GraphView {
         view,

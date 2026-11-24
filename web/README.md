@@ -342,7 +342,9 @@ static assets and an R2 bucket.
       kept a graph beside the result, and 16 for the edge-list view of
       #426), and the result is decoded in pieces, out of the page's
       buffer, so no task while the view is made is over 60 ms (decoding
-      was one of 63 to 92). The layout worker holds 55.7 MB (it was 101):
+      was one of 63 to 92). What draws the layout's coarse levels is made
+      a piece at a time too, and the page takes the view in a task of its
+      own (#520: together they were one of 51 to 80 ms). The layout worker holds 55.7 MB (it was 101):
       it builds the adjacency a layout reads and no topology, and holds a
       dense coarse level's weights only while it lays that level out.
       Positions come from the worker in an array filled once from the

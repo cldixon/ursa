@@ -523,6 +523,36 @@ and the size of the page's wasm memory when it is.
   event loop between them: the largest piece is the shader.
 - **The pieces add about 10 ms** of waiting for the event loop to
   `createView` as a whole.
+- **The level pipelines (#520).** Since #514 a view of 200,000 nodes and
+  edges or more also makes what draws a level of the layout's hierarchy,
+  in a task of its own at the end, and what the page does with the view
+  it is handed ran on in that task. In the shell (`.graph rmat`,
+  `web/tests/graph-timing.ts`, one page a run, the two builds in turn,
+  each run started with the machine's one-minute load at 4.5 or under, on
+  four cores shared with other builds) that task was the longest while
+  the view was made:
+
+  | | longest task while the view is made, five runs | making the view, in all |
+  |---|---|---|
+  | before | 80, 67, 71, 51, 76 ms (load 3.3 to 5.8) | 460–531 ms |
+  | the level pipelines and the hand-back in pieces (now) | none over 50 ms in six of six (load 2.8 to 4.7) | 497–616 ms |
+
+  What was in it, by `performance.mark` around each piece, in four runs
+  at a load of 2.0 to 3.3: the level shader 2 to 5 ms, the pipeline for
+  the discs 9 to 18 ms, the one for the links 4 to 10 ms, the first draw
+  with them 14 to 21 ms, and then the page's own work with the view (its
+  theme, sizes, fit, handlers and status line) 12 to 27 ms: 54 to 74 ms.
+  Neither `prepareCut` (#515), which runs in the layout worker once the
+  layout is done, nor refinement (#512) is in it. Each piece is now a
+  task: by the same marks the largest of them was 23 ms in eight runs. A
+  piece is still one call into the driver, and a driver kept waiting
+  keeps the page waiting. Of 33 runs with this change, each started at a
+  load of 4.5 or under (eleven of `graph-timing.ts`, 22 with the marks),
+  two had a task over 50 ms: 73 ms linking the first pipeline of the
+  graph's own shader, which is one call, and 457 ms in a run of
+  `graph-timing.ts` during which the load rose from 4.4 to 5.2, with no
+  marks to say where. The change adds up to six turns of the event loop,
+  about 4 ms each, to making the view.
 - **Memory.** The 16 MiB is the edge list (8 MB), which the view keeps for
   `View::step` and for picking an edge's ends, the lists the degrees are
   counted from (4 MB, freed) and the runs of edges on their way to the GPU.

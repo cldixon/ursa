@@ -26,7 +26,9 @@
 //   Then `.graph detail on`: what follows is of the graph in full detail;
 // - the page's long tasks since Enter;
 // - the longest task while the view was made (#426), which fails the run if
-//   it is over 60 ms: the view builds no adjacency, and is made in pieces;
+//   it is over 60 ms: the view builds no adjacency, and is made in pieces,
+//   the pipelines of the coarse levels and the page's own work with the
+//   new view among them (#520);
 // - frame times while a scripted wheel zoom runs for WHEEL_MS (5000): the
 //   time from one frame to the next, and the time in render() itself (with
 //   no GPU the browser rasterises after render() returns, on the page's

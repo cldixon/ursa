@@ -128,9 +128,11 @@ impl View {
 
     /// [`View::warm_levels`], giving the event loop a turn as `pace` says
     /// between its pieces: the shader, each of the two pipelines, and the
-    /// first draw with each, which is when a GL driver links it. On
-    /// software WebGL2 they are 10 to 30 ms each, and in one task they
-    /// held the page's thread for over 60 ms (#520).
+    /// first draw, which is the last (the caller gives the turn after it).
+    /// On software WebGL2 they are 2 to 7 ms, 4 to 23 ms each
+    /// and 9 to 21 ms, and in one task, with what the page does with its
+    /// new view after them, they held the page's thread for over 60 ms
+    /// (#520).
     pub async fn warm_levels_paced(
         &mut self,
         device: &wgpu::Device,
@@ -168,21 +170,15 @@ impl View {
             width: 1.0,
             alpha: 0.0,
         };
-        let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // A draw for each pipeline, and a turn after each: the driver
-        // links one at a time.
-        for (discs, links) in [(&[disc][..], &[][..]), (&[][..], &[link][..])] {
-            gpu.set(device, queue, discs, links);
-            gpu.draw(
-                device,
-                queue,
-                &target,
-                &self.camera,
-                self.renderer.background,
-                self.theme.edge,
-            );
-            pace.turn().await;
-        }
+        gpu.set(device, queue, &[disc], &[link]);
+        gpu.draw(
+            device,
+            queue,
+            &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            &self.camera,
+            self.renderer.background,
+            self.theme.edge,
+        );
         gpu.set(device, queue, &[], &[]);
         self.level = Some(Level {
             scene: None,
