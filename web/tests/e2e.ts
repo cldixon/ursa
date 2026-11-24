@@ -2381,6 +2381,9 @@ for (const scheme of ["light", "dark"] as const) {
       await known();
       // A node not yet expanded, with neighbours to add, the fewest first:
       // the hubs of this graph have thousands.
+      // With the inspector open, once the camera has made room for its
+      // panel (#493): any node in sight can be double-clicked.
+      await roomSettled(r);
       const all: any[] = await r.evaluate(() => (window as any).ursaShell.graphExpandable(100_000));
       const next = all.filter((c) => !commands.includes(`.expand ${c.id}`)).sort((a, b) => a.notShown - b.notShown)[0];
       if (!next) break;

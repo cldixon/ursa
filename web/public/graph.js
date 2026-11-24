@@ -1213,7 +1213,6 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   };
   /** Room for the panel as it is now, once the pointer has rested. */
   const roomSoon = () => {
-    console.error("ROOMSOON", new Error().stack.split("\n").slice(1, 4).join(" | "));
     roomStop();
     roomTimer = setTimeout(roomMove, ROOM_WAIT_MS);
   };
@@ -2287,13 +2286,14 @@ export function nodePlace(id) {
  * For tests: up to `limit` shown nodes with the most edges not shown (the
  * engine's count), each {index, id, notShown, x, y} with its place in whole
  * CSS pixels of the canvas; only those on the canvas that a click there picks.
+ * The inspector's panel can be over one until the camera has made room for it
+ * (`graph().room.waits` is false again, #493).
  */
 export function expandable(limit = 10) {
   const state = current;
   if (!state?.notShown) return [];
   atNewest(state);
   const ratio = state.canvas.width / state.canvas.clientWidth;
-  const box = state.canvas.getBoundingClientRect();
   const order = Array.from(state.notShown.keys())
     .filter((i) => state.notShown[i] > 0 && !(state.graph.removed[i] & 1))
     .sort((a, b) => state.notShown[b] - state.notShown[a] || a - b);
@@ -2303,9 +2303,6 @@ export function expandable(limit = 10) {
     // At a whole CSS pixel, as a mouse event gives its place.
     const [x, y] = Array.from(state.view.nodePixel(index), (v) => Math.round(v / ratio));
     if (x < 0 || y < 0 || x >= state.canvas.clientWidth || y >= state.canvas.clientHeight || state.view.pick(x * ratio, y * ratio) !== index) continue;
-    // Not one under the inspector's panel, which a node can be until the
-    // camera has made room, or after a pan: a click there is the panel's.
-    if (document.elementFromPoint(box.left + x, box.top + y) !== state.canvas) continue;
     out.push({ index, id: state.ids.get(index), notShown: state.notShown[index], x, y });
   }
   return out;
