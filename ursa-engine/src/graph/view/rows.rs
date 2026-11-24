@@ -31,7 +31,7 @@ use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetFileReaderFactory, ParquetRowSelection,
 };
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
+    FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
