@@ -491,6 +491,9 @@ pub struct GraphTraversalNode {
     pub nodes: Vec<Arc<LogicalPlan>>,
     /// Each node-id argument as written, for `EXPLAIN`.
     pub written: Vec<String>,
+    /// Whether each node-id argument is a subquery, whose ids that are not
+    /// nodes are skipped; a literal one is an error (#416).
+    pub from_query: Vec<bool>,
     /// The source and destination of each edge: column references into
     /// `input`.
     pub source: Expr,
@@ -516,6 +519,7 @@ impl GraphTraversalNode {
         weight: Option<String>,
         nodes: Vec<Arc<LogicalPlan>>,
         written: Vec<String>,
+        from_query: Vec<bool>,
         source: Expr,
         destination: Expr,
         vertex_label: Option<String>,
@@ -525,7 +529,7 @@ impl GraphTraversalNode {
         check_vertices(&graph, vertices.as_deref())?;
         let spec = traversal.spec();
         let expected = spec.node_params().count();
-        if nodes.len() != expected || written.len() != expected {
+        if nodes.len() != expected || written.len() != expected || from_query.len() != expected {
             return Err(plan(format!(
                 "{}() takes {expected} node-id inputs; got {}",
                 spec.name,
@@ -563,6 +567,7 @@ impl GraphTraversalNode {
             weight,
             nodes,
             written,
+            from_query,
             source,
             destination,
             id_type,
@@ -590,6 +595,7 @@ type TraversalKey<'a> = (
     &'a Traversal,
     &'a Option<String>,
     &'a Vec<String>,
+    &'a Vec<bool>,
     &'a Option<String>,
     &'a String,
 );
@@ -601,6 +607,7 @@ impl GraphTraversalNode {
             &self.traversal,
             &self.weight,
             &self.written,
+            &self.from_query,
             &self.vertex_label,
             &self.edge_label,
         )
@@ -724,6 +731,7 @@ impl UserDefinedLogicalNodeCore for GraphTraversalNode {
             self.weight.clone(),
             inputs.collect(),
             self.written.clone(),
+            self.from_query.clone(),
             source,
             destination,
             self.vertex_label.clone(),

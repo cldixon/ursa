@@ -275,7 +275,7 @@ async fn paths_agree_with_hop_and_shortest_path() {
         ),
     )
     .await;
-    // Reached in one or two steps either way = hop(n => 2)'s nodes.
+    // Reached in one or two steps either way = hop(steps => 2)'s nodes.
     let reached = rows(
         &ctx,
         "SELECT b FROM GRAPH_TABLE (karate
@@ -287,7 +287,7 @@ async fn paths_agree_with_hop_and_shortest_path() {
     .await;
     let hop = rows(
         &ctx,
-        "SELECT DISTINCT id FROM hop(karate, seeds => [0], n => 2, direction => 'both')
+        "SELECT DISTINCT id FROM hop(karate, seeds => [0], steps => 2, direction => 'both')
          WHERE id <> 0 ORDER BY id",
     )
     .await;
@@ -319,7 +319,7 @@ async fn paths_agree_with_hop_and_shortest_path() {
     .await;
     let distances = rows(
         &ctx,
-        "SELECT id, distance FROM hop(karate, seeds => [0], n => 3, direction => 'both')
+        "SELECT id, distance FROM hop(karate, seeds => [0], steps => 3, direction => 'both')
          ORDER BY id",
     )
     .await;
@@ -486,7 +486,7 @@ async fn any_shortest_counts_destinations_not_paths() {
     assert_eq!(
         rows(
             &ctx,
-            "SELECT distance, count(*) FROM hop(g, seeds => [0], n => 2) GROUP BY 1 ORDER BY 1"
+            "SELECT distance, count(*) FROM hop(g, seeds => [0], steps => 2) GROUP BY 1 ORDER BY 1"
         )
         .await,
         ["1|4000", "2|12000000"]

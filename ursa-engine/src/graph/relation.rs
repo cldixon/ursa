@@ -1,6 +1,6 @@
 //! Graph functions in `FROM`: `pagerank(g, direction => 'both')`,
 //! `density(g)`, `algorithms(g, degree(), community => louvain(seed => 1))`,
-//! and the traversals, `hop(g, seeds => [0], n => 2)`.
+//! and the traversals, `hop(g, seeds => [0], steps => 2)`.
 //!
 //! [`GraphFunctions`] is a DataFusion `RelationPlanner`. It sees the call's
 //! syntax, so the first argument can be a bare graph name, the others named
@@ -80,7 +80,7 @@ use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
 
 use super::functions::{
-    self, did_you_mean, is_per_node, nested_signature, plan, signature, Literal, ALGORITHMS,
+    self, did_you_mean, is_per_node, nested_signature, plan, signature, Given, Literal, ALGORITHMS,
     VALUES_QUERY,
 };
 use super::kernels;
@@ -508,7 +508,7 @@ fn traversal_node(
         };
         let name = context.normalize_ident(name);
         let Some(param) = spec.param(&name) else {
-            return Err(traversal::unknown_param(spec, &name));
+            return Err(traversal::unknown_param(spec, &name, Some(given(&arg))));
         };
         if !seen.insert(name.clone()) {
             return Err(plan(format!("{f}() was given '{name}' more than once")));
@@ -552,8 +552,12 @@ fn traversal_node(
     };
     let mut inputs = Vec::with_capacity(nodes.len());
     let mut written = Vec::with_capacity(nodes.len());
+    let mut from_query = Vec::with_capacity(nodes.len());
     for (p, expr) in node_params.iter().zip(nodes) {
         written.push(expr.to_string());
+        // Ids from a subquery are the data's: one that is not a node is
+        // skipped, where a literal one is an error (#416).
+        from_query.push(matches!(expr, ast::Expr::Subquery(_)));
         inputs.push(Arc::new(ids.input(p, expr, context)?));
     }
     let traversal = traversal::resolve(spec, &literals)?;
@@ -566,6 +570,7 @@ fn traversal_node(
         edges.weights.into_iter().next(),
         inputs,
         written,
+        from_query,
         edges.source,
         edges.destination,
         vertex_label(graph),
@@ -958,7 +963,11 @@ fn resolve_call(
                 // An unknown name is the better message than its value's form.
                 let known = name == "dtype" || functions::sql_params(spec).any(|p| p.name == name);
                 if !known {
-                    return Err(in_context(functions::unknown_param(spec, &name)));
+                    return Err(in_context(functions::unknown_param(
+                        spec,
+                        &name,
+                        Some(given(&arg)),
+                    )));
                 }
                 let value = literal(&arg).ok_or_else(|| {
                     plan(format!(
@@ -1000,6 +1009,7 @@ fn algorithms(
             .filter(|s| is_per_node(s) && !s.reads_attribute())
             .map(|s| s.name)
     };
+    let args = named_args(args);
     let mut outputs = Vec::new();
     for arg in &args {
         let (key, inner) = match arg {
@@ -1072,7 +1082,7 @@ fn algorithms(
             FunctionArguments::List(list)
                 if !modified && list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
             {
-                list.args.clone()
+                named_args(list.args.clone())
             }
             FunctionArguments::None if !modified => Vec::new(),
             _ => {
@@ -2032,7 +2042,7 @@ impl GraphFunctions {
                 )))
             }
         };
-        Ok((Arc::new(pair), args.collect()))
+        Ok((Arc::new(pair), named_args(args.collect())))
     }
 
     /// The graph called `name`.
@@ -2183,6 +2193,61 @@ fn quoted_name_hint(arg: &FunctionArgExpr) -> String {
 
 /// The literal `arg` is, if it is one: a number (with an optional sign), a
 /// single-quoted string, a boolean, or `NULL`.
+/// The arguments with every named one written `name => value` (#415): a
+/// graph function also takes `name = value` and `name := value`, as DuckDB's
+/// table functions and Ursa's `read_*` do. `name = value` parses as a
+/// comparison, which no graph function takes as an argument.
+fn named_args(args: Vec<FunctionArg>) -> Vec<FunctionArg> {
+    let arrow = |name, arg| FunctionArg::Named {
+        name,
+        arg,
+        operator: FunctionArgOperator::RightArrow,
+    };
+    args.into_iter()
+        .map(|arg| match arg {
+            FunctionArg::Named {
+                name,
+                arg,
+                operator:
+                    FunctionArgOperator::Equals
+                    | FunctionArgOperator::Assignment
+                    | FunctionArgOperator::RightArrow,
+            } => arrow(name, arg),
+            FunctionArg::ExprNamed {
+                name: ast::Expr::Identifier(name),
+                arg,
+                operator:
+                    FunctionArgOperator::Equals
+                    | FunctionArgOperator::Assignment
+                    | FunctionArgOperator::RightArrow,
+            } => arrow(name, arg),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            })) if matches!(left.as_ref(), ast::Expr::Identifier(_)) => {
+                let ast::Expr::Identifier(name) = *left else {
+                    unreachable!("matched above")
+                };
+                arrow(name, FunctionArgExpr::Expr(*right))
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// What `arg` is, for "did you mean" (#415).
+fn given(arg: &FunctionArgExpr) -> Given {
+    if let Some(l) = literal(arg) {
+        return Given::of_literal(&l);
+    }
+    match arg {
+        FunctionArgExpr::Expr(ast::Expr::Array(_)) => Given::List,
+        FunctionArgExpr::Expr(ast::Expr::Subquery(_)) => Given::Query,
+        _ => Given::Expression,
+    }
+}
+
 fn literal(arg: &FunctionArgExpr) -> Option<Literal> {
     let FunctionArgExpr::Expr(expr) = arg else {
         return None;

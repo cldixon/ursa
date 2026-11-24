@@ -1015,6 +1015,27 @@ impl Topology {
         })
     }
 
+    /// The reversed graph: every row `u -> v` read as `v -> u`, so a directed
+    /// kernel run over it follows in-edges (`direction='in'` for `pagerank` and
+    /// `betweenness`, #415). Its out-adjacency is this topology's in-adjacency
+    /// and the other way round; both are shared, not copied (cloning an
+    /// [`Adjacency`] clones references). Edge ids are kept, so a per-row weight
+    /// or an [`EdgeMask`] of this topology applies to the reversed one unchanged.
+    pub fn transposed(&self) -> Topology {
+        let inc = OnceLock::new();
+        let _ = inc.set(self.out.clone());
+        Topology {
+            n_nodes: self.n_nodes,
+            n_edges: self.n_edges,
+            out: self.incoming().clone(),
+            inc,
+            inc_loader: LazyIncoming::default(),
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+        }
+    }
+
     /// Undirected sorted adjacency (`out ∪ in`, self-loops dropped, deduplicated),
     /// built and cached on first call. Shared by `triangle_count` and
     /// `clustering_coefficient` so a pipeline computing both pays the build once.

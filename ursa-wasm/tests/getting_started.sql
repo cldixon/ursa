@@ -107,17 +107,17 @@ FROM connected_components(lesmis_strong);
 
 -- @step Traversals
 -- Traversals return rows of their own. hop returns (seed, id, distance): each
--- node within n steps of a seed; the seeds can be a list or a query.
-SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both') ORDER BY seed, id;
+-- node within `steps` steps of a seed; the seeds can be a list or a query.
+SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both') ORDER BY seed, id;
 SELECT * FROM hop(karate,
                   seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                  n => 2) ORDER BY seed, id;
+                  steps => 2) ORDER BY seed, id;
 
 -- @step Shortest paths and random walks
 -- shortest_path returns the path's edges with their running cost. A seeded
 -- random walk repeats exactly.
 SELECT * FROM shortest_path(karate, source => 0, target => 33, direction => 'both');
-SELECT * FROM random_walk(karate, start => [0, 1], steps => 4, walks_per_node => 2, seed => 7);
+SELECT * FROM random_walk(karate, seeds => [0, 1], steps => 4, walks_per_node => 2, random_seed => 7);
 
 -- @step Match patterns
 -- GRAPH_TABLE is SQL/PGQ's pattern matching: nodes in parentheses, edges in

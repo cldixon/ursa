@@ -130,6 +130,9 @@ pub struct Evaluator<'a> {
     /// The weighted symmetric views and their per-row weights, by the address of
     /// the weight column.
     symmetric_weighted: HashMap<usize, (Topology, Vec<f64>)>,
+    /// The reversed graph, the `direction='in'` input of `pagerank` and
+    /// `betweenness` (#415), built on first use.
+    transposed: Option<Topology>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -143,6 +146,7 @@ impl<'a> Evaluator<'a> {
             triangles: None,
             symmetric: None,
             symmetric_weighted: HashMap::new(),
+            transposed: None,
         }
     }
 
@@ -247,6 +251,14 @@ impl<'a> Evaluator<'a> {
         (sym, sw)
     }
 
+    /// The reversed graph (see [`Topology::transposed`]), built on first use.
+    /// It keeps the edge ids, so the mask and the weights apply to it as they
+    /// are.
+    fn transposed(&mut self) -> &Topology {
+        let topo = self.topo;
+        self.transposed.get_or_insert_with(|| topo.transposed())
+    }
+
     /// The undirected view and per-node triangle counts, computed on first use.
     fn triangles(&mut self) -> &(UndirectedView<'a>, Vec<u32>) {
         if self.triangles.is_none() {
@@ -334,6 +346,12 @@ impl<'a> Evaluator<'a> {
                         pagerank_weighted(sym, sw, None, params)
                     }
                     (Direction::Both, None) => pagerank(self.symmetric(), None, params),
+                    // `In` runs it over the reversed graph: a walk that
+                    // follows in-edges (NetworkX's `pagerank(G.reverse())`).
+                    (Direction::In, Some(w)) => {
+                        pagerank_weighted(self.transposed(), w, mask, params)
+                    }
+                    (Direction::In, None) => pagerank(self.transposed(), mask, params),
                     (_, Some(w)) => pagerank_weighted(topo, w, mask, params),
                     (_, None) => pagerank(topo, mask, params),
                 };
@@ -392,6 +410,13 @@ impl<'a> Evaluator<'a> {
                         };
                         bc.into_iter().map(|x| x * 0.5).collect()
                     }
+                    // `In`: the reversed graph. Exact values are those of
+                    // `Out` (a shortest path reversed is one); a sample draws
+                    // its sources among the targets of the stored rows.
+                    (Direction::In, Some(w)) => {
+                        betweenness_weighted(self.transposed(), w, mask, sample, seed)
+                    }
+                    (Direction::In, None) => betweenness(self.transposed(), mask, sample, seed),
                     (_, Some(w)) => betweenness_weighted(topo, w, mask, sample, seed),
                     (_, None) => betweenness(topo, mask, sample, seed),
                 };

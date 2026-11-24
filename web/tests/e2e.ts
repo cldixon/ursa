@@ -1316,7 +1316,7 @@ for (const scheme of ["light", "dark"] as const) {
   // The result → graph rules (#433): .graph draws what the last result means.
   // Each: the query, what the terminal and the pane say it was drawn as, its
   // nodes and edges, and what the legend shows.
-  const hop = "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both');";
+  const hop = "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both');";
   const three = "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[]-(b WHERE b.id = 1)-[]-(c) COLUMNS (a.id AS a, b.id AS b, c.id AS c));";
   for (const [what, query, as, nodes, edges, legend] of [
     // A path: the route, six nodes in order, not one edge from 5 to a list.
@@ -1330,7 +1330,7 @@ for (const scheme of ["light", "dark"] as const) {
     // Three variables: both edges of each match (0–1, and 1's nine ties), not only a–b.
     ["a three-variable match", three, "pattern matches on karate (a, b, c)", 10, 9, ""],
     // shortest_path(): the same edges, as a route.
-    ["shortest_path()", "SELECT * FROM shortest_path(karate, source => 16, target => 26, direction => 'both');", "a path on karate (src, dst, hop)", 6, 5, ""],
+    ["shortest_path()", "SELECT * FROM shortest_path(karate, source => 16, target => 26, direction => 'both');", "a path on karate (src, dst, step)", 6, 5, ""],
   ] as [string, string, string, number, number, string][]) {
     await type(query, s);
     const before = await errors(s);
@@ -1368,7 +1368,7 @@ for (const scheme of ["light", "dark"] as const) {
   // columns of other names, which the rules read otherwise or not at all.
   {
     // Computed columns carry no metadata: by the rules, s and i are edges.
-    const hops = "SELECT seed + 0 AS s, id + 0 AS i, CAST(distance AS INT) AS far FROM hop(karate, seeds => [0], n => 2, direction => 'both')";
+    const hops = "SELECT seed + 0 AS s, id + 0 AS i, CAST(distance AS INT) AS far FROM hop(karate, seeds => [0], steps => 2, direction => 'both')";
     const pairs = "SELECT 'tie' AS tag, a.id AS x, b.id AS y FROM members a JOIN ties t ON t.src = a.id JOIN members b ON b.id = t.dst";
     for (const [what, command, as, nodes, edges, legend, fixed] of [
       // One of each form.
@@ -1380,7 +1380,7 @@ for (const scheme of ["light", "dark"] as const) {
       ["ON graph", `${pairs} AS edges(x, y) ON karate SIZE BY pagerank`, "edges of karate (x, y)", 34, 78, "size: pagerank", false],
       // LAYOUT overrides the rule: a hop by its edges' pull, in any order.
       ["LAYOUT force", `${hops} LAYOUT force AS hops(s, i, far)`, "rings on karate (s, i, far)", 26, 59, "colour: distance", false],
-      ["LAYOUT layers", "SELECT * FROM hop(karate, seeds => [0], n => 2, direction => 'both') LAYOUT layers", "rings on karate (seed, id, distance)", 26, 59, "colour: distance", true],
+      ["LAYOUT layers", "SELECT * FROM hop(karate, seeds => [0], steps => 2, direction => 'both') LAYOUT layers", "rings on karate (seed, id, distance)", 26, 59, "colour: distance", true],
     ] as [string, string, string, number, number, string, boolean][]) {
       const before = await errors(s);
       await type(`.graph ${command}`, s);
@@ -1454,7 +1454,7 @@ for (const scheme of ["light", "dark"] as const) {
       await type(line, s);
       return squeezed(await after(line, s));
     };
-    await type(hop.replace("n => 2", "n => 1"), s);
+    await type(hop.replace("steps => 2", "steps => 1"), s);
     await type(".graph", s);
     await graphSettled(s);
     const base = await graphInfo(s);
@@ -1581,7 +1581,7 @@ for (const scheme of ["light", "dark"] as const) {
 
     // Part of the graph: the matches that are not drawn are named under the
     // header, and a hidden one has a button that shows it again.
-    await type(hop.replace("n => 2", "n => 1"), s);
+    await type(hop.replace("steps => 2", "steps => 1"), s);
     await type(".graph", s);
     await graphSettled(s);
     await type(".hide 31", s);
@@ -1630,7 +1630,7 @@ for (const scheme of ["light", "dark"] as const) {
       await idle(s);
       await graphSettled(s);
     };
-    await typed(hop.replace("n => 2", "n => 1"));
+    await typed(hop.replace("steps => 2", "steps => 1"));
     await typed(".graph");
     await settled();
     const box = (await s.locator("#graph-stage canvas").boundingBox())!;
@@ -2317,7 +2317,7 @@ for (const scheme of ["light", "dark"] as const) {
   // them, and a click's frame comes within 250 ms.
   {
     // (From node 0: this R-MAT graph has no node 1.)
-    await type(".graph SELECT * FROM hop(rmat, seeds => [0], n => 1, direction => 'both')", r);
+    await type(".graph SELECT * FROM hop(rmat, seeds => [0], steps => 1, direction => 'both')", r);
     await graphSettled(r);
     const box = (await r.locator("#graph-stage canvas").boundingBox())!;
     const known = () => r.waitForFunction(() => (window as any).ursaShell.graph()?.notShownKnown === true, null, { timeout: 30_000, polling: 50 }).then(() => true, () => false);

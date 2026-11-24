@@ -967,7 +967,7 @@ fn traversals_match_getting_started() {
     // "Member 0 has 16 friends, so this returns 16 rows."
     let sql = format!(
         "{}
-         SELECT * FROM hop(karate, seeds => [0], n => 1, direction => 'both');",
+         SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both');",
         define_karate()
     );
     let out = ok(ursa(&["--format", "csv", "-c", &sql]));
@@ -984,7 +984,7 @@ fn traversals_match_getting_started() {
         "{}
          SELECT * FROM hop(karate,
                            seeds => (SELECT id FROM karate.nodes WHERE club = 'Officer'),
-                           n => 2);",
+                           steps => 2);",
         define_karate()
     );
     assert_eq!(
@@ -1046,7 +1046,7 @@ fn traversals_match_getting_started() {
         ok(ursa(&["-c", &sql])),
         "\
 ┌───────┬───────┬───────┬─────────┐
-│  src  │  dst  │  hop  │  cost   │
+│  src  │  dst  │ step  │  cost   │
 │ Int64 │ Int64 │ Int64 │ Float64 │
 ├───────┼───────┼───────┼─────────┤
 │     0 │     8 │     0 │     1.0 │
@@ -1063,7 +1063,7 @@ fn traversals_match_getting_started() {
             )
         ])),
         "Error: algorithms(): hop() is a traversal, which returns rows of its own, not one per \
-         node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], n => 1, \
+         node; call it on its own: SELECT * FROM hop(<graph>, seeds => [<id>, ...], steps => 1, \
          direction => 'out')\n"
     );
 }
@@ -1152,7 +1152,7 @@ fn ursa_functions_lists_the_catalog() {
         out,
         "[{\"name\":\"pagerank\",\"family\":\"algorithm\",\
 \"summary\":\"PageRank (pull-based fixpoint); a dangling node spreads its score to all nodes. Scores sum to 1 over every node and isolated nodes count too: with a vertex table more keys give lower scores.\",\
-\"networkx\":\"nx.pagerank(G, alpha=damping) (both: nx.pagerank(U))\",\
+\"networkx\":\"nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))\",\
 \"parameters\":[\
 {\"name\":\"damping\",\"type\":\"number\",\"default\":\"0.85\",\"choices\":[],\
 \"range\":\"between 0 and 1\",\"doc\":\"Probability of following an edge.\"},\
@@ -1162,9 +1162,9 @@ fn ursa_functions_lists_the_catalog() {
 \"range\":\"at least 0\",\"doc\":\"Convergence tolerance on the L1 change.\"},\
 {\"name\":\"weight\",\"type\":\"expression\",\"default\":\"NULL\",\"choices\":[],\
 \"range\":null,\"doc\":\"A non-negative weight per edge; null is unweighted.\"},\
-{\"name\":\"direction\",\"type\":\"string\",\"default\":\"'out'\",\"choices\":[\"out\",\"both\"],\
-\"range\":null,\"doc\":\"Follow the rows as stored, or read the graph as undirected.\"}],\
-\"directions\":[\"out\",\"both\"],\
+{\"name\":\"direction\",\"type\":\"string\",\"default\":\"'out'\",\"choices\":[\"out\",\"in\",\"both\"],\
+\"range\":null,\"doc\":\"Follow out-edges, in-edges, or both (the undirected view).\"}],\
+\"directions\":[\"out\",\"in\",\"both\"],\
 \"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}]}]\n"
     );
     let out = ok(ursa(&[
@@ -1179,11 +1179,11 @@ fn ursa_functions_lists_the_catalog() {
         "\
 name,family,parameters,directions
 degree,algorithm,1,out in both
-pagerank,algorithm,5,out both
+pagerank,algorithm,5,out in both
 connected_components,algorithm,1,\"\"
 triangle_count,algorithm,0,\"\"
 clustering_coefficient,algorithm,0,\"\"
-betweenness,algorithm,4,out both
+betweenness,algorithm,4,out in both
 closeness,algorithm,2,out in both
 label_propagation,algorithm,3,\"\"
 louvain,algorithm,4,\"\"
@@ -1383,7 +1383,7 @@ fn every_statement_prints_a_result_or_nothing_by_rule() {
         ),
         (
             graph,
-            "SELECT * FROM hop(g, seeds => [100])".into(),
+            "SELECT * FROM hop(g, seeds => (SELECT 100))".into(),
             Some("seed,id,distance"),
         ),
         (
