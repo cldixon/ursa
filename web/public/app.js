@@ -1056,7 +1056,17 @@ async function drawGraph(text) {
   const count = (n, one) => `${n.toLocaleString("en-US")} ${one}${n === 1 ? "" : "s"}`;
   const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
   const as = drawn.drawnAs ? ` as ${drawn.drawnAs}` : "";
-  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  const at = drawn.saved ? " at its saved positions" : "";
+  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${wasOpen ? "replacing the last drawing; " : ""}Esc closes)\r\n`);
+  // A layout that will take a minute: how to run it once and draw from it (#502).
+  const hint = drawn.saved ? null : graphLoaded?.positionsHint(drawn.edges, drawn.graph);
+  if (hint)
+    await write(
+      `Its layout's fine level takes about a minute. To draw it at once, lay it out once and draw from that:\r\n` +
+        `  ${hint.here.join("\r\n  ")}\r\n` +
+        `or, in the ursa CLI (every core), ${hint.copy} then .files add here, and\r\n` +
+        `  ${hint.draw}\r\n`,
+    );
   countNotShown();
   return true;
 }
@@ -1296,9 +1306,23 @@ function formatBytes(n) {
 
 // ---------------------------------------------------------------- the bar
 
+/** The most edges the graph view draws on a phone: ursa.graph_max_edges there (5,000,000 elsewhere, the engine's default). */
+const PHONE_MAX_EDGES = 500_000;
+
+/**
+ * Whether this is a phone, for the graph view's edge cap (#502; the test
+ * the design gives #448): the device reports a coarse pointer and at most
+ * 4 GB of memory. A browser that does not say how much memory it has
+ * (Safari, Firefox) is taken to have no more: a touch-first device there is
+ * a phone or a tablet.
+ */
+function onPhone() {
+  return matchMedia("(pointer: coarse)").matches && (navigator.deviceMemory ?? 4) <= 4;
+}
+
 /** A fresh shell (New, a dataset, after a crash), and a clear screen. */
 async function restart({ clear = true } = {}) {
-  const r = await engine("start", { commands: HOST_COMMANDS, shortcuts: SHORTCUTS });
+  const r = await engine("start", { commands: HOST_COMMANDS, shortcuts: SHORTCUTS, graphMaxEdges: onPhone() ? PHONE_MAX_EDGES : undefined });
   prompt = r.prompt;
   promptColor = r.promptColor;
   sendWidth();
@@ -1613,4 +1637,6 @@ window.ursaShell = {
   graphInspector: () => graphLoaded?.inspected() ?? null,
   // For tests: where the node with a key is drawn, {index, x, y} in CSS pixels of the canvas.
   graphNodePlace: (id) => graphLoaded?.nodePlace(id) ?? null,
+  // Where every node is, by its key: {ids, xy} (graph.js's placement).
+  graphPlacement: () => graphLoaded?.placement() ?? null,
 };

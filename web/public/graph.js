@@ -223,10 +223,41 @@ const commandId = (id) => (/^[\w.:@-]+$/.test(id) && id !== "--sql" ? id : `'${S
 
 /** The most positions kept for undo and redo, in numbers (4 bytes each): older steps undo where the nodes are. */
 const MAX_SAVED_POSITIONS = 16_000_000;
+/**
+ * From this many edges the layout's fine level takes about a minute, and
+ * the status line offers saved positions instead (#502).
+ */
+export const SLOW_LAYOUT_EDGES = 2_000_000;
 
 /**
- * Draw the engine's graph (`sent`: {ugr, skipped}, a graph result as a UGR
- * buffer, and the rows left out of it; graph-data.js's drawingOf says what is
+ * For a drawing of `edges` edges that is being laid out, large enough that
+ * it takes a minute or so: how to lay it out once and draw from that
+ * (`graph` is the property graph drawn, if it is one; else "g" stands for
+ * one over the edges). null for a smaller one.
+ *
+ *   status  for the pane's status line: the statement that saves the
+ *           positions to a file, which the ursa CLI runs (on every core)
+ *   copy    that statement
+ *   here    the statements that do it in this session, where COPY has no
+ *           disk to write to: the positions as a table, and the drawing
+ *   draw    the drawing from the file, once it is added (.files add)
+ */
+export function positionsHint(edges, graph) {
+  if (edges <= SLOW_LAYOUT_EDGES) return null;
+  const g = graph ?? "g";
+  const copy = `COPY (SELECT * FROM layout_fa2(${g})) TO 'pos.parquet'`;
+  return {
+    status: `the fine level takes about a minute; saved positions draw at once: ${copy}`,
+    copy: `${copy};`,
+    here: [`CREATE TABLE pos AS SELECT * FROM layout_fa2(${g});`, `.graph ${g} POSITIONS (SELECT * FROM pos)`],
+    draw: `.graph ${g} POSITIONS (SELECT * FROM 'pos.parquet')`,
+  };
+}
+
+/**
+ * Draw the engine's graph (`sent`: {ugr, skipped, positions?}, a graph result as a UGR
+ * buffer, the rows left out of it, and, with POSITIONS (query), where the
+ * nodes are (x then y: they are drawn there at once, and no layout runs, #502); graph-data.js's drawingOf says what is
  * read from it: dense node indexes, each node's id, and what SIZE BY and
  * COLOR BY made, with the legend) in `stage`, replacing what was drawn. `status` is the pane's header line and `legend`
  * the legend under it; `onError(message)` is called if the view fails once
@@ -240,7 +271,9 @@ const MAX_SAVED_POSITIONS = 16_000_000;
  * worker's `inspect`): the inspector's buttons and rows.
  * `times` gets the moments each step ended (performance.now()), for
  * graphTimings. Resolves once the view is made (it draws when the layout's
- * first positions come), to {nodes, edges, backend}.
+ * first positions come), to {nodes, edges, backend, drawnAs, saved, graph}:
+ * `saved` whether it is drawn at saved positions, `graph` the property
+ * graph drawn, if it is one.
  */
 export async function show(stage, sent, { status, legend, onError, onCommand, times = {}, run, inspect }) {
   close();
@@ -258,7 +291,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
     // (graph-worker.js): each node's distance or layer in `level`.
     const start = { type: "start", n: graph.n, module: url, layout: graph.layout };
-    if (graph.adjacency && !anyRemoved(graph)) {
+    if (sent.positions) {
+      // Saved positions (#502): the worker's layout is at them, with
+      // nothing to run, for an expansion to grow from. A copy: these are
+      // the view's to draw.
+      const { src, dst } = shownEdges(graph);
+      const positions = sent.positions.slice();
+      worker.postMessage({ ...start, layout: undefined, src, dst, positions }, [src.buffer, dst.buffer, positions.buffer]);
+    } else if (graph.adjacency && !anyRemoved(graph)) {
       // The engine had the adjacency to send: the layout uses it as it is
       // (a copy of it: the result's buffer stays this page's).
       // The edges go too, in this page's numbering: the order to draw them
@@ -343,6 +383,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   style(degree);
   // A selection shows its nodes' edges too.
   view.selectionEdges = true;
+  // Saved positions: the nodes are where POSITIONS put them, from the
+  // first frame.
+  const placed = sent.positions?.length === 2 * view.nodeCount;
+  if (placed) view.setPositions(sent.positions);
   view.fit();
 
   const state = {
@@ -366,9 +410,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // What each frame of a coarse level cost, in ms: the time to the next
     // animation frame, as the frame budget measures a moving frame.
     levelFrames: [],
-    // Nothing is drawn before the layout's first positions.
-    positioned: false,
-    layoutDone: false,
+    // Nothing is drawn before the layout's first positions. Saved positions
+    // (#502) are there from the start, and there is no layout to wait for.
+    positioned: placed,
+    layoutDone: placed,
+    saved: placed,
+    // The first frame of saved positions is drawn as a moving one: within
+    // the frame budget, at once, and then everything at rest.
+    kick: placed,
     // The layout is placing an expansion's nodes, not laying the graph out.
     growing: false,
     // Bumped by each delta that moves the layout on: the worker's positions
@@ -462,13 +511,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (state.selection.length || state.edge) {
       text = `${selectionText()} · ${counts}`;
     } else if (state.layoutDone) {
-      text = `${counts}${drawn} · Done`;
+      text = `${counts}${drawn}${state.saved ? " · saved positions" : ""} · Done`;
     } else if (state.growing) {
       text = `${counts}${drawn} · Placing the new nodes`;
     } else if (state.levels !== null) {
       // A coarse level drawn in place of the graph says how many nodes it has.
       const groups = state.groups === null ? "" : ` · ${plural(state.groups, "group")}`;
-      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}${groups}`;
+      // A layout that will take a minute says how to save one (#502).
+      const hint = positionsHint(state.edges, graph.name);
+      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}${groups}${hint ? ` · ${hint.status}` : ""}`;
     } else {
       text = `Loading graph view… ${counts}`;
     }
@@ -512,7 +563,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       // Within the frame budget (#495): while the view moves, as many edges
       // as fit in a frame; at rest, all of them.
       // A layout that is running is movement, between its positions too.
-      if (!state.layoutDone) view.keepMoving();
+      if (!state.layoutDone || state.kick) view.keepMoving();
+      state.kick = false;
       const moving = view.renderFrame(frameTime);
       const end = performance.now();
       timings.frameDrawn(start, end);
@@ -694,6 +746,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     worker.onmessage = fromWorker;
     worker.onerror = workerFailed;
   })();
+  if (placed) {
+    // The first frame, of the whole graph where it was saved: it waits for
+    // no worker.
+    times.firstPositions ??= performance.now();
+    times.graphDrawn ??= times.firstPositions;
+    redraw(false);
+  }
 
   // A lost GPU: WebGL2 says so on the canvas; WebGPU's loss shows as a frame
   // that fails to draw (above).
@@ -1245,7 +1304,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   state.cleanup.push(() => legend.replaceChildren());
   state.cleanup.push(() => (legend.hidden = true));
 
-  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs };
+  return { nodes: state.nodes, edges: state.edges, backend: state.backend, drawnAs: graph.drawnAs, saved: placed, graph: graph.name };
 }
 
 /**
@@ -1473,6 +1532,9 @@ export function info() {
     level,
     levels,
     layoutDone,
+    // Whether the nodes are where POSITIONS (query) put them (#502): no
+    // layout ran.
+    saved: current.saved,
     // The selected nodes in the order selected, the last of them, the node
     // under the pointer, and how many times the pointer was looked up.
     selection,
@@ -1625,6 +1687,19 @@ function atNewest(state) {
   state.view.setPositions(state.pending);
   state.pending = null;
   state.redraw?.(false);
+}
+
+/**
+ * For tests: where every shown node is, by its key: {ids, xy} with `xy` the
+ * view's positions (x then y, one per node slot), read back from the view
+ * once the layout's newest are in it.
+ */
+export function placement() {
+  const state = current;
+  if (!state) return null;
+  atNewest(state);
+  const ids = Array.from({ length: state.ids.length }, (_, i) => String(state.ids.get(i)));
+  return { ids, xy: state.view.positions() };
 }
 
 /**

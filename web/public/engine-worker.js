@@ -15,13 +15,16 @@
 //                                               what is pending unless alone)
 //   addFile   {name, bytes}    -> {url}          (memory://uploads/<name>)
 //   export    {format}         -> {bytes}        (the last result, every row)
-//   graph     {text}           -> {ugr, skipped}  (a graph to draw: the last
+//   graph     {text}           -> {ugr, skipped, positions?}  (a graph to draw: the last
 //                                               result, a query's or a property
 //                                               graph's; see WebShell.graph. `ugr`
 //                                               is the graph result as one UGR
 //                                               buffer, transferred, which
 //                                               graph.js reads; `skipped` the rows
-//                                               left out for a NULL endpoint)
+//                                               left out for a NULL endpoint;
+//                                               `positions` where POSITIONS (query)
+//                                               puts the nodes, x then y in a
+//                                               Float32Array, transferred, #502)
 //   explore   {command}        -> {out, err, delta, nodes, edges}  (an explore
 //                                               command on the graph the last
 //                                               `graph` opened: .expand, .hide,
@@ -105,6 +108,9 @@ async function handle({ id, op, ...args }) {
       hostCommands = args.commands ?? hostCommands;
       shortcuts = args.shortcuts ?? shortcuts;
       fresh();
+      // The page's default for the edges a view draws, where it is not the
+      // engine's (a phone, #502): a SET like any other, which RESET undoes.
+      if (args.graphMaxEdges) await shell.feed(`SET ursa.graph_max_edges = ${Number(args.graphMaxEdges)};`);
       postMessage({ id, ok: true, version: version(), prompt: shell.prompt(), promptColor: WebShell.promptColor() });
     } else if (op === "feed") {
       const result = JSON.parse(await shell.feed(args.line));
@@ -133,8 +139,9 @@ async function handle({ id, op, ...args }) {
       // One buffer, the engine's whole answer: nothing is copied per array.
       const ugr = g.takeUgr();
       const skipped = g.skipped;
+      const positions = g.takePositions();
       g.free();
-      postMessage({ id, ok: true, ugr, skipped }, [ugr.buffer]);
+      postMessage({ id, ok: true, ugr, skipped, positions }, positions ? [ugr.buffer, positions.buffer] : [ugr.buffer]);
     } else if (op === "explore") {
       const e = await shell.explore(args.command);
       const bytes = e.takeDelta();

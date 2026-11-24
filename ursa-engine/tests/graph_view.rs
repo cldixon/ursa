@@ -1392,3 +1392,52 @@ async fn the_edge_cap_is_a_setting_and_its_refusal_names_it() {
     run(&ctx, "SET ursa.graph_max_edges = 0").await;
     assert_eq!(draw(&ctx, "ringed", None).await.result.n_edges(), 46);
 }
+
+/// The acceptance of #502, in the engine: a drawing at the positions
+/// `layout_fa2(g)` wrote is the picture a view's own layout ends on. A view
+/// lays a drawing out coarse to fine on the drawing's nodes, as it numbers
+/// them (`ursa-viz`'s `LiveLayout::multilevel_on`); `layout_fa2` runs on the
+/// graph's index. Node for node, by id, the positions are the same bits.
+#[tokio::test]
+async fn saved_positions_are_the_live_layouts_end_state() {
+    use ursa_core::algo::{Fa2Multilevel, MultilevelParams};
+    use ursa_core::topology::UndirectedCsr;
+
+    let ctx = new_session();
+    // Ids in no order, so the drawing's numbering is not the ids'.
+    run(
+        &ctx,
+        "CREATE TABLE ring AS SELECT (i * 37) % 600 AS src, ((i + 1) * 37) % 600 AS dst FROM \
+         (SELECT unnest(range(0, 600)) AS i) UNION ALL SELECT (i * 37) % 600 AS src, ((i + 91) * \
+         37) % 600 AS dst FROM (SELECT unnest(range(0, 600, 5)) AS i)",
+    )
+    .await;
+    create_graph(
+        &ctx,
+        def("ringed", ("ring", "src", "dst"), None),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    run(&ctx, "CREATE TABLE pos AS SELECT * FROM layout_fa2(ringed)").await;
+    let saved = draw(&ctx, "ringed POSITIONS (SELECT * FROM pos)", None).await;
+
+    // The live layout of the drawing, to its end, stepped as a view steps it.
+    let live = draw(&ctx, "ringed", None).await;
+    let r = &live.result;
+    assert_ne!(ids(&live)[..3], ["0", "1", "2"]);
+    let adjacency = UndirectedCsr::from_edges(r.n_nodes(), r.src(), r.dst());
+    let mut layout = Fa2Multilevel::new_lean(&adjacency, MultilevelParams::default());
+    while !layout.is_done() {
+        layout.step(&adjacency, 7.0);
+    }
+    let (x, y) = layout.into_positions();
+    let mut ended: Vec<(String, u32, u32)> = ids(&live)
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.to_string(), x[i].to_bits(), y[i].to_bits()))
+        .collect();
+    ended.sort();
+    assert_eq!(placed(&saved), ended);
+}
