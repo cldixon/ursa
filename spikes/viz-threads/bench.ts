@@ -33,6 +33,7 @@ function serve(isolated: boolean) {
     async fetch(req) {
       let path = decodeURIComponent(new URL(req.url).pathname);
       if (path === "/") path = "/index.html";
+      if (path === "/favicon.ico") return new Response(null, { status: 204 });
       const full = normalize(join(web, path));
       const f = file(full);
       if (!full.startsWith(web + sep) || !(await f.exists())) return new Response("not found", { status: 404 });
@@ -55,6 +56,7 @@ async function open(isolated: boolean): Promise<{ page: Page; close: () => Promi
   const server = serve(isolated);
   const page = await browser.newPage();
   page.on("console", (m) => (m.type() === "error" || m.type() === "warning") && problems.push(`console ${m.type()}: ${m.text()}`));
+  if (process.env.DEBUG) page.on("console", (m) => console.log(`[${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => problems.push(`page error: ${e.message}`));
   await page.goto(`http://localhost:${server.port}/`);
   await page.waitForFunction("window.ready === true");

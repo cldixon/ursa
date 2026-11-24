@@ -55,6 +55,27 @@ if [[ $what == threads || $what == all ]]; then
     cargo "+$NIGHTLY" build --lib --features threads --target wasm32-unknown-unknown \
       -Z build-std=std,panic_abort --profile wasm-release --locked
   bindgen "$TARGET/spike-threads/wasm32-unknown-unknown/wasm-release/ursa_viz_threads.wasm" web/pkg-threads
+  # wasm-bindgen-rayon 1.3 starts each of the pool's workers from a blob: URL
+  # (a copy of its helper script, so that a CDN can host it). The shell's CSP
+  # is `worker-src 'self'`, which refuses blob: workers, and the pool then
+  # never starts. The helper is same-origin here: start the workers from it.
+  helper=$(find web/pkg-threads/snippets -name workerHelpers.no-bundler.js)
+  python3 - "$helper" <<'PY'
+import re, sys
+path = sys.argv[1]
+src = open(path).read()
+new, n = re.subn(
+    r"let scriptBlob = await fetch\(import\.meta\.url\)\.then\(r => r\.blob\(\)\);\s*let url = URL\.createObjectURL\(scriptBlob\);",
+    "let url = import.meta.url;",
+    src,
+)
+new, m = re.subn(r"\s*URL\.revokeObjectURL\(url\);", "", new)
+# And the glue's initializer takes one object now (0.2.126 warns otherwise).
+new, k = re.subn(r"pkg\.default\(data\.module, data\.memory\)", "pkg.default({ module_or_path: data.module, memory: data.memory })", new)
+if n != 1 or m != 1 or k != 1:
+    sys.exit("build.sh: wasm-bindgen-rayon's worker helper has changed; re-read the patch")
+open(path, "w").write(new)
+PY
 fi
 
 if [[ $what == native || $what == all ]]; then
