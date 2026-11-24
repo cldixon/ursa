@@ -2670,10 +2670,22 @@ for (const scheme of ["light", "dark"] as const) {
   await k.click("#terminal");
   await type(".undo", k);
   await openIs([]);
-  // (Nothing selected, as when the closed frame was read: no ring.)
+  // (Nothing selected, as when the closed frame was read: no ring.) No
+  // frame is drawn between the click and the read-back: a read-back is of
+  // the view as it is, not of its last frame, whose discs had the ring.
+  // (Under load the frame came after the read-back, and the ring with it.)
+  await k.evaluate(() => {
+    (window as any).__raf = window.requestAnimationFrame;
+    window.requestAnimationFrame = () => 0;
+  });
   await k.mouse.click(box.x + 6, box.y + 6);
   g = await graphInfo(k);
   const undone = await ink();
+  // Frames again, and one drawn (a read-back asks for one when it ends).
+  await k.evaluate(async () => {
+    window.requestAnimationFrame = (window as any).__raf;
+    await (window as any).ursaShell.graphInked();
+  });
   check(
     g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
     "GROUP BY: .undo restores the closed drawing, read back",
