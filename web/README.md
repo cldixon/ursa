@@ -57,6 +57,19 @@ static assets and an R2 bucket.
     where characters other than ASCII letters, digits, `.`, `_` and `-` become
     `_` and a name so changed gets a hash of the original) and defines a view
     over each, named after the file and quoted (`"données"`, `"order"`).
+  - **`COPY … TO 'name.parquet'` writes a file in the session** (#517), at
+    `memory://uploads/name.parquet`, beside the imported ones: a browser has
+    no disk. `FROM 'name.parquet'` then reads it (a session file is found by
+    its name before the datasets' files are), and `.files` lists it as
+    `written here`. `.csv`, `.json` and `.arrow` are written too, with
+    `STORED AS` and the options the CLI takes. The name is ASCII letters,
+    digits, `.`, `_` and `-`, with no folder; any other target (a path, an
+    `https://` URL), `PARTITIONED BY`, compressed CSV or JSON, and an
+    `INSERT INTO` a table of files are refused with a message that says
+    what works. The engine writes the file itself
+    (`ursa_engine::session_files`): DataFusion's file sinks start tokio
+    tasks, and the browser has no tokio runtime, so they ended the engine.
+    The files last as long as the session; `.export` downloads a result.
     **New** starts a fresh session. The theme follows the system until the
     toggle picks one, which is remembered; the terminal's colours follow it.
     A click on a bar button hands the focus back to the terminal; pressed from
@@ -250,11 +263,11 @@ static assets and an R2 bucket.
     - **Above 2,000,000 edges with no `POSITIONS`**, the status line says,
       while the layout runs, that the fine level takes about a minute and
       offers `COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet'`, and the
-      terminal prints the statements. `COPY … TO` has no disk to write to
-      in the browser, so the terminal gives the in-session form first
-      (`CREATE TABLE pos AS …`, `.graph g POSITIONS (SELECT * FROM pos)`)
-      and the `COPY` for the `ursa` CLI, whose file `.files add` brings
-      here.
+      terminal prints the statements: that `COPY` and `.graph g POSITIONS
+      (SELECT * FROM 'pos.parquet')` first (the file is kept in the
+      session, #517), then the same as a table (`CREATE TABLE pos AS …`,
+      `.graph g POSITIONS (SELECT * FROM pos)`), and that the `ursa` CLI
+      runs the `COPY` on every core, for `.files add` to bring here.
     - `bun tests/graph-positions-bench.ts [url] [edges] [scale]` is the
       benchmark at 5M edges: it generates an R-MAT graph for the run (a CSV
       in the temporary directory, deleted at the end), draws it live and

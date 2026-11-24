@@ -152,7 +152,11 @@ pub async fn open_files(
     // Each location's first file's extensions (`.jsonl.gz`), to list by.
     let mut extensions = Vec::with_capacity(locations.len());
     for location in locations {
-        let url = table_url(location)?;
+        // A file the session keeps under this name (#517) is the one read.
+        let url = match crate::session_files::existing(state.runtime_env(), location).await {
+            Some(kept) => table_url(&kept)?,
+            None => table_url(location)?,
+        };
         ensure_object_store(state.runtime_env(), url.get_url()).await?;
         let store = state.runtime_env().object_store(&url)?;
         let file = url

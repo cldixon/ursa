@@ -141,6 +141,11 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
             let state = ctx.state();
             // A COPY target or external table location in object storage needs
             // its store registered before DataFusion plans the write or read.
+            // In a session that keeps its files in memory (the browser), a
+            // COPY writes one of those (#517).
+            if ursa_engine::session_files::takes_copy(state.runtime_env()) {
+                session_copy_target(state.runtime_env(), &mut statement)?;
+            }
             match statement.as_ref() {
                 DFStatement::CopyTo(copy) => {
                     ursa_engine::ensure_object_store_for(state.runtime_env(), &copy.target).await?
@@ -214,7 +219,44 @@ async fn plan_and_run(ctx: &SessionContext, statement: DFStatement) -> Result<Da
     // A column an inner join equates with a node key is one (#431).
     let plan = ursa_engine::graph::provenance::carry_through_joins(plan)?;
     ursa_engine::graph::check_ddl(&state, &plan).await?;
+    // A session that keeps its files in memory (the browser) writes them
+    // itself, and cannot run DataFusion's file sinks (#517).
+    if ursa_engine::session_files::takes_copy(state.runtime_env()) {
+        if let datafusion::logical_expr::LogicalPlan::Copy(copy) = &plan {
+            return ursa_engine::session_files::copy_to(ctx, copy).await;
+        }
+        ursa_engine::session_files::check_insert(&plan)?;
+    }
     ctx.execute_logical_plan(plan).await
+}
+
+/// Point a `COPY … TO` (or the one an `EXPLAIN` explains) at the session
+/// file its target names, or refuse a target that is none. `EXPLAIN ANALYZE`
+/// of a `COPY` is refused: it would run DataFusion's file sink, which a
+/// browser cannot (see `ursa_engine::session_files`).
+fn session_copy_target(
+    runtime: &datafusion::execution::runtime_env::RuntimeEnv,
+    statement: &mut DFStatement,
+) -> Result<()> {
+    match statement {
+        DFStatement::CopyTo(copy) => {
+            let target = ursa_engine::session_files::copy_target(runtime, &copy.target)?;
+            ursa_engine::session_files::check_copy_format(&copy.target, copy.stored_as.as_deref())?;
+            copy.target = target;
+        }
+        DFStatement::Explain(explain) => {
+            if explain.options.analyze && matches!(*explain.statement, DFStatement::CopyTo(_)) {
+                return Err(DataFusionError::Plan(
+                    "EXPLAIN ANALYZE of a COPY cannot run in a browser session; run the COPY, \
+                     or EXPLAIN it"
+                        .into(),
+                ));
+            }
+            session_copy_target(runtime, &mut explain.statement)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Whether `statement` is `SHOW TABLES`, with no option DataFusion would
