@@ -2054,6 +2054,106 @@ for (const scheme of ["light", "dark"] as const) {
     const lf = graph.levelFrames;
     check(lf.count > 5 && lf.p95 <= 100 && times.graphDrawn > times.firstDraw, "a big graph: the coarse levels' frames come 50 ms apart at most, before the graph itself is drawn", `${JSON.stringify(lf)}; first frame at ${Math.round(times.firstDraw)} ms, the graph itself at ${Math.round(times.graphDrawn)} ms`);
   }
+  // #498: the aggregated view. Laid out, the million edges are drawn as a
+  // cut through the layout's hierarchy: at the fitted zoom at most 20,000
+  // discs and 100,000 merged edges, which the status line says first, the
+  // groups together holding every node, the largest labelled with their
+  // counts; a cut takes the layout worker 30 ms at most (twice that is
+  // allowed here); a click on a group selects its nodes; `a` and
+  // `.graph detail on|off` force full detail and let it go; and zooming in
+  // reaches the graph's own nodes, drawn as the graph is.
+  {
+    const cutDrawn = (want = true) =>
+      r
+        .waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g && !g.cuts.waiting && (g.cut !== null) === want; }, want, { timeout: 30_000, polling: 50 })
+        .then(() => true, () => false);
+    const statusNow = async () => (await r.locator("#graph-status").textContent()) ?? "";
+    const drawn = await cutDrawn();
+    const g = await graphInfo(r);
+    const status = await statusNow();
+    const said = status.match(/^aggregated: ([\d,]+) groups of 46,318 nodes · 1,000,000 edges · /);
+    check(
+      drawn && g.cut && g.cut.groups <= 20_000 && g.cut.groups > 20 && g.cut.edges <= 100_000 && g.cut.edges > 0 && g.cut.totalEdges >= g.cut.edges && g.coarse === null,
+      "a big graph, laid out, is drawn aggregated: at most 20,000 discs and 100,000 merged edges at the fitted zoom",
+      JSON.stringify(g.cut),
+    );
+    check(g.cut?.nodes === 46_318 && said && Number(said[1].replace(/,/g, "")) === g.cut.groups, "a big graph: the groups hold every node, and the status says aggregated: G groups of N nodes", status);
+    check(g.cuts.ms.count >= 1 && g.cuts.ms.max <= 60 && g.cuts.prepared?.bytes > 0, "a big graph: a cut takes the layout worker 30 ms at most (60 allowed)", JSON.stringify(g.cuts));
+    check(g.groupLabels.length >= 1 && g.groupLabels.every((l: string) => /^[\d,.]+[KM]?$/.test(l)), "a big graph: its largest groups are labelled with their node counts", JSON.stringify(g.groupLabels));
+    // A click on the heaviest group's label: its nodes are selected.
+    const box = (await r.locator("#graph-stage canvas").boundingBox())!;
+    const label = await r.evaluate(() => {
+      const el = [...document.querySelectorAll<HTMLElement>("#graph-stage .graph-group")].find((l) => !l.hidden)!;
+      const b = el.getBoundingClientRect();
+      return { x: b.x + b.width / 2, y: b.y + b.height / 2, text: el.textContent };
+    });
+    await r.mouse.click(label.x, label.y);
+    await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    const picked = await statusNow();
+    const members = Number(label.text!.replace(/,/g, ""));
+    check(
+      new RegExp(`^Selected ${label.text!.replace(".", "\\.")} nodes: .* · aggregated: [\\d,]+ groups of 46,318 nodes · `).test(picked) && (await graphInfo(r)).cut !== null && members > 1,
+      "a big graph: a click on a group selects its nodes",
+      picked.slice(0, 160),
+    );
+    // A click on empty space clears.
+    await r.mouse.click(box.x + 8, box.y + box.height - 8);
+    await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    check(/^aggregated: /.test(await statusNow()), "a big graph: a click on empty space clears the group's selection", (await statusNow()).slice(0, 80));
+    // `a` forces full detail, and `a` again lets it go.
+    await r.locator("#graph-stage canvas").focus();
+    await r.keyboard.press("a");
+    const forced = await cutDrawn(false);
+    const full = await graphInfo(r);
+    check(forced && full.cut === null && full.cuts.detail && !full.cuts.on && !(await statusNow()).includes("aggregated") && full.groupLabels.length === 0, "a big graph: a forces full detail", `${JSON.stringify(full.cuts)}; ${(await statusNow()).slice(0, 80)}`);
+    await r.keyboard.press("a");
+    check((await cutDrawn()) && /^aggregated: /.test(await statusNow()), "a big graph: a again aggregates it", (await statusNow()).slice(0, 80));
+    // Zooming in on the middle opens the groups in view, down to the
+    // graph's own nodes: then the graph itself is drawn.
+    const sizes: number[] = [];
+    let reached = false;
+    for (let step = 0; step < 16 && !reached; step++) {
+      await r.evaluate(
+        ([x, y]) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          for (let i = 0; i < 4; i++) canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+        },
+        [box.x + box.width / 2, box.y + box.height / 2],
+      );
+      // The camera at rest, and the cut for it.
+      await r.waitForTimeout(250);
+      await r.waitForFunction(() => !(window as any).ursaShell.graph().cuts.waiting, null, { timeout: 30_000, polling: 50 }).catch(() => {});
+      const now = await graphInfo(r);
+      sizes.push(now.cut?.groups ?? 0);
+      reached = now.cut === null;
+    }
+    const near = await graphInfo(r);
+    check(
+      reached && sizes.length > 1 && sizes[0] > g.cut.groups && sizes.slice(0, -1).every((n) => n <= 20_000) && near.cuts.on && !(await statusNow()).includes("aggregated"),
+      "a big graph: zooming into a region opens its groups and reaches the graph's own nodes",
+      `${g.cut.groups} groups fitted, then ${sizes.join(", ")} (0: the graph itself); ${(await statusNow()).slice(0, 80)}`,
+    );
+    check(near.cuts.ms.max <= 60, "a big graph: every cut on the way took the layout worker 30 ms at most (60 allowed)", JSON.stringify(near.cuts.ms));
+    // Fitted again, it is aggregated again.
+    await r.keyboard.press("0");
+    check((await cutDrawn()) && (await graphInfo(r)).cut.groups === g.cut.groups, "a big graph: fitted again, the same cut as before", JSON.stringify((await graphInfo(r)).cut));
+    // `.graph detail on` in the terminal: full detail from here, which is
+    // what the checks below (the frame budget and the refinement of the
+    // million edges themselves) are of.
+    await r.click("#terminal");
+    await type(".graph detail", r);
+    const asked = await after(".graph detail", r);
+    await type(".graph detail on", r);
+    const on = await after(".graph detail on", r);
+    await cutDrawn(false);
+    check(
+      asked.includes("drawn aggregated once it is laid out") && on.includes("drawn in full detail") && (await graphInfo(r)).cut === null && !(await statusNow()).includes("aggregated"),
+      ".graph detail says which, and .graph detail on draws every node and edge",
+      `${asked.trim().slice(0, 60)} | ${on.trim().slice(0, 60)} | ${(await statusNow()).slice(0, 60)}`,
+    );
+    await type(".graph detail sideways", r);
+    check((await after(".graph detail sideways", r)).includes("usage: .graph detail on|off"), ".graph detail refuses another word");
+  }
   // #495: the frame budget, on the million edges. The layout worker's order
   // of the edges is in the view; a wheel zoom, an event an animation frame,
   // is drawn in frames 50 ms apart at most (the 95th percentile; twice that
@@ -2210,7 +2310,7 @@ for (const scheme of ["light", "dark"] as const) {
     await r.keyboard.press("Escape");
   }
   await r.keyboard.press("Escape");
-  check(!(await graphOpen(r)) && (await errors(r)) === 0, "a big graph's view closes");
+  check(!(await graphOpen(r)) && (await errors(r)) === 1, "a big graph's view closes, with no error but the one asked for", `${await errors(r)}`);
 
   // #443's acceptance, on the million-edge graph: from a hop result, ten
   // double-clicks each add nodes, each echoes one command, .history lists
@@ -2311,6 +2411,10 @@ for (const scheme of ["light", "dark"] as const) {
     w.__live = new Map();
     for (let i = 0; i < n; i++) w.__live.set(g.ids[i], [f(g.xy[i] - mx), f(g.xy[n + i] - my)]);
   });
+  // Laid out, rmat is drawn aggregated (#498), and saved positions have no
+  // hierarchy to aggregate: compare the frames in full detail.
+  await type(".graph detail on", s);
+  await s.waitForFunction(() => { const g = (window as any).ursaShell.graph(); return g && g.cut === null && !g.cuts.waiting; }, null, { timeout: 30_000, polling: 50 });
   const inkLive = await s.evaluate(() => (window as any).ursaShell.graphInked());
 
   await type("CREATE TABLE pos AS SELECT * FROM layout_fa2(rmat);", s);
@@ -2352,6 +2456,7 @@ for (const scheme of ["light", "dark"] as const) {
   check(same.nodes === 46_318 && same.same === same.nodes && same.live === same.nodes, "saved positions: layout_fa2's positions are the live layout's end state, node for node, to the bit", JSON.stringify(same));
   const inkSaved = await s.evaluate(() => (window as any).ursaShell.graphInked());
   check(inkLive.inked > 10_000 && JSON.stringify(inkSaved) === JSON.stringify(inkLive), "saved positions: the frame read back is the live layout's, pixel count for pixel count", `${JSON.stringify(inkLive)} | ${JSON.stringify(inkSaved)}`);
+  await type(".graph detail off", s);
   // The edges' order still comes (by degree: there is no hierarchy), and a
   // frame with every edge.
   const ordered = await s.waitForFunction(() => { const f = (window as any).ursaShell.graph()?.frame; return f?.ordered === 1_000_000 && f.partial === false; }, null, { timeout: 60_000, polling: 100 }).then(() => true, () => false);

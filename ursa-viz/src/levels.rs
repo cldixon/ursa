@@ -38,6 +38,9 @@ pub const COVERAGE: f32 = 0.06;
 pub const MIN_RADIUS: f32 = 1.5;
 /// The greatest, as a share of the canvas's shorter side.
 pub const MAX_RADIUS_SHARE: f32 = 0.12;
+/// How wide the ring around a marked disc is, in pixels
+/// ([`LevelScene::discs_by`]).
+pub const RING_WIDTH: f32 = 3.0;
 /// A merged edge's width, in pixels: the lightest and the heaviest.
 pub const MIN_WIDTH: f32 = 1.0;
 pub const MAX_WIDTH: f32 = 5.0;
@@ -107,6 +110,9 @@ pub struct LevelScene {
     weight: Vec<f32>,
     /// How many merged edges the level has: `src.len()` of them are held.
     total_edges: usize,
+    /// The greatest radius a disc is drawn with, in pixels, if less than
+    /// [`MAX_RADIUS_SHARE`] allows ([`LevelScene::set_max_radius`]).
+    max_radius: f32,
 }
 
 impl LevelScene {
@@ -151,6 +157,7 @@ impl LevelScene {
             by_mass,
             total_mass,
             total_edges: total_edges.max(src.len()),
+            max_radius: f32::INFINITY,
             src,
             dst,
             weight,
@@ -180,6 +187,13 @@ impl LevelScene {
     /// How many merged edges the level has.
     pub fn total_edges(&self) -> usize {
         self.total_edges
+    }
+
+    /// Draw no disc with a radius over `pixels`, however heavy and however
+    /// far the view is zoomed in: for discs that stand a known distance
+    /// apart (a cut's, `crate::cut`), which larger ones would cover.
+    pub fn set_max_radius(&mut self, pixels: f32) {
+        self.max_radius = if pixels > 0.0 { pixels } else { f32::INFINITY };
     }
 
     /// The nodes' positions, to write: `x` and `y`, one per node each.
@@ -219,27 +233,78 @@ impl LevelScene {
             0.0
         };
         let area = COVERAGE * width * height * share;
-        let most = (MAX_RADIUS_SHARE * width.min(height)).max(MIN_RADIUS);
+        let most = (MAX_RADIUS_SHARE * width.min(height))
+            .min(self.max_radius)
+            .max(MIN_RADIUS);
         ((area / std::f32::consts::PI).sqrt() * zoom).clamp(MIN_RADIUS, most)
     }
 
     /// The `count` heaviest nodes as discs of `color` (`0xRRGGBBAA`), the
     /// lightest of them first, so that the heaviest are drawn over them.
     pub fn discs(&self, count: usize, width: f32, height: f32, zoom: f32, color: u32) -> Vec<Disc> {
+        self.discs_by(count, width, height, zoom, |_| (color, None))
+    }
+
+    /// [`LevelScene::discs`], each node `i` in the colour `ink(i)` gives
+    /// first, and with a ring [`RING_WIDTH`] pixels wide around it in the
+    /// colour it gives second, if any: a disc that much larger, under the
+    /// node's own.
+    pub fn discs_by(
+        &self,
+        count: usize,
+        width: f32,
+        height: f32,
+        zoom: f32,
+        ink: impl Fn(usize) -> (u32, Option<u32>),
+    ) -> Vec<Disc> {
         let count = count.min(self.n_nodes());
-        self.by_mass[..count]
-            .iter()
-            .rev()
-            .map(|&i| {
-                let i = i as usize;
-                Disc {
-                    x: self.x[i],
-                    y: self.y[i],
-                    radius: self.radius_of(self.mass[i], width, height, zoom),
-                    color: color.to_be_bytes(),
-                }
-            })
-            .collect()
+        let mut discs = Vec::with_capacity(count);
+        for &i in self.by_mass[..count].iter().rev() {
+            let i = i as usize;
+            let radius = self.radius_of(self.mass[i], width, height, zoom);
+            let (color, ring) = ink(i);
+            let (x, y) = (self.x[i], self.y[i]);
+            if let Some(ring) = ring {
+                discs.push(Disc {
+                    x,
+                    y,
+                    radius: radius + RING_WIDTH,
+                    color: ring.to_be_bytes(),
+                });
+            }
+            discs.push(Disc {
+                x,
+                y,
+                radius,
+                color: color.to_be_bytes(),
+            });
+        }
+        discs
+    }
+
+    /// The node whose disc covers the point `(x, y)` of the layout, on a
+    /// `width` x `height` canvas at `pixels_per_unit` (and `zoom`, as
+    /// [`LevelScene::radius`] has it): the one drawn last of those that
+    /// do, which is the heaviest.
+    pub fn pick(
+        &self,
+        (x, y): (f32, f32),
+        pixels_per_unit: f32,
+        width: f32,
+        height: f32,
+        zoom: f32,
+    ) -> Option<u32> {
+        self.by_mass.iter().copied().find(|&i| {
+            let i = i as usize;
+            let r = self.radius_of(self.mass[i], width, height, zoom) / pixels_per_unit;
+            let (dx, dy) = (self.x[i] - x, self.y[i] - y);
+            dx * dx + dy * dy <= r * r
+        })
+    }
+
+    /// The nodes, heaviest first (then by index).
+    pub fn by_mass(&self) -> &[u32] {
+        &self.by_mass
     }
 
     /// The `count` heaviest edges, the lightest of them first.
@@ -318,6 +383,17 @@ mod tests {
         assert!(s.radius(1, w, h, 2.0) > s.radius(1, w, h, 1.0));
         assert_eq!(s.radius(1, w, h, 1e6), MAX_RADIUS_SHARE * h);
         assert_eq!(s.radius(0, 10.0, 10.0, 1.0), MIN_RADIUS);
+        // Nor over a most of its own.
+        let mut capped = scene();
+        capped.set_max_radius(12.0);
+        assert_eq!(capped.radius(1, w, h, 1.0), 12.0);
+        assert_eq!(capped.radius(1, w, h, 1e6), 12.0);
+        assert_eq!(
+            capped.radius(0, 100.0, 100.0, 1.0),
+            s.radius(0, 100.0, 100.0, 1.0)
+        );
+        capped.set_max_radius(0.0);
+        assert_eq!(capped.radius(1, w, h, 1.0), s.radius(1, w, h, 1.0));
     }
 
     #[test]
@@ -344,6 +420,39 @@ mod tests {
             MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * 0.25
         );
         assert_eq!((s.n_edges(), s.total_edges()), (3, 7));
+    }
+
+    #[test]
+    fn discs_take_their_own_colours_and_rings() {
+        let s = scene();
+        let discs = s.discs_by(2, 1000.0, 800.0, 1.0, |i| {
+            (i as u32, (i == 1).then_some(0xff))
+        });
+        // Node 2, then node 1's ring and node 1 over it.
+        assert_eq!(discs.len(), 3);
+        assert_eq!(discs[0].color, [0, 0, 0, 2]);
+        assert_eq!(
+            (discs[1].color, discs[2].color),
+            ([0, 0, 0, 0xff], [0, 0, 0, 1])
+        );
+        assert_eq!(discs[1].radius, discs[2].radius + RING_WIDTH);
+        assert_eq!((discs[1].x, discs[1].y), (discs[2].x, discs[2].y));
+    }
+
+    #[test]
+    fn a_point_picks_the_heaviest_disc_over_it() {
+        let s = scene();
+        let (w, h) = (1000.0, 800.0);
+        // On node 1 (at 10, 1), and a pixel inside its edge.
+        assert_eq!(s.pick((10.0, 1.0), 1.0, w, h, 1.0), Some(1));
+        let r = s.radius(1, w, h, 1.0);
+        assert_eq!(s.pick((10.0 + r - 1.0, 1.0), 1.0, w, h, 1.0), Some(1));
+        // Node 2 is ten units away: under node 1's disc at this zoom,
+        // and its own disc once the view is zoomed in.
+        assert!(r > 10.0);
+        assert_eq!(s.pick((20.0, 2.0), 1.0, w, h, 1.0), Some(1));
+        assert_eq!(s.pick((20.0, 2.0), 100.0, w, h, 1.0), Some(2));
+        assert_eq!(s.pick((500.0, 500.0), 1.0, w, h, 1.0), None);
     }
 
     #[test]

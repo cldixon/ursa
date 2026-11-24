@@ -876,7 +876,7 @@ const HOST_COMMANDS = [
   [".dataset", "?NAME?", "List the sample datasets, or load one in a fresh session"],
   [".export", "FORMAT", "Download the last result: csv, parquet, json or arrow"],
   [".files", "?add?", "List the files you can query by name; add picks some from your computer"],
-  [".graph", "?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); AS edges(x, y) says what the columns are, and .help graph lists every clause; the pane says what it was drawn as; click a node or an edge to select it (Shift+click adds a node) and the inspector shows its row; i moves to the inspector; / in the pane finds nodes (.find) and f fits the selection in view; double-click a node, or press Enter with nodes selected, to add its neighbours (it runs .expand ID here; Shift adds up to 5,000; .graph echo off stops showing those commands); Esc clears the selection, then closes it"],
+  [".graph", "?QUERY|NAME? ?AS …? ?SIZE BY x? ?COLOR BY y?", "Draw the last result as a graph, by what it is (edges by src and dst or two id columns, nodes by id with the graph's edges among them, a hop's rings, a pattern's matches, or paths), or a query's, or a property graph's, its nodes sized and coloured by a column or an algorithm (.graph karate SIZE BY pagerank COLOR BY louvain); AS edges(x, y) says what the columns are, and .help graph lists every clause; the pane says what it was drawn as; click a node or an edge to select it (Shift+click adds a node) and the inspector shows its row; i moves to the inspector; / in the pane finds nodes (.find) and f fits the selection in view; a large graph is drawn aggregated once it is laid out, a disc for each group of nodes, opened as the view zooms in (a in the pane, or .graph detail on|off, draws every node and edge instead); double-click a node, or press Enter with nodes selected, to add its neighbours (it runs .expand ID here; Shift adds up to 5,000; .graph echo off stops showing those commands); Esc clears the selection, then closes it"],
   [".history", "?N?", "Show the last N commands (default 20)"],
   [".share", "", "Copy a link that replays this session's commands"],
   [".tour", "", "Take the tour: five steps on the karate club, from PageRank to a drawing"],
@@ -912,6 +912,7 @@ async function hostCommand(line) {
     case ".graph": {
       if (/^history\b/i.test(arg)) return explore(line);
       if (/^echo\b/i.test(arg)) return graphEcho(rest.slice(1));
+      if (/^detail\b/i.test(arg)) return graphDetail(rest.slice(1));
       // The query as typed: its spaces may be in a string.
       const drawn = await drawGraph(line.trim().slice(name.length).trim());
       // A drawing is part of the session a link replays: what is explored
@@ -1099,6 +1100,27 @@ async function graphEcho(words) {
     graphEchoes
       ? "The graph view's commands are shown here as they run (.graph echo off hides them).\r\n"
       : "The graph view's commands run without being shown here; .history still lists them (.graph echo on shows them again).\r\n",
+  );
+  return true;
+}
+
+/**
+ * `.graph detail ?on|off?`: draw a large graph in full detail, or
+ * aggregated again (#498); with no word, say which. The view's `a` does
+ * the same.
+ */
+async function graphDetail(words) {
+  const word = (words[0] ?? "").toLowerCase();
+  if (words.length > 1 || !["", "on", "off"].includes(word)) return errorLine("usage: .graph detail on|off");
+  const graph = await loadGraphModule();
+  const { detail, large } = graph.detail(word ? word === "on" : undefined);
+  const small = large === false ? " The graph drawn now is small enough to be drawn whole either way." : "";
+  await write(
+    (detail
+      ? "A large graph is drawn in full detail, every node and edge (.graph detail off aggregates it again)."
+      : "A large graph is drawn aggregated once it is laid out: a disc for each group of nodes, opened as the view zooms in (.graph detail on draws every node and edge).") +
+      small +
+      "\r\n",
   );
   return true;
 }

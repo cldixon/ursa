@@ -201,8 +201,11 @@ impl Coarse {
         group
     }
 
-    /// Let go of everything but the counts: the layout is past this level,
-    /// and nothing reads it again.
+    /// Let go of everything but the counts and the members: the layout is
+    /// past this level, and nothing lays it out again. The members stay
+    /// (four bytes for each node of this level and of the one below): they
+    /// are the hierarchy itself, which a cut through it reads after the
+    /// layout is done ([`Fa2Multilevel::level_members`]).
     fn release(&mut self) {
         self.adj = UndirectedCsr {
             offsets: Vec::new(),
@@ -210,8 +213,6 @@ impl Coarse {
         };
         self.weights = Vec::new();
         self.mass = Vec::new();
-        self.member_offsets = Vec::new();
-        self.members = Vec::new();
         self.dropped = Vec::new();
     }
 
@@ -1035,6 +1036,21 @@ impl Fa2Multilevel {
         }
     }
 
+    /// The nodes of level `level - 1` that each node of level `level`
+    /// stands for (`1..=coarse_levels()`; level 0 is the input graph), as
+    /// a CSR: node `c`'s are `members[offsets[c]..offsets[c + 1]]`, in
+    /// index order. A node of the level below that is in no node's
+    /// members left the hierarchy there (an isolated node, or a whole
+    /// component merged into one node). `None` for a level there is not.
+    ///
+    /// Held for as long as the layout is, whichever level it is laying
+    /// out: the hierarchy is a pure function of the graph, and this is
+    /// all of it that outlasts the layout.
+    pub fn level_members(&self, level: usize) -> Option<(&[u32], &[u32])> {
+        let c = self.coarse.get(level.checked_sub(1)?)?;
+        Some((&c.member_offsets, &c.members))
+    }
+
     /// For each node of the level below the one being laid out, the node
     /// of this level it is part of: where it will start from when the
     /// layout comes down. `u32::MAX` for a node that has no group (an
@@ -1710,6 +1726,60 @@ mod tests {
             assert_eq!(ml.positions(), whole.positions());
             assert_eq!(ml.work_done().round(), whole.work_done().round());
             assert_eq!(ml.into_positions(), want);
+        }
+    }
+
+    #[test]
+    fn the_members_of_every_level_outlast_the_layout() {
+        // The hierarchy itself is kept when a level is let go (#498): what
+        // each node of a level stands for in the level below, the same
+        // before the layout starts and after it ends, lean or not.
+        let t = grid(30, 30);
+        let adj = t.undirected();
+        let params = MultilevelParams {
+            coarsest_nodes: 20,
+            ..MultilevelParams::default()
+        };
+        for lean in [false, true] {
+            let mut ml = Fa2Multilevel::build(adj, params, lean);
+            let levels = ml.coarse_levels();
+            assert!(levels >= 3);
+            let sizes = ml.level_sizes();
+            let members = |ml: &Fa2Multilevel| -> Vec<(Vec<u32>, Vec<u32>)> {
+                (1..=levels)
+                    .map(|l| {
+                        let (offsets, members) = ml.level_members(l).unwrap();
+                        (offsets.to_vec(), members.to_vec())
+                    })
+                    .collect()
+            };
+            let before = members(&ml);
+            for (l, (offsets, of)) in before.iter().enumerate() {
+                // A CSR over the level's nodes, of nodes of the level
+                // below, each in one node's members at most.
+                assert_eq!(offsets.len(), sizes[l + 1] + 1);
+                assert_eq!(*offsets.last().unwrap() as usize, of.len());
+                let mut seen = vec![false; sizes[l]];
+                for &m in of {
+                    assert!(!std::mem::replace(&mut seen[m as usize], true));
+                }
+                // They are the parents the layout prolongs by.
+                let group = ml.coarse[l].groups();
+                for c in 0..sizes[l + 1] {
+                    for &m in &of[offsets[c] as usize..offsets[c + 1] as usize] {
+                        assert_eq!(group[m as usize], c as u32);
+                    }
+                }
+            }
+            assert!(ml.level_members(0).is_none() && ml.level_members(levels + 1).is_none());
+            ml.step(adj, f64::INFINITY);
+            assert!(ml.is_done());
+            assert_eq!(members(&ml), before);
+            // And nothing else of the levels the layout came down from.
+            assert!(ml
+                .coarse
+                .iter()
+                .all(|c| c.adj.targets.is_empty() && c.weights.is_empty() && c.mass.is_empty()));
         }
     }
 

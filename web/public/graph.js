@@ -36,6 +36,12 @@
 // show() hands the worker the graph before it builds the view, so the
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
+// A large graph, once laid out, is drawn aggregated (#498, graph-cut.js): a
+// cut through its layout's hierarchy, a disc for each group of nodes, made
+// by the layout worker for the camera whenever it comes to rest. Zooming
+// in opens the groups in view, down to the graph itself. `a` (and
+// `.graph detail on|off`: detail(), below) forces full detail.
+//
 // A large graph's first drawing is the coarsest level of its layout's
 // hierarchy, a few dozen discs, and then each level the layout comes to
 // (#497, graph-levels.js): the graph's own nodes and edges are first drawn
@@ -58,6 +64,7 @@
 import { drawingOf } from "./graph-data.js";
 import { createInspector } from "./graph-inspector.js";
 import { createLevels } from "./graph-levels.js";
+import { DISC_RADIUS, LABEL_RADIUS, MAX_LABELS, REST_MS, SEPARATION, aggregatedText, countLabel, createCuts } from "./graph-cut.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
@@ -336,7 +343,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       `Graph of ${plural(nodes, "node")} and ${plural(edges, "edge")}${styled ? `, ${styled} (see the legend)` : ""}. ` +
         "Drag or arrow keys to pan, wheel, pinch or plus and minus to zoom, double-click empty space or press 0 to fit. " +
         "Click a node to select it, Shift+click to add another, click empty space or press Escape to clear the selection. " +
-        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection.",
+        "Double-click or double tap a node, or press Enter with nodes selected, to add its neighbours. Slash finds nodes, F fits the selection. " +
+        "A large graph is drawn as groups of nodes once it is laid out, which open as the view zooms in: click a group to select its nodes, and press A for every node and edge.",
     );
   };
   describeCanvas(graph.n, graph.src.length);
@@ -407,6 +415,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     // is drawn).
     hierarchy: createLevels({ animate: !matchMedia("(prefers-reduced-motion: reduce)").matches }),
     groups: null,
+    // The aggregated view (#498): the cuts through the layout's hierarchy
+    // drawn in place of the graph once it is laid out; the timer of the
+    // next one, asked for when the camera has rested; the camera of the
+    // last frame; and the labels of the groups on the canvas.
+    cuts: createCuts({ nodes: graph.n, edges: graph.src.length, detail: fullDetail, separation: SEPARATION * dpr }),
+    cutRest: 0,
+    camera: null,
+    labels: [],
     // What each frame of a coarse level cost, in ms: the time to the next
     // animation frame, as the frame budget measures a moving frame.
     levelFrames: [],
@@ -504,7 +520,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // The header: what is selected, then the graph's size and how far the
   // layout is.
   const header = () => {
-    const counts = `${plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
+    // A cut is drawn in place of the graph (#498): always said, and first,
+    // where a narrow pane does not cut it off.
+    const shown = state.cuts.shown;
+    const counts = `${shown ? aggregatedText(shown.groups, state.nodes) : plural(state.nodes, "node")} · ${plural(state.edges, "edge")}`;
     // The rule that drew it (graph-data.js's drawnAs): the pane never guesses silently.
     const drawn = graph.drawnAs ? ` · drawn as ${graph.drawnAs}` : "";
     let text;
@@ -579,6 +598,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       return;
     }
     placeBusy();
+    cameraLooked();
+    placeLabels();
   };
   // Refinement at rest (#496). A frame at rest that does not fit in a frame
   // is not drawn at once: renderFrame leaves the canvas as it is, and the
@@ -657,6 +678,98 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     };
     more();
   };
+  // The aggregated view (#498, graph-cut.js). Once the layout is done, and
+  // whenever the camera has then been still for REST_MS, the layout worker
+  // is asked for a cut through its hierarchy at that camera; its answer is
+  // drawn in place of the graph, or says that the graph itself is to be
+  // (zoomed in to its own nodes). Meanwhile the last cut is drawn, moved
+  // as the camera is.
+  const askCut = () => {
+    state.cutRest = 0;
+    if (current !== state || !state.layoutDone || !state.cuts.on) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void cutSoon(50);
+    const message = state.cuts.request(view.camera());
+    if (message) worker.postMessage(message);
+  };
+  const cutSoon = (ms = REST_MS) => {
+    clearTimeout(state.cutRest);
+    state.cutRest = state.layoutDone && state.cuts.on ? setTimeout(askCut, ms) : 0;
+  };
+  state.cleanup.push(() => clearTimeout(state.cutRest));
+  // After a frame: if the camera is not where the last frame had it, a
+  // cut once it rests.
+  const cameraLooked = () => {
+    if (!state.cuts.on || !state.layoutDone) return;
+    const camera = view.camera();
+    const was = state.camera;
+    state.camera = camera;
+    if (was && camera.every((v, i) => v === was[i])) return;
+    cutSoon();
+  };
+  // The graph itself again, in place of a cut.
+  const leaveCut = () => {
+    view.clearLevel();
+    placeLabels();
+    header();
+    redraw(false);
+  };
+  const applyCut = (data) => {
+    if (current !== state) return;
+    if (state.paused) return void setTimeout(() => applyCut(data), 50);
+    const was = state.cuts.shown !== null;
+    const what = state.cuts.answer(data);
+    if (what === "stale") return;
+    if (what !== "cut") return void (was && leaveCut());
+    try {
+      view.setCut(data.xy, data.mass, data.members, data.of, data.src, data.dst, data.weight, data.totalEdges, DISC_RADIUS * dpr);
+    } catch {
+      // Not a cut of what is drawn (the graph changed meanwhile): the graph itself.
+      if (state.cuts.drop() || was) leaveCut();
+      return;
+    }
+    header();
+    redraw(false);
+  };
+  // Full detail forced, or let go (`a`, `.graph detail`).
+  state.setDetail = (detail) => {
+    if (state.cuts.setDetail(detail)) leaveCut();
+    else header();
+    if (!detail) cutSoon(0);
+  };
+  // The groups' labels: how many nodes each disc that is large enough
+  // stands for, over the canvas.
+  const placeLabels = () => {
+    const found = state.cuts.shown ? view.groupLabels(LABEL_RADIUS * dpr, MAX_LABELS) : [];
+    const count = found.length / 5;
+    while (state.labels.length < count) {
+      const label = document.createElement("div");
+      label.className = "graph-group";
+      label.setAttribute("aria-hidden", "true");
+      stage.append(label);
+      state.labels.push(label);
+    }
+    // Heaviest first: a label that would lie over one already placed is
+    // left out.
+    const placed = [];
+    state.labels.forEach((label, i) => {
+      label.hidden = true;
+      if (i >= count) return;
+      const [, x, y, , members] = found.slice(5 * i, 5 * i + 5);
+      const text = countLabel(members);
+      const [cx, cy, w, h] = [x / dpr, y / dpr, 7 * text.length + 12, 18];
+      if (placed.some((b) => Math.abs(b[0] - cx) < (b[2] + w) / 2 && Math.abs(b[1] - cy) < (b[3] + h) / 2)) return;
+      placed.push([cx, cy, w, h]);
+      if (label.textContent !== text) label.textContent = text;
+      label.style.left = `${cx}px`;
+      label.style.top = `${cy}px`;
+      label.hidden = false;
+    });
+  };
+  state.cleanup.push(() => {
+    for (const label of state.labels) label.remove();
+    state.labels = [];
+  });
   // `input` unless the layout or a test asked: graphTimings' frame intervals
   // are of frames the user's movement asked for.
   const redraw = (input = true) => {
@@ -680,6 +793,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (data.type === "order") return orderEdges(data);
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
+    if (data.type === "cut") return applyCut(data);
     if (data.type === "level" || data.type === "levelPositions") {
       // The layout at a level of its hierarchy (#497): drawn in place of
       // the graph while it is a coarse one. Level 0 is the graph itself:
@@ -724,6 +838,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.layoutDone = true;
       state.growing = false;
       header();
+      // Laid out: aggregated from here, if it is large (#498).
+      cutSoon(0);
     } else if (data.type === "error") {
       fail(`the layout stopped: ${data.message}`);
     }
@@ -981,7 +1097,12 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     else if (e.key === "+" || e.key === "=") view.zoom(1.25, ...middle);
     else if (e.key === "-" || e.key === "_") view.zoom(0.8, ...middle);
     else if (e.key === "0") view.fit();
-    else if (e.key === "i") {
+    else if (e.key === "a") {
+      // Full detail, or aggregated again (#498): `.graph detail on|off`.
+      e.preventDefault();
+      detail(state.cuts.wanted);
+      return;
+    } else if (e.key === "i") {
       // Into the inspector, if it is open; Esc there comes back.
       state.inspectNow();
       if (state.inspector.focus()) e.preventDefault();
@@ -997,6 +1118,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // selection. Returns whether the selection changed, and so the frame.
   function pick(x, y, extend, byTouch = false) {
     const start = performance.now();
+    // A cut is drawn (#498): the group there, for its nodes.
+    if (state.cuts.shown) {
+      const group = view.pickGroup(x, y);
+      timings.picked(performance.now() - start);
+      const changed = view.selectGroup(group, extend);
+      if (changed) selectionChanged(byTouch);
+      return changed;
+    }
     const node = view.pick(x, y);
     // With no node there, the edge within 4 px (a plain click only: Shift
     // builds a selection of nodes).
@@ -1205,6 +1334,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.groups = null;
     }
     state.hierarchy.forget();
+    // Nor is a cut drawn from here on (#498): the layout's hierarchy is of
+    // the graph before the step.
+    clearTimeout(state.cutRest);
+    if (state.cuts.drop()) leaveCut();
     // The layout's newest positions are the ones the step starts from.
     if (state.pending) {
       view.setPositions(state.pending);
@@ -1469,6 +1602,26 @@ export function selectFound(nodes, matched = nodes.length) {
   return true;
 }
 
+// Whether full detail is forced (`a`, `.graph detail on`): kept from one
+// drawing to the next.
+let fullDetail = false;
+
+/**
+ * Force full detail (`true`), or let a large graph be drawn aggregated
+ * again (`false`); with no argument, change nothing (#498). Returns
+ * {detail, large, aggregated}: whether full detail is forced now, whether
+ * what is drawn is large enough to be aggregated (null with nothing
+ * drawn), and the cut drawn, {groups, nodes}, or null.
+ */
+export function detail(on) {
+  if (on !== undefined) {
+    fullDetail = Boolean(on);
+    current?.setDetail?.(fullDetail);
+  }
+  const shown = current?.cuts.shown ?? null;
+  return { detail: fullDetail, large: current ? current.cuts.large : null, aggregated: shown && { groups: shown.groups, nodes: shown.nodes } };
+}
+
 /** Fit the selection in view, as `f` does. Returns whether there was one. */
 export function fitSelection() {
   return current?.fitSelection?.() ?? false;
@@ -1574,6 +1727,16 @@ export function info() {
     // the 95th percentile and the most, in ms (null before any).
     levelFrames: spread(current.levelFrames),
     hierarchy: current.hierarchy.levels.filter(Boolean).map((l) => [l.level, l.n]).reverse(),
+    // The aggregated view (#498): the cut drawn in place of the graph,
+    // {groups, merged, nodes, groupsDrawn, edges, edgesDrawn, totalEdges}
+    // (GraphView.cutInfo), or null when the graph itself is; whether cuts
+    // are asked for (a large graph, laid out coarse to fine, full detail
+    // not forced), whether an answer is awaited, what the cuts took in
+    // the layout worker, in ms, and the labels on the canvas.
+    cut: current.view.cutInfo() ?? null,
+    cuts: { on: current.cuts.on, large: current.cuts.large, detail: !current.cuts.wanted, waiting: current.cuts.waiting || current.cutRest !== 0, ms: spread(current.cuts.took), last: current.cuts.took.at(-1) ?? null, prepared: current.cuts.prepared },
+    groupLabels: current.labels.filter((l) => !l.hidden).map((l) => l.textContent),
+    camera: Array.from(current.view.camera()),
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,

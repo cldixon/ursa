@@ -25,6 +25,8 @@ later, in a notebook widget or a native window through the same `View`.
 | `live` | a result as the view draws it, kept in step with its deltas: which slots a delta changes. No GPU. |
 | `budget` | the frame budget: how much a frame draws while the view moves, from what the last frames cost. No GPU. |
 | `order` | the edges' drawing order, most important first: what a prefix of them is. No GPU. |
+| `levels` | a level of the layout's hierarchy as a graph of its own: discs by mass, merged edges by weight. No GPU. |
+| `cut` | the aggregated view: a cut through the layout's hierarchy, chosen by the camera. No GPU. |
 | `pace` (feature `render`) | making a view in pieces, with a turn of the event loop between them. |
 | `render` (feature, on by default) | drawing with wgpu: WebGPU, else WebGL2, in the browser; Vulkan, Metal or DX12 natively. |
 | `view` (feature `render`) | a scene and its renderer, for a platform binding to drive; offscreen snapshots. |
@@ -387,6 +389,105 @@ nodes at their groups' places; the frames of the coarse levels are 33 ms
 apart at the 95th percentile and 50 ms at most. The 0.6 s the issue asks
 for is not met here: the engine's answer takes 0.35 to 0.42 s of it and
 building the hierarchy 0.5 s more.
+
+## The aggregated view: a cut through the hierarchy
+
+Zoomed out, a million edges are a blot at any frame rate (#498). Once the
+layout has reached the graph itself, a view can draw a **cut** through the
+layout's hierarchy in its place: a set of the hierarchy's nodes such that
+every node of the graph is under exactly one of them, each drawn as a disc
+(area by mass, as a level's are), with the merged edges between them,
+heaviest first. `cut.rs` (no GPU) makes it; the view draws it as it draws a
+level.
+
+**Which cut.** The coarsest one whose discs stand `separation` pixels apart
+on screen (24 by default; the shell asks for 20 CSS pixels). A group is
+opened into its children only if they would: if the children's centres
+are, by the root of their mean square distance from the group's own (by
+mass), at least `separation` pixels from it. Starting from the roots, the
+group *in view* with the largest such spread on screen is opened, again and
+again, until none has that much or opening another would pass `max_nodes`
+(20,000). So:
+
+- a group out of view is never opened: it costs one disc however far the
+  view zooms in;
+- a group whose children lie on top of one another stays one disc until
+  the view is close enough to tell them apart;
+- zooming in opens the groups in view down to the graph's own nodes. When
+  every node of the cut in view is one of the graph's, or the groups in
+  view hold at most `detail_nodes` (2,000) of them, the cut says `detail`,
+  and the view draws **the graph itself, exactly as it does with no cut**:
+  the frame is the same, byte for byte.
+
+A group is at the centre of mass of its nodes, where the layout has them
+now, and is in view if the box around those nodes meets the view. The
+merged edges are the graph's own, counted between the cut's nodes; at most
+`max_edges` (100,000) are given, the heaviest (those as heavy, in a fixed
+order). All of it is a pure function of the hierarchy, the positions and
+the camera, on one thread: the same camera gives the same cut.
+
+**What the layout's hierarchy leaves out.** A node with no neighbour, and a
+component the hierarchy has merged into one node, are in no group above:
+the layout brings them back on a ring around the drawing. A graph can have
+tens of thousands (the scale-17 R-MAT graph has 54,000 nodes with no edge),
+and each would be a disc at any zoom. They are grouped by where they are,
+in Z order over their box, four to a group and those groups again, each
+time the positions move; such groups open as any other does.
+
+**What it costs.** The layout keeps each level's members when it comes down
+from it (`Fa2Multilevel::level_members`; a lean hierarchy let them go):
+four bytes for each node of a level and of the one below, under 1 MB at a
+million edges. The first cut, or `Layout.prepareCut()` before it, makes
+the forest (`cut::Hierarchy`): the children of each group, each group's
+mass, centre, spread and box, and the graph's edges once each, in the
+forest's order, so that a cut reads each edge between two of its nodes
+once and no other. That is four bytes an edge and about 60 a node: 5.2 MB
+for the shell's 46K-node, 1M-edge R-MAT graph, made in 44 to 48 ms in the
+browser, in memory the layout has let go of by then (the worker's
+WebAssembly memory stays at 55.6 MB). A cut then takes 6 to 26 ms there,
+with a median of 10 to 12 (one of 39 measured took 35 ms; 11 to 16 ms
+natively for the 131K-node graph: `tests/cut_scale.rs`), against the
+30 ms #498 allows; one with `detail` set gathers no edges and takes 3 ms.
+
+**In the browser.** `Layout.hasCut`, `Layout.prepareCut()` and
+`Layout.cut(camera, separation?, maxNodes?, maxEdges?, detailNodes?)`, for
+`GraphView.camera()`'s `[x, y, pixelsPerUnit, width, height]`, in the
+layout's worker; `GraphView.setCut(xy, mass, members, of, src, dst, weight,
+totalEdges, maxRadius?)` draws it and `clearLevel()` draws the graph again.
+While a cut is drawn:
+
+- **the camera is the graph's**: it does not move when a cut is set, and
+  fits the graph's own nodes;
+- **a disc takes the colour of most of its nodes** (`colorBy`'s
+  categories; the lowest of those that tie), and none is drawn larger than
+  `maxRadius` (the shell: 12 CSS pixels), since discs `separation` apart
+  would cover one another;
+- **a group is picked for its nodes**: `pickGroup(x, y)`, `groupNodes(g)`,
+  `groupOf(node)` and `selectGroup(g, extend)`, which selects a group's
+  nodes as `select` does one node (#438's selection set). A disc with a
+  selected node in it carries a ring in the selection colour, read from
+  the nodes' flags (#470), so `.find` and `setSelection` ring groups too.
+  The selected nodes' edges are not drawn under a cut, nor for more than
+  10,000 selected nodes;
+- `groupLabels(minRadius, most)` gives where the largest groups' discs are
+  and how many nodes each stands for, for a front end to label; `cutInfo()`
+  what is drawn; the graph's own nodes and edges are not picked.
+
+`tests/browser/view.ts` (`ONLY=cut`) reads frames back on WebGL2 on a
+100K-edge R-MAT graph: at the fitted zoom and zoomed in, the heaviest
+discs are where their groups are and the camera where it was; the groups'
+members are the nodes in them and sum to the node count; the same camera
+gives the same cut; a group is picked for its nodes, Shift adds another's
+and a click on empty space clears; a cut of another graph is refused; six
+zoom steps of 1.5 reach the graph's own nodes; and with the cut cleared
+the frame is the graph's own, 0 bytes different, zoomed in and fitted.
+`cut.rs`'s unit tests check that a cut is an antichain covering every
+node, at every zoom and under its limits, and deterministic.
+
+In the shell on `.graph rmat` ([`BENCH.md`](BENCH.md#the-aggregated-view)):
+92 discs and 2,389 merged edges at the fitted zoom, where the graph is
+46,318 nodes and a million edges; a wheel zoom over cuts is drawn in frames
+26 to 29 ms apart at the 95th percentile, with no GPU.
 
 ## Making a view
 
@@ -1022,9 +1123,22 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
   for five dense levels.
 - **A moving frame of a level draws its heaviest discs and its heaviest
   edges, each chosen alone**: where the budget is small (software), an
-  edge's far end may be a disc that was left out. And a level's edges are
-  at most the 16,384 heaviest: a cut (#498) that wants a light edge
-  between two small groups does not have it.
+  edge's far end may be a disc that was left out. A cut's frames (#498)
+  are drawn the same way.
+- **The aggregated view begins when the layout ends** (#498). While the
+  layout is at the graph itself (its last second or two at a million
+  edges) the graph is drawn whole, as before; then the cut. A cut is made
+  again each time the camera rests, in full: a pan that opens no group
+  costs what a zoom does, and nothing of the last cut is reused.
+- **A cut is not animated**: a group opens at once, where #497's levels
+  move out from their parents.
+- **A group sprawls where the layout does.** R-MAT has no clusters, and
+  its groups' nodes are spread over the whole drawing; their discs are at
+  the centre of mass, and the cut opens them by how far apart their
+  children's centres are, not by how far their nodes reach. On a clustered
+  graph a group is a clump.
+- **Aggregation by a column** (`GROUP BY louvain`, the design's other half
+  of this) is not here: the cut is the layout's hierarchy only.
 - **A step applied while a coarse level is drawn** (an `.expand` typed in
   the first seconds of a large graph) leaves the level for the graph, whose
   nodes the view has no positions for until the grown layout's first; an
