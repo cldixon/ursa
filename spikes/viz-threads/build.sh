@@ -13,10 +13,10 @@
 # own, and the nightly is named only on this script's cargo command line.
 #
 #   ./build.sh [serial|threads|native|all]        (default: all)
+#   ./build.sh toolchain                          install the pinned nightly
 #
-# Needs: rustup, wasm-bindgen 0.2.126 (the CLI the shell's build uses), and,
-# for `threads`, network access to static.rust-lang.org the first time:
-#   rustup toolchain install "$NIGHTLY" --profile minimal -c rust-src -t wasm32-unknown-unknown
+# Needs: rustup, wasm-bindgen 0.2.126 (the CLI the shell's build uses) and
+# python3; `toolchain` downloads from static.rust-lang.org.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,6 +30,12 @@ MAX_MEMORY="${MAX_MEMORY:-4294967296}"
 
 TARGET="${CARGO_TARGET_DIR:-$PWD/target}"
 what="${1:-all}"
+
+if [[ $what == toolchain ]]; then
+  # rust-src is what `-Z build-std` rebuilds std from.
+  rustup toolchain install "$NIGHTLY" --profile minimal -c rust-src -t wasm32-unknown-unknown
+  exit
+fi
 
 bindgen() { # <wasm> <out dir>
   rm -rf "$2"

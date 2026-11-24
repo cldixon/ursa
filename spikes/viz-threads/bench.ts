@@ -14,9 +14,9 @@
 // CHROME=/path/to/chrome (else Playwright's Chromium).
 import { chromium, type Page } from "playwright";
 import { file, spawnSync } from "bun";
-import { cpus, loadavg, totalmem } from "node:os";
+import { cpus, totalmem } from "node:os";
 import { extname, join, normalize, sep } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { withSecurityHeaders } from "../../web/src/headers";
 
 const here = import.meta.dir;
@@ -50,6 +50,7 @@ type Result = {
 };
 
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
+const chromiumVersion = browser.version();
 const problems: string[] = [];
 
 async function open(isolated: boolean): Promise<{ page: Page; close: () => Promise<void> }> {
@@ -73,6 +74,43 @@ function native(bin: string, sizes: string[], threads: number[], repeats: number
   const p = spawnSync([join(here, "bin", bin), sizes.join(","), threads.join(","), String(repeats)], { stdout: "pipe", stderr: "inherit" });
   if (p.exitCode !== 0) throw new Error(`${bin} failed`);
   return p.stdout.toString().trim().split("\n").map((l) => JSON.parse(l));
+}
+
+// The machine is shared: other work on it takes cores from a run and makes a
+// speed-up meaningless. So each timed run waits for the machine to be idle
+// (QUIET_WAIT_MS at most, default two minutes), and records how many cores
+// were busy while it ran, its own included. A run is "clean" if that is no
+// more than its own threads and half a core: only clean runs are summarised.
+function cpu() {
+  const [, ...f] = readFileSync("/proc/stat", "utf8").split("\n")[0].trim().split(/\s+/);
+  const n = f.map(Number);
+  return { idle: n[3] + n[4], total: n.reduce((a, b) => a + b, 0) };
+}
+const busyBetween = (a: ReturnType<typeof cpu>, b: ReturnType<typeof cpu>) => cores * (1 - (b.idle - a.idle) / Math.max(1, b.total - a.total));
+async function quiet(): Promise<boolean> {
+  const until = Date.now() + Number(process.env.QUIET_WAIT_MS ?? 120_000);
+  for (;;) {
+    const a = cpu();
+    await Bun.sleep(1500);
+    if (busyBetween(a, cpu()) < 0.35) return true;
+    if (Date.now() > until) return false;
+  }
+}
+async function timed<T>(threads: number, f: () => Promise<T> | T): Promise<{ r: T; quietStart: boolean; busyCores: number; clean: boolean }> {
+  const quietStart = await quiet();
+  const a = cpu();
+  const r = await f();
+  const busyCores = busyBetween(a, cpu());
+  return { r, quietStart, busyCores, clean: busyCores <= Math.min(threads, cores) + 0.5 };
+}
+
+function summary(name: string, got: Map<string, { ms: number; clean: boolean }[]>) {
+  const of = (key: string) => { const all = got.get(key)!; const c = all.filter((x) => x.clean); return { ms: (c.length ? c : all).map((x) => x.ms), clean: c.length, runs: all.length }; };
+  const base = median(of("serial/1").ms);
+  for (const key of got.keys()) {
+    const { ms, clean, runs } = of(key);
+    console.log(`  ${name} ${key}: layout median ${median(ms).toFixed(0)} ms (min ${Math.min(...ms).toFixed(0)}; ${clean} of ${runs} runs clean), x${(base / median(ms)).toFixed(2)}`);
+  }
 }
 
 const median = (xs: number[]) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
@@ -144,40 +182,39 @@ if (mode === "check") {
     // the builds are interleaved so that a burst of load from elsewhere on
     // the machine lands on all of them.
     const jobs = [{ build: "serial", threads: 1 }, ...threads.map((t) => ({ build: "threads", threads: t }))];
-    const got = new Map<string, Result[]>();
+    const got = new Map<string, { ms: number; clean: boolean }[]>();
     for (let i = 0; i < repeats; i++) {
       for (const want of jobs) {
-        const load = loadavg()[0];
-        const r = await run(page, { graph, want });
+        const { r, busyCores, clean } = await timed(want.threads, () => run(page, { graph, want }));
         const key = `${want.build}/${want.threads}`;
-        got.set(key, [...(got.get(key) ?? []), r]);
+        got.set(key, [...(got.get(key) ?? []), { ms: r.runs[0].layoutMs, clean }]);
         rows.push({ where: "chromium", graph, build: r.build, threads: r.threads, initMs: r.initMs, poolMs: r.poolMs, startMs: r.startMs,
           buildMs: r.runs[0].buildMs, layoutMs: r.runs[0].layoutMs, iterations: r.runs[0].iterations, hash: r.runs[0].hash,
-          memoryBytes: r.memoryBytes, load1: load });
-        console.log(`${graph} ${key} start ${r.startMs.toFixed(0)} ms (pool ${r.poolMs.toFixed(0)}), build ${r.runs[0].buildMs.toFixed(0)} ms, layout ${r.runs[0].layoutMs.toFixed(0)} ms, ${(r.memoryBytes / 2 ** 20).toFixed(0)} MB, ${r.runs[0].hash}, load ${load.toFixed(1)}`);
+          memoryBytes: r.memoryBytes, busyCores, clean });
+        console.log(`${graph} ${key} start ${r.startMs.toFixed(0)} ms (pool ${r.poolMs.toFixed(0)}), build ${r.runs[0].buildMs.toFixed(0)} ms, layout ${r.runs[0].layoutMs.toFixed(0)} ms, ${(r.memoryBytes / 2 ** 20).toFixed(0)} MB, ${r.runs[0].hash}, busy ${busyCores.toFixed(1)}${clean ? "" : " (not clean)"}`);
       }
     }
-    const base = median(got.get("serial/1")!.map((r) => r.runs[0].layoutMs));
-    for (const [key, rs] of got) {
-      const ms = rs.map((r) => r.runs[0].layoutMs);
-      console.log(`  ${graph} ${key}: layout median ${median(ms).toFixed(0)} ms (min ${Math.min(...ms).toFixed(0)}), x${(base / median(ms)).toFixed(2)}`);
-    }
+    summary(`${graph} chromium`, got);
   }
   await close();
   if (process.env.NATIVE !== "0") {
     for (const graph of sizes) {
+      const got = new Map<string, { ms: number; clean: boolean }[]>();
       for (let i = 0; i < repeats; i++) {
-        const load = loadavg()[0];
-        for (const r of [...native("bench-serial", [graph], [1], 1), ...native("bench-threads", [graph], threads, 1)]) {
-          rows.push({ ...r, load1: load });
-          console.log(`${graph} native ${r.build}/${r.threads} build ${r.buildMs} ms, layout ${r.layoutMs} ms, ${r.hash}, load ${load.toFixed(1)}`);
+        for (const [bin, t] of [["bench-serial", 1], ...threads.map((t) => ["bench-threads", t])] as [string, number][]) {
+          const { r: [r], busyCores, clean } = await timed(t, () => native(bin, [graph], [t], 1));
+          const key = `${r.build}/${r.threads}`;
+          got.set(key, [...(got.get(key) ?? []), { ms: r.layoutMs, clean }]);
+          rows.push({ ...r, busyCores, clean });
+          console.log(`${graph} native ${key} build ${r.buildMs} ms, layout ${r.layoutMs} ms, ${r.hash}, busy ${busyCores.toFixed(1)}${clean ? "" : " (not clean)"}`);
         }
       }
+      summary(`${graph} native`, got);
     }
   }
   await browser.close();
   mkdirSync(join(out, ".."), { recursive: true });
-  writeFileSync(out, JSON.stringify({ cores, cpu: cpus()[0]?.model, memoryGB: Math.round(totalmem() / 2 ** 30), chromium: browser.version(), rows, problems }, null, 2) + "\n");
+  writeFileSync(out, JSON.stringify({ cores, cpu: cpus()[0]?.model, memoryGB: Math.round(totalmem() / 2 ** 30), chromium: chromiumVersion, rows, problems }, null, 2) + "\n");
   console.log(`wrote ${out}`);
   if (problems.length) console.log(problems.join("\n"));
 }
