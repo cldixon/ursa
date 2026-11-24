@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use bytemuck::{Pod, Zeroable};
 
 use crate::levels::{Disc, Link};
+use crate::pace::{ready, Pace};
 use crate::scene::{rgba, Camera};
 
 #[repr(C)]
@@ -204,10 +205,22 @@ pub struct LevelRenderer {
 impl LevelRenderer {
     /// For frames in `format`.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        ready(Self::new_paced(device, format, &mut Pace::never()))
+    }
+
+    /// [`LevelRenderer::new`], giving the event loop a turn as `pace` says
+    /// between compiling the shader and linking each of the two pipelines.
+    pub async fn new_paced(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        pace: &mut Pace,
+    ) -> Self {
+        pace.breathe().await;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ursa-viz level"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
         });
+        pace.breathe().await;
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("level uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -291,6 +304,7 @@ impl LevelRenderer {
                 attributes: &disc_attrs,
             }],
         );
+        pace.breathe().await;
         let link_attrs = [
             attr(wgpu::VertexFormat::Float32x2, 0, 0),
             attr(wgpu::VertexFormat::Float32x2, 8, 1),
@@ -306,6 +320,7 @@ impl LevelRenderer {
                 attributes: &link_attrs,
             }],
         );
+        pace.breathe().await;
         Self {
             discs,
             links,

@@ -20,6 +20,7 @@ use crate::budget::{split, total_units, Frame, NODE_UNITS};
 use crate::highlight::flag;
 use crate::level_render::LevelRenderer;
 use crate::levels::{LevelInfo, LevelScene};
+use crate::pace::{ready, Pace};
 use crate::scene::NO_CATEGORY;
 
 use super::View;
@@ -122,10 +123,27 @@ impl View {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
     ) {
+        ready(self.warm_levels_paced(device, queue, format, &mut Pace::never()));
+    }
+
+    /// [`View::warm_levels`], giving the event loop a turn as `pace` says
+    /// between its pieces: the shader, each of the two pipelines, and the
+    /// first draw, which is the last (the caller gives the turn after it).
+    /// On software WebGL2 they are 2 to 7 ms, 4 to 23 ms each
+    /// and 9 to 21 ms, and in one task, with what the page does with its
+    /// new view after them, they held the page's thread for over 60 ms
+    /// (#520).
+    pub async fn warm_levels_paced(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        pace: &mut Pace,
+    ) {
         if self.level.is_some() {
             return;
         }
-        let mut gpu = LevelRenderer::new(device, format);
+        let mut gpu = LevelRenderer::new_paced(device, format, pace).await;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("level warm-up"),
             size: wgpu::Extent3d {

@@ -366,7 +366,9 @@ A level is never refined in slices: at rest a frame has all the view
 holds of it. The level's pipelines are a shader of their own
 (`level_render.rs`), made on the first `setLevel`, or, for a graph of
 200,000 nodes and edges or more, while the view is made, so that the frame
-a large graph is first seen in does not wait for a compile.
+a large graph is first seen in does not wait for a compile. On a page they
+are made a piece at a time, as the rest of the view is
+(`View::warm_levels_paced`, [Making a view](#making-a-view)).
 
 **Moving between levels** is the page's: the shell's `graph-levels.js`
 keeps each level as it arrives and, for 150 ms after the layout comes down
@@ -530,6 +532,16 @@ and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)). A view made from a result
   frame waits for one piece, not all of them. The largest piece is the
   shader, about 30 ms. `View::new` and `View::from_result` make the same
   view in one go, for a caller with no event loop.
+- **The level pipelines, and the hand-back, are pieces too** (#520). A
+  large graph's view also makes what draws a level
+  (`View::warm_levels_paced`): its shader, two pipelines and a first draw,
+  43 to 46 ms on software WebGL2. They were one task, and the page's own
+  work with its new view ran on at the end of it, with no turn of the
+  event loop between: in the shell, a task of 51 to 80 ms. Each is now a
+  piece, `createView` and `createViewFromResult` give a turn before they
+  resolve, and making the canvas's context is apart from asking for the
+  adapter and the device. The turns this adds, up to six of about 4 ms,
+  are what it costs ([`BENCH.md`](BENCH.md#making-a-view)).
 
 ## Highlights: paths, selection, pins, hidden nodes
 

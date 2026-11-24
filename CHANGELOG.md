@@ -1742,6 +1742,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Making the graph view of a large graph no longer holds the page for
+  over 60 ms** (#520). On `.graph rmat` in the Web Shell
+  `tests/graph-timing.ts` saw one task of 51 to 80 ms while the view was
+  made, in four runs of five over its limit of 60 ms. It was the last task
+  of `createViewFromResult`: the shader, the two pipelines and the first
+  draw of the coarse levels (#514), 43 to 46 ms in one go, and then,
+  with no turn of the event loop between, the page's own work with the
+  view it was handed, 12 to 27 ms. Each is now a piece, paced as the rest
+  of the view is (#426): `View::warm_levels_paced` and
+  `LevelRenderer::new_paced` in `ursa-viz`; `createView` and
+  `createViewFromResult` give the event loop a turn before they resolve,
+  and one between making the canvas's context and asking for the device;
+  and the shell counts the degrees in a task of its own. Six runs of six
+  have no task over 50 ms (`ursa-viz/BENCH.md` has the spread); making
+  the view takes up to six turns of the event loop longer, about 4 ms
+  each. What is drawn is the same.
+
 - **Web shell: `COPY … TO` writes a file in the session, and no longer ends
   the engine** (#517). A browser has no disk, so `COPY … TO 'pos.parquet'`
   (or `.csv`, `.json`, `.arrow`; `'memory://uploads/pos.parquet'` is the
