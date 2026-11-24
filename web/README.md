@@ -673,7 +673,15 @@ static assets and an R2 bucket.
     - **an edge:** its two ends (each with a button that selects it), its
       edge columns, and its row of the edge table, found by its ends;
       where several rows join them, by its row number if the drawing knows
-      it, and else all of them are shown, with a note.
+      it, and else all of them are shown, with a note. The rows are found
+      through the graph's index (#489), not by a scan of the table: the
+      index gives the numbers of the rows between the two ends, and they
+      are read by number, from a Parquet file with a row selection. A
+      table of the two keys alone, as rmat's is, is not read at all.
+      `bun tests/inspector-timing.ts [url] [runs] [clicks]` clicks edges
+      of a hop on rmat and prints the time from click to row, the
+      inspector's own `rowMs` and the engine's part; `TABLE=wide` runs it
+      on a view of rmat with a third column, whose rows are read.
     - **several nodes:** how many, the edges drawn among them, and a
       `WHERE id IN (…)` clause with a copy button.
 

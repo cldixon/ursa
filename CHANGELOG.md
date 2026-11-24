@@ -1012,6 +1012,23 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The graph view's inspector shows an edge's row in 20 to 40 ms on a
+  million edges, not 90 to 160** (#489). An edge's rows were found by a
+  scan of the edge table for its two ends. They are now found through the
+  graph's index (`induced_edges` of the two ends gives their row numbers)
+  and read by number: from a Parquet file with a row selection, which
+  skips the pages before the row, with the bytes read kept for the
+  session (`ursa_engine::graph::view::rows`, 64 MiB at most); from any
+  other table by passing over the rows before. A table of the two key
+  columns alone, such as rmat's, is not read at all, and the drawing's
+  row number picks one of parallel edges among the rows found. The rows
+  are the ones the query by the two ends gives, in the same order, and
+  the scan remains for what the index cannot say: a graph of several edge
+  tables, or a table read as several partitions. `WebShell.inspectEdge`'s
+  JSON says `indexed`. On rmat in headless Chromium the median from click
+  to row is 27 to 41 ms after the first click of a session; the first is
+  69 to 83 ms, of which the engine's part is 24 to 41 ms (see
+  `web/tests/inspector-timing.ts`). `inspect` takes a `RunSql`.
 - **SQL: graph function parameters and columns renamed, one name per role**
   (breaking, #415). The old names are not accepted. Each one gets a "did
   you mean" with its new name, and so do `k`, `max_hops` and `depth`:
