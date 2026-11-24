@@ -583,6 +583,136 @@ impl UndirectedCsr {
     pub fn degree(&self, u: u32) -> usize {
         (self.offsets[u as usize + 1] - self.offsets[u as usize]) as usize
     }
+
+    /// The undirected adjacency of the edges `(src[i], dst[i])` between
+    /// `n_nodes` nodes, built from the edge list alone: the same offsets and
+    /// targets as [`Topology::build`] followed by [`Topology::undirected`],
+    /// without the out-adjacency, the transpose and the edge ids that a
+    /// [`Topology`] holds beside it. For a caller that needs only this (a
+    /// layout): its peak is the edge list and one buffer of two slots an
+    /// edge.
+    ///
+    /// Serial, and the result does not depend on the order of the edges.
+    ///
+    /// # Panics
+    ///
+    /// If `src` and `dst` differ in length, or an endpoint is `>= n_nodes`.
+    pub fn from_edges(n_nodes: usize, src: &[u32], dst: &[u32]) -> UndirectedCsr {
+        assert_eq!(src.len(), dst.len(), "src/dst length mismatch");
+        // Each node's slots before deduplication: one per edge end, self-loops
+        // left out.
+        let mut bound = vec![0u64; n_nodes + 1];
+        for (&s, &d) in src.iter().zip(dst) {
+            if s != d {
+                bound[s as usize + 1] += 1;
+                bound[d as usize + 1] += 1;
+            }
+        }
+        let mut total = 0u64;
+        for slot in &mut bound[1..] {
+            let len = *slot;
+            *slot = total;
+            total += len;
+        }
+        // Filling moves each node's start to its end, the next node's start.
+        let mut targets = vec![0u32; total as usize];
+        for (&s, &d) in src.iter().zip(dst) {
+            if s != d {
+                for (u, v) in [(s, d), (d, s)] {
+                    let next = &mut bound[u as usize + 1];
+                    targets[*next as usize] = v;
+                    *next += 1;
+                }
+            }
+        }
+        // Sort and deduplicate each segment, sliding it left over the slots
+        // the earlier segments gave up.
+        let mut write = 0usize;
+        let mut start = 0usize;
+        for u in 0..n_nodes {
+            let end = bound[u + 1] as usize;
+            targets[start..end].sort_unstable();
+            bound[u] = write as u64;
+            let mut last = None;
+            for i in start..end {
+                let v = targets[i];
+                if last != Some(v) {
+                    targets[write] = v;
+                    write += 1;
+                    last = Some(v);
+                }
+            }
+            start = end;
+        }
+        bound[n_nodes] = write as u64;
+        targets.truncate(write);
+        targets.shrink_to_fit();
+        UndirectedCsr {
+            offsets: bound,
+            targets,
+        }
+    }
+
+    /// An undirected adjacency from its parts, as another holder of the
+    /// graph hands them over (the fields of an [`UndirectedCsr`] it built):
+    /// nothing is sorted and nothing is copied.
+    ///
+    /// The parts are checked in one pass, so a malformed adjacency is an
+    /// error and never a wrong answer later: `n_nodes + 1` offsets rising
+    /// from 0 to the number of targets; each node's targets strictly
+    /// ascending (sorted, no duplicates), below `n_nodes`, and never the
+    /// node itself; and every pair in both nodes' lists.
+    pub fn from_parts(
+        n_nodes: usize,
+        offsets: Vec<u64>,
+        targets: Vec<u32>,
+    ) -> Result<UndirectedCsr, String> {
+        if n_nodes > u32::MAX as usize {
+            return Err(format!("{n_nodes} nodes is beyond the u32 dense-index cap"));
+        }
+        if offsets.len() != n_nodes + 1 {
+            return Err(format!(
+                "the adjacency has {} offsets; {n_nodes} nodes need {}",
+                offsets.len(),
+                n_nodes + 1
+            ));
+        }
+        if offsets[0] != 0 || offsets[n_nodes] != targets.len() as u64 {
+            return Err(format!(
+                "the adjacency's offsets run from {} to {}, not from 0 to its {} targets",
+                offsets[0],
+                offsets[n_nodes],
+                targets.len()
+            ));
+        }
+        if let Some(u) = (0..n_nodes).find(|&u| offsets[u] > offsets[u + 1]) {
+            return Err(format!("the adjacency's offsets fall at node {u}"));
+        }
+        // Nodes are read in ascending order, so node `v` meets its
+        // neighbours in ascending order too: `seen[v]` of them so far, and
+        // the next must be the one reading it.
+        let mut seen = vec![0u32; n_nodes];
+        for u in 0..n_nodes {
+            let list = &targets[offsets[u] as usize..offsets[u + 1] as usize];
+            let mut last = None;
+            for &v in list {
+                if v as usize >= n_nodes || v as usize == u || last.is_some_and(|l| l >= v) {
+                    return Err(format!(
+                        "node {u}'s neighbours are not distinct other nodes in ascending order"
+                    ));
+                }
+                last = Some(v);
+                let at = offsets[v as usize] + u64::from(seen[v as usize]);
+                if at >= offsets[v as usize + 1] || targets[at as usize] != u as u32 {
+                    return Err(format!(
+                        "node {u} has the neighbour {v}, but node {v} does not have {u}"
+                    ));
+                }
+                seen[v as usize] += 1;
+            }
+        }
+        Ok(UndirectedCsr { offsets, targets })
+    }
 }
 
 /// Reads a stored in-adjacency on first demand: see
@@ -1357,6 +1487,64 @@ mod tests {
         assert_eq!(u.neighbors(2), &[0, 1]);
         // cached: a second call returns the same slice contents
         assert_eq!(t.undirected().neighbors(0), &[1, 2]);
+    }
+
+    #[test]
+    fn undirected_from_edges_is_the_topologys() {
+        // A skewed multigraph with self-loops, repeats, both directions and
+        // nodes with no edges.
+        let n = 300u32;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for _ in 0..4000 {
+            let (a, b) = (next() % 280, next() % 280);
+            src.push(((a * a) / 280) as u32);
+            dst.push(b as u32);
+        }
+        for n_nodes in [n as usize, 0] {
+            let (src, dst) = if n_nodes == 0 {
+                (Vec::new(), Vec::new())
+            } else {
+                (src.clone(), dst.clone())
+            };
+            let direct = UndirectedCsr::from_edges(n_nodes, &src, &dst);
+            let topology = Topology::build(n_nodes, src, dst);
+            let built = topology.undirected();
+            assert_eq!(direct.offsets, built.offsets);
+            assert_eq!(direct.targets, built.targets);
+            // And it passes as parts, unchanged.
+            let parts =
+                UndirectedCsr::from_parts(n_nodes, direct.offsets.clone(), direct.targets.clone())
+                    .unwrap();
+            assert_eq!(parts.offsets, built.offsets);
+            assert_eq!(parts.targets, built.targets);
+        }
+    }
+
+    #[test]
+    fn malformed_undirected_parts_are_errors() {
+        let bad = |n, offsets: &[u64], targets: &[u32]| {
+            UndirectedCsr::from_parts(n, offsets.to_vec(), targets.to_vec()).unwrap_err()
+        };
+        // 0 - 1, 1 - 2.
+        assert!(UndirectedCsr::from_parts(3, vec![0, 1, 3, 4], vec![1, 0, 2, 1]).is_ok());
+        assert!(bad(3, &[0, 1, 3], &[1, 0, 2, 1]).contains("offsets"));
+        assert!(bad(3, &[0, 1, 3, 5], &[1, 0, 2, 1]).contains("not from 0"));
+        assert!(bad(3, &[0, 3, 1, 4], &[1, 0, 2, 1]).contains("fall"));
+        assert!(bad(3, &[0, 1, 3, 4], &[1, 2, 0, 1]).contains("does not have"));
+        assert!(bad(3, &[0, 1, 3, 4], &[1, 2, 0, 0]).contains("does not have"));
+        assert!(bad(4, &[0, 2, 3, 4, 4], &[2, 1, 0, 0]).contains("ascending"));
+        assert!(bad(3, &[0, 1, 3, 4], &[1, 0, 7, 1]).contains("ascending"));
+        assert!(bad(2, &[0, 1, 2], &[0, 1]).contains("ascending"));
+        assert!(bad(3, &[0, 2, 3, 4], &[1, 1, 0, 1]).contains("ascending"));
+        // 0 names 2, and 2 does not name 0.
+        assert!(bad(3, &[0, 2, 3, 4], &[1, 2, 0, 1]).contains("does not have"));
     }
 
     #[test]

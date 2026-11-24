@@ -36,6 +36,10 @@
 // show() hands the worker the graph before it builds the view, so the
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
+// A large graph's first drawing is the coarsest level of its layout's
+// hierarchy, a few dozen discs, and then each level the layout comes to
+// (#497, graph-levels.js): the graph's own nodes and edges are first drawn
+// when the layout reaches them.
 //
 // The graph comes from the engine as one UGR buffer (ursa-viz/UGR.md), a
 // graph result: ugr.js (ursa-viz/ui/ugr.js, copied in by the build) reads it
@@ -53,17 +57,21 @@
 
 import { drawingOf } from "./graph-data.js";
 import { createInspector } from "./graph-inspector.js";
+import { createLevels } from "./graph-levels.js";
 import { readResult } from "./ugr.js";
 
 import * as timings from "./graph-timings.js";
 
 let viz = null;
+// Its WebAssembly memory, once loaded: what the view holds (memoryNow).
+let vizMemory = null;
 /** ursa-viz, loaded and initialised once: its module, its wasm exports and its URL. */
 function loadViz() {
   viz ??= (async () => {
     const manifest = await (await fetch("/viz/viz.json")).json();
     const module = await import(manifest.module);
     const wasm = await module.default();
+    vizMemory = wasm.memory;
     return { module, wasm, url: new URL(manifest.module, location.origin).href };
   })().catch((e) => {
     viz = null; // try again next time
@@ -247,10 +255,21 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // The layout first: its hierarchy is built while the view is made here.
   const worker = takeWorker(url);
   {
-    const { src, dst } = shownEdges(graph);
     // graph.layout, {kind: "rings" | "layers", level}, asks for a fixed layout
     // (graph-worker.js): each node's distance or layer in `level`.
-    worker.postMessage({ type: "start", n: graph.n, src, dst, module: url, layout: graph.layout }, [src.buffer, dst.buffer]);
+    const start = { type: "start", n: graph.n, module: url, layout: graph.layout };
+    if (graph.adjacency && !anyRemoved(graph)) {
+      // The engine had the adjacency to send: the layout uses it as it is
+      // (a copy of it: the result's buffer stays this page's).
+      // The edges go too, in this page's numbering: the order to draw them
+      // in (#495) is an order of these, which an adjacency does not have.
+      const adjacency = { offsets: graph.adjacency.offsets.slice(), targets: graph.adjacency.targets.slice() };
+      const { src, dst } = shownEdges(graph);
+      worker.postMessage({ ...start, adjacency, src, dst }, [adjacency.offsets.buffer, adjacency.targets.buffer, src.buffer, dst.buffer]);
+    } else {
+      const { src, dst } = shownEdges(graph);
+      worker.postMessage({ ...start, src, dst }, [src.buffer, dst.buffer]);
+    }
     times.posted = performance.now();
   }
   // The view is made in pieces, with turns of the event loop between them
@@ -339,6 +358,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     iterations: 0,
     level: null,
     levels: null,
+    // The levels of the layout's hierarchy as they arrive (#497), and how
+    // many nodes the one drawn in place of the graph has (null: the graph
+    // is drawn).
+    hierarchy: createLevels({ animate: !matchMedia("(prefers-reduced-motion: reduce)").matches }),
+    groups: null,
+    // What each frame of a coarse level cost, in ms: the time to the next
+    // animation frame, as the frame budget measures a moving frame.
+    levelFrames: [],
     // Nothing is drawn before the layout's first positions.
     positioned: false,
     layoutDone: false,
@@ -367,6 +394,9 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     hoverPicks: 0,
     tip,
     frames: 0,
+    // The frame at rest is being drawn in slices (#496), and the timer of the next.
+    refining: false,
+    refine: 0,
     // The layout worker's wasm memory, in bytes, as its last message gave it.
     layoutMemory: null,
     paused: false,
@@ -436,10 +466,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     } else if (state.growing) {
       text = `${counts}${drawn} · Placing the new nodes`;
     } else if (state.levels !== null) {
-      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}`;
+      // A coarse level drawn in place of the graph says how many nodes it has.
+      const groups = state.groups === null ? "" : ` · ${plural(state.groups, "group")}`;
+      text = `${counts}${drawn} · Laying out · level ${state.levels - state.level} of ${state.levels}${groups}`;
     } else {
       text = `Loading graph view… ${counts}`;
     }
+    // The frame at rest is being drawn in slices (#496): what is on the
+    // canvas is not yet everything.
+    if (state.refining && state.layoutDone) text += " · refining…";
     // Only when it changes: the line is a live region.
     if (status.textContent !== text) status.textContent = text;
     status.title = `${counts}${drawn} · drawn with ${state.backend}`;
@@ -460,7 +495,15 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const draw = (frameTime) => {
     state.frame = 0;
     if (current !== state || state.paused || !state.positioned) return;
-    if (state.pending) {
+    // The level drawn, its nodes on their way out from their parents or in
+    // place (#497); or the graph's own, on their way out from level 1.
+    const split = state.hierarchy.frame(performance.now());
+    if (split && split.level > 0) {
+      if (state.groups !== null) view.setLevelPositions(split.xy);
+    } else if (split && split.xy.length === 2 * view.nodeCount) {
+      view.setPositions(split.xy);
+      state.pending = null;
+    } else if (state.pending) {
       view.setPositions(state.pending);
       state.pending = null;
     }
@@ -476,12 +519,45 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       state.frames++;
       times.firstDraw ??= end;
       if (moving) budgeted(frameTime);
+      else if (view.refining) refineSoon();
+      refiningIs(view.refining);
+      if (split?.moving) redraw(false);
     } catch (e) {
       fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
       return;
     }
     placeBusy();
   };
+  // Refinement at rest (#496). A frame at rest that does not fit in a frame
+  // is not drawn at once: renderFrame leaves the canvas as it is, and the
+  // view draws everything offscreen a slice a task, each sent when the GPU
+  // has finished the last, so a pan or a zoom begun meanwhile waits for one
+  // slice at most. Then a frame, which has everything, and so has every
+  // frame at rest after it; the frames of the next pan or zoom draw it
+  // under their own, moved as the camera is. If the view moved or changed
+  // meanwhile, the slices stop and that frame is the one that shows it.
+  const refine = () => {
+    state.refine = 0;
+    if (current !== state) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void (state.refine = setTimeout(refine, 50));
+    try {
+      if (view.refine(performance.now())) state.refine = setTimeout(refine);
+      else redraw(false);
+    } catch (e) {
+      fail(`the graph view stopped drawing: ${String(e?.message ?? e)}`);
+    }
+  };
+  const refineSoon = () => {
+    state.refine ||= setTimeout(refine);
+  };
+  // The status line says so while slices remain.
+  const refiningIs = (on) => {
+    if (state.refining === on) return;
+    state.refining = on;
+    header();
+  };
+  state.cleanup.push(() => clearTimeout(state.refine));
   // After a moving frame: what it cost, which the budget follows, is the
   // time to the next animation frame (with no GPU the browser rasterises on
   // this thread first; with one, a late frame misses a refresh), from one
@@ -489,7 +565,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // callback ran. And if it left anything out, a frame with everything once
   // nothing has moved for a while.
   const budgeted = (frameTime) => {
-    requestAnimationFrame((next) => current === state && !state.paused && view.frameCost(next - frameTime));
+    // A frame of a coarse level (#497): its cost is kept too, for graphTimings.
+    const level = state.groups !== null;
+    requestAnimationFrame((next) => {
+      if (current !== state || state.paused) return;
+      view.frameCost(next - frameTime);
+      if (level) state.levelFrames.push(next - frameTime);
+    });
     clearTimeout(state.rest);
     state.rest = view.framePartial ? setTimeout(rested, view.frameRestMs + 1) : 0;
   };
@@ -518,7 +600,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const more = () => {
       if (current !== state) return;
       if (state.paused) return void setTimeout(more, 50);
-      if (view.orderEdges()) setTimeout(more);
+      // A run a task, each once the GPU has taken the last (#501).
+      if (view.orderEdges(undefined, true)) setTimeout(more);
     };
     more();
   };
@@ -545,9 +628,36 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (data.type === "order") return orderEdges(data);
     // Of a graph before the last delta: not what is drawn now.
     if (data.type !== "error" && (data.epoch ?? 0) !== state.epoch) return;
-    if (data.type === "positions") {
+    if (data.type === "level" || data.type === "levelPositions") {
+      // The layout at a level of its hierarchy (#497): drawn in place of
+      // the graph while it is a coarse one. Level 0 is the graph itself:
+      // its positions follow, and its nodes come out from level 1's.
+      times.firstPositions ??= performance.now();
+      if (data.type === "levelPositions") state.hierarchy.place(data.level, data.xy);
+      else {
+        state.hierarchy.add(data, performance.now());
+        if (data.level > 0) {
+          view.setLevel(data.level, data.levels, data.mass, data.src, data.dst, data.weight, data.totalEdges);
+          state.groups = data.n;
+        }
+      }
+      if (data.level === 0) return;
+      state.iterations = data.iterations;
+      state.level = data.level;
+      state.levels = data.levels;
+      state.positioned = true;
+      header();
+      redraw(false);
+    } else if (data.type === "positions") {
       if (data.xy.length !== 2 * view.nodeCount) return;
       times.firstPositions ??= performance.now();
+      // The graph itself, from here on.
+      if (state.groups !== null) {
+        view.clearLevel();
+        state.groups = null;
+        times.graphDrawn ??= performance.now();
+      }
+      state.hierarchy.place(0, data.xy);
       state.pending = data.xy;
       state.iterations = data.iterations;
       state.level = data.level;
@@ -1029,6 +1139,13 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // nothing changed, if the delta does not fit what is drawn.
   state.apply = (bytes, { kind = "step", command = kind, at: began = performance.now(), engine = null } = {}) => {
     const start = performance.now();
+    // A step while a coarse level is drawn (#497): the graph is drawn from
+    // here on, and the layout, grown, has a place for every node.
+    if (state.groups !== null) {
+      view.clearLevel();
+      state.groups = null;
+    }
+    state.hierarchy.forget();
     // The layout's newest positions are the ones the step starts from.
     if (state.pending) {
       view.setPositions(state.pending);
@@ -1076,7 +1193,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const n1 = view.nodeCount;
     if (restored || n1 < n0) {
       const { src, dst } = shownEdges(graph);
-      const xy = new Float32Array(view.positions());
+      const xy = view.positions();
       state.epoch++;
       state.layoutDone = true;
       state.growing = false;
@@ -1335,6 +1452,13 @@ export function close() {
   state.inspector?.remove();
 }
 
+/** How many `values` there are, and their median, 95th percentile and greatest (null for none). */
+function spread(values) {
+  const sorted = Float64Array.from(values).sort();
+  const at = (q) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] * 100) / 100 : null);
+  return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
+}
+
 /** For tests: what is drawn. */
 export function info() {
   if (!current) return null;
@@ -1373,10 +1497,21 @@ export function info() {
     busy: [...current.busy.keys()].map(node),
     notShownKnown: current.notShown !== null,
     frames,
-    // The frame budget (#495): {k, nodes, edges, ordered, p95, frames, limit}
-    // (GraphView.frameInfo), whether the last frame left anything out, and
-    // the ms the layout worker took to order the edges (null until it has).
+    // The frame budget (#495) and the refinement at rest (#496): {k, nodes,
+    // edges, ordered, p95, frames, limit, refining, refined, refinement}
+    // (GraphView.frameInfo), whether the canvas lacks anything after the
+    // last frame, and the ms the layout worker took to order the edges
+    // (null until it has).
     frame: { ...current.view.frameInfo(), partial: current.view.framePartial, orderMs: current.orderMs },
+    // The level of the layout's hierarchy drawn in place of the graph
+    // (#497): {level, levels, nodes, nodesDrawn, edges, edgesDrawn,
+    // totalEdges} (GraphView.levelInfo), or null when the graph is drawn;
+    // and the levels that have arrived, coarsest first: [level, nodes].
+    coarse: current.view.levelInfo() ?? null,
+    // What the frames of the coarse levels cost: how many, and the median,
+    // the 95th percentile and the most, in ms (null before any).
+    levelFrames: spread(current.levelFrames),
+    hierarchy: current.hierarchy.levels.filter(Boolean).map((l) => [l.level, l.n]).reverse(),
     drawnAs: current.drawnAs,
     width: current.canvas.width,
     height: current.canvas.height,
@@ -1425,7 +1560,24 @@ export async function inked() {
  * the page's clock given from `origin` (the last `.graph`'s Enter). See
  * graph-timings.js's read().
  */
-export const readTimings = (origin) => timings.read(origin);
+export const readTimings = (origin) => ({ ...timings.read(origin), memory: memoryNow() });
+
+/**
+ * For graphTimings (#501): what the two ursa-viz instances hold now, each
+ * as {bytes, perEdge}: the bytes of its WebAssembly memory (the view's, on
+ * this page; the layout worker's, as its last message gave it) and those
+ * bytes per edge slot of the graph drawn (`edges`). Null with nothing
+ * drawn. A WebAssembly memory only grows, so each is its instance's peak
+ * since it loaded: a spare worker starts fresh with each drawing, and the
+ * view's module is this page's for as long as it is open.
+ */
+function memoryNow() {
+  const state = current;
+  if (!state) return null;
+  const edges = state.view.edgeCount;
+  const part = (bytes) => (bytes == null ? null : { bytes, perEdge: edges ? Math.round(bytes / edges) : null });
+  return { edges, view: part(vizMemory?.buffer.byteLength), layout: part(state.layoutMemory) };
+}
 /** For tests: forget the frames and picks timed so far. */
 export const resetTimings = () => timings.reset();
 
@@ -1466,6 +1618,9 @@ export async function memory({ timeoutMs = 10_000 } = {}) {
  * where the node will be.
  */
 function atNewest(state) {
+  // Nodes on their way out from their parents (#497): in place.
+  const split = state.hierarchy.settle();
+  if (split?.level === 0 && split.xy.length === 2 * state.view.nodeCount) state.pending = split.xy;
   if (!state.pending) return;
   state.view.setPositions(state.pending);
   state.pending = null;

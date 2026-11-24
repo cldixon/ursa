@@ -4,24 +4,46 @@
 //! calls [`View::step`] to advance the layout and [`View::draw`] to draw a
 //! frame into a texture. `web` is one such binding; a native window or a
 //! notebook widget would be others.
+//!
+//! A binding with a frame loop draws with [`View::plan_frame`] and
+//! [`View::draw_planned`] (or [`View::draw_frame`], which is both), and
+//! calls [`View::refine`] between frames while [`View::refining`]: what a
+//! frame cannot draw whole is then drawn in slices once the view rests
+//! ([`crate::refine`]).
 
 use std::cell::Cell;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use ursa_core::algo::{fa2_seed_positions, Fa2Params};
+use ursa_core::topology::UndirectedCsr;
 
 use crate::budget::{split, total_units, Frame, FrameBudget};
 use crate::highlight::{flag, BadHighlight, HighlightState, MARK_REACH};
 use crate::interact::nearest_edge;
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
-use crate::model::{GraphDelta, GraphResult, ModelError, Op};
-use crate::order::{check_order, BadOrder, Ordered};
+use crate::model::{GraphDelta, GraphResult, ModelError, Op, Room, Source, UgrError};
+use crate::order::{check_order_from, BadOrder, EdgeOrder, Ordered};
 use crate::pace::{ready, yield_now, Pace};
-use crate::render::{disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer};
+use crate::refine::{change, Change, Kind, SlicePace, SLICE_TIMEOUT_MS};
+use crate::render::{
+    disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer, Slice, Under,
+};
 use crate::scene::{bounds, Camera, Graph, Growth, LiveLayout, NodeStyle, Pairs, Theme};
 use crate::spatial::{Discs, EdgeGrid, NodeGrid};
 
+mod level;
+
 pub struct View {
-    graph: Graph,
+    /// The graph, for a view made of one ([`View::new`]). A view made from
+    /// a result ([`View::from_result`]) has none: the result (`live`) is
+    /// the one holder of its nodes and edges, and they are read from it.
+    graph: Option<Graph>,
+    /// A result's undirected adjacency, for a layout on this thread: built
+    /// on the first [`View::step`], and again after a delta. A graph keeps
+    /// its own ([`Graph::adjacency`]).
+    adjacency: Option<Arc<UndirectedCsr>>,
     /// The layout, when it runs on this thread: made on the first
     /// [`View::step`]. A view whose layout runs elsewhere (a Web Worker) gets
     /// its positions through [`View::set_positions`] and never makes one.
@@ -70,6 +92,154 @@ pub struct View {
     moving_drew: (usize, usize),
     /// Where the nodes are, for picking and culling ([`Spatial`]).
     spatial: Spatial,
+    /// A level of the layout's hierarchy, drawn in place of the graph
+    /// until the layout reaches the graph itself ([`View::set_level`]).
+    level: Option<level::Level>,
+    /// The detail texture: what it holds, and the refinement that fills
+    /// it ([`crate::refine`]).
+    detail: Detail,
+}
+
+/// The detail texture's side of a view.
+#[derive(Default)]
+struct Detail {
+    /// What the texture holds, if anything of use.
+    held: Option<Held>,
+    /// A refinement is to begin at the next [`View::refine`].
+    wanted: bool,
+    /// Something a frame shows has changed since the last frame drawn.
+    stale: bool,
+    /// How large the slices are; `None` before the first.
+    pace: Option<SlicePace>,
+    /// The last refinement that finished.
+    last: Option<Refinement>,
+    /// Never refine: a frame at rest draws everything at once
+    /// ([`View::set_refining`]).
+    off: bool,
+}
+
+/// What the detail texture holds: everything under the highlighted edges
+/// as `camera` saw it, or the first slices of that.
+struct Held {
+    camera: Camera,
+    key: Key,
+    /// Whether the rest was dimmed, and any node hidden, when it was begun.
+    dims: bool,
+    hidden: bool,
+    progress: Progress,
+    /// The first slice, which clears the texture, has been sent.
+    cleared: bool,
+    /// The edges, and the instances of the node pass, sent so far; and how
+    /// many instances there are.
+    edges: usize,
+    nodes: usize,
+    node_total: usize,
+    /// The slices the GPU has not finished, oldest first: at most
+    /// [`SLICES_AHEAD`].
+    pending: VecDeque<Pending>,
+    /// When the GPU was last seen to finish a slice, or was sent one with
+    /// none before it: the slice it is on began then.
+    busy_since: f64,
+    began_ms: f64,
+    slices: u32,
+    longest_ms: f64,
+    /// Once done: every node's flags as the texture has it drawn, and the
+    /// nodes it has no copy of that the node pass now draws.
+    flags: Vec<u8>,
+    missing: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    /// Slices are being drawn.
+    Refining,
+    /// Something stopped them: what is there is a part, good for under a
+    /// moving frame and no more.
+    Stopped,
+    /// Everything is there.
+    Done,
+}
+
+/// How many slices the GPU is sent ahead of the one it is on: one, so
+/// that it has the next when it finishes, and is not idle until the next
+/// call of [`View::refine`] finds it has. A pan or a zoom waits for those
+/// two at most.
+const SLICES_AHEAD: usize = 2;
+
+/// A slice sent to the GPU.
+struct Pending {
+    /// Set when the GPU has finished it.
+    done: Arc<AtomicBool>,
+    sent_ms: f64,
+    /// What it drew, how many, and whether that was a slice's full size.
+    kind: Option<Kind>,
+    drawn: usize,
+    whole: bool,
+}
+
+/// What, besides the camera, the texture's pixels depend on and nothing
+/// tells the view of when it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Key {
+    radius_scale: u32,
+    draw_nodes: bool,
+    counts: (usize, usize),
+}
+
+/// A refinement that finished ([`FrameInfo::refinement`]).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refinement {
+    /// From its first slice's being sent to its last's being done, in
+    /// milliseconds.
+    pub ms: f64,
+    /// How many slices it took.
+    pub slices: u32,
+    /// The longest the GPU took over the slices one call of
+    /// [`View::refine`] found done (one, or two), in milliseconds, as the
+    /// calls saw it.
+    pub longest_slice_ms: f64,
+    /// The edges and the nodes in its last full slices.
+    pub slice_edges: usize,
+    pub slice_nodes: usize,
+}
+
+/// What a frame is to draw ([`View::plan_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Planned {
+    /// How much, and whether the view moves. `partial` is whether what is
+    /// on the canvas after it lacks anything.
+    pub frame: Frame,
+    how: How,
+}
+
+impl Planned {
+    /// Whether there is anything to draw: if not, the canvas is left as it
+    /// is ([`View::draw_planned`] draws nothing), and no texture need be
+    /// had for it.
+    pub fn draws(&self) -> bool {
+        self.how != How::Nothing
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum How {
+    /// The canvas stays as it is while the slices are drawn.
+    Nothing,
+    /// Everything, at once.
+    Everything,
+    /// A level of the layout's hierarchy, in place of the graph
+    /// ([`View::set_level`]): what its plan gathered of it.
+    Level,
+    /// The detail texture, which has everything.
+    Refined,
+    /// What fits: so many edges and nodes, over the detail texture as it
+    /// was drawn for another camera if there is one.
+    Some {
+        edges: usize,
+        some_nodes: Option<usize>,
+        under: Option<Camera>,
+    },
 }
 
 /// The nodes for a frame that does not draw them all: the largest first.
@@ -85,8 +255,9 @@ struct SomeNodes {
 /// An edge order on its way to the GPU: the frames draw the buffer there
 /// was until the new one is whole.
 struct Reorder {
-    /// `order[slot]` is the edge to draw in that slot.
-    order: Vec<u32>,
+    /// `order[slot]` is the edge to draw in that slot: read a run at a
+    /// time, from wherever it is held.
+    order: Box<dyn EdgeOrder>,
     /// The new buffer, and how many of its slots are written.
     buffer: wgpu::Buffer,
     written: usize,
@@ -114,6 +285,14 @@ pub struct FrameInfo {
     pub frames: usize,
     /// The cost a moving frame is held to, in milliseconds.
     pub limit: f64,
+    /// Whether slices of the frame at rest remain to be drawn
+    /// ([`View::refining`]).
+    pub refining: bool,
+    /// Whether the detail texture has everything, as the camera sees it
+    /// now: a frame at rest draws it.
+    pub refined: bool,
+    /// The last refinement that finished; `None` before any.
+    pub refinement: Option<Refinement>,
 }
 
 /// The grids over the positions, and how far they can be trusted: the
@@ -179,6 +358,36 @@ struct Fitted {
     before: Vec<(usize, Bounds)>,
 }
 
+/// The room a view's result is decoded with: [`crate::live::room`] for its
+/// first deltas.
+fn room_of(nodes: usize, edges: usize) -> Room {
+    Room {
+        nodes: crate::live::room(nodes),
+        edges: crate::live::room(edges),
+    }
+}
+
+/// The most turns of the event loop [`settle`] waits for the GPU: a GPU
+/// that slow is waited for no longer, and the view is made holding more.
+const SETTLE_TURNS: usize = 32;
+
+/// For a paced view: give the event loop turns until the GPU has taken
+/// everything written to it, so that the staging of those writes is freed.
+async fn settle(device: &wgpu::Device, pace: &mut Pace) {
+    if !pace.yields() {
+        return;
+    }
+    for _ in 0..SETTLE_TURNS {
+        pace.turn().await;
+        if device
+            .poll(wgpu::PollType::Poll)
+            .map_or(true, |status| status.is_queue_empty())
+        {
+            return;
+        }
+    }
+}
+
 /// What a new view draws.
 enum Scene {
     Graph(Graph),
@@ -188,6 +397,11 @@ enum Scene {
 /// How many edges go to the GPU at a time when a view is made: half a
 /// megabyte of indexes.
 const EDGE_RUN: usize = 1 << 16;
+
+/// How many bytes of edges a paced view writes to the GPU before it gives
+/// the event loop a turn, so that the writes' staging is freed: half a
+/// megabyte, a run.
+const EDGE_STAGING: usize = 1 << 19;
 
 /// What [`View::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +491,29 @@ impl View {
         Self::make(device, queue, format, scene, width, height, &mut pace).await
     }
 
+    /// [`View::from_result_paced`] of a result still in its wire format
+    /// (UGR), wherever those bytes are ([`Source`]): each section is copied
+    /// once, from the source to where the result keeps it, with room for
+    /// the view's first deltas, and decoding gives the event loop its turns
+    /// as making the view does. So a page's thread is not held while a
+    /// large result is read, and the buffer is never in this program's
+    /// memory beside the result made of it.
+    pub async fn from_ugr_paced(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        ugr: &dyn Source,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, UgrError> {
+        let mut pace = Pace::yielding();
+        // The header says how many nodes and edges to make room for; the
+        // sections are read with it.
+        let result = GraphResult::read_paced(ugr, &room_of, &mut pace).await?;
+        let scene = Scene::Result(Box::new(result));
+        Ok(Self::make(device, queue, format, scene, width, height, &mut pace).await)
+    }
+
     async fn make(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -288,27 +525,38 @@ impl View {
     ) -> Self {
         let theme = Theme::light();
         pace.breathe().await;
-        // The graph, and its degrees from the edge list, a pass at a time.
-        let (graph, result) = match scene {
-            Scene::Graph(graph) => (graph, None),
-            Scene::Result(mut result) => (LiveResult::graph_of(&mut result), Some(result)),
+        // The graph, or the result that holds it, and its degrees from the
+        // edge list, a pass at a time.
+        let (graph, mut result) = match scene {
+            Scene::Graph(graph) => (Some(graph), None),
+            Scene::Result(result) => (None, Some(result)),
         };
-        pace.breathe().await;
-        let mut counted = Pairs::count(&graph);
-        pace.breathe().await;
-        counted.fill(&graph);
-        pace.breathe().await;
-        let (pairs, degrees) = counted.finish();
+        if let Some(result) = &mut result {
+            LiveResult::make_room(result);
+            pace.breathe().await;
+        }
+        let (pairs, degrees) = {
+            let (n, src, dst) = match (&graph, &result) {
+                (Some(graph), _) => (graph.n_nodes(), graph.src(), graph.dst()),
+                (None, Some(result)) => (result.n_nodes(), result.src(), result.dst()),
+                (None, None) => unreachable!("a scene is a graph or a result"),
+            };
+            let mut counted = Pairs::count(n, src, dst);
+            pace.breathe().await;
+            counted.fill(src, dst);
+            pace.breathe().await;
+            counted.finish()
+        };
         pace.breathe().await;
         let (live, drawn) = match result {
             None => {
                 drop(pairs);
+                let n = graph.as_ref().map_or(0, Graph::n_nodes);
                 let style = NodeStyle::by_degree(&degrees);
                 // The seeded positions, as a layout starts from them.
-                let (x, y) = fa2_seed_positions(graph.n_nodes(), &Fa2Params::default());
-                let highlight = HighlightState::new(graph.n_nodes());
+                let (x, y) = fa2_seed_positions(n, &Fa2Params::default());
+                let highlight = HighlightState::new(n);
                 let drawn = Drawn {
-                    graph,
                     x,
                     y,
                     style,
@@ -318,19 +566,22 @@ impl View {
                 (None, drawn)
             }
             Some(result) => {
-                let (live, drawn) = LiveResult::with_graph(*result, graph, pairs, degrees, &theme);
+                let (live, drawn) = LiveResult::with_pairs(*result, pairs, degrees, &theme);
                 (Some(live), drawn)
             }
         };
         let Drawn {
-            graph,
             x,
             y,
             style,
             categories,
             highlight,
         } = drawn;
-        let (n, m) = (graph.n_nodes(), graph.n_edges());
+        let (n, m) = match (&graph, &live) {
+            (Some(graph), _) => (graph.n_nodes(), graph.n_edges()),
+            (None, Some(live)) => (live.result().n_nodes(), live.result().n_edges()),
+            (None, None) => unreachable!("a scene is a graph or a result"),
+        };
         // A view that takes deltas has room for the first, so that they do
         // not grow the buffers.
         let room = match live {
@@ -341,20 +592,33 @@ impl View {
         // The edges, a run at a time: each is in the GPU's hands, and its
         // staging freed, before the next is made.
         let mut start = 0;
+        let mut staged = 0;
         while start < m {
             let run = start..m.min(start + EDGE_RUN);
-            let lines = match &live {
-                Some(live) => live.line_indices(run.clone()),
-                None => graph.line_indices(run.clone()),
+            let lines = match (&live, &graph) {
+                (Some(live), _) => live.line_indices(run.clone()),
+                (None, Some(graph)) => graph.line_indices(run.clone()),
+                (None, None) => unreachable!("a scene is a graph or a result"),
             };
             renderer.write_edges(queue, start, &lines);
             queue.submit([]);
             let _ = device.poll(wgpu::PollType::Poll);
             start = run.end;
-            pace.breathe().await;
+            // What is written is staged in this program's memory until
+            // the GPU has taken it, which on WebGL2 it does between the
+            // page's tasks, in its own time: wait for it after each run,
+            // or all the runs are held at once.
+            staged += lines.len() * 4;
+            if staged >= EDGE_STAGING {
+                staged = 0;
+                settle(device, pace).await;
+            } else {
+                pace.breathe().await;
+            }
         }
         let mut view = Self {
             graph,
+            adjacency: None,
             layout: None,
             x,
             y,
@@ -377,6 +641,8 @@ impl View {
             some: SomeNodes::default(),
             moving_drew: (0, 0),
             spatial: Spatial::default(),
+            level: None,
+            detail: Detail::default(),
         };
         view.spatial.max_radius = max_radius(&view.style.radius);
         if view.live.is_some() {
@@ -436,7 +702,7 @@ impl View {
             ));
         };
         if let Some((x, y)) = positions {
-            let mut n = self.graph.n_nodes();
+            let mut n = live.result().n_nodes();
             for op in &delta.ops {
                 match op {
                     Op::AddNodes(batch) => n += batch.len(),
@@ -455,7 +721,6 @@ impl View {
         let mut changes = live.apply(
             delta,
             &mut Parts {
-                graph: &mut self.graph,
                 x: &mut self.x,
                 y: &mut self.y,
                 style: &mut self.style,
@@ -470,6 +735,10 @@ impl View {
             changes.positions = true;
         }
         let ((n0, n1), (m0, m1)) = (changes.nodes, changes.edges);
+        // Whatever changed, the detail texture does not have it.
+        self.detail.wanted = false;
+        self.detail.held = None;
+        self.detail.stale = true;
         // The grid still has the nodes that were there and did not move.
         let spatial = &mut self.spatial;
         spatial.fresh = match changes.positions {
@@ -563,6 +832,7 @@ impl View {
 
         if (n0, m0) != (n1, m1) {
             self.layout_stale = true;
+            self.adjacency = None;
         }
         if changes.positions {
             self.budget.moved();
@@ -589,6 +859,7 @@ impl View {
         let dirty = self.highlight.take_dirty();
         self.renderer.set_flags(queue, &self.highlight, &dirty);
         self.uncull();
+        self.flags_changed(device, queue, &dirty);
         if layer || !dirty.is_empty() {
             self.front = self.highlight.front_nodes().collect();
             self.upload_highlight(device, queue, true, true);
@@ -596,8 +867,35 @@ impl View {
         uploaded(&self.renderer) - before
     }
 
-    pub fn graph(&self) -> &Graph {
-        &self.graph
+    /// How many nodes there are: every slot, hidden or not.
+    pub fn n_nodes(&self) -> usize {
+        match (&self.graph, &self.live) {
+            (Some(graph), _) => graph.n_nodes(),
+            (None, Some(live)) => live.result().n_nodes(),
+            (None, None) => 0,
+        }
+    }
+
+    /// How many edges there are: every slot, removed or not.
+    pub fn n_edges(&self) -> usize {
+        self.edges().0.len()
+    }
+
+    /// The edges, `(src[i], dst[i])` as node indexes: the graph's, or the
+    /// result's for a view made from one, which holds them once.
+    pub fn edges(&self) -> (&[u32], &[u32]) {
+        match (&self.graph, &self.live) {
+            (Some(graph), _) => (graph.src(), graph.dst()),
+            (None, Some(live)) => (live.result().src(), live.result().dst()),
+            (None, None) => (&[], &[]),
+        }
+    }
+
+    /// Whether an adjacency has been built on this thread: only
+    /// [`View::step`] builds one, so a view whose layout runs elsewhere
+    /// never has.
+    pub fn has_adjacency(&self) -> bool {
+        self.adjacency.is_some() || self.graph.as_ref().is_some_and(Graph::has_adjacency)
     }
 
     pub fn camera(&self) -> &Camera {
@@ -617,8 +915,21 @@ impl View {
         &self.renderer
     }
 
+    /// The renderer, to change how it draws (the edges' opacity, the dim
+    /// level): the detail texture is drawn again.
     pub fn renderer_mut(&mut self) -> &mut Renderer {
+        self.forget_detail();
+        self.detail.stale = true;
         &mut self.renderer
+    }
+
+    /// Draw nodes as well as edges, or the edges alone.
+    pub fn set_draw_nodes(&mut self, on: bool) {
+        if self.draw_nodes != on {
+            self.draw_nodes = on;
+            self.forget_detail();
+            self.detail.stale = true;
+        }
     }
 
     /// Run `iterations` more layout iterations and upload the new positions.
@@ -626,23 +937,40 @@ impl View {
         if iterations == 0 {
             return;
         }
-        let graph = &self.graph;
+        // The adjacency: the graph's own, or built here from the result's
+        // edges (every slot, as a graph of them would have).
+        let adjacency = match (&self.graph, &self.live) {
+            (Some(graph), _) => Arc::clone(graph.adjacency()),
+            (None, Some(live)) => {
+                let r = live.result();
+                Arc::clone(self.adjacency.get_or_insert_with(|| {
+                    Arc::new(UndirectedCsr::from_edges(r.n_nodes(), r.src(), r.dst()))
+                }))
+            }
+            (None, None) => return,
+        };
+        let n = adjacency.offsets.len() - 1;
         if std::mem::take(&mut self.layout_stale) {
             // The graph changed under the layout ([`View::apply`]): grow it,
             // or, if nodes went, start again from what is drawn.
             if let Some(mut layout) = self.layout.take() {
-                let fits = layout.positions().0.len() <= graph.n_nodes();
-                self.layout = if fits && layout.grow(graph, Growth::default()).is_ok() {
+                let fits = layout.positions().0.len() <= n;
+                let grown = fits
+                    && layout
+                        .grow_on(Arc::clone(&adjacency), Growth::default())
+                        .is_ok();
+                self.layout = if grown {
                     Some(layout)
                 } else {
                     let (x, y) = (self.x.clone(), self.y.clone());
-                    LiveLayout::from_positions(graph, Fa2Params::default(), x, y).ok()
+                    let params = Fa2Params::default();
+                    LiveLayout::from_positions_on(Arc::clone(&adjacency), params, x, y).ok()
                 };
             }
         }
         let layout = self
             .layout
-            .get_or_insert_with(|| LiveLayout::new(graph, Fa2Params::default()));
+            .get_or_insert_with(|| LiveLayout::new_on(adjacency, Fa2Params::default()));
         layout.step(iterations);
         let (x, y) = layout.positions();
         self.x.copy_from_slice(x);
@@ -658,15 +986,30 @@ impl View {
         x: &[f32],
         y: &[f32],
     ) {
-        assert_eq!(x.len(), self.graph.n_nodes());
-        assert_eq!(y.len(), self.graph.n_nodes());
+        assert_eq!(x.len(), self.n_nodes());
+        assert_eq!(y.len(), self.n_nodes());
         self.x.copy_from_slice(x);
         self.y.copy_from_slice(y);
         self.upload(device, queue);
     }
 
+    /// [`View::set_positions`] for a caller whose positions are not in a
+    /// slice here (a page's array): `fill(x, y)` writes every node's into
+    /// the positions the view keeps, in place, and they are uploaded from
+    /// there.
+    pub fn set_positions_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fill: impl FnOnce(&mut [f32], &mut [f32]),
+    ) {
+        fill(&mut self.x, &mut self.y);
+        self.upload(device, queue);
+    }
+
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.budget.moved();
+        self.moved();
+        self.forget_detail();
         self.renderer.set_positions(queue, &self.x, &self.y);
         // Every node moved: no grid has them now.
         self.spatial.fresh = 0;
@@ -709,6 +1052,7 @@ impl View {
         let dirty = self.highlight.take_dirty();
         self.renderer.set_flags(queue, &self.highlight, &dirty);
         self.uncull();
+        self.flags_changed(device, queue, &dirty);
         if flags_changed {
             self.front = self.highlight.front_nodes().collect();
         }
@@ -725,6 +1069,7 @@ impl View {
         edges: bool,
         front: bool,
     ) {
+        self.detail.stale = true;
         if edges && !(!self.highlight.any_wide_edges() && self.renderer.highlight_edges() == 0) {
             let ends = self.highlight_ends();
             self.renderer.set_highlight_edges(device, queue, &ends);
@@ -784,14 +1129,15 @@ impl View {
     }
 
     pub fn set_style(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, style: NodeStyle) {
-        assert_eq!(style.radius.len(), self.graph.n_nodes());
-        assert_eq!(style.color.len(), self.graph.n_nodes());
+        assert_eq!(style.radius.len(), self.n_nodes());
+        assert_eq!(style.color.len(), self.n_nodes());
         self.renderer.set_style(queue, &style);
         self.spatial.max_radius = max_radius(&style.radius);
         self.spatial.disc_area.set(None);
         self.style = style;
         self.some = SomeNodes::default();
         self.uncull();
+        self.forget_detail();
         // The nodes in front hold their radius and colour.
         self.upload_highlight(device, queue, false, true);
     }
@@ -813,7 +1159,7 @@ impl View {
         categories: Option<Vec<u32>>,
     ) {
         if let Some(c) = &categories {
-            assert_eq!(c.len(), self.graph.n_nodes());
+            assert_eq!(c.len(), self.n_nodes());
         }
         self.categories = categories;
         self.recolor(device, queue);
@@ -822,6 +1168,7 @@ impl View {
     /// Draw with `theme`: its background, edge ink and highlight colours,
     /// and node colours from its palette (or its node colour).
     pub fn set_theme(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, theme: Theme) {
+        self.forget_detail();
         self.renderer.set_theme(&theme);
         self.theme = theme;
         self.recolor(device, queue);
@@ -831,13 +1178,16 @@ impl View {
         let mut style = self.style.clone();
         style.color = match &self.categories {
             Some(c) => self.theme.colors(c),
-            None => vec![self.theme.node; self.graph.n_nodes()],
+            None => vec![self.theme.node; self.n_nodes()],
         };
         self.set_style(device, queue, style);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.budget.moved();
+        self.moved();
+        // The texture is the size the canvas was.
+        self.forget_detail();
+        self.renderer.release_detail();
         self.camera.viewport = (width.max(1) as f32, height.max(1) as f32);
         self.uncull();
         if self.follow {
@@ -846,14 +1196,14 @@ impl View {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
-        self.budget.moved();
+        self.moved();
         self.follow = false;
         self.camera.pan(dx, dy);
         self.uncull();
     }
 
     pub fn zoom(&mut self, factor: f32, px: f32, py: f32) {
-        self.budget.moved();
+        self.moved();
         self.follow = false;
         self.camera.zoom(factor, px, py);
         self.uncull();
@@ -866,6 +1216,10 @@ impl View {
     }
 
     fn fit_camera(&mut self) {
+        // A level's nodes, while one is drawn: the graph's have no place yet.
+        if let Some(b) = self.level_bounds() {
+            return self.fit_to(b);
+        }
         let b = bounds(&self.x, &self.y);
         self.fit_to(b);
         self.fitted = Some(Fitted {
@@ -876,7 +1230,7 @@ impl View {
 
     fn fit_to(&mut self, bounds: Bounds) {
         if let Some(b) = bounds {
-            self.budget.moved();
+            self.moved();
             self.camera.fit(b);
             self.fitted_zoom = self.camera.pixels_per_unit;
             self.uncull();
@@ -963,7 +1317,7 @@ impl View {
     pub fn rebuild_grid(&mut self) {
         self.spatial.grid = Some(NodeGrid::build(&self.x, &self.y));
         self.spatial.fresh = self.x.len();
-        self.uncull();
+        self.recull();
     }
 
     /// Whether the grid has every node where it is now: a pick reads only
@@ -982,6 +1336,10 @@ impl View {
     /// while a layout runs. The answer is the same either way
     /// ([`View::pick_linear`]).
     pub fn pick(&mut self, px: f32, py: f32) -> Option<u32> {
+        // A level's discs are not the graph's nodes: nothing to pick.
+        if self.draws_level() {
+            return None;
+        }
         self.rested();
         let discs = self.discs();
         match &self.spatial.grid {
@@ -992,6 +1350,9 @@ impl View {
 
     /// [`View::pick`], testing every node: what the grid must agree with.
     pub fn pick_linear(&self, px: f32, py: f32) -> Option<u32> {
+        if self.draws_level() {
+            return None;
+        }
         self.discs().pick_linear(px, py)
     }
 
@@ -1000,7 +1361,7 @@ impl View {
     fn edge_is_gone(&self, e: u32) -> bool {
         let flags = self.highlight.flags();
         let hidden = |v: u32| flags.get(v as usize).is_none_or(|f| f & flag::HIDDEN != 0);
-        let (src, dst) = (self.graph.src(), self.graph.dst());
+        let (src, dst) = self.edges();
         hidden(src[e as usize])
             || hidden(dst[e as usize])
             || (self.live.as_ref()).is_some_and(|l| !l.result().edge_is_shown(e as usize))
@@ -1015,15 +1376,20 @@ impl View {
     /// otherwise every edge. The answer is the same either way
     /// ([`View::pick_edge_linear`]).
     pub fn pick_edge(&mut self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
+        if self.draws_level() {
+            return None;
+        }
         self.rested();
-        let (src, dst) = (self.graph.src(), self.graph.dst());
-        let at_rest = self.grid_is_fresh() && src.len() <= EDGE_GRID_MAX;
+        let at_rest = self.grid_is_fresh() && self.n_edges() <= EDGE_GRID_MAX;
         if at_rest && self.spatial.edges.is_none() {
             self.spatial.edge_picks += 1;
             if self.spatial.edge_picks >= 2 {
-                self.spatial.edges = Some(EdgeGrid::build(src, dst, &self.x, &self.y));
+                let (src, dst) = self.edges();
+                let grid = EdgeGrid::build(src, dst, &self.x, &self.y);
+                self.spatial.edges = Some(grid);
             }
         }
+        let (src, dst) = self.edges();
         let Some(grid) = self.spatial.edges.as_ref().filter(|_| at_rest) else {
             return self.pick_edge_linear(px, py, tolerance);
         };
@@ -1035,7 +1401,10 @@ impl View {
 
     /// [`View::pick_edge`], testing every edge.
     pub fn pick_edge_linear(&self, px: f32, py: f32, tolerance: f32) -> Option<u32> {
-        let (src, dst) = (self.graph.src(), self.graph.dst());
+        if self.draws_level() {
+            return None;
+        }
+        let (src, dst) = self.edges();
         let at = self.camera.to_world(px, py);
         let reach = tolerance / self.camera.pixels_per_unit;
         let skip = |e| self.edge_is_gone(e);
@@ -1043,10 +1412,23 @@ impl View {
     }
 
     /// The camera, a position, a style or a flag changed: the nodes in
-    /// view are worked out again before the next frame.
+    /// view are worked out again before the next frame, which is not the
+    /// frame on the canvas.
     fn uncull(&mut self) {
+        self.detail.stale = true;
         self.spatial.culled = false;
         self.renderer.set_culled_nodes_off();
+    }
+
+    /// The nodes in view are worked out again before the next frame, which
+    /// is the same frame: there is a grid to find them with, or they are
+    /// no longer to be drawn alone. A refinement begins again: its node
+    /// slices are runs of the pass over every node, which is now another
+    /// list of the same nodes.
+    fn recull(&mut self) {
+        self.spatial.culled = false;
+        self.renderer.set_culled_nodes_off();
+        self.restart_refining();
     }
 
     /// Get ready to draw a frame: call it before [`View::draw`]. Once the
@@ -1056,6 +1438,9 @@ impl View {
     /// The frame is the same, bit for bit: only nodes that put nothing on
     /// the canvas are left out, and the rest are drawn in the same order.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.draws_level() {
+            return self.prepare_level(device, queue);
+        }
         self.rested();
         if std::mem::replace(&mut self.spatial.culled, true) {
             return;
@@ -1079,7 +1464,7 @@ impl View {
     /// compare the two frames.
     pub fn set_culling(&mut self, on: bool) {
         self.spatial.no_culling = !on;
-        self.uncull();
+        self.recull();
     }
 
     /// The nodes the pass over every node draws on the canvas, in index
@@ -1134,6 +1519,52 @@ impl View {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
     ) -> Result<Vec<u8>, wgpu::BufferAsyncError> {
+        self.read_back(device, queue, format, |target| {
+            self.draw(device, queue, target)
+        })
+        .await
+    }
+
+    /// [`View::snapshot`], of the frame a view at rest shows once it is
+    /// refined: the detail texture under the highlighted edges and the
+    /// nodes in front, as [`View::draw_planned`] draws it. `None` unless
+    /// the texture has everything as the camera sees it now
+    /// ([`FrameInfo::refined`]). It is the frame of [`View::snapshot`],
+    /// byte for byte, until a node comes to the front or leaves it
+    /// ([`crate::refine`]).
+    pub async fn snapshot_refined(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Option<Result<Vec<u8>, wgpu::BufferAsyncError>> {
+        if !self.refined() {
+            return None;
+        }
+        let draw = |target: &wgpu::TextureView| {
+            let (camera, scale) = (&self.camera, self.radius_scale());
+            self.renderer.draw_over(
+                device,
+                queue,
+                target,
+                camera,
+                self.draw_nodes,
+                scale,
+                Under::Detail,
+            );
+        };
+        Some(self.read_back(device, queue, format, draw).await)
+    }
+
+    /// Draw into an offscreen texture of the canvas's size and read it
+    /// back: RGBA, row by row from the top.
+    async fn read_back(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        draw: impl FnOnce(&wgpu::TextureView),
+    ) -> Result<Vec<u8>, wgpu::BufferAsyncError> {
         let (width, height) = (self.camera.viewport.0 as u32, self.camera.viewport.1 as u32);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("snapshot"),
@@ -1149,11 +1580,7 @@ impl View {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        self.draw(
-            device,
-            queue,
-            &texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        draw(&texture.create_view(&wgpu::TextureViewDescriptor::default()));
         // Rows are padded to 256 bytes for the copy.
         let row = width * 4;
         let padded =
@@ -1255,13 +1682,30 @@ impl View {
         device: &wgpu::Device,
         order: Vec<u32>,
     ) -> Result<(), BadOrder> {
-        check_order(&order, self.graph.n_edges())?;
+        self.set_edge_order_from(device, Box::new(order))
+    }
+
+    /// [`View::set_edge_order`] of an order held elsewhere (a page's
+    /// array): it is checked and then written a run at a time from there,
+    /// and never held here whole.
+    pub fn set_edge_order_from(
+        &mut self,
+        device: &wgpu::Device,
+        order: Box<dyn EdgeOrder>,
+    ) -> Result<(), BadOrder> {
+        check_order_from(&*order, self.n_edges())?;
         self.reorder = Some(Reorder {
             order,
             buffer: self.renderer.edge_buffer(device),
             written: 0,
         });
         Ok(())
+    }
+
+    /// Whether an edge order is on its way to the GPU
+    /// ([`View::order_edges`] has more to write).
+    pub fn is_ordering(&self) -> bool {
+        self.reorder.is_some()
     }
 
     /// Write up to `max_edges` more edges of the order being set
@@ -1278,7 +1722,7 @@ impl View {
         let Some(mut reorder) = self.reorder.take() else {
             return false;
         };
-        let m = self.graph.n_edges();
+        let m = self.n_edges();
         let ordered = reorder.order.len();
         let mut left = max_edges;
         while reorder.written < m && left > 0 {
@@ -1286,12 +1730,14 @@ impl View {
             let end = m.min(start + left.min(EDGE_RUN));
             // The ordered edges, then the rest in the slots of their indexes.
             let lines = if start < ordered {
-                let end = end.min(ordered);
-                self.lines_of(&reorder.order[start..end])
+                let mut run = vec![0u32; end.min(ordered) - start];
+                reorder.order.read(start, &mut run);
+                self.lines_of(&run)
             } else {
-                match &self.live {
-                    Some(live) => live.line_indices(start..end),
-                    None => self.graph.line_indices(start..end),
+                match (&self.live, &self.graph) {
+                    (Some(live), _) => live.line_indices(start..end),
+                    (None, Some(graph)) => graph.line_indices(start..end),
+                    (None, None) => Vec::new(),
                 }
             };
             self.renderer
@@ -1307,6 +1753,8 @@ impl View {
         }
         self.renderer.replace_edges(reorder.buffer);
         self.ordered = Ordered(ordered);
+        // A slice is a run of the buffer, which is now another.
+        self.restart_refining();
         false
     }
 
@@ -1315,7 +1763,7 @@ impl View {
         match &self.live {
             Some(live) => live.lines_of(edges),
             None => {
-                let (src, dst) = (self.graph.src(), self.graph.dst());
+                let (src, dst) = self.edges();
                 edges
                     .iter()
                     .flat_map(|&e| [src[e as usize], dst[e as usize]])
@@ -1339,6 +1787,9 @@ impl View {
             p95: self.budget.p95_ms(),
             frames: self.budget.observed(),
             limit: self.budget.limit_ms(),
+            refining: self.refining(),
+            refined: self.refined(),
+            refinement: self.detail.last,
         }
     }
 
@@ -1347,14 +1798,24 @@ impl View {
     /// the last frame, or less than [`crate::budget::REST_MS`] before
     /// `now_ms` (any clock, in milliseconds), only as much as the last
     /// frames' costs say fits: the first edges of the buffer and, if the
-    /// nodes are too many as well, the largest of them. Otherwise
-    /// everything, as [`View::draw`] does.
+    /// nodes are too many as well, the largest of them, over the detail
+    /// texture if it holds an earlier frame ([`crate::refine`]). At rest,
+    /// everything: at once if that fits in a frame, as [`View::draw`]
+    /// does; else from the detail texture, once [`View::refine`] has drawn
+    /// everything into it, and until then nothing new (`target` is left
+    /// alone) unless something has changed that only a frame can show.
     ///
-    /// The binding does two things with what this returns. After a
+    /// The binding does three things with what this returns. After a
     /// `moving` frame it measures the frame's cost, from its start to when
     /// the next could start, and reports it ([`View::frame_cost`]). After a
     /// `partial` one it draws again once the view has rested, so that what
-    /// stays on screen has everything.
+    /// stays on screen has everything. And while [`View::refining`], it
+    /// calls [`View::refine`] between frames, and draws again when that
+    /// says it is done.
+    ///
+    /// A binding that must not take a texture it will not draw on (a
+    /// canvas's next frame) plans first: [`View::plan_frame`], then
+    /// [`View::draw_planned`] if the plan draws.
     pub fn draw_frame(
         &mut self,
         device: &wgpu::Device,
@@ -1362,30 +1823,435 @@ impl View {
         target: &wgpu::TextureView,
         now_ms: f64,
     ) -> Frame {
+        let planned = self.plan_frame(device, queue, now_ms);
+        self.draw_planned(device, queue, target, &planned);
+        planned.frame
+    }
+
+    /// What the frame at `now_ms` is to draw ([`View::draw_frame`]), with
+    /// everything it needs uploaded.
+    pub fn plan_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        now_ms: f64,
+    ) -> Planned {
+        // A level of the hierarchy, while one is set, in place of the graph.
+        if self.draws_level() {
+            let frame = self.plan_level_frame(device, queue, now_ms);
+            let how = How::Level;
+            return Planned { frame, how };
+        }
         // The grid once the positions rest, and the nodes in view: what a
         // frame that draws every node draws of them ([`View::prepare`]).
         self.prepare(device, queue);
         let (n, m) = self.renderer.counts();
-        let frame = self.budget.frame(now_ms, total_units(n, m));
-        let (nodes, edges) = split(frame.units, n, m);
+        let total = total_units(n, m);
+        let mut frame = self.budget.frame(now_ms, total);
         if frame.moving {
+            self.stop_refining();
+            let (nodes, edges) = split(frame.units, n, m);
             self.moving_drew = (nodes, edges);
+            let under = match frame.partial {
+                true => self.held_camera(),
+                false => None,
+            };
+            let how = self.some_of(device, queue, nodes, edges, under);
+            return Planned { frame, how };
         }
-        let some = (nodes < n).then_some(nodes);
-        if let Some(some) = some {
+        let fits = self.budget.prefix(total) >= total;
+        if fits || self.detail.off {
+            // Everything fits in a frame: no texture is kept for it.
+            self.forget_detail();
+            self.renderer.release_detail();
+            let how = How::Everything;
+            return Planned { frame, how };
+        }
+        if self.refined() {
+            let how = How::Refined;
+            return Planned { frame, how };
+        }
+        frame.partial = true;
+        if !self.refining_this() {
+            self.stop_refining();
+            self.detail.wanted = true;
+        }
+        if !self.detail.stale {
+            // The canvas has the last moving frame, and keeps it until
+            // the slices are drawn.
+            let how = How::Nothing;
+            return Planned { frame, how };
+        }
+        // Something changed that only a frame can show (a hover's ring):
+        // what fits of the scene as it is now.
+        frame.units = self.budget.prefix(total);
+        let (nodes, edges) = split(frame.units, n, m);
+        let under = self.held_camera();
+        let how = self.some_of(device, queue, nodes, edges, under);
+        Planned { frame, how }
+    }
+
+    /// A frame of the first `edges` edges and the `nodes` largest nodes.
+    fn some_of(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nodes: usize,
+        edges: usize,
+        under: Option<Camera>,
+    ) -> How {
+        let some_nodes = (nodes < self.renderer.counts().0).then_some(nodes);
+        if let Some(some) = some_nodes {
             self.gather_some(device, queue, some);
         }
-        self.renderer.draw_prefix(
+        How::Some {
+            edges,
+            some_nodes,
+            under,
+        }
+    }
+
+    /// Draw what [`View::plan_frame`] planned into `target`: nothing, if
+    /// the plan does not draw ([`Planned::draws`]).
+    pub fn draw_planned(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        planned: &Planned,
+    ) {
+        let under = match planned.how {
+            How::Nothing => return,
+            How::Level => {
+                self.draw_level(device, queue, target);
+                self.detail.stale = false;
+                return;
+            }
+            How::Everything => Under::Live {
+                edges: self.renderer.counts().1,
+                some_nodes: None,
+            },
+            How::Refined => Under::Detail,
+            How::Some {
+                edges,
+                some_nodes,
+                under: None,
+            } => Under::Live { edges, some_nodes },
+            How::Some {
+                edges,
+                some_nodes,
+                under: Some(from),
+            } => Under::Both {
+                from,
+                edges,
+                some_nodes,
+            },
+        };
+        let scale = self.radius_scale();
+        self.renderer.draw_over(
             device,
             queue,
             target,
             &self.camera,
             self.draw_nodes,
-            self.radius_scale(),
-            edges,
-            some,
+            scale,
+            under,
         );
-        frame
+        self.detail.stale = false;
+    }
+
+    /// The canvas shows the scene as it is: a frame was drawn some other
+    /// way ([`View::draw`]).
+    pub fn shown(&mut self) {
+        self.detail.stale = false;
+    }
+
+    /// The camera or the positions changed: the next frame is a moving
+    /// one, and no more slices are drawn.
+    fn moved(&mut self) {
+        self.budget.moved();
+        self.stop_refining();
+    }
+
+    fn key(&self) -> Key {
+        Key {
+            radius_scale: self.radius_scale().to_bits(),
+            draw_nodes: self.draw_nodes,
+            counts: self.renderer.counts(),
+        }
+    }
+
+    /// Whether the detail texture has everything under the highlighted
+    /// edges as the camera sees it now.
+    fn refined(&self) -> bool {
+        (self.detail.held.as_ref()).is_some_and(|h| {
+            h.progress == Progress::Done && h.camera == self.camera && h.key == self.key()
+        })
+    }
+
+    /// Whether slices are being drawn for the camera as it is now.
+    fn refining_this(&self) -> bool {
+        (self.detail.held.as_ref()).is_some_and(|h| {
+            h.progress == Progress::Refining && h.camera == self.camera && h.key == self.key()
+        })
+    }
+
+    /// The camera the detail texture was drawn for, if it holds anything
+    /// to draw under a frame of the scene as it is: a canvas of this size,
+    /// and these nodes and edges.
+    fn held_camera(&self) -> Option<Camera> {
+        let held = self.detail.held.as_ref()?;
+        let key = self.key();
+        let same = held.cleared
+            && held.camera.viewport == self.camera.viewport
+            && held.key.counts == key.counts
+            && held.key.draw_nodes == key.draw_nodes;
+        same.then_some(held.camera)
+    }
+
+    /// Whether slices of the frame at rest remain to be drawn: call
+    /// [`View::refine`] until it says there are none.
+    pub fn refining(&self) -> bool {
+        let held = self.detail.held.as_ref();
+        self.detail.wanted || held.is_some_and(|h| h.progress == Progress::Refining)
+    }
+
+    /// Whether a frame at rest that does not fit in a frame is drawn in
+    /// slices ([`View::refine`]): on unless turned off, when it is drawn
+    /// at once, as [`View::draw`] draws it, however long that takes.
+    pub fn set_refining(&mut self, on: bool) {
+        self.detail.off = !on;
+        if !on {
+            self.forget_detail();
+        }
+    }
+
+    /// No more slices: what the texture has stays, as a part.
+    fn stop_refining(&mut self) {
+        self.detail.wanted = false;
+        if let Some(held) = self.detail.held.as_mut() {
+            if held.progress == Progress::Refining {
+                held.progress = Progress::Stopped;
+                held.pending.clear();
+            }
+        }
+    }
+
+    /// A refinement under way begins again.
+    fn restart_refining(&mut self) {
+        if self.refining() {
+            self.stop_refining();
+            self.detail.wanted = true;
+        }
+    }
+
+    /// The detail texture holds nothing of use: the scene changed.
+    fn forget_detail(&mut self) {
+        self.detail.wanted = false;
+        self.detail.held = None;
+    }
+
+    /// The flags of the nodes in `dirty` changed: what that asks of the
+    /// detail texture ([`crate::refine::change`]).
+    fn flags_changed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dirty: &[std::ops::Range<usize>],
+    ) {
+        let (dims, hidden) = (self.highlight.dims_the_rest(), self.highlight.any_hidden());
+        let Some(held) = self.detail.held.as_mut() else {
+            return;
+        };
+        if (held.dims, held.hidden) != (dims, hidden) {
+            return self.forget_detail();
+        }
+        match held.progress {
+            // The slices to come would draw other flags than the ones
+            // sent: begun again at the next frame at rest.
+            Progress::Refining => return self.stop_refining(),
+            Progress::Stopped => return,
+            Progress::Done => {}
+        }
+        let now = self.highlight.flags();
+        let was = held.missing.len();
+        let mut changed = false;
+        for i in dirty.iter().cloned().flatten() {
+            let (Some(&before), Some(&after)) = (held.flags.get(i), now.get(i)) else {
+                return self.forget_detail();
+            };
+            match change(before, after) {
+                Change::Same | Change::Covered => changed |= held.missing.remove(&(i as u32)),
+                Change::Missing => changed |= held.missing.insert(i as u32),
+                Change::Redraw => return self.forget_detail(),
+            }
+        }
+        if changed || was != held.missing.len() {
+            let nodes: Vec<FrontNode> = held
+                .missing
+                .iter()
+                .map(|&i| {
+                    let i = i as usize;
+                    let (radius, color) = (self.style.radius[i], self.style.color[i]);
+                    FrontNode::new(self.x[i], self.y[i], radius, color, now[i])
+                })
+                .collect();
+            self.renderer.set_patch_nodes(device, queue, &nodes);
+        }
+    }
+
+    /// Draw the next slice of the frame at rest into the detail texture,
+    /// if the GPU has finished the last (`now_ms` is any clock, in
+    /// milliseconds: what a slice took sizes the next). Returns whether
+    /// slices remain: call it again, a task later, until it says none do,
+    /// and then draw a frame ([`View::draw_frame`]), which has everything.
+    /// It also says none do when the view has moved or changed meanwhile:
+    /// the frame drawn then begins the refinement again once the view
+    /// rests.
+    ///
+    /// A call holds the thread for as long as it takes to send a slice or
+    /// two, which is not long (1 to 6 ms at a million edges in a browser
+    /// with no GPU): the GPU draws them afterwards, and is kept one slice
+    /// ahead so that it does not wait for the next call.
+    pub fn refine(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, now_ms: f64) -> bool {
+        if std::mem::take(&mut self.detail.wanted) {
+            self.begin_refining(device, now_ms);
+        }
+        if !self.refining_this() {
+            // Not for the scene as it is (the nodes are no longer drawn):
+            // the next frame at rest begins again.
+            self.stop_refining();
+            return false;
+        }
+        let m = self.renderer.counts().1;
+        let flags = self.highlight.flags();
+        let Detail {
+            held, pace, last, ..
+        } = &mut self.detail;
+        let (Some(held), Some(pace)) = (held.as_mut(), pace.as_mut()) else {
+            return false;
+        };
+        let _ = device.poll(wgpu::PollType::Poll);
+        // The slices the GPU has finished since the last call: what they
+        // took, together, sizes the next.
+        let mut finished: Option<(Option<Kind>, usize, bool)> = None;
+        while let Some(pending) = held.pending.front() {
+            let timed_out = now_ms - pending.sent_ms >= SLICE_TIMEOUT_MS;
+            if !pending.done.load(Ordering::Acquire) && !timed_out {
+                break;
+            }
+            finished = Some(match finished {
+                None => (pending.kind, pending.drawn, pending.whole),
+                Some((kind, drawn, whole)) if kind == pending.kind => {
+                    (kind, drawn + pending.drawn, whole && pending.whole)
+                }
+                Some(first) => first,
+            });
+            held.pending.pop_front();
+        }
+        if let Some((kind, drawn, whole)) = finished {
+            let took = now_ms - held.busy_since;
+            held.busy_since = now_ms;
+            held.longest_ms = held.longest_ms.max(took);
+            if let Some(kind) = kind {
+                pace.observe(kind, drawn, whole, took);
+            }
+        }
+        while held.pending.len() < SLICES_AHEAD {
+            let (kind, slice) = if held.edges < m {
+                let size = pace.slice(Kind::Edges, usize::MAX);
+                let end = m.min(held.edges.saturating_add(size));
+                (Some(Kind::Edges), Slice::Edges(held.edges..end))
+            } else if held.nodes < held.node_total {
+                let size = pace.slice(Kind::Nodes, usize::MAX);
+                let end = held.node_total.min(held.nodes.saturating_add(size));
+                (Some(Kind::Nodes), Slice::Nodes(held.nodes..end))
+            } else if !held.cleared {
+                // Nothing to draw but the background.
+                (None, Slice::Nothing)
+            } else if !held.pending.is_empty() {
+                // The last slices are with the GPU.
+                break;
+            } else {
+                held.progress = Progress::Done;
+                held.flags = flags.to_vec();
+                held.missing.clear();
+                *last = Some(Refinement {
+                    ms: now_ms - held.began_ms,
+                    slices: held.slices,
+                    longest_slice_ms: held.longest_ms,
+                    slice_edges: pace.slice(Kind::Edges, usize::MAX),
+                    slice_nodes: pace.slice(Kind::Nodes, usize::MAX),
+                });
+                self.renderer.set_patch_nodes(device, queue, &[]);
+                return false;
+            };
+            let scale = f32::from_bits(held.key.radius_scale);
+            self.renderer
+                .draw_slice(device, queue, &held.camera, scale, !held.cleared, &slice);
+            held.cleared = true;
+            held.slices += 1;
+            let (drawn, whole) = match (&slice, kind) {
+                (Slice::Edges(run), Some(kind)) => {
+                    held.edges = run.end;
+                    (run.len(), run.len() == pace.slice(kind, usize::MAX))
+                }
+                (Slice::Nodes(run), Some(kind)) => {
+                    held.nodes = run.end;
+                    (run.len(), run.len() == pace.slice(kind, usize::MAX))
+                }
+                _ => (0, false),
+            };
+            let done = Arc::new(AtomicBool::new(false));
+            let signal = done.clone();
+            queue.on_submitted_work_done(move || signal.store(true, Ordering::Release));
+            if held.pending.is_empty() {
+                held.busy_since = now_ms;
+            }
+            held.pending.push_back(Pending {
+                done,
+                sent_ms: now_ms,
+                kind,
+                drawn,
+                whole,
+            });
+        }
+        true
+    }
+
+    /// A refinement of the scene as the camera sees it now: a texture the
+    /// size of the canvas, and nothing in it yet.
+    fn begin_refining(&mut self, device: &wgpu::Device, now_ms: f64) {
+        let (w, h) = self.camera.viewport;
+        self.renderer.make_detail(device, w as u32, h as u32);
+        if self.detail.pace.is_none() {
+            // A first slice of what a moving frame draws.
+            let (n, m) = self.renderer.counts();
+            let units = self.budget.prefix(total_units(n, m));
+            self.detail.pace = Some(SlicePace::new(split(units, n, m).1));
+        }
+        let node_total = match self.draw_nodes {
+            true => self.renderer.nodes_drawn() as usize,
+            false => 0,
+        };
+        self.detail.held = Some(Held {
+            camera: self.camera,
+            key: self.key(),
+            dims: self.highlight.dims_the_rest(),
+            hidden: self.highlight.any_hidden(),
+            progress: Progress::Refining,
+            cleared: false,
+            edges: 0,
+            nodes: 0,
+            node_total,
+            pending: VecDeque::new(),
+            busy_since: now_ms,
+            began_ms: now_ms,
+            slices: 0,
+            longest_ms: 0.0,
+            flags: Vec::new(),
+            missing: BTreeSet::new(),
+        });
     }
 
     /// Have the renderer hold at least the `count` largest nodes, as they
@@ -1393,7 +2259,7 @@ impl View {
     /// (then twice as many as asked for, so that a budget that grows a
     /// little does not gather every frame).
     fn gather_some(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, count: usize) {
-        let n = self.graph.n_nodes();
+        let n = self.n_nodes();
         if self.some.order.len() != n {
             let radius = &self.style.radius;
             let mut order: Vec<u32> = (0..n as u32).collect();
@@ -1434,7 +2300,7 @@ impl View {
     /// frame (a layout on another thread is between two sets of
     /// positions): the next [`View::draw_frame`] is a moving one.
     pub fn keep_moving(&mut self) {
-        self.budget.moved();
+        self.moved();
     }
 
     /// The last moving frame ([`View::draw_frame`]) cost `ms`.
@@ -1445,6 +2311,9 @@ impl View {
     /// Draw a frame into `target`: everything, whether the view moves or
     /// not.
     pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
+        if self.draws_level() {
+            return self.draw_level(device, queue, target);
+        }
         self.renderer.draw(
             device,
             queue,

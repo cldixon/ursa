@@ -56,6 +56,7 @@ function shape(buffer: ArrayBuffer | Uint8Array) {
       rows: plain(r.edges.rows),
       flags: plain(r.edges.flags),
       columns: columns(r.edges.columns),
+      adjacency: r.edges.adjacency && { offsets: plain(r.edges.adjacency.offsets), targets: plain(r.edges.adjacency.targets) },
     },
     highlights: {
       paths: r.highlights.paths.map((p: any) => ({ nodes: plain(p.nodes), edges: plain(p.edges) })),
@@ -65,7 +66,7 @@ function shape(buffer: ArrayBuffer | Uint8Array) {
   };
 }
 
-for (const name of ["empty", "plain", "town"]) {
+for (const name of ["empty", "plain", "town", "adjacent"]) {
   test(`reads the result '${name}' as Rust wrote it`, () => {
     expect(shape(ugr(name))).toEqual(json(name));
   });
@@ -87,6 +88,17 @@ test("returns views of the buffer, not copies", () => {
   expect(Number.isNaN(r.nodes.columns[0].values[2])).toBe(true);
   expect(r.edges.rows[2]).toBe(7n);
   expect(r.edges.rows[3]).toBe(2n ** 64n - 1n);
+});
+
+test("reads the adjacency a result carries, as views for a layout", () => {
+  const buffer = ugr("adjacent");
+  const { adjacency } = readResult(buffer).edges;
+  expect(adjacency.offsets).toBeInstanceOf(BigUint64Array);
+  expect(adjacency.targets).toBeInstanceOf(Uint32Array);
+  expect(adjacency.offsets.buffer).toBe(buffer);
+  // Node 1's neighbours.
+  expect(Array.from(adjacency.targets.subarray(Number(adjacency.offsets[1]), Number(adjacency.offsets[2])))).toEqual([0, 2]);
+  expect(readResult(ugr("plain")).edges.adjacency).toBeNull();
 });
 
 test("reads a buffer at any offset of a larger one", () => {

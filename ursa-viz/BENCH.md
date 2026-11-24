@@ -104,6 +104,12 @@ load the wasm (`wasm-release`).
 - **Grid** (from the next run on): the median of nine `view.rebuildGrid()`
   calls, and `view.nodesDrawn` for a frame zoomed 10× into the middle of
   the drawing (1% of its area).
+- **Refinement at rest**: after the budgeted pan and zoom, the frame with
+  everything as a page draws it at rest: `view.renderFrame` leaves the
+  canvas alone, `view.refine(performance.now())` is called a task at a
+  time until it returns false, and a frame is drawn. The time from the
+  first call to the animation frame after that frame, the slices, and the
+  page's tasks over 50 ms meanwhile (a `longtask` observer).
 - **The frame budget**: the pan and the zoom again, as a page draws them:
   `view.renderFrame(now)` each animation frame, and the time from that frame
   to the next told to `view.frameCost`, with the edges in the layout's
@@ -503,7 +509,9 @@ and the size of the page's wasm memory when it is.
 | no adjacency, in one go | 190–270 ms | 200–270 ms | 30.3 MiB |
 | no adjacency, edges a run at a time, in pieces (now) | none over 50 ms | 190–260 ms | 16.3–17.4 MiB |
 | `createViewFromResult`, before | 280–400 ms | 530 ms | 98.5 MiB |
-| `createViewFromResult`, now | none over 50 ms | 230–300 ms | 62.9 MiB |
+| `createViewFromResult`, #426 | none over 50 ms | 230–300 ms | 62.9 MiB |
+| `createView`, now (#501) | none over 50 ms | 230–300 ms | 13.5 MiB |
+| `createViewFromResult`, now (#501) | none over 50 ms | 270–280 ms | 28.8 MiB |
 
 - **Where the time went.** Of the old task, 130 to 200 ms built the
   topology. Counting the degrees from the edge list takes 25 to 35 ms, in
@@ -518,11 +526,18 @@ and the size of the page's wasm memory when it is.
 - **Memory.** The 16 MiB is the edge list (8 MB), which the view keeps for
   `View::step` and for picking an edge's ends, the lists the degrees are
   counted from (4 MB, freed) and the runs of edges on their way to the GPU.
-  A view made from a result holds the result as well as its graph, and the
-  demo builds the result's bytes in the same memory: most of the 63 MiB.
+  A view made from a result held the result as well as a graph of its
+  own, and the demo builds the result's bytes in the same memory: most of
+  the 63 MiB. It now reads the edges from the result
+  ([Memory at a million edges](#memory-at-a-million-edges)).
+- **Since #501** the 28.8 MiB of a view made from a result here is 18 MiB
+  of view ([Memory at a million edges](#memory-at-a-million-edges)) and the
+  demo's own making of the result's bytes in the same memory; the harness
+  holds it to 34 MiB. `createView` lost 3 MiB to exact reserves and the
+  uploads' staging.
 - **The first step of a layout on the view's own thread** builds the
-  adjacency then: 550 to 680 ms with its first iteration, and the memory
-  grows to 39 MiB.
+  adjacency then: 440 ms with its first iteration, and the memory grows to
+  21 MiB (it was 550 to 680 ms and 39 MiB with a topology).
 - **A browser's first WebGL2 context** starts its GPU process, which held
   the page's thread for a second here. The harness makes a small view
   first, so that is not measured.
@@ -577,11 +592,11 @@ a run over it. What the numbers say:
   rasterising a million edges after each set of positions: it draws the
   positions as they come, and the worker's messages do not queue behind 4 s
   frames.
-- **A frame at rest still draws everything**, in one go: 2.5 to 6 s of the
-  page's thread here, as every frame took before. There is one 200 ms
-  after the layout's end and one 200 ms after each movement's, and a click
-  or a hover on the view at rest draws another. A zoom begun under one
-  waits for it. Drawing it in slices is the design's next step (P3-2).
+- **A frame at rest still drew everything**, in one go, when this was
+  measured: 2.5 to 6 s here, as every frame took before; one 200 ms after
+  the layout's end, one 200 ms after each movement's, and another for a
+  click or a hover on the view at rest; and a zoom begun under one waited
+  for it. It is drawn in slices now: [below](#refinement-at-rest).
 - **The order costs the layout 0.3 s**, once, after its first positions,
   and 8 MiB of the worker's heap while it sorts (eight bytes an edge, and
   the copy of the edge list the call is given). The view holds nothing for
@@ -615,6 +630,258 @@ bun bench/report.ts bench/results-laptop.json
 ```
 
 **It has not been measured on a GPU**: there is none here.
+
+## Refinement at rest
+
+Where everything does not fit in a frame, the frame at rest is drawn in
+slices into a texture and kept (#496;
+[README](README.md#refinement-at-rest)). Three measurements, on this
+container (no GPU: SwiftShader on 4 cores shared with another build, a
+load of 3 to 5 unless said), 2026-11-23. The issue's targets with no GPU
+are no task of the page over 50 ms while the slices are drawn, and
+everything drawn within 5 s of the view's coming to rest, at 1M edges.
+
+**In the shell**, `.graph rmat` (46,318 nodes with an edge, 1,000,000
+edges) at 1280 × 800, with `web/tests/graph-timing.ts`: after its wheel
+zoom, a long-task observer on the page until the frame with everything is
+shown. Three runs, and main (`777a930`) in the same hour:
+
+| | main | with refinement (three runs) |
+|---|---|---|
+| the slices, after the layout | – (one draw) | 2.2, 2.4 and 2.5 s, 144 to 157 slices |
+| the slices, after the zoom | – | **2.2, 2.4 and 2.9 s**, 137 to 177 slices |
+| everything shown, from the zoom's last event (200 ms of it waiting to be at rest) | not measured | 2.5, 2.7 and 3.1 s |
+| page tasks over 50 ms meanwhile | the draw itself | **none** |
+| the GPU's longest over the slices one call found done | – | 35 to 42 ms |
+| a click on the view at rest, to its frame | 2.2, 2.4 and 2.9 s | **90, 120 and 138 ms** |
+| wheel-zoom frame interval, p95 | 25.2, 25.4 and 26.5 ms | 25.8, 26.4 and 26.9 ms |
+
+At a load of 5 to 7 (two earlier runs) the slices took 2.3 and 4.6 s, 137
+and 271 of them, still with no long task. `graph-timing.ts` fails a run
+with a task over 50 ms while the slices are drawn or with slices that take
+over 5 s; the e2e allows a task 100 ms.
+
+**In the bare view** (`tests/browser/view.ts`, `ONLY="refine rmat 1M"`:
+131,072 nodes, every one drawn, 1,000,000 edges, 1000 × 700), against the
+frame drawn at once and read back in the same page:
+
+| load | drawn at once | in slices | slices | calls of `refine`, the longest | page tasks over 50 ms | pixels that differ |
+|---|---|---|---|---|---|---|
+| about 4 | 5.2 s | 5.4 s | 325 | 1,237, 6.2 ms | none | 0 |
+| about 5 | 7.0 s | 7.8 s | 468 | 1,809, 5.4 ms | none | 0 |
+
+A zoom begun six calls into the slices had its frame drawn 5 and 12 ms
+later.
+
+**In the bench** (`BACKENDS=webgl2 GRAPHS=rmat MODES=multilevel`), after
+the budgeted pan and zoom:
+
+| graph | pan frame, every edge, ms (median) | first slice to the frame shown, ms | slices | the GPU's longest, ms | last slices (edges / nodes) | longest call of `refine`, ms | page tasks over 50 ms |
+|---|---|---|---|---|---|---|---|
+| rmat 10k | 65 | 71 | 10 | 23 | 5,648 / 1,276 | 1.4 | none |
+| rmat 100k | 498 | 437 | 34 | 26 | 21,711 / 734 | 1.8 | none |
+| rmat 1m | 3785 | 3776 | 239 | 26 | 16,405 / 986 | 5.2 | none |
+
+What the numbers say:
+
+- **The slices cost what the draw costs.** This renderer draws about
+  600,000 edges or 60,000 nodes a second whether it is given them at once
+  or 16 ms at a time, so everything takes as long as it took (within a
+  tenth), and is within 5 s where one draw is: in the shell's 46K nodes
+  with room, with all 131K nodes drawn at about 4 to 5 s, and not on a
+  busy machine. What changes is that nothing waits for it: the page's
+  thread is never held (the calls are 1 to 6 ms; the GPU process does the
+  drawing), a zoom begun under the slices is drawn at once, and a click at
+  rest draws the texture and a ring.
+- **The first version sent one slice at a time**, and the GPU idled from
+  each slice's end until the next call noticed it (a timer's 4 ms): 10.2 s
+  against 7.6 s at once on a busy machine. One slice ahead, it is 7.8 s
+  against 7.0.
+- **16 ms a slice is not the page's 50 ms.** The page's tasks are the
+  calls. The slice is what a zoom waits for at the GPU: two of them at
+  most. 32 ms slices were no faster (5.3 s against 5.2).
+- **A moving frame draws the texture under its prefix** and costs no more
+  for it here: the wheel zoom's frames are as far apart as on main.
+- **The frame read back is the frame drawn at once, byte for byte**, at
+  1M and at 100K edges (fitted, zoomed in, both themes, a highlight, a
+  hidden node, a delta, an order written under the slices), which is what
+  the arithmetic says: the tolerance is 0.
+
+**It has not been measured on a GPU.** The target there is everything
+within 0.3 s of the view's coming to rest at 1M edges. Run the bench
+headed ([above](#on-a-laptop-with-a-real-gpu)) and read the "Refinement at
+rest" table `bun bench/report.ts` prints: "first slice to the frame shown"
+is the number, and "–" means the GPU fits everything in a frame and
+nothing is drawn in slices. Or, for the read-back check and the
+comparison with one draw, `ONLY="refine rmat 1M" bun
+tests/browser/view.ts` (WebGL2).
+
+## The first paint
+
+A large graph is first drawn as the coarsest level of its layout's
+hierarchy, then each level the layout comes to (#497;
+[README](README.md#the-first-paint-a-level-of-the-hierarchy)). In the
+shell, `.graph rmat` (46,318 nodes with an edge, 1,000,000 edges) at
+1280 × 800, with `web/tests/graph-timing.ts`, on this container (no GPU:
+SwiftShader, 4 cores, a load of 1 to 2), 2026-11-23. Times are from Enter;
+"shown" is the `.graph` action's `frame`, when the page's thread was free
+of the frame (`firstDraw` is when `render()` returned). Three runs, and
+main (`5c03374`, two runs) in the same session:
+
+| | main | a level at a time (three runs) |
+|---|---|---|
+| the engine's answer | 388, 393 ms | 345, 364, 366 ms |
+| the graph posted to the layout worker | 403, 412 ms | 359, 380, 378 ms |
+| the view made | 774, 847 ms | 764, 767, 769 ms |
+| the hierarchy built | 967, 1,072 ms | 898, 897, 904 ms |
+| the first positions on the page | 968, 1,073 ms | 907, 905, 912 ms |
+| the first frame, `render()` returned | 1,004, 1,101 ms | 914, 915, 928 ms |
+| **the first frame shown** | 1,128, 1,234 ms | **941, 941, 953 ms** |
+| what it shows | 273 of the nodes and 822 of the edges, at their groups' places before any iteration | 27 discs, laid out, and the merged edges between them |
+| frames before the graph itself, each to the next | – | 59 to 65 frames: p50 16.7 ms, **p95 33.3 ms, max 50 ms** |
+| the graph itself first drawn | 968 ms | 4.2 to 4.5 s |
+| the layout done | 6.1, 6.3 s | 5.4, 5.5, 5.4 s |
+| the layout worker's memory | 55.7 MB | 55.6 MB |
+| the view's memory | 18.3 MiB | 17.9 to 18.3 MiB |
+
+The issue asks for a first frame within 0.6 s, and for frames before level
+0 of at most 50 ms each. The second is met. The first is not: of the
+0.94 s, 0.35 to 0.37 s is the engine's and 0.52 to 0.54 s is the layout
+worker building the graph's adjacency (0.15 s, timed alone) and the
+hierarchy (0.35 s), with the page making its view on another core
+meanwhile; no level exists to draw before the hierarchy does. From the
+hierarchy to the pixels is 40 to 50 ms (it was 100 ms before the level's
+pipelines were made with the view). What was gained: the worker lays out
+the coarsest level and sends it (10 ms) where it prolonged every level to
+the graph and the page drew a quarter of a million vertices; and the
+hierarchy's rows are gathered without sorting their edges
+(`ursa-core/examples/fa2_multilevel.rs bench 1m rmat`: 225 ms where it was
+336 ms, one core, native). The layout ends sooner as well: it no longer
+prolongs ten levels to the graph, nor does the page upload 46,318
+positions, after every batch.
+
+`tests/browser/view.ts` (`ONLY=levels`) reads frames back at the four
+coarsest levels of a 100K-edge R-MAT graph on WebGL2 (49, 99, 198 and 397
+discs).
+
+## Memory at a million edges
+
+What the two `ursa-viz` instances hold in the shell on `.graph rmat`
+(46,318 nodes, 1,000,000 edges; #501), as `graphTimings().memory` gives it:
+the size of each WebAssembly memory once the layout is done. A memory only
+grows, so each figure is the most its instance held, and it is the same on
+every run: it follows what is allocated, not the machine's load.
+`web/tests/graph-timing.ts` prints both and fails over 20 MiB and 60 MB.
+
+| | before | now | budget |
+|---|---|---|---|
+| the page's view | 59.6 MiB (62.5 MB), 62 bytes an edge | 17.9 MiB (18.7 MB), 19 bytes an edge; 18.3 MiB in some runs once the edge order is written | 20 MiB |
+| the layout worker | 96.7 MiB (101.4 MB), 101 bytes an edge | 53.1 MiB (55.7 MB), 56 bytes an edge | 60 MB |
+| both | 164 MB | 74.4 MB | 76 MB |
+
+**The view**, as it is made (the memory's size after each piece, MiB):
+
+| after | size | what was added |
+|---|---|---|
+| the module, a device and a surface | 1.8 | |
+| the result's sections | 9.8 | `src` and `dst` (8 bytes an edge, with a sixty-fourth of room), the keys |
+| the result checked | 11.2 | the key index (5 bytes a node) and the checks' scratch |
+| the degrees counted | 15.1 | the pairs of nodes joined (at most 4 bytes an edge), which a delta's degrees need |
+| what is drawn | 15.8 | positions, radii, colours and flags (20 bytes a node) |
+| the renderer | 16.8 | the shader's compilation, five pipelines |
+| the edges uploaded | 17.9 | a run of 65,536 edges on its way to the GPU |
+
+- **What went.** The result's buffer copied whole into the memory (8.4 MB);
+  the view's `Graph`, a second `src` and `dst` (8 MB); a doubling of each
+  where a sixty-fourth of room was asked for (8 MB); an edge label and a
+  flag for every edge, all zero (3 MB); a key index holding every key again
+  (2.7 MB at 46K nodes, now 0.3); and the staging of the edge uploads,
+  which WebGL2 frees only once the GPU has taken a write (up to 8 MB when
+  the uploads ran ahead of it).
+- **The uploads wait for the GPU**, a few turns of the event loop a run. On
+  a machine whose GPU process is starved the view waits at most 32 turns a
+  run and then goes on, holding that run's half megabyte longer: one run
+  here, under a load of 15 on 4 cores and waiting 16 turns, ended at
+  19.0 MiB.
+- **After a delta** the page reads the result again (`resultBytes()`),
+  which is written into the page's array a section at a time, not built in
+  the view's memory first.
+
+**The layout worker** held a topology (the out-adjacency, its transpose and
+their edge ids) to read the undirected adjacency out of it, and a weight for
+every entry of every coarse level. Counting every allocation natively, for
+the shell's R-MAT result (`tests/memory_scale.rs` does the same for a
+random graph of that size, in CI):
+
+| | peak, beyond the adjacency | held when built |
+|---|---|---|
+| the adjacency from the edge list | 8.0 MiB, the edge list's size | 7.0 MiB |
+| the hierarchy, every level's weights held | 59.5 MiB | 53.2 MiB |
+| the hierarchy, lean, rows gathered a level at a time | 49.3 MiB | 35.1 MiB |
+| the hierarchy, lean, rows gathered a run of entries at a time (now) | 38.3 MiB | 35.1 MiB |
+
+- **R-MAT's levels do not thin.** Its eleven levels have 46,318, 14,462,
+  7,120, 3,540, 1,766, 882, … nodes, and 1.74M, 1.66M, 1.61M, 1.47M, 1.18M,
+  0.65M, 0.19M, … adjacency entries: the first three coarse levels have
+  more than three quarters of the graph's entries, and each held a target
+  and a weight for every one.
+- **A lean hierarchy** holds those three levels' weights only while each is
+  laid out, and makes them again when the layout arrives: three
+  contractions for the third level, two for the second, one for the first.
+  What is held falls as the layout comes down the levels (35 MiB when
+  built, 25 at level 3, 7 at level 1, 1 on the graph itself), since each
+  level is released once the layout is past it.
+- **What it costs in time.** In the shell, from the hierarchy built to
+  the layout's end, back to back on the same machine: 5.2, 5.5, 5.6 and
+  5.6 s lean, 5.3 and 5.9 s with every weight held (72.9 MB), so less than
+  the runs differ by. Natively, on a random graph of the same size, whose
+  six coarse levels are all as large as it is (21 contractions made
+  again, R-MAT's six): 3.3 s lean against 2.8 s (`tests/memory_scale.rs`
+  in a release build prints both). Building the hierarchy is no slower:
+  the worker's time to its first positions is 510 to 570 ms where it was
+  600 to 630, with no topology to build.
+- **Same bits.** `ursa-core`'s tests step a lean and a full hierarchy side
+  by side and compare every position after every step; the golden layouts
+  and the thread-count tests pass unchanged.
+
+**The edge order** (#495, [The frame budget](#the-frame-budget)) is taken
+in the worker right after its first positions, when the hierarchy is whole
+and the memory is as full as it gets. As first merged, on this branch:
+
+| | the view | the layout worker |
+|---|---|---|
+| the order sorted in the worker's memory, given to the view as a vector | 24.0 MiB | 67.1 MB |
+| the keys read and written a run at a time, one buffer for rounds and weights | 17.9 MiB | 63.8 MB |
+| the keys in a `BigUint64Array` outside the WebAssembly memory, sorted there (now) | 17.9–18.3 MiB | 55.7 MB |
+
+- **In the worker** the order needed eight bytes an edge for its keys in
+  one block, which a memory that has just built a hierarchy does not have
+  free in one piece: it grew by all of it. Setting the block aside before
+  the hierarchy was built moved the growth, and did not remove it. The keys
+  now live outside the WebAssembly memory (`OrderKeys`), are written and
+  read back a run of 32,768 at a time, and are sorted by the typed array's
+  own sort (80 ms for a million).
+- **On a lean hierarchy** the three dense levels' weights are not there to
+  rank by: they are counted again from the input adjacency, capped at the
+  4,095 a key tells apart, into the same two bytes an entry that count the
+  rounds. `ursa-core` checks that the counts are the weights and the order
+  the same, edge for edge.
+- **In the view** the order is read from the page's array a run at a time
+  as it is written to the GPU, 65,536 edges a task, each waiting for the
+  GPU to take the last: neither the order (4 MB) nor more than a run of
+  staging is held.
+- **It costs time:** ordering takes the worker 510 to 620 ms here, where
+  #495 measured 285 to 325 ms: the weights counted again, and the keys
+  crossing to the typed array and back at each level. The layout's first
+  iteration starts that much later; the first positions are already drawn.
+
+**Positions** go from the layout to the GPU in two copies: the layout's
+state into a `Float32Array` (`Layout.positions()`), which the worker
+transfers, and that array into the positions the view keeps
+(`setPositions`), which are what `queue.write_buffer` is given. Before:
+the state to a `Vec`, to a `Float32Array`, to a second one made for the
+transfer, into the page's wasm memory, into the view's positions, and from
+there to the GPU.
 
 ## Caveats
 

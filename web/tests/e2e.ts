@@ -37,7 +37,7 @@ const context = await browser.newContext({ viewport: { width: 1280, height: 900 
 const violations: string[] = [];
 await context.addInitScript(() => {
   document.addEventListener("securitypolicyviolation", (e) =>
-    console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+    console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"} @${e.sourceFile}:${e.lineNumber}:${e.columnNumber}`),
   );
 });
 context.on("console", (m) => {
@@ -784,7 +784,7 @@ async function watchedContext(options: Parameters<typeof browser.newContext>[0])
   const ctx = await browser.newContext(options);
   await ctx.addInitScript(() => {
     document.addEventListener("securitypolicyviolation", (e) =>
-      console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"}`),
+      console.error(`CSP violation: ${e.violatedDirective} blocked ${e.blockedURI || "inline"} @${e.sourceFile}:${e.lineNumber}:${e.columnNumber}`),
     );
   });
   ctx.on("console", (m) => {
@@ -1078,6 +1078,16 @@ for (const scheme of ["light", "dark"] as const) {
     "graphMemory: each wasm instance's memory, and the browser's measure of the page",
     JSON.stringify({ ...mem, userAgent: mem.userAgent && { bytes: mem.userAgent.bytes, parts: mem.userAgent.breakdown.length } }),
   );
+
+  {
+    const held: any = await g.evaluate(() => (window as any).ursaShell.graphTimings().memory);
+    const part = (p: any) => pages(p?.bytes) && p.perEdge === Math.round(p.bytes / held.edges);
+    check(
+      held && held.edges > 0 && part(held.view) && part(held.layout) && held.view.bytes === mem.wasm.view && held.layout.bytes === mem.wasm.layout,
+      "graphTimings.memory: what the view and the layout worker hold, in bytes and bytes an edge",
+      JSON.stringify(held),
+    );
+  }
 
   // Esc, in the terminal, clears a selection first, then closes the pane: the
   // terminal takes the whole width again.
@@ -2012,7 +2022,7 @@ for (const scheme of ["light", "dark"] as const) {
   await graphSettled(r);
   const timed: [number, string][] = await r.evaluate(() => (window as any).__timed);
   const first = timed[0];
-  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
+  const laying = timed.filter(([, t]) => / · Laying out · level \d+ of \d+( · [\d,]+ groups)?$/.test(t)).map(([, t]) => t.match(/level (\d+) of (\d+)/)!.slice(1).map(Number));
   const doneAt = timed.findIndex(([, t]) => t.endsWith(" · Done"));
   const times = await r.evaluate(() => (window as any).ursaShell.graphTimings());
   check(
@@ -2020,6 +2030,30 @@ for (const scheme of ["light", "dark"] as const) {
     "a big graph: its status within a second, then its layout's levels, then Done",
     `"${first?.[1]}" at ${Math.round((first?.[0] ?? 0) - enter)} ms; levels ${JSON.stringify(laying.slice(0, 3))}…; ms after Enter ${JSON.stringify(times)}`,
   );
+  // #497: a graph this large is first drawn as the coarsest level of its
+  // layout's hierarchy, then each level the layout comes to, the status
+  // saying how many groups each has (more at every level), until the graph
+  // itself; nothing is picked meanwhile, and the frames of the levels are
+  // 50 ms apart at most (the 95th percentile; twice that is allowed here).
+  {
+    const groups = timed.map(([, t]) => t.match(/ · Laying out · level (\d+) of (\d+) · ([\d,]+) groups$/)).filter(Boolean).map((m) => [Number(m![1]), Number(m![2]), Number(m![3].replace(/,/g, ""))]);
+    const graph = await graphInfo(r);
+    const levels: [number, number][] = graph.hierarchy;
+    const rising = groups.every((g, i) => i === 0 || (g[0] > groups[i - 1][0] ? g[2] > groups[i - 1][2] : g[0] === groups[i - 1][0] && g[2] === groups[i - 1][2]));
+    const last = timed.findLast(([, t]) => / · Laying out · /.test(t))?.[1] ?? "";
+    check(
+      groups.length > 3 && groups[0][0] === 1 && groups[0][2] < 100 && rising && / · Laying out · level (\d+) of \1$/.test(last) && graph.coarse === null,
+      "a big graph: the status counts each level's groups, coarsest first, until the graph itself",
+      `${JSON.stringify(groups.slice(0, 4))}…; the last "${last}"; coarse ${JSON.stringify(graph.coarse)}`,
+    );
+    check(
+      levels.length === groups[0]?.[1] && levels[0][1] === groups[0]?.[2] && levels.at(-1)![0] === 0 && levels.every((l, i) => i === 0 || (l[0] === levels[i - 1][0] - 1 && l[1] > levels[i - 1][1])),
+      "a big graph: every level of the hierarchy reached the page, each larger than the one above",
+      JSON.stringify(levels),
+    );
+    const lf = graph.levelFrames;
+    check(lf.count > 5 && lf.p95 <= 100 && times.graphDrawn > times.firstDraw, "a big graph: the coarse levels' frames come 50 ms apart at most, before the graph itself is drawn", `${JSON.stringify(lf)}; first frame at ${Math.round(times.firstDraw)} ms, the graph itself at ${Math.round(times.graphDrawn)} ms`);
+  }
   // #495: the frame budget, on the million edges. The layout worker's order
   // of the edges is in the view; a wheel zoom, an event an animation frame,
   // is drawn in frames 50 ms apart at most (the 95th percentile; twice that
@@ -2069,6 +2103,92 @@ for (const scheme of ["light", "dark"] as const) {
       .waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 60_000, polling: 100 })
       .then(() => true, () => false);
     check(rested, "a big graph: at rest again, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
+  }
+  // #496: refinement at rest. The frame with every edge is drawn offscreen
+  // in slices, the status saying so, with no long task on the page (none
+  // over 50 ms is the target; twice that is allowed here); a hover at rest
+  // draws no slices; and a zoom begun under the slices stops them.
+  {
+    const box = (await r.locator("#graph-stage canvas").boundingBox())!;
+    const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+    const refined: any = await r.evaluate(
+      ([x, y]) =>
+        new Promise((done) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          const frame = () => (window as any).ursaShell.graph().frame;
+          const status = () => document.getElementById("graph-status")?.textContent ?? "";
+          const tasks: number[][] = [];
+          const seen = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) tasks.push([e.startTime, e.duration]);
+          });
+          seen.observe({ type: "longtask" });
+          canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: -30, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+          const t0 = performance.now();
+          let said = "";
+          let began = 0;
+          const look = () => {
+            if (frame().refining) {
+              began ||= performance.now();
+              if (status().includes("refining…")) said = status();
+            }
+            if (!began || frame().partial || frame().refining) return void (performance.now() - t0 < 60_000 ? setTimeout(look, 20) : done({ timedOut: true, frame: frame() }));
+            const ended = performance.now();
+            setTimeout(() => {
+              seen.disconnect();
+              done({ said, status: status(), frame: frame(), ms: ended - t0, tasks: tasks.filter(([start]) => start >= began && start <= ended).map(([, d]) => Math.round(d)) });
+            }, 300);
+          };
+          setTimeout(look, 20);
+        }),
+      [x, y],
+    );
+    check(
+      !refined.timedOut && refined.frame.refined && refined.frame.refinement.slices > 4 && refined.said.endsWith(" · refining…") && !refined.status.includes("refining"),
+      "a big graph: at rest, the frame with every edge is drawn in slices, and the status says refining… meanwhile",
+      JSON.stringify(refined),
+    );
+    check(!refined.timedOut && Math.max(0, ...refined.tasks) <= 100, "a big graph: no task of the page over 50 ms while the slices are drawn (100 allowed)", JSON.stringify(refined.tasks));
+    // A hover at rest: the refined texture and the hovered node over it.
+    await r.mouse.move(x + 7, y + 5);
+    await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(done, 300)))));
+    const hovered = (await graphInfo(r)).frame;
+    check(
+      hovered.refined && !hovered.refining && !hovered.partial && hovered.refinement.ms === refined.frame?.refinement.ms,
+      "a big graph: a hover at rest draws no slices",
+      JSON.stringify(hovered),
+    );
+    // A zoom under the slices: they stop, and its frame is a moving one.
+    const under: any = await r.evaluate(
+      ([x, y]) =>
+        new Promise((done) => {
+          const canvas = document.querySelector("#graph-stage canvas")!;
+          const frame = () => (window as any).ursaShell.graph().frame;
+          const wheel = () => canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+          wheel();
+          const t0 = performance.now();
+          const look = () => {
+            if (!frame().refining) return void (performance.now() - t0 < 30_000 ? setTimeout(look, 10) : done({ timedOut: true, frame: frame() }));
+            // Slices are being drawn: a few more, then the zoom.
+            setTimeout(() => {
+              const before = frame();
+              wheel();
+              const asked = performance.now();
+              requestAnimationFrame(() => requestAnimationFrame(() => done({ before, after: frame(), ms: performance.now() - asked })));
+            }, 100);
+          };
+          setTimeout(look, 10);
+        }),
+      [x, y],
+    );
+    check(
+      !under.timedOut && under.before.refining && !under.after.refining && !under.after.refined && under.after.partial && under.ms <= 250,
+      "a big graph: a zoom begun under the slices stops them, and is drawn within two frames",
+      JSON.stringify(under),
+    );
+    const again = await r
+      .waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 60_000, polling: 100 })
+      .then(() => true, () => false);
+    check(again, "a big graph: at rest after that zoom, a frame with every edge", JSON.stringify((await graphInfo(r)).frame));
   }
   // #445: a key search on the million edges answers within 50 ms (the
   // engine's round trip; drawing the selection is the view's, after it).

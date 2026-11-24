@@ -4756,6 +4756,7 @@ dependencies = [
  "bytemuck",
  "console_error_panic_hook",
  "futures-channel",
+ "hashbrown 0.17.1",
  "js-sys",
  "naga",
  "serde",

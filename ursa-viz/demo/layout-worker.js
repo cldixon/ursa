@@ -27,7 +27,8 @@ self.onmessage = async ({ data }) => {
 };
 
 function post(extra) {
-  const xy = new Float32Array(layout.positions());
+  // A new array, filled from the layout's memory once: this message's to give.
+  const xy = layout.positions();
   self.postMessage({ type: "positions", xy, iterations: layout.iterations, level: layout.level, memoryBytes: wasm.memory.buffer.byteLength, ...extra }, [xy.buffer]);
 }
 

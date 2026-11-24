@@ -222,14 +222,19 @@ static assets and an R2 bucket.
       result: a path's route is highlighted, a `hop`'s seeds are ringed,
       and the rest is dimmed. They follow the deltas (a hidden node's
       route edge is not drawn).
-    - **What it costs.** A view made from a result holds the result as
-      well as what it draws. On `.graph rmat` (1M edges) the view's heap
-      is 60 MiB where the edge-list view of #426 was 16, and decoding the
-      result is one task of 63 to 92 ms on the page's thread
-      (`GraphResult::from_bytes`, not yet done in pieces), so
-      `tests/graph-timing.ts`, which allows 60, fails there until it is.
-      The drawings one explores from (a `hop`, a path, a pattern's
-      matches) are small, and cost nothing to speak of.
+    - **What it costs** (#501, #492). A view made from a result holds
+      the result, and the edges once. On `.graph rmat` (1M edges) the
+      view's WebAssembly memory is 17.9 MiB (it was 59.6 when the view
+      kept a graph beside the result, and 16 for the edge-list view of
+      #426), and the result is decoded in pieces, out of the page's
+      buffer, so no task while the view is made is over 60 ms (decoding
+      was one of 63 to 92). The layout worker holds 55.7 MB (it was 101):
+      it builds the adjacency a layout reads and no topology, and holds a
+      dense coarse level's weights only while it lays that level out.
+      Positions come from the worker in an array filled once from the
+      layout and transferred, and the view copies it once.
+      `tests/graph-timing.ts` fails if the view is over 20 MiB or the
+      worker over 60 MB.
     - **What the page knows** (each node's id, its degree among what is
       shown, the legend, the counts in the header) is read again from the
       view's own result (`view.resultBytes()`) after each delta, and the
@@ -311,7 +316,8 @@ static assets and an R2 bucket.
     while the engine still runs the query. The graph goes to the worker
     before the page builds its view, and nothing is drawn before the
     layout's first positions. The header then reads `… · Laying out · level
-    k of n`, then `N nodes · M edges · Done`. `window.ursaShell.graphTimings()`
+    k of n` (and, while a coarse level is drawn, `· G groups`), then
+    `N nodes · M edges · Done`. `window.ursaShell.graphTimings()`
     gives when each step ended, and `bun tests/graph-timing.ts [url] [runs]`
     times `.graph rmat` (1M edges): in headless Chromium, the first drawing
     went from 4.6 s after Enter to 0.95 s, and the layout's end from 12.1 s
@@ -326,6 +332,13 @@ static assets and an R2 bucket.
     | `pick` | `{count, last, p95}`: the time in `view.pick()` of a click or a hover, over the last 120. With the layout at rest a pick reads the view's spatial grid (#500), not every node. |
     | `actions` | the last 32, oldest first: `{command, at, engine, delta, frame}`. `command` is what was typed (`.graph karate`) or the input (`click`, `fit`, `key +`); `at` is when the input arrived, in ms after the last `.graph`'s Enter; `engine` is the ms the engine took and `delta` the ms applying its answer to the view (both `null` for an input that needs neither); `frame` is the ms from the input to when the page's thread was free of the frame that showed it: with no GPU the browser rasterises a frame on that thread after `render()` returns (4 s at a million edges), so this is when the pixels are there, where `firstDraw` is when `render()` returned. A click that changes no selection draws nothing, and is shown by the next frame the browser paints. |
     | `longTasks` | the page's last 64 tasks over 50 ms: `{start, duration}`, `start` in ms after Enter. |
+
+    `graphTimings().memory` is `{edges, view, layout}` (#501): the edge
+    slots of what is drawn, and for the view and for the layout worker
+    `{bytes, perEdge}`, its WebAssembly memory and those bytes an edge. A
+    WebAssembly memory only grows, so each is the most its instance has
+    held: the worker is new with each drawing, the view's module is the
+    page's.
 
     `await window.ursaShell.graphMemory()` gives `wasm.engine`, `wasm.view`
     and `wasm.layout`, the bytes of each WebAssembly instance's memory (the
@@ -343,7 +356,8 @@ static assets and an R2 bucket.
     `tests/graph-timing.ts` prints all of it: the steps, the `.graph`
     action, the long tasks (and the longest while the view was made, which
     fails the run over 60 ms: the view builds no topology, #426), the frame times of a scripted wheel zoom, a pick
-    and the heaps. It runs the full Chromium (`channel: "chromium"`), since
+    and the heaps (on rmat it fails if the view holds over 20 MiB or the
+    layout worker over 60 MB, #501). It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
     `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
     tests the arithmetic.
@@ -357,6 +371,35 @@ static assets and an R2 bucket.
     heaps are 49 MiB (engine), 52 MiB (view) and 97 MiB (layout worker),
     of 219 MiB for the page and its workers. On karate: frames 16.7 ms
     apart (p95 20 ms), `render()` 1.4 ms, a pick 0.2 ms.
+
+  - **The first paint** (#497): a graph of 200,000 nodes and edges or more
+    is first drawn as the coarsest level of its layout's hierarchy, laid
+    out: a few dozen discs, each with area by the mass of the nodes it
+    stands for, and the merged edges between them, as wide as their weights
+    say. Then each level the layout comes to, twice the discs each time,
+    their nodes moving out from their parents over 150 ms (at once under
+    `prefers-reduced-motion`), the header counting them: `… · Laying out ·
+    level 3 of 11 · 110 groups`. The graph's own nodes and edges are first
+    drawn when the layout reaches them. `graph-worker.js` sends each level
+    as it reaches it (`level`: masses, parents, the 16,384 heaviest merged
+    edges and positions, as transferred typed arrays, read before the
+    hierarchy lets the level go; then `levelPositions` after each batch)
+    in place of every node's position; `graph-levels.js` keeps them
+    (`levels[l]`, for whoever cuts through the hierarchy later) and says
+    where the nodes are on their way; the view draws the level
+    (`ursa-viz`'s `setLevel`). Nothing is picked while a level is drawn.
+    The layout's final positions are the same bits, and the worker holds
+    what it held (55.6 MB at a million edges).
+    `window.ursaShell.graph()` gives `coarse` (what is drawn of the
+    level, or null), `hierarchy` (`[level, nodes]` of the levels that
+    arrived) and `levelFrames` (what the levels' frames cost);
+    `graphTimings().graphDrawn` is when the graph itself was first drawn.
+    On `.graph rmat` (headless Chromium, software WebGL2, three runs,
+    2026-11-23) the first frame is shown 941 to 953 ms after Enter (1,130
+    to 1,230 ms before), the levels' frames are 33 ms apart at the p95 and
+    50 ms at most, and the graph itself is first drawn at 4.2 to 4.5 s.
+    The 600 ms #497 asks for is not met: the engine answers at 345 to
+    366 ms, and the worker's hierarchy is built 520 to 540 ms after that.
 
   - **The frame budget** (#495): while the view moves (a pan, a zoom, a
     layout still running) a frame draws only what fits in one: a prefix of
@@ -383,12 +426,39 @@ static assets and an R2 bucket.
     31 ms apart at the p95 (3.3 s before), each with 512 to 1,081 edges and
     170 to 360 nodes, which is what that renderer shows in a frame; the
     first frame is shown 1.3 s after Enter (6.0 s) and the layout is done at
-    5.6 s (10.6 s). A frame at rest still draws everything in one go, 2.5
-    to 6 s of the page's thread with no GPU: one after the layout, one after each movement, and
-    one for a click on the view at rest. `tests/graph-timing.ts` starts its
+    5.6 s (10.6 s). `tests/graph-timing.ts` starts its
     zoom from rest and fails a run whose p95 is over 50 ms; the e2e allows
     100 (`ursa-viz/BENCH.md` has the runs, and what a busy machine does to
     them).
+
+  - **Refinement at rest** (#496): where everything does not fit in a
+    frame, the frame at rest is not drawn at once (with no GPU that was
+    2.5 to 6 s of drawing after the layout, after each movement and for
+    each click, and a zoom begun under it waited). `renderFrame` leaves the
+    canvas as it is, and `graph.js` calls `view.refine(performance.now())`
+    a task at a time while `view.refining`: each call sends the GPU one
+    slice of the edges or the nodes, drawn offscreen into a texture the
+    size of the canvas, once the GPU has finished the last but one. Then a
+    frame, which is that texture under the highlighted edges and the nodes
+    in front, and so is every frame at rest after it: a hover or a click
+    draws no edge. A pan or a zoom stops the slices and waits for two of
+    them at most; its frames draw the texture under their own edges, moved
+    and scaled with the camera, so the whole picture stays on screen while
+    it moves. The status line ends in ` · refining…` while slices remain.
+    `ursaShell.graph().frame` gains `refining`, `refined` and `refinement`
+    (`{ms, slices, longestSliceMs, sliceEdges, sliceNodes}` of the last one
+    finished), and `partial` stays true until the refined frame is drawn.
+
+    On `.graph rmat` (1M edges, headless Chromium, software WebGL2,
+    2026-11-23, three runs at a load of 4): the slices take 2.2, 2.4 and
+    2.9 s (137 to 177 of them), so everything is shown 2.5 to 3.1 s after a
+    zoom's last event, with no task of the page over 50 ms meanwhile; a
+    click on the view at rest is shown 90 to 140 ms after it (2.2 to 2.9 s
+    on main in the same hour); and the wheel zoom's frames are as far apart
+    as before (p95 26 to 27 ms; main 25 to 26). On a busier machine (a
+    load of 5 to 7) the slices took 2.3 to 4.6 s. `tests/graph-timing.ts` fails a run with a task
+    over 50 ms while the slices are drawn, or slices that take over 5 s.
+    Not measured on a GPU, where the target is 0.3 s.
 
     The layout worker (`graph-worker.js`) also lays out **rings and layers**
     (#436): a graph that carries `layout: {kind: "rings" | "layers", level}`,
@@ -541,7 +611,7 @@ its echo and `.graph echo off`, the new nodes drawn and picked, `+N` in the
 header and the tooltip, the busy rings of queued commands, `.undo` restoring
 the frame's pixels and `.redo` the settled places, `.hide` and `.show` drawn,
 ten double-clicks on rmat with a median click-to-frame time within 250 ms, and a shared link replaying the
-exploration to the same counts; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
+exploration to the same counts; the coarse levels on rmat, #497: the status counting each level's groups, coarsest first, every level of the hierarchy reaching the page, and their frames at most 100 ms apart at the p95 before the graph itself is drawn; the frame budget on rmat, #495: the worker's order of the million edges in the view, a wheel zoom drawn in frames at most 100 ms apart at the p95, each a prefix of the edges, and a frame with everything at rest; refinement at rest, #496: that frame drawn in slices with the status saying `refining…` and no task of the page over 50 ms, a click at rest drawing no slices, and a zoom begun under the slices stopping them); a node's tooltip on hover, a click selecting it and the status naming it, Shift+click, a click on empty space and Esc clearing the selection, typing while it shows, Esc and the close
 button, the terminal refitting beside it and under it on a phone, a pinch, a
 one-finger drag, a tap and a double tap from Chromium's touch input with each
 node's place read back, the Graph button, and `ursa-viz` not downloaded until `.graph`); the keyboard and

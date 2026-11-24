@@ -13,6 +13,10 @@
 //   worker mark them, and the `.graph` action: ms in the engine, ms making
 //   the view of its answer, and ms from Enter to when the page's thread was
 //   free of the frame that showed it (firstDraw is when render() returned);
+// - the coarse levels (#497): when the first frame, a level of the
+//   layout's hierarchy, was shown, against the 600 ms asked for; the levels
+//   that were drawn; and what their frames cost, each to the next animation
+//   frame. The run fails if the 95th percentile of those is over 50 ms;
 // - the page's long tasks since Enter;
 // - the longest task while the view was made (#426), which fails the run if
 //   it is over 60 ms: the view builds no adjacency, and is made in pieces;
@@ -22,10 +26,21 @@
 //   thread, so the interval is the frame's cost); and what the frame budget
 //   (#495) drew in them. The run fails if the 95th percentile of the
 //   intervals is over 50 ms;
+// - the refinement at rest (#496) that follows the zoom: from the zoom's
+//   last event to the frame with everything (which includes the 200 ms the
+//   view waits to be at rest), how many slices it was drawn in, and the
+//   page's tasks over 50 ms meanwhile. The run fails if there is one, or if
+//   the slices take over 5 s;
 // - a pick, by a click in the middle of the canvas, with the view at rest
-//   (its frame draws every edge);
+//   (its frame is the refined texture and the selection over it);
 // - the wasm heaps (the engine's, the view's and the layout worker's) and
-//   the page's memory as the browser measures it.
+//   the page's memory as the browser measures it; and, from
+//   graphTimings().memory, what the two ursa-viz instances hold in bytes an
+//   edge. On rmat (a million edges) the run fails if the view's is over
+//   20 MiB or the layout worker's over 60 MB (#501): they are 17.9 to
+//   18.3 MiB and 55.7 MB, the edge order of #495 included, and vary little
+//   with the machine's load, since a WebAssembly memory grows by what is
+//   asked of it.
 //
 // Then the medians over the runs.
 import { chromium } from "playwright";
@@ -45,6 +60,14 @@ const browser =
     ? await chromium.launch({ args })
     : await chromium.launch({ args, channel: process.env.CHANNEL ?? "chromium" }).catch(() => chromium.launch({ args }));
 console.log(`${browser.browserType().name()} ${browser.version()}${process.env.CHANNEL === "shell" ? " (headless shell)" : ""}`);
+// What the page's view and the layout worker may hold at a million edges
+// (#501): 20 MiB and 60 MB of WebAssembly memory.
+const VIEW_BYTES = 20 * 2 ** 20;
+const LAYOUT_BYTES = 60e6;
+// When a large graph's first frame should be shown, from Enter (#497):
+// reported, not failed, since the engine's answer and the layout's
+// hierarchy alone take longer than this here.
+const FIRST_FRAME_MS = 600;
 const all: Record<string, number>[] = [];
 // What took too long: the run fails if anything did.
 const slow: string[] = [];
@@ -83,6 +106,25 @@ for (let r = 0; r < runs; r++) {
   console.log(`run ${r + 1}:`, JSON.stringify(rel), "first status:", JSON.stringify(await status));
   const shown = t.actions.find((a: any) => a.command.startsWith(".graph"));
   console.log(`  action ${JSON.stringify(shown?.command)}: engine ${shown?.engine} ms, view ${shown?.delta} ms, Enter to its frame shown ${shown?.frame} ms`);
+  // The first drawing (#497): a coarse level of the layout's hierarchy,
+  // then each level the layout comes to, until the graph itself. When the
+  // first frame was shown (the action's frame: on software WebGL2
+  // firstDraw is when render() returned, not when the pixels were there),
+  // against the issue's 600 ms; what the frames of the coarse levels cost
+  // (the time from each to the next animation frame), which fails the run
+  // over 50 ms at the 95th percentile; and when the graph itself was
+  // first drawn.
+  const drawn = await p.evaluate(() => (window as any).ursaShell.graph());
+  const lf = drawn.levelFrames;
+  if (lf?.count) {
+    console.log(
+      `  coarse levels: the first frame shown ${Math.round(shown?.frame)} ms after Enter${shown?.frame > FIRST_FRAME_MS ? ` (over the ${FIRST_FRAME_MS} ms asked for: the engine answered at ${Math.round(rel.engine)} ms and the hierarchy was built at ${Math.round(rel.hierarchy)} ms)` : ""}; ` +
+        `levels ${JSON.stringify(drawn.hierarchy)} as [level, nodes]; ${lf.count} frames before the graph itself (at ${Math.round(rel.graphDrawn)} ms), each to the next p50 ${lf.p50} ms, p95 ${lf.p95} ms, max ${lf.max} ms`,
+    );
+    if (lf.p95 > 50) slow.push(`run ${r + 1}: the frames of the coarse levels cost ${lf.p95} ms at the 95th percentile; at most 50 ms are allowed`);
+    rel.levelFrameP95 = lf.p95;
+    rel.levelFrameMax = lf.max;
+  }
   console.log("  main-thread tasks over 50 ms since Enter [start, ms]:", JSON.stringify(t.longTasks.filter((l: any) => l.start + l.duration > 0).map((l: any) => [l.start, l.duration])));
 
   // Making the view (#426): from when the layout worker was posted its
@@ -102,10 +144,11 @@ for (let r = 0; r < runs; r++) {
   await p.mouse.move(cx, cy);
   // From rest: the frame with every edge that follows the layout (#495) is
   // drawn, so that the zoom's frames are the view moving and nothing else.
-  // (With no GPU that frame holds the page's thread for seconds, as every
-  // frame did before the budget: a zoom begun under it waits for it.)
+  // (It is drawn in slices, #496: with no GPU, seconds of them.)
   const atRest = () => p.waitForFunction(() => (window as any).ursaShell.graph()?.frame.partial === false, null, { timeout: 120_000, polling: 100 });
   await atRest();
+  const firstRefinement = (await p.evaluate(() => (window as any).ursaShell.graph())).frame.refinement;
+  console.log(`  after the layout, everything was drawn in ${firstRefinement?.slices} slices in ${Math.round(firstRefinement?.ms)} ms`);
   await p.evaluate(() => new Promise((done) => requestAnimationFrame(() => setTimeout(done, 150))));
   await p.evaluate(() => (window as any).ursaShell.graphTimingsReset());
   const began = Date.now();
@@ -126,11 +169,50 @@ for (let r = 0; r < runs; r++) {
       }),
     [cx, cy, wheelMs],
   );
-  // The last frame asked for, drawn.
-  await p.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  const wheelTook = Date.now() - began;
+  // The refinement at rest (#496), from the zoom's last event: the view
+  // waits to be at rest, draws everything offscreen in slices, and shows
+  // it. The page's long tasks meanwhile, as the browser reports them (it
+  // reports a task a little after its end: 300 ms more are waited for).
+  const refined: any = await p.evaluate(
+    () =>
+      new Promise((done) => {
+        const t0 = performance.now();
+        const tasks: number[][] = [];
+        const seen = new PerformanceObserver((list) => {
+          for (const e of list.getEntries()) tasks.push([e.startTime, e.duration]);
+        });
+        seen.observe({ type: "longtask" });
+        let said = false;
+        const look = () => {
+          said ||= (document.getElementById("graph-status")?.textContent ?? "").includes("refining…");
+          const frame = (window as any).ursaShell.graph().frame;
+          if (frame.partial || frame.refining) return void setTimeout(look, 20);
+          const ms = performance.now() - t0;
+          setTimeout(() => {
+            seen.disconnect();
+            const status = document.getElementById("graph-status")?.textContent ?? "";
+            done({ ms, said, status, refinement: frame.refinement, tasks: tasks.filter(([start]) => start >= t0 && start <= t0 + ms).map(([, d]) => Math.round(d)) });
+          }, 300);
+        };
+        look();
+      }),
+  );
+  console.log(
+    `  refinement at rest: everything shown ${Math.round(refined.ms)} ms after the zoom's last event; drawn in ${refined.refinement?.slices} slices in ${Math.round(refined.refinement?.ms)} ms ` +
+      `(the last of ${refined.refinement?.sliceEdges} edges and ${refined.refinement?.sliceNodes} nodes; the GPU's longest ${Math.round(refined.refinement?.longestSliceMs)} ms); ` +
+      `tasks over 50 ms meanwhile: ${JSON.stringify(refined.tasks)}; the status said "refining…": ${refined.said}, and then ${JSON.stringify(refined.status)}`,
+  );
+  if (refined.tasks.length) slow.push(`run ${r + 1}: tasks of ${refined.tasks.join(", ")} ms on the page while the frame at rest was drawn in slices; none over 50 ms is allowed`);
+  if (!(refined.refinement?.ms <= 5000)) slow.push(`run ${r + 1}: the frame at rest took ${Math.round(refined.refinement?.ms)} ms to draw in slices; at most 5000 are allowed`);
+  if (!refined.said || refined.status.includes("refining")) slow.push(`run ${r + 1}: the status line said "refining…" while the slices were drawn: ${refined.said}; after them it says ${JSON.stringify(refined.status)}`);
+  rel.refinedAfter = Math.round(refined.ms);
+  rel.refineMs = Math.round(refined.refinement?.ms);
+  rel.refineSlices = refined.refinement?.slices;
+  rel.refineLongestTask = Math.max(0, ...refined.tasks);
   const w = (await timings()).frames;
   console.log(
-    `  wheel zoom, ${events} events in ${Date.now() - began} ms: ${w.interval.count} frame intervals, p50 ${w.interval.p50} ms, p95 ${w.interval.p95} ms, max ${w.interval.max} ms; ` +
+    `  wheel zoom, ${events} events in ${wheelTook} ms: ${w.interval.count} frame intervals, p50 ${w.interval.p50} ms, p95 ${w.interval.p95} ms, max ${w.interval.max} ms; ` +
       `render() p50 ${w.render.p50} ms, p95 ${w.render.p95} ms, max ${w.render.max} ms`,
   );
   // The frame budget (#495): what the last of those frames drew, and what
@@ -147,7 +229,8 @@ for (let r = 0; r < runs; r++) {
   rel.wheelRenderP95 = w.render.p95;
   rel.shown = shown?.frame;
 
-  // A click on the view at rest: its frame draws every edge.
+  // A click on the view at rest: its frame is the refined texture, and
+  // the selection over it.
   await atRest();
   await p.mouse.click(cx, cy);
   // The frame that shows the click.
@@ -166,11 +249,20 @@ for (let r = 0; r < runs; r++) {
   rel.engineHeapMiB = Math.round(m.wasm.engine / 2 ** 20);
   rel.viewHeapMiB = Math.round(m.wasm.view / 2 ** 20);
   rel.layoutHeapMiB = Math.round(m.wasm.layout / 2 ** 20);
+  const held = (await timings()).memory;
+  console.log(
+    `  ursa-viz, ${held.edges.toLocaleString("en-US")} edges: the view ${held.view.bytes.toLocaleString("en-US")} bytes (${held.view.perEdge} an edge), ` +
+      `the layout worker ${held.layout.bytes.toLocaleString("en-US")} bytes (${held.layout.perEdge} an edge)`,
+  );
+  if (dataset === "rmat") {
+    if (held.view.bytes > VIEW_BYTES) slow.push(`run ${r + 1}: the view holds ${mb(held.view.bytes)}; at most ${mb(VIEW_BYTES)} are allowed`);
+    if (held.layout.bytes > LAYOUT_BYTES) slow.push(`run ${r + 1}: the layout worker holds ${(held.layout.bytes / 1e6).toFixed(1)} MB; at most ${LAYOUT_BYTES / 1e6} MB are allowed`);
+  }
   all.push(rel);
   await ctx.close();
 }
 const median = (xs: number[]) => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-const steps = ["viewLongestTask", "shown", "wheelEdges", "wheelFrameP95", "wheelRenderP95", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
+const steps = ["viewLongestTask", "shown", "levelFrameP95", "levelFrameMax", "wheelEdges", "wheelFrameP95", "wheelRenderP95", "refinedAfter", "refineMs", "refineSlices", "refineLongestTask", "pick", "clickToFrame", "engineHeapMiB", "viewHeapMiB", "layoutHeapMiB"];
 const keys = Object.keys(all[0]).filter((k) => !steps.includes(k)).sort((a, b) => all[0][a] - all[0][b]);
 console.log("median ms from Enter:");
 for (const k of keys) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);

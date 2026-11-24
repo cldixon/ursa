@@ -68,7 +68,8 @@ pub use layout::{
 pub use levels::{layout_layers, layout_rings, LayersParams, RingsParams, NO_LEVEL};
 pub use louvain::{louvain, louvain_weighted};
 pub use multilevel::{
-    edge_order_by_degree, layout_fa2_multilevel, Fa2Multilevel, MultilevelParams,
+    edge_of_key, edge_order_by_degree, edge_order_by_degree_keys, layout_fa2_multilevel,
+    Fa2Multilevel, LevelEdges, MultilevelParams, OrderKeys, ReadEdges,
 };
 pub use neighbor_agg::{neighbor_aggregate, AggKind};
 pub use pagerank::{pagerank, pagerank_weighted, PageRankParams};

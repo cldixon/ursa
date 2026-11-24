@@ -61,6 +61,10 @@ export function readUgr(input) {
 
 // Read a result into the model's shape. Labels and flags that the writer
 // left out, because every one is 0, come back as arrays of zeros.
+// `edges.adjacency` is the undirected adjacency of the edges, where the
+// writer had it to give (`{ offsets, targets }`: node i's neighbours are
+// targets[offsets[i] .. offsets[i + 1]], offsets a BigUint64Array), for a
+// layout to use as it is; null in most results.
 export function readResult(input) {
   const { header, sections, need, strings } = readUgr(input);
   if (header.kind !== "result") fail(`the buffer holds a ${header.kind}, not a result`);
@@ -106,6 +110,10 @@ export function readResult(input) {
       rows: sections["edges.rows"] ?? null, // BigUint64Array; 2^64 - 1: unknown
       flags: sections["edges.flags"] ?? new Uint8Array(m),
       columns: columns("edges"),
+      adjacency:
+        sections["edges.adjacency.offsets"] && sections["edges.adjacency.targets"]
+          ? { offsets: sections["edges.adjacency.offsets"], targets: sections["edges.adjacency.targets"] }
+          : null,
     },
     highlights: { paths, seeds: need("highlights.seeds"), distance: header.highlights.distance },
   };

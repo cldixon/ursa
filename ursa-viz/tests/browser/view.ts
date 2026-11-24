@@ -58,6 +58,22 @@
 // of the drawing the node pass draws at most 5% of the instances, in a
 // frame that is the frame with every node drawn, byte for byte. ONLY=grid
 // runs these alone.
+//
+// Then refinement at rest (#496), on WebGL2. The karate club fits in a
+// frame and is never refined. On R-MAT with 100K edges, the frame at rest
+// leaves the canvas alone and is drawn in slices, no call of more than
+// 50 ms; the frame that follows is the frame drawn at once, byte for byte,
+// read back and on the canvas, fitted, zoomed in (the nodes in view alone),
+// in the dark theme and with a path highlighted; a hover and a selection
+// draw no slices and differ only at their nodes' rims; a hidden node, a
+// highlight and a delta draw them again; a pan stops them, and its frames
+// draw the texture under their own. ONLY=refine runs these alone, and
+// ONLY="refine rmat 1M" the issue's size: no task of the page over 50 ms
+// while the slices are drawn, and how long they take.
+//
+// Then a level of the layout's hierarchy drawn in place of the graph
+// (#497), on WebGL2: frames read back at the four coarsest levels of the
+// 100K-edge R-MAT graph. ONLY=levels runs these alone.
 import { chromium, type Page } from "playwright";
 import { file } from "bun";
 import { extname, join, normalize, resolve } from "node:path";
@@ -618,7 +634,11 @@ if (CREATE_CASES.length) {
     if (r.backend !== "Gl") fail(`ran on ${r.backend}, not WebGL2`);
     if (r.edges !== 1_000_000) fail(`${r.edges} edges, not 1,000,000`);
     if (!(longest <= 60)) fail(`making the view held the page's thread for ${longest} ms in one task; at most 60 ms are allowed`);
-    if (!fromResult && !(wasm <= 20 * 2 ** 20)) fail(`the page's wasm memory is ${mib(wasm)} after making the view; at most 20 MiB are allowed`);
+    // A view made from a result (#501) holds the result and no second copy
+    // of its edges; here the demo also builds the result's bytes in the
+    // same memory (resultFromEdges), 8 MB more than a page given them holds.
+    const limit = (fromResult ? 34 : 20) * 2 ** 20;
+    if (!(wasm <= limit)) fail(`the page's wasm memory is ${mib(wasm)} after making the view; at most ${mib(limit)} are allowed`);
     if (runs.some((x) => x.topology) || r.topologyInUse) fail("the view built the graph's adjacency without a layout of its own");
     if (!r.topologyStepped || r.iterations !== 1) fail(`step(1) should build the adjacency and run one iteration (built: ${r.topologyStepped}, iterations: ${r.iterations})`);
     console.log(
@@ -1362,9 +1382,16 @@ if (BUDGET_CASES.length) {
       // A running layout keeps the view moving past the rest.
       view.keepMoving();
       if (!view.renderFrame((now += 1000)) || !view.framePartial) problem("keepMoving did not keep the view moving");
-      const rested = view.renderFrame((now += view.frameRestMs));
+      // At rest, everything: in slices (#496), since it no longer fits in
+      // a frame, and then a frame that is render()'s.
+      const before = shown();
+      let rested = view.renderFrame((now += view.frameRestMs));
+      if (rested || !view.framePartial || !view.refining) problem(`the frame after the rest: moving ${rested}, partial ${view.framePartial}, refining ${view.refining}`);
+      if (differ(before, shown())) problem("the frame after the rest changed the canvas before the slices were drawn");
+      while (view.refine(performance.now())) await new Promise((r) => setTimeout(r));
+      rested = view.renderFrame((now += 16));
       out.restDiffers = differ(whole, shown());
-      if (rested || view.framePartial) problem(`a frame after the rest: moving ${rested}, partial ${view.framePartial}`);
+      if (rested || view.framePartial) problem(`a frame after the slices: moving ${rested}, partial ${view.framePartial}`);
       if (out.restDiffers) problem(`the frame at rest differs from render() in ${out.restDiffers} bytes`);
       w.pauseFrames(false);
       return out;
@@ -1377,6 +1404,474 @@ if (BUDGET_CASES.length) {
     );
     await page.close();
   }
+  await gl.close();
+}
+// Refinement at rest.
+const REFINE_CASES = [
+  { name: "refine karate", query: "graph=karate&result=xy" },
+  { name: "refine rmat 100K", query: "graph=rmat&scale=14&edges=100000&result=1" },
+  // The issue's size: seconds of slices with no GPU, so only when asked
+  // for by name (ONLY="refine rmat 1M").
+  { name: "refine rmat 1M", query: "graph=rmat&scale=17&edges=1000000&result=1&multilevel=0&iterations=3", big: true },
+].filter((c) => (c.big ? ONLY === c.name : !ONLY || c.name.startsWith(ONLY)));
+if (REFINE_CASES.length) {
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  for (const c of REFINE_CASES) {
+    const name = c.name;
+    const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+    page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+    page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+    await page.goto(`${base}?${c.query}`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    await page.waitForTimeout(500);
+    const r: any = await page.evaluate(async (which) => {
+      const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+      const canvas = document.getElementById("view") as HTMLCanvasElement;
+      const [W, H] = [canvas.width, canvas.height];
+      const n = g.n, m = g.src.length;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      const out: any = { backend: view.backend, problems: [] as string[], n, m };
+      const problem = (what: string) => out.problems.push(what);
+      const copy = document.createElement("canvas");
+      copy.width = W; copy.height = H;
+      const ctx = copy.getContext("2d", { willReadFrequently: true })!;
+      const shown = () => { ctx.clearRect(0, 0, W, H); ctx.drawImage(canvas, 0, 0); return ctx.getImageData(0, 0, W, H).data; };
+      const differ = (a: ArrayLike<number>, b: ArrayLike<number>) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+      const ink = (px: Uint8ClampedArray) => { let c = 0; for (let i = 0; i < px.length; i += 4) if (px[i] < 235 || px[i + 1] < 235 || px[i + 2] < 235) c++; return c; };
+      let now = 100_000;
+      // A frame while the view moves, a frame at rest, and the slices.
+      const move = () => { view.pan(2, 0); view.pan(-2, 0); return view.renderFrame((now += 16)); };
+      const rest = () => view.renderFrame((now += 1000));
+      const slices = async () => {
+        let calls = 0, longest = 0;
+        for (;;) {
+          const t = performance.now();
+          const more = view.refine(t);
+          longest = Math.max(longest, performance.now() - t);
+          calls++;
+          if (!more) return { calls, longest };
+          await new Promise((r) => setTimeout(r));
+        }
+      };
+      // The frame at rest, refined: no slices drawn yet, then all of them,
+      // then the frame.
+      const refined = async (what: string) => {
+        const moving = rest();
+        if (moving || !view.refining || !view.framePartial) problem(`${what}: the frame at rest: moving ${moving}, refining ${view.refining}, partial ${view.framePartial}`);
+        const s = await slices();
+        if (s.longest > 50) problem(`${what}: a call of refine() took ${s.longest.toFixed(1)} ms`);
+        rest();
+        const f = view.frameInfo();
+        if (view.refining || view.framePartial || !f.refined) problem(`${what}: after the slices: refining ${view.refining}, partial ${view.framePartial}, ${JSON.stringify(f)}`);
+        return s;
+      };
+      // The refined frame against the frame drawn at once, read back:
+      // how many pixels differ, by how much at most, and how far from
+      // (x, y) the furthest is.
+      const against = async (what: string, x = 0, y = 0) => {
+        const a: Uint8Array | undefined = await view.snapshotRefined();
+        const b: Uint8Array = await view.snapshot();
+        if (!a) { problem(`${what}: no refined frame to read back`); return { pixels: -1, most: 0, far: 0 }; }
+        let pixels = 0, most = 0, far = 0;
+        for (let i = 0; i < b.length; i += 4) {
+          let d = 0;
+          for (let k = 0; k < 4; k++) d = Math.max(d, Math.abs(a[i + k] - b[i + k]));
+          if (!d) continue;
+          pixels++;
+          most = Math.max(most, d);
+          far = Math.max(far, Math.hypot(((i / 4) % W) - x, Math.floor(i / 4 / W) - y));
+        }
+        return { pixels, most, far };
+      };
+      const exact = async (what: string) => {
+        const d = await against(what);
+        if (d.pixels) problem(`${what}: ${d.pixels} pixels of the refined frame differ from the frame drawn at once, by up to ${d.most}`);
+        return d.pixels;
+      };
+
+      if (which === "refine karate") {
+        // Everything fits in a frame: drawn at once, moving or not.
+        const whole = (view.render(), shown());
+        move();
+        if (view.framePartial || view.refining) problem("a moving frame of karate left something out");
+        const moving = rest();
+        if (moving || view.framePartial || view.refining) problem(`karate at rest: moving ${moving}, partial ${view.framePartial}, refining ${view.refining}`);
+        if (view.refine(performance.now())) problem("refine() found slices to draw for karate");
+        if (differ(whole, shown())) problem("karate's frame at rest is not render()'s");
+        if ((await view.snapshotRefined()) !== undefined) problem("karate has a refined frame");
+        out.info = view.frameInfo();
+        if (out.info.refined || out.info.refinement) problem(`karate: ${JSON.stringify(out.info)}`);
+        w.pauseFrames(false);
+        return out;
+      }
+
+      if (which === "refine rmat 1M") {
+        // The frame drawn at once: how long the GPU takes over it.
+        let t = performance.now();
+        await view.snapshot();
+        out.atOnceMs = performance.now() - t;
+        move();
+        await new Promise((r) => setTimeout(r, 300));
+        const tasksBefore = w.stats.longTasks.length;
+        t = performance.now();
+        const s = await refined("1M");
+        out.ms = performance.now() - t;
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        out.shownMs = performance.now() - t;
+        await new Promise((r) => setTimeout(r, 300));
+        out.calls = s.calls;
+        out.longestCall = s.longest;
+        out.longTasks = w.stats.longTasks.slice(tasksBefore).filter((l: number[]) => l[0] >= t - 50 && l[0] < t + out.shownMs).map((l: number[]) => Math.round(l[1]));
+        out.refinement = view.frameInfo().refinement;
+        if (out.longTasks.length) problem(`tasks over 50 ms on the page while the slices were drawn: ${out.longTasks.join(", ")} ms`);
+        // 5 s, where drawing it at once takes under 4: on a machine busy
+        // with other things the slices are held to what that takes, and a
+        // quarter more.
+        out.allowed = Math.max(5000, 1.25 * out.atOnceMs);
+        if (out.ms > out.allowed) problem(`everything took ${Math.round(out.ms)} ms to draw in slices; at most ${Math.round(out.allowed)} are allowed (at once: ${Math.round(out.atOnceMs)} ms)`);
+        out.differs = await exact("1M");
+        // A zoom begun under the slices: its frame is asked for at once.
+        view.zoom(1.2, W / 2, H / 2);
+        move();
+        rest();
+        for (let i = 0; i < 6; i++) { view.refine(performance.now()); await new Promise((r) => setTimeout(r)); }
+        t = performance.now();
+        view.zoom(1.2, W / 2, H / 2);
+        const moving = view.renderFrame((now += 16));
+        await new Promise((r) => requestAnimationFrame(r));
+        out.zoomUnderMs = performance.now() - t;
+        if (!moving || view.refining) problem(`a zoom under the slices: moving ${moving}, refining ${view.refining}`);
+        w.pauseFrames(false);
+        return out;
+      }
+
+      // Everything, drawn at once, on the canvas; and a moving frame.
+      const whole = (view.render(), shown());
+      out.inkWhole = ink(whole);
+      if (!move() || !view.framePartial) problem("a moving frame of 100K edges left nothing out");
+      const moving = shown();
+      out.inkMoving = ink(moving);
+
+      // At rest: the canvas stays, the slices are drawn, and the frame is
+      // the frame drawn at once.
+      rest();
+      if (differ(moving, shown())) problem("the frame at rest changed the canvas before its slices were drawn");
+      if ((await view.snapshotRefined()) !== undefined) problem("a refined frame before the slices were drawn");
+      rest();
+      const first = await slices();
+      rest();
+      out.first = { ...first, ...view.frameInfo().refinement };
+      if (!(first.calls > 3 && out.first.slices > 3)) problem(`100K edges were drawn in ${out.first.slices} slices, ${first.calls} calls`);
+      if (first.longest > 50) problem(`a call of refine() took ${first.longest.toFixed(1)} ms`);
+      if (view.refining || view.framePartial || !view.frameInfo().refined) problem(`after the slices: ${JSON.stringify(view.frameInfo())}, partial ${view.framePartial}`);
+      out.canvasDiffers = differ(whole, shown());
+      if (out.canvasDiffers) problem(`the refined frame on the canvas differs from render() in ${out.canvasDiffers} bytes`);
+      out.fitted = await exact("fitted");
+      // Again at rest: the same texture, no slices.
+      rest();
+      if (view.refining || view.framePartial || differ(whole, shown())) problem("a second frame at rest was not the refined one");
+
+      // A hover and a selection: no slices, and the frame differs only at
+      // the node's rim.
+      let node = 0;
+      for (let i = 0; i < n; i++) { const [x, y] = view.nodePixel(i); if (x > 100 && x < W - 100 && y > 100 && y < H - 100) { node = i; break; } }
+      const [nx, ny] = view.nodePixel(node);
+      view.setHovered(node);
+      rest();
+      if (view.refining || view.framePartial || !view.frameInfo().refined) problem("a hover drew the slices again");
+      out.hover = await against("hovered", nx, ny);
+      if (out.hover.pixels > 200 || out.hover.far > 24 || out.hover.most > 64) problem(`a hovered node changed ${JSON.stringify(out.hover)} of the refined frame`);
+      view.setHovered(undefined);
+      rest();
+      if (view.refining) problem("the hover's end drew the slices again");
+      await exact("after a hover");
+      view.setSelection(Uint32Array.of(node));
+      rest();
+      if (view.refining || !view.frameInfo().refined) problem("a selection drew the slices again");
+      out.selected = await against("selected", nx, ny);
+      if (out.selected.pixels > 200 || out.selected.far > 24) problem(`a selected node changed ${JSON.stringify(out.selected)} of the refined frame`);
+
+      // A pan: its frames draw the texture under their own edges and
+      // nodes, so nearly everything is there.
+      view.pan(40, 0);
+      if (!view.renderFrame((now += 16)) || !view.framePartial) problem("a frame after a pan is not a moving, partial one");
+      out.inkPanned = ink(shown());
+      if (!(out.inkPanned > 0.8 * out.inkWhole && out.inkPanned > 2 * out.inkMoving)) problem(`a pan's frame inked ${out.inkPanned} pixels: everything is ${out.inkWhole}, a prefix ${out.inkMoving}`);
+      if (view.frameInfo().refined) problem("the texture is taken as the frame at rest after a pan");
+      // Refined with the node selected: it is in front, and not in the
+      // texture. Deselected, it is drawn over the texture.
+      await refined("panned");
+      await exact("panned, a node selected");
+      view.setSelection(new Uint32Array(0));
+      rest();
+      if (view.refining || !view.frameInfo().refined) problem("the selection's end drew the slices again");
+      const [px, py] = view.nodePixel(node);
+      out.deselected = await against("deselected", px, py);
+      if (out.deselected.pixels > 200 || out.deselected.far > 24) problem(`a deselected node changed ${JSON.stringify(out.deselected)} of the refined frame`);
+
+      // Zoomed in: the node slices are of the nodes in view.
+      view.zoom(8, W / 2, H / 2);
+      view.renderFrame((now += 16));
+      await refined("zoomed");
+      out.nodesDrawn = view.nodesDrawn;
+      if (!(out.nodesDrawn < n / 2)) problem(`zoomed in 8 times, the node pass draws ${out.nodesDrawn} of ${n} nodes`);
+      out.zoomed = await exact("zoomed in");
+      view.zoom(1 / 8, W / 2, H / 2);
+      view.renderFrame((now += 16));
+
+      // What changes everything draws the slices again: a theme, a
+      // highlight (the rest is dimmed), a hidden node, a delta.
+      const again = async (what: string, change: () => void) => {
+        if (!view.frameInfo().refined) await refined(`before ${what}`);
+        change();
+        if (view.frameInfo().refined) problem(`${what} left the texture as the frame at rest`);
+        const before = shown();
+        rest();
+        if (!differ(before, shown())) problem(`${what} was not shown before its slices were drawn`);
+        if (!view.refining || !view.framePartial) problem(`${what}: refining ${view.refining}, partial ${view.framePartial}`);
+        await slices();
+        rest();
+        return exact(what);
+      };
+      out.dark = await again("the dark theme", () => view.setThemeNamed("dark"));
+      await again("the light theme", () => view.setThemeNamed("light"));
+      let e = 0;
+      while (g.src[e] === g.dst[e]) e++;
+      out.highlit = await again("a highlight", () => view.setHighlights(Uint32Array.of(0, 2), Uint32Array.of(g.src[e], g.dst[e])));
+      await again("the highlight's end", () => view.clearHighlights());
+      out.hidden = await again("a hidden node", () => view.setHidden(Uint32Array.of(g.src[e])));
+      await again("the hidden node's return", () => view.setHidden(new Uint32Array(0)));
+      const grow = new viz.DeltaBuilder().addNodes(n, 1).addEdges(Uint32Array.of(n), Uint32Array.of(node)).toBytes();
+      out.grown = await again("a delta", () => view.applyDelta(grow));
+      await again("the delta's inverse", () => view.applyDelta(viz.invertDelta(grow)));
+
+      // A pan stops the slices; an order written under them begins them
+      // again; both end in the frame drawn at once.
+      view.pan(7, 0);
+      view.renderFrame((now += 16));
+      rest();
+      for (let i = 0; i < 3; i++) { view.refine(performance.now()); await new Promise((r) => setTimeout(r)); }
+      if (!view.refining) problem("three calls drew every slice of 100K edges");
+      view.pan(5, 0);
+      if (view.refining || view.refine(performance.now())) problem("a pan left slices to draw");
+      if (!view.renderFrame((now += 16))) problem("the frame after the pan is not a moving one");
+      await refined("after a pan under the slices");
+      await exact("after a pan under the slices");
+      view.pan(7, 0);
+      view.renderFrame((now += 16));
+      rest();
+      for (let i = 0; i < 3; i++) { view.refine(performance.now()); await new Promise((r) => setTimeout(r)); }
+      const layout = new viz.Layout(n, g.src, g.dst);
+      view.setEdgeOrder(layout.edgeOrder(g.src, g.dst));
+      layout.free();
+      while (view.orderEdges()) await new Promise((r) => setTimeout(r));
+      if (!view.refining) problem("an order written under the slices ended them");
+      const reordered = await slices();
+      rest();
+      out.reordered = { calls: reordered.calls, slices: view.frameInfo().refinement.slices, differs: await exact("after an order under the slices") };
+
+      // Turned off: the frame at rest is drawn at once.
+      view.setRefining(false);
+      move();
+      const atOnce = rest();
+      if (atOnce || view.refining || view.framePartial) problem(`with refining off, the frame at rest: moving ${atOnce}, refining ${view.refining}, partial ${view.framePartial}`);
+      view.render();
+      const direct = shown();
+      move();
+      rest();
+      if (differ(direct, shown())) problem("with refining off, the frame at rest is not render()'s");
+      view.setRefining(true);
+      w.pauseFrames(false);
+      return out;
+    }, name).catch((e) => ({ problems: [String(e)] }));
+    for (const what of r.problems) failures.push(`${name}: ${what}`);
+    if (name === "refine karate") console.log(`${name} on ${r.backend}: never refined; ${JSON.stringify(r.info)}`);
+    else if (c.big) {
+      console.log(
+        `${name} on ${r.backend}: ${r.n} nodes, ${r.m} edges; drawn in slices in ${Math.round(r.ms)} ms (shown after ${Math.round(r.shownMs)} ms; drawn at once and read back: ${Math.round(r.atOnceMs)} ms), ` +
+          `${JSON.stringify(r.refinement)}; ${r.calls} calls of refine(), the longest ${r.longestCall?.toFixed(1)} ms; tasks over 50 ms meanwhile: ${JSON.stringify(r.longTasks)}; ` +
+          `${r.differs} pixels differ from the frame drawn at once; a zoom begun under the slices was drawn in ${Math.round(r.zoomUnderMs)} ms`,
+      );
+    } else {
+      console.log(
+        `${name} on ${r.backend}: ${r.n} nodes, ${r.m} edges; the first refinement ${JSON.stringify(r.first)}; pixels that differ from the frame drawn at once: fitted ${r.fitted} (on the canvas ${r.canvasDiffers} bytes), ` +
+          `zoomed in ${r.zoomed} (${r.nodesDrawn} nodes in view), dark ${r.dark}, a highlight ${r.highlit}, a hidden node ${r.hidden}, a delta ${r.grown}, an order under the slices ${JSON.stringify(r.reordered)}; ` +
+          `hovered ${JSON.stringify(r.hover)}, selected ${JSON.stringify(r.selected)}, deselected ${JSON.stringify(r.deselected)}; ink: everything ${r.inkWhole}, a prefix ${r.inkMoving}, a pan over the texture ${r.inkPanned}`,
+      );
+    }
+    await page.close();
+  }
+  await gl.close();
+  // The slices under WebGPU, whose validation is the stricter: the
+  // texture is drawn into and drawn from, texel for texel and moved, with
+  // no error from the device. Its frames cannot be read back here.
+  if (webgpu && REFINE_CASES.some((c) => c.name === "refine rmat 100K")) {
+    const gpu = await chromium.launch({ args: ["--enable-unsafe-webgpu", "--enable-features=Vulkan"] });
+    const page = await gpu.newPage({ viewport: { width: 1000, height: 700 } });
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+    await page.goto(`${base}?graph=rmat&scale=14&edges=100000&result=1`);
+    await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+    const r: any = await page.evaluate(async () => {
+      const w = window as any, view = w.view;
+      w.pauseFrames(true);
+      await new Promise((r) => setTimeout(r, 200));
+      let now = 100_000;
+      view.pan(3, 0);
+      view.renderFrame((now += 16));
+      view.renderFrame((now += 1000));
+      const began = view.refining;
+      while (view.refine(performance.now())) await new Promise((r) => setTimeout(r));
+      view.renderFrame((now += 16));
+      const refined = view.frameInfo();
+      view.setHovered(5);
+      view.renderFrame((now += 16));
+      view.pan(30, 10);
+      view.zoom(1.5, 400, 300);
+      view.renderFrame((now += 16));
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      w.pauseFrames(false);
+      return { backend: view.backend, began, refined, partial: view.framePartial };
+    });
+    await page.waitForTimeout(300);
+    for (const e of errors) failures.push(`refine on ${r.backend}: ${e}`);
+    if (!r.began || !r.refined.refined || !r.partial) failures.push(`refine on ${r.backend}: ${JSON.stringify(r)}`);
+    console.log(`refine on ${r.backend}: 100K edges drawn in ${r.refined.refinement?.slices} slices, shown, hovered, and panned and zoomed over the texture with ${errors.length} errors`);
+    await gpu.close();
+  }
+}
+// A level of the layout's hierarchy drawn in place of the graph (#497), on
+// WebGL2, where frames can be read back: the coarsest level of a 100K-edge
+// R-MAT graph, and the levels under it as the layout comes down. Every
+// disc is on the canvas where its node is, the heaviest merged edge is
+// drawn between its ends, a moving frame of a large level draws the
+// heaviest of it, nothing is picked, and once the level is cleared the
+// frame is the graph's own, byte for byte. And the layout stepped a level
+// at a time ends on the bits of one stepped whole. ONLY=levels runs this
+// alone.
+if (!ONLY || "levels".startsWith(ONLY)) {
+  const name = "levels rmat 100K";
+  const gl = await chromium.launch({ args: ["--disable-features=WebGPU"] });
+  const page = await gl.newPage({ viewport: { width: 1000, height: 700 }, deviceScaleFactor: 1 });
+  page.on("pageerror", (e) => failures.push(`${name}: ${e.message}`));
+  page.on("console", (m) => m.type() === "error" && failures.push(`${name}: ${m.text()}`));
+  await page.goto(`${base}?graph=rmat&scale=14&edges=100000&result=1`);
+  await page.waitForFunction(() => (window as any).stats?.layoutDone, null, { timeout: 300_000, polling: 100 });
+  await page.waitForTimeout(500);
+  const r: any = await page.evaluate(async () => {
+    const w = window as any, view = w.view, viz = w.viz, g = w.graph;
+    const canvas = document.getElementById("view") as HTMLCanvasElement;
+    const [W, H] = [canvas.width, canvas.height];
+    w.pauseFrames(true);
+    await new Promise((r) => setTimeout(r, 200));
+    const out: any = { backend: view.backend, problems: [] as string[], levels: [] as any[] };
+    const problem = (what: string) => out.problems.push(what);
+    const differ = (a: Uint8Array, b: Uint8Array) => { let d = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++; return d; };
+    const ink = (px: Uint8Array) => { let c = 0; for (let i = 0; i < px.length; i += 4) if (px[i] < 235 || px[i + 1] < 235 || px[i + 2] < 235) c++; return c; };
+    const at = (px: Uint8Array, x: number, y: number) => { const i = 4 * (Math.round(y) * W + Math.round(x)); return [px[i], px[i + 1], px[i + 2]]; };
+    // Everything, read back.
+    const frame = async (): Promise<Uint8Array> => { view.render(); return view.snapshot(); };
+    view.fit();
+    const graphFrame = await frame();
+    const picked = view.pick(W / 2, H / 2);
+    if (view.levelInfo() !== undefined) problem("a view with no level set says it draws one");
+
+    // The layout the levels come from, and one stepped whole, to end on
+    // the same bits.
+    const layout = new viz.Layout(g.n, g.src, g.dst);
+    const whole = new viz.Layout(g.n, g.src, g.dst);
+    out.count = layout.levels;
+    if (!(layout.levels > 3)) problem(`the layout has ${layout.levels} levels`);
+    while (!layout.levelFinished) layout.stepLevel(1);
+    // Where the camera, fitted to `xy`, puts a point: Camera::fit's margin.
+    const place = (xy: Float32Array, n: number) => {
+      let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+      for (let i = 0; i < n; i++) { x0 = Math.min(x0, xy[i]); x1 = Math.max(x1, xy[i]); y0 = Math.min(y0, xy[n + i]); y1 = Math.max(y1, xy[n + i]); }
+      const scale = Math.min(W / Math.max(x1 - x0, 1e-6), H / Math.max(y1 - y0, 1e-6)) * 0.92;
+      return (i: number) => [W / 2 + (xy[i] - (x0 + x1) / 2) * scale, H / 2 - (xy[n + i] - (y0 + y1) / 2) * scale];
+    };
+    let above = 0;
+    let disc: number[] | null = null;
+    for (let step = 0; step < 4; step++) {
+      const level = layout.levelGraph(4096);
+      const n = level.mass.length;
+      const xy: Float32Array = layout.levelPositions();
+      const tag = `level ${level.level}`;
+      if (level.level !== layout.level || level.levels !== layout.levels || xy.length !== 2 * n) problem(`${tag}: ${n} masses, ${xy.length} positions, level ${layout.level}`);
+      if (step === 0 ? level.parents !== undefined : level.parents?.length !== n || level.parents.some((p: number) => p >= above && p !== 0xffffffff)) problem(`${tag}: its parents are not nodes of the level above`);
+      if (level.src.length !== level.dst.length || level.src.length !== level.weight.length || level.src.length > 4096 || level.totalEdges < level.src.length) problem(`${tag}: ${level.src.length} edges of ${level.totalEdges}`);
+      if (level.weight.some((x: number, i: number) => i > 0 && x > level.weight[i - 1])) problem(`${tag}: the edges are not heaviest first`);
+      view.setLevel(level.level, level.levels, level.mass, level.src, level.dst, level.weight, level.totalEdges);
+      view.setLevelPositions(xy);
+      const px = await frame();
+      const info = view.levelInfo();
+      if (info?.level !== level.level || info.nodes !== n || info.nodesDrawn !== n || info.edges !== level.src.length || info.edgesDrawn !== level.src.length || info.totalEdges !== level.totalEdges) problem(`${tag}: levelInfo ${JSON.stringify(info)}`);
+      // The heaviest discs, where their nodes are, in the nodes' colour.
+      const to = place(xy, n);
+      const heaviest = Array.from(level.mass as Float32Array, (m, i) => [m, i]).sort((a, b) => b[0] - a[0]).slice(0, 5).map(([, i]) => i);
+      for (const i of heaviest) {
+        const [x, y] = to(i);
+        const c = at(px, x, y);
+        disc ??= c;
+        if (c.some((v, k) => Math.abs(v - disc![k]) > 2) || c.every((v) => v > 235)) problem(`${tag}: node ${i} at ${Math.round(x)},${Math.round(y)} is ${c}, not a disc (${disc})`);
+      }
+      // The heaviest edge, half way between its ends (unless a disc is there).
+      if (level.src.length) {
+        const [a, b] = [to(level.src[0]), to(level.dst[0])];
+        const c = at(px, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+        if (c.every((v) => v > 235)) problem(`${tag}: nothing is drawn half way along its heaviest edge`);
+      }
+      if (!differ(px, graphFrame)) problem(`${tag}: the frame is the graph's`);
+      if (view.pick(W / 2, H / 2) !== undefined || view.pickLinear(W / 2, H / 2) !== undefined || view.pickEdge(W / 2, H / 2, 4) !== undefined) problem(`${tag}: something was picked`);
+      // A moving frame: within the budget, the heaviest of the level.
+      view.keepMoving();
+      view.renderFrame(performance.now());
+      const moving = view.levelInfo();
+      const part: Uint8Array = await view.snapshot();
+      if (!(moving.nodesDrawn >= 1 && moving.nodesDrawn <= n && moving.edgesDrawn <= level.src.length)) problem(`${tag}: a moving frame drew ${JSON.stringify(moving)}`);
+      if (moving.nodesDrawn < n && !(view.framePartial && ink(part) < ink(px))) problem(`${tag}: a moving frame of ${moving.nodesDrawn} of ${n} nodes is not less than all of it`);
+      out.levels.push({ level: level.level, nodes: n, edges: level.src.length, totalEdges: level.totalEdges, ink: ink(px), movingNodes: moving.nodesDrawn, movingEdges: moving.edgesDrawn });
+      above = n;
+      // Down a level, and that level to its last iteration.
+      const from = layout.level;
+      layout.stepLevel(1);
+      if (layout.level !== from - 1) problem(`${tag}: a step from a finished level went to level ${layout.level}`);
+      while (!layout.levelFinished && !layout.done) layout.stepLevel(1);
+    }
+    // More positions than the level has nodes are refused.
+    let refused = false;
+    try { view.setLevelPositions(new Float32Array(3)); } catch { refused = true; }
+    if (!refused) problem("positions of the wrong length were taken");
+    // The graph again: its own frame, byte for byte, and its picks.
+    view.clearLevel();
+    view.fit();
+    out.afterClear = differ(await frame(), graphFrame);
+    if (out.afterClear) problem(`once the level is cleared, ${out.afterClear} bytes of the frame differ from the graph's`);
+    if (view.levelInfo() !== undefined || view.pick(W / 2, H / 2) !== picked) problem("once the level is cleared, the graph is not picked as before");
+    try { view.setLevelPositions(new Float32Array(2)); problem("positions were taken with no level set"); } catch { /* refused */ }
+    // To the end, a level at a time, against one stepped whole.
+    const t = performance.now();
+    while (!layout.done) layout.stepLevel(8);
+    out.layoutMs = performance.now() - t;
+    while (!whole.done) whole.step(8);
+    const [a, b]: Float32Array[] = [layout.positions(), whole.positions()];
+    const bits = (f: Float32Array) => new Uint32Array(f.buffer, f.byteOffset, f.length);
+    out.sameBits = a.length === b.length && bits(a).every((v, i) => v === bits(b)[i]);
+    if (!out.sameBits) problem("a layout stepped a level at a time does not end on the bits of one stepped whole");
+    const last = layout.levelGraph(16);
+    if (last.level !== 0 || last.mass.length || last.src.length || last.totalEdges <= 0) problem(`level 0: ${last.mass.length} masses, ${last.src.length} edges of ${last.totalEdges}`);
+    layout.free();
+    whole.free();
+    w.pauseFrames(false);
+    return out;
+  });
+  for (const problem of r.problems) failures.push(`${name}: ${problem}`);
+  console.log(
+    `${name}: ${r.backend} · ${r.count} levels · read back ${r.levels.map((l: any) => `level ${l.level}: ${l.nodes} discs, ${l.edges} of ${l.totalEdges} edges, ${l.ink} px inked (moving: ${l.movingNodes} discs, ${l.movingEdges} edges)`).join("; ")} · ` +
+      `cleared, ${r.afterClear} bytes differ from the graph's frame · a level at a time ends on the same bits: ${r.sameBits}`,
+  );
   await gl.close();
 }
 server.stop();

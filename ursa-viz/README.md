@@ -171,14 +171,16 @@ when it rests (#495, the design's §5).
   One late frame is a hiccup and changes nothing. Under a steady load the
   budget moves by 4%.
 - **At rest** (200 ms after the last movement; `frameRestMs`) a frame draws
-  everything, as `render()` always does. The page draws that frame when
-  `framePartial` says the last one left something out; a layout that is
-  still running counts as movement (`keepMoving()`).
+  everything: at once, as `render()` always does, if that fits in a frame,
+  and else in slices ([below](#refinement-at-rest)). The page draws that
+  frame when `framePartial` says the last one left something out; a layout
+  that is still running counts as movement (`keepMoving()`).
 - `frameInfo()` (and `info().frame`) says what the budget is doing:
-  `{k, nodes, edges, ordered, p95, frames, limit}`: the edges and nodes the
-  last moving frame drew, the edges there are, how many are in importance
-  order, the p95 of the last 120 moving frames' costs, how many were
-  measured, and the cost a frame is held to.
+  `{k, nodes, edges, ordered, p95, frames, limit, refining, refined,
+  refinement}`: the edges and nodes the last moving frame drew, the edges
+  there are, how many are in importance order, the p95 of the last 120
+  moving frames' costs, how many were measured, the cost a frame is held
+  to, and the refinement at rest.
 
 The view keeps no table of where each edge went (it would be four bytes an
 edge for as long as the view lives), only how many are ordered. So a delta
@@ -206,19 +208,205 @@ runs, where they were 3.3 s; they draw 512 to 1,081 edges and 170 to 360
 nodes, which is all this renderer shows in a frame. Ordering the million edges takes the layout
 worker 0.3 s. It has not been measured on a GPU.
 
+## Refinement at rest
+
+Everything, at rest, is seconds of a software renderer's time, and more
+than a frame of an integrated GPU's. Drawn at once it holds up whatever
+comes next: a zoom begun under it waits for it. So where everything does
+not fit in a frame (the budget says: it is what a moving frame leaves
+something out of), the frame at rest is drawn in slices into a texture,
+and the texture is kept (#496, the design's §5; `refine.rs`).
+
+- **The slices.** `renderFrame` at rest leaves the canvas as it is (the
+  last moving frame) and sets `refining`. The page then calls
+  `refine(performance.now())` a task at a time. Each call sends the GPU a
+  run of the edge buffer, and after the edges a run of the node pass, drawn
+  into a texture the size of the canvas over what the runs before left
+  there; the first clears it. A slice is sized to take the GPU 16 ms: the
+  first is what a moving frame draws, and each is at most twice the last,
+  or a quarter of it, by what the last took (`SlicePace`). The GPU says
+  when it has finished one (`queue.onSubmittedWorkDone`: a fence under
+  WebGL2), and is kept one slice ahead so that it is never idle; `refine`
+  sends no more than that, so nothing queues behind seconds of drawing.
+  When it returns `false` the page draws a frame.
+- **The frame.** That frame, and every frame at rest after it, is the
+  texture, copied texel for texel, and over it the highlighted edges and
+  the nodes in front: `framePartial` is false again. A hover or a click on
+  a million edges is a frame of next to nothing (in the shell with no GPU,
+  0.1 s from the click to its frame, where it was 2.5 to 4 s).
+- **Any movement stops the slices**: a pan, a zoom, a resize, new
+  positions. It waits for the slices the GPU has (two at most), not for
+  the rest. A change that only a frame can show (a hover's ring) while
+  they are drawn stops them too: a frame of what fits shows it, and they
+  begin again.
+- **While the view moves**, the texture is drawn under the moving frame's
+  own edges and nodes, moved and scaled as the camera has been since it
+  was drawn: the whole picture stays on screen through a pan, as a map's
+  tiles do, a little soft through a zoom, and what the texture does not
+  cover is the prefix alone. A texture whose slices were stopped is drawn
+  the same way, with what it has. At the next rest it is drawn again.
+- **One render target**, the size of the canvas (4 bytes a pixel), made
+  when a refinement first needs it, and destroyed when the view is freed
+  (which is what the page does when the pane closes or the context is
+  lost), when the canvas changes size, and when everything fits in a frame
+  again. It needs nothing WebGL2 lacks: a node slice is drawn from where
+  its buffers are bound, not from a first instance.
+
+**The same pixels.** The texture is what `render()` puts under its
+highlighted edges: the background, every edge, every node not in front, in
+the same order, with the same blending, in the canvas's format. A slice is
+a run of the same draw, and blending reads what is in the target whichever
+pass put it there, so the refined frame is the frame drawn at once **byte
+for byte: the tolerance is 0**, and `tests/browser/view.ts` holds it to
+that on WebGL2 (`snapshotRefined()` against `snapshot()`). Two cases are
+not byte for byte, both after the fact:
+
+- A node that comes to the front **after** the texture was drawn (hovered,
+  selected) is drawn in front as ever, over its copy in the texture. Where
+  the two discs are the same size the rim's pixels are blended twice: at
+  most a quarter of the way further from what is under the node to its
+  colour, on the rim of that node alone. Nodes under 3 px (every node of a
+  large graph, fitted) are drawn at 3 px in front and cover their copy
+  whole: no pixel differs. When the node leaves the front the frame is
+  exact again.
+- A node that was in front **when** the texture was drawn and no longer is
+  has no copy in it: it is drawn over the texture, after every other node
+  and not among them, so it differs where another node overlaps it.
+
+Any other change of flags (a highlight, which dims the rest; a hidden or a
+pinned node), a delta, new positions, a style, a theme or the edges'
+opacity draws the texture again; an edge order written under the slices,
+or the grid's being built, begins them again.
+
+`tests/browser/view.ts` (`ONLY=refine`) checks, on WebGL2: karate fits in
+a frame and is never refined; on R-MAT with 100K edges the frame at rest
+leaves the canvas alone, is drawn in 25 to 40 slices with no call of
+`refine` over 5 ms, and is then the frame drawn at once, 0 bytes apart,
+read back and on the canvas: fitted, zoomed in eight times (the nodes in
+view alone), in the dark theme, with a path highlighted, a node hidden,
+after a delta, and after an order written under the slices; a hover and a
+selection draw no slices; a pan stops them, and its frame over the texture
+inks as much as everything does. `ONLY="refine rmat 1M"` is the issue's
+size.
+
+Measured on R-MAT with 1M edges in headless Chromium's software WebGL2
+([`BENCH.md`](BENCH.md#refinement-at-rest)): no task of the page over
+50 ms while the slices are drawn, and everything drawn in 2.2 to 2.9 s in
+the shell (46,318 nodes) and 3.8 to 5.4 s in the demo (131,072 nodes),
+which is what drawing it at once takes there, to a tenth more. It has not
+been measured on a GPU.
+
+## The first paint: a level of the hierarchy
+
+Coarse to fine lays out a pyramid of the graph from the top down: a few
+dozen nodes first, each standing for thousands, then twice as many, down to
+the graph itself. Until the layout reaches the graph, drawing the graph is
+the most expensive way to show the least: every edge, between points that
+coincide. So a view can draw **the level being laid out** in its place
+(#497):
+
+- **A disc for each node of the level**, its area in proportion to the
+  node's mass (the summed `degree + 1` of the nodes it stands for). The
+  discs of a level cover 6% of the canvas together, at every level, so a
+  node's disc is as large as its children's will be together.
+- **The level's heaviest merged edges**, each 1 to 5 pixels wide and as
+  dark as its weight says (the number of the graph's edges it stands for,
+  by the square root, against the level's heaviest).
+- **Within the frame budget**: a moving frame (and a running layout is
+  movement) draws the heaviest discs and the heaviest edges that fit, in
+  the budget's own units (a disc and a merged edge are a quad each, as a
+  node is).
+
+```js
+const layout = new Layout(n, src, dst);
+while (!layout.levelFinished) layout.stepLevel(1);   // the coarsest level, laid out
+let g = layout.levelGraph(16384);    // {level, levels, mass, parents, src, dst, weight, totalEdges}
+view.setLevel(g.level, g.levels, g.mass, g.src, g.dst, g.weight, g.totalEdges);
+view.setLevelPositions(layout.levelPositions());     // x then y, one per node of the level
+// … then, a batch at a time:
+const before = layout.level;
+layout.stepLevel(batch);             // comes down one level at most, and stops at its end
+if (layout.level === 0) { view.clearLevel(); view.setPositions(layout.positions()); }
+else if (layout.level !== before) { /* setLevel(layout.levelGraph(…)) again */ }
+else view.setLevelPositions(layout.levelPositions());
+view.levelInfo();                    // {level, levels, nodes, nodesDrawn, edges, edgesDrawn, totalEdges}
+```
+
+`Layout.stepLevel` is `step` a level at a time: it comes down a level only
+at the start of a call, from a level that has had all its iterations, and
+stops when the level it is at has had its own, so every level can be read
+before the hierarchy lets it go (`Fa2Multilevel::step_level`,
+`LiveLayout::step_level`). It does not prolong a coarse level's positions
+to the graph, which `step` does after every call and a caller that draws
+the level has no use for (`positions()` prolongs them when asked). **The
+layout ends on the same positions, bit for bit**, whichever way it is
+stepped and whatever is read on the way, on any thread count
+(`ursa-core/tests/determinism_threads.rs`).
+
+`levelGraph(mostEdges)` is the level as a graph of its own, in new typed
+arrays outside the module's memory, the caller's to transfer: each node's
+mass, its parent in the level above (if `stepLevel` came down to this
+level; given once), and the heaviest `mostEdges` merged edges, heaviest
+first. The heaviest are found by counting, not by sorting them all (a
+quarter of a megabyte, whatever the level's size), and a lean hierarchy's
+weights are made again for the level as its first iteration would have:
+the layout worker's memory at a million edges is what it was (55.6 MB,
+`web/tests/graph-timing.ts`). Level 0 has `parents` alone: its nodes,
+masses and edges are the graph's own. Level by level this is the
+hierarchy in each level's own numbering, which is what a cut through it
+(#498) is made of: some nodes of each level, found by going down
+`parents`.
+
+While a level is drawn the view fits the level (if the camera follows),
+picks nothing (the graph's nodes have no place yet), and draws nothing of
+the graph; `clearLevel()` draws the graph again, the same frame as ever.
+A level is never refined in slices: at rest a frame has all the view
+holds of it. The level's pipelines are a shader of their own
+(`level_render.rs`), made on the first `setLevel`, or, for a graph of
+200,000 nodes and edges or more, while the view is made, so that the frame
+a large graph is first seen in does not wait for a compile.
+
+**Moving between levels** is the page's: the shell's `graph-levels.js`
+keeps each level as it arrives and, for 150 ms after the layout comes down
+one, draws each node on its way out from its parent's place (at once under
+`prefers-reduced-motion`), by giving `setLevelPositions` (or, for the graph
+itself, `setPositions`) the positions between.
+
+`tests/browser/view.ts` (`ONLY=levels`) reads frames back on WebGL2 at the
+four coarsest levels of a 100K-edge R-MAT graph: every one of the heaviest
+discs is where its node is, the heaviest edge is drawn between its ends, a
+moving frame draws no more than the level has, nothing is picked, the frame
+after `clearLevel()` is the graph's own byte for byte, and the layout
+stepped a level at a time ends on the bits of one stepped whole.
+
+Measured on `.graph rmat` (1M edges) in the shell, in headless Chromium's
+software WebGL2 ([`BENCH.md`](BENCH.md#the-first-paint)): the first frame
+is shown 0.94 s after Enter where it was 1.13 to 1.23 s, and it is 27
+laid-out discs and their edges where it was the largest 270 of the graph's
+nodes at their groups' places; the frames of the coarse levels are 33 ms
+apart at the 95th percentile and 50 ms at most. The 0.6 s the issue asks
+for is not met here: the engine's answer takes 0.35 to 0.42 s of it and
+building the hierarchy 0.5 s more.
+
 ## Making a view
 
 Making a view costs an upload, not a graph build (#426). At 46K nodes and
 1M edges `createView` holds the page's thread for no task over 50 ms and
 leaves the page's wasm memory at 16 MiB; it was one task of 190 to 350 ms
-and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)).
+and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)). A view made from a result
+(`createViewFromResult`) is made the same way and holds 18 MiB (#501).
 
 - **No adjacency.** A `Graph` is the node count and the edge list. Its
-  topology, which a layout needs and a frame does not, is built when first
-  asked for (`Graph::topology`), so the page's view never builds one: its
-  layout runs in a worker. `View::step`, a layout on the view's own thread,
-  builds it on its first call. `GraphView.hasTopology` says whether it is
-  there.
+  undirected adjacency, which a layout needs and a frame does not, is built
+  when first asked for (`Graph::adjacency`), so the page's view never builds
+  one: its layout runs in a worker. `View::step`, a layout on the view's own
+  thread, builds it on its first call. `GraphView.hasTopology` says whether
+  it is there.
+- **The edges once.** A view made from a result reads its nodes and edges
+  from the result (`View::edges`), and keeps no graph of its own beside it.
+  The result is read from the page's buffer a section at a time
+  (`View::from_ugr_paced`, [`UGR.md`](UGR.md#reading-a-large-result)), so
+  the buffer is never in the view's memory as well.
 - **Degrees from the edge list.** A node's degree is its distinct
   neighbours, as the adjacency counts them. `Graph::degrees` counts them in
   three passes over the edges, with no sort: each pair of nodes is put in
@@ -230,7 +418,9 @@ and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)).
   (`ursa_core::algo::fa2_seed_positions`).
 - **Edges a run at a time.** The edges go to the GPU 65,536 at a time, each
   run submitted before the next is made, so a million edges are never held
-  again as one list of indexes.
+  again as one list of indexes. On a page the view waits for the GPU to
+  take each run (a few turns of the event loop): until it has, WebGL2 keeps
+  the run's bytes in the view's memory.
 - **In pieces.** What is left is compiling the shader, linking five
   pipelines and the uploads: 150 to 200 ms on software WebGL2. On a page
   (`createView`, `createViewFromResult`; `View::new_paced` and
@@ -584,6 +774,36 @@ whatever the layout costs. `Layout`'s `level` and `levels` say how far it
 is: coarse to fine counts `level` down from `levels - 1` to 0, the graph
 itself.
 
+What the worker holds (#501), 56 MB at 1M edges where it was 101:
+
+- **An adjacency, not a topology.** A layout reads the graph's undirected
+  adjacency and nothing else, so that is all that is built
+  (`UndirectedCsr::from_edges`: two slots an edge, sorted and merged in
+  place), or it is handed over: `Layout.fromAdjacency(n, offsets, targets)`
+  takes the adjacency a result carries
+  ([`UGR.md`](UGR.md), `edges.adjacency.*`), checks it in one pass and
+  sorts nothing (`LiveLayout::multilevel_on` and the other `_on`
+  constructors). Either way it is the adjacency `Topology::undirected`
+  gives, so the layout has the same bits.
+- **A lean hierarchy** (`Fa2Multilevel::new_lean`). R-MAT's coarse levels
+  do not thin: at 1M edges the first four have 68 to 95% of the graph's
+  adjacency entries each, and with a weight for every entry the hierarchy
+  was 53 MiB. A
+  level with more than three quarters of the graph's entries lets go of its
+  weights once the level above is built from them, and they are made again
+  (one more contraction for each level between it and the graph) when the
+  layout comes down to it; and every level is released once the layout is
+  past it. The positions are the same at every step. It costs a 1M-edge
+  R-MAT layout six contractions, which is within the spread of the runs
+  here (5.2 to 5.6 s from the hierarchy to the end lean, 5.3 to 5.9 s
+  with every weight held; [`BENCH.md`](BENCH.md#memory-at-a-million-edges));
+  a graph whose levels shrink pays nothing.
+- **Positions in two copies.** `Layout.positions()` fills a new
+  `Float32Array` from the layout's state, which the worker transfers;
+  `GraphView.setPositions` copies it into the positions the view keeps
+  (for picking, and the nodes in front) and writes those to the GPU. They
+  used to be copied six times on the way.
+
 ## Growing a layout
 
 A view that expands a node gains a few neighbours, and what is drawn must
@@ -785,6 +1005,30 @@ HEADED=1 CHROME=/path/to/chrome bun run bench         # a real GPU
 
 ## Not yet
 
+- **Refinement that survives a hover.** A change of flags while the slices
+  are drawn begins them again (#496), so with no GPU, where they take
+  seconds, the full picture comes only once the pointer stops crossing
+  nodes. And there is one texture: a refinement begun after a pan draws
+  over the picture the pan was showing, so a frame needed before it ends
+  (that hover) has only what fits. A second target would keep the old
+  picture until the new one is whole, at 4 bytes a pixel more.
+- **A first frame within 0.6 s of Enter at a million edges** (#497). It
+  comes at 0.94 s in CI: 0.35 to 0.42 s in the engine, then 0.5 s building
+  the adjacency (0.15 s) and the hierarchy (0.35 s) in the layout worker,
+  which nothing can be drawn before, then 40 ms to the pixels. An adjacency
+  handed over by the engine (`Layout.fromAdjacency`, which nothing emits
+  yet) would save the first; the hierarchy's rows are gathered without a
+  sort now, and what is left of it is reading two million entries a level
+  for five dense levels.
+- **A moving frame of a level draws its heaviest discs and its heaviest
+  edges, each chosen alone**: where the budget is small (software), an
+  edge's far end may be a disc that was left out. And a level's edges are
+  at most the 16,384 heaviest: a cut (#498) that wants a light edge
+  between two small groups does not have it.
+- **A step applied while a coarse level is drawn** (an `.expand` typed in
+  the first seconds of a large graph) leaves the level for the graph, whose
+  nodes the view has no positions for until the grown layout's first; an
+  undo of that step puts them at the origin.
 - **A 1M-edge R-MAT graph fully converged in seconds.** Coarse to fine
   draws its shape in 7.5 s, and it looks as flat ForceAtlas2 does after
   500 iterations; but by edge length it is where flat is after about 170, as
