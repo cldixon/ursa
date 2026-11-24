@@ -1704,7 +1704,9 @@ for (const scheme of ["light", "dark"] as const) {
       const status = (await s.locator("#graph-status").textContent()) ?? "";
       check(status.startsWith("Selected node 2: ") && status.includes("+4 not shown") && /not shown\s*\+4/.test(tip), "a node with neighbours not shown says +N, in the header and the tooltip", `${status} | ${tip}`);
     }
-    // The frame before: node 2 selected, the pointer off the canvas.
+    // The frame before: node 2 selected, the pointer off the canvas, and the
+    // camera at rest, having made room for the inspector's panel (#493).
+    await roomSettled(s);
     await away();
     await s.waitForFunction(() => (window as any).ursaShell.graph().hovered === null);
     const places = async (ids: number[]) => Promise.all(ids.map(place));
@@ -3176,9 +3178,12 @@ for (const phone of [false, true]) {
     await tap(panned[a.n]);
     const tapped = (await graphInfo(p)).picked;
     check(tapped?.index === a.n && /^Selected node \S+: /.test((await p.locator("#graph-status").textContent()) ?? ""), "a tap selects the node under the finger", JSON.stringify(tapped));
-    await p.waitForTimeout(400);
+    // The camera makes room for the inspector's panel, and gives it back
+    // when the selection is cleared (#493).
+    await roomSettled(p);
     const empty = { x: 6, y: 6 };
     await tap(empty);
+    await roomSettled(p);
     check(off(pinched2, await spots(), [a.n], start, { x: start.x - 25, y: start.y + 35 }, 1) <= 2, "one tap beside the graph leaves the view where it is");
     await p.waitForTimeout(400);
     await tap(empty);
@@ -3197,10 +3202,12 @@ for (const phone of [false, true]) {
       const text = await screen(p);
       check(id !== undefined && text.replace(/\s+/g, "").includes(`fromthegraphmemoryU.expand${id}`), "a double tap on a node runs .expand for it", text.split("\n").slice(-3).join(" | "));
     }
-    // One tap beside the graph: nothing is selected again.
+    // One tap beside the graph: nothing is selected again, and the camera
+    // gives back the room it made for the inspector's panel.
     await p.waitForTimeout(400);
     await tap(empty);
     await p.waitForTimeout(400);
+    await roomSettled(p);
 
     // A mouse still drags and zooms with its wheel on the same canvas, and the keys work.
     await p.mouse.move(box.x + 20, box.y + 20);
