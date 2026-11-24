@@ -18,7 +18,7 @@ use ursa_viz::model::{Column as ModelColumn, Layout, Path, Role, Values, NO_ROW,
 use super::rules::Shape;
 use super::rules::{MatchEdge, Reading};
 use super::style::{ColorBy, SizeBy};
-use super::{plan_err, thousands, MAX_EDGES, MAX_NODES};
+use super::{plan_err, thousands, MAX_NODES};
 
 /// A drawing before it is a `GraphResult`: `n` nodes, the edges
 /// `(src[i], dst[i])` between them, and each node's id as the shell prints
@@ -65,7 +65,7 @@ pub(crate) struct EdgeList {
 #[cfg(test)]
 pub(crate) fn from_shape(shape: Shape, batches: &[RecordBatch]) -> Result<(EdgeList, NodeIndex)> {
     match shape {
-        Shape::Edges { src, dst } => edges_of(batches, src, dst),
+        Shape::Edges { src, dst } => edges_of(batches, src, dst, super::MAX_EDGES),
         other => panic!("from_shape reads edges, not {other:?}"),
     }
 }
@@ -75,12 +75,13 @@ pub(crate) fn edges_of(
     batches: &[RecordBatch],
     src: usize,
     dst: usize,
+    max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
     let edges: Vec<(ArrayRef, ArrayRef)> = batches
         .iter()
         .map(|b| (Arc::clone(b.column(src)), Arc::clone(b.column(dst))))
         .collect();
-    build_indexed(&[], &edges)
+    build_within(&[], &edges, max_edges)
 }
 
 /// The graph with the nodes `vertices` (keys, in order) and the edges
@@ -92,21 +93,35 @@ pub(crate) fn build(vertices: &[ArrayRef], edges: &[(ArrayRef, ArrayRef)]) -> Re
 }
 
 /// [`build`], and the index from node ids to node indexes, to join node
-/// values on.
+/// values on, with the default cap on edges.
+#[cfg(test)]
 pub(crate) fn build_indexed(
     vertices: &[ArrayRef],
     edges: &[(ArrayRef, ArrayRef)],
+) -> Result<(EdgeList, NodeIndex)> {
+    build_within(vertices, edges, super::MAX_EDGES)
+}
+
+/// The graph with the nodes `vertices` and the edges `edges`, of at most
+/// `max_edges` edges (`ursa.graph_max_edges`), and the index from node ids
+/// to node indexes, to join node values on.
+pub(crate) fn build_within(
+    vertices: &[ArrayRef],
+    edges: &[(ArrayRef, ArrayRef)],
+    max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
     let rows: usize = edges.iter().map(|(s, _)| s.len()).sum();
     if rows == 0 {
         return plan_err("the result has no rows: there are no edges to draw");
     }
-    if rows > MAX_EDGES {
+    if rows > max_edges {
         return plan_err(format!(
-            "the result has {} edges; the graph view draws at most {}. Draw part of it, \
-             with a WHERE or a LIMIT: .graph SELECT src, dst FROM … LIMIT 100000",
+            "the result has {} edges; the graph view draws at most {} \
+             (ursa.graph_max_edges). Draw part of it, with a WHERE or a LIMIT (.graph SELECT \
+             src, dst FROM … LIMIT 100000), or raise the limit: {}",
             thousands(rows),
-            thousands(MAX_EDGES)
+            thousands(max_edges),
+            super::raise_max_edges(rows)
         ));
     }
     let keys: usize = vertices.iter().map(|v| v.len()).sum();
@@ -372,12 +387,14 @@ impl Interner {
     }
 }
 
-fn too_many_edges(edges: usize) -> DataFusionError {
+fn too_many_edges(edges: usize, max_edges: usize) -> DataFusionError {
     DataFusionError::Plan(format!(
-        "the result has more than {} edges, the most the graph view draws (it has {} or \
-         more). Draw part of it, with a WHERE or a LIMIT",
-        thousands(MAX_EDGES),
-        thousands(edges)
+        "the result has more than {} edges, the most the graph view draws \
+         (ursa.graph_max_edges; it has {} or more). Draw part of it, with a WHERE or a LIMIT, \
+         or raise the limit: {}",
+        thousands(max_edges),
+        thousands(edges),
+        super::raise_max_edges(edges)
     ))
 }
 
@@ -416,6 +433,7 @@ pub(crate) fn paths_of(
     edges: Option<usize>,
     elements: Option<usize>,
     reading: &Reading,
+    max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
     // Each row's nodes, and its edges' rows if the result has them.
     let (keys, ranges, rows): (ArrayRef, Ranges, Option<Vec<Vec<u64>>>) = match (nodes, elements) {
@@ -525,8 +543,8 @@ pub(crate) fn paths_of(
                 out.src.push(u);
                 out.dst.push(v);
                 edge_rows.push(row);
-                if out.src.len() > MAX_EDGES {
-                    return Err(too_many_edges(out.src.len()));
+                if out.src.len() > max_edges {
+                    return Err(too_many_edges(out.src.len(), max_edges));
                 }
             }
             let ends = (out.src[edge as usize], out.dst[edge as usize]);
@@ -743,6 +761,7 @@ pub(crate) fn matches_of(
     keys: &[(usize, u16)],
     labels: &[String],
     edges: &[MatchEdge],
+    max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
     let types: Vec<&DataType> = keys
         .iter()
@@ -783,8 +802,8 @@ pub(crate) fn matches_of(
                 out.src.push(u);
                 out.dst.push(v);
                 out.edge_label.push(label);
-                if out.src.len() > MAX_EDGES {
-                    return Err(too_many_edges(out.src.len()));
+                if out.src.len() > max_edges {
+                    return Err(too_many_edges(out.src.len(), max_edges));
                 }
             }
         }

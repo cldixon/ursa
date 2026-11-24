@@ -101,8 +101,11 @@ fn what_cannot_be_drawn_says_why() {
     let err = build(&[], &[(Arc::clone(&big), big)])
         .unwrap_err()
         .to_string();
-    assert!(err.contains("2,000,001 edges"), "{err}");
-    assert!(err.contains("at most 2,000,000"), "{err}");
+    assert!(err.contains("5,000,001 edges"), "{err}");
+    assert!(err.contains("at most 5,000,000"), "{err}");
+    // The refusal names the setting, and the SET that lets the result through.
+    assert!(err.contains("(ursa.graph_max_edges)"), "{err}");
+    assert!(err.contains("SET ursa.graph_max_edges = 6000000"), "{err}");
 }
 
 fn schema_of(columns: &[(&str, DataType)]) -> Schema {
@@ -306,17 +309,56 @@ fn a_clause_that_does_not_fit_says_why() {
         ("karate NODES (SELECT 1", "NODES ( is not closed"),
         ("karate NODES ( )", "NODES () is empty"),
         (
+            "karate POSITIONS (SELECT 1) POSITIONS (SELECT 2)",
+            "POSITIONS is given twice",
+        ),
+        ("karate POSITIONS (SELECT 1", "POSITIONS ( is not closed"),
+        ("karate POSITIONS ( )", "POSITIONS () is empty"),
+        (
+            "karate POSITIONS pos",
+            "POSITIONS needs the query that places the nodes, in parentheses",
+        ),
+        (
             "karate SIZE BY pagerank WITH care",
             "unexpected 'WITH' after the graph's source",
         ),
         (
             "karate SIZE BY pagerank GROUP BY club",
-            "LAYOUT force|rings|layers]",
+            "[POSITIONS (SELECT id, x, y FROM …)]",
         ),
     ] {
         let err = parse(text).unwrap_err().to_string();
         assert!(err.contains(says), "{text}: {err}");
     }
+}
+
+#[test]
+fn positions_is_a_clause() {
+    let (source, style) = parsed("karate POSITIONS (SELECT * FROM 'pos.parquet') SIZE BY degree");
+    assert_eq!(source, "karate");
+    assert_eq!(
+        style.positions.as_deref(),
+        Some("SELECT * FROM 'pos.parquet'")
+    );
+    assert_eq!(style.size, name("degree", "degree"));
+    // After a query, in any order, with parentheses of its own; with no
+    // source, the last result's.
+    let (source, style) = parsed(
+        "SELECT src, dst FROM e COLOR BY club positions (SELECT id, x, y FROM layout_fa2(g)) \
+         NODES (FROM m)",
+    );
+    assert_eq!(source, "SELECT src, dst FROM e");
+    assert_eq!(
+        style.positions.as_deref(),
+        Some("SELECT id, x, y FROM layout_fa2(g)")
+    );
+    assert_eq!(style.nodes.as_deref(), Some("FROM m"));
+    let (source, style) = parsed("POSITIONS (FROM p)");
+    assert_eq!(source, "");
+    assert_eq!(style.positions.as_deref(), Some("FROM p"));
+    // A column called positions is the query's own.
+    let q = "SELECT positions, dst FROM e";
+    assert_eq!(parsed(q), (q.into(), Style::default()));
 }
 
 fn col(ident: &str) -> Name {
@@ -458,7 +500,7 @@ fn a_misused_as_on_or_layout_says_what_to_write() {
         // In a query, a form typed nearly right is the clause it was meant as.
         ("SELECT s, i FROM t AS hop(s, i, d)", "AS hop is not a form; write AS hops(seed, id, distance)"),
         ("FROM t AS edge(a, b)", "AS edge is not a form; write AS edges(src, dst [, weight])"),
-        ("AS nodes(a) GROUP BY z", "unexpected 'GROUP' after the graph's source; the clauses are ON graph, AS …, NODES (…), SIZE BY x, COLOR BY y and LAYOUT l"),
+        ("AS nodes(a) GROUP BY z", "unexpected 'GROUP' after the graph's source; the clauses are ON graph, AS …, NODES (…), SIZE BY x, COLOR BY y, LAYOUT l and POSITIONS (…)"),
     ] {
         let err = parse(text).unwrap_err().to_string();
         assert!(err.contains(says), "{text}: {err}");

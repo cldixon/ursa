@@ -927,6 +927,74 @@ the state to a `Vec`, to a `Float32Array`, to a second one made for the
 transfer, into the page's wasm memory, into the view's positions, and from
 there to the GPU.
 
+## Saved positions, and five million edges
+
+`.graph g POSITIONS (SELECT id, x, y …)` draws a graph where a query puts
+its nodes and runs no layout (#502), and the most edges a view draws went
+from 2,000,000 to the setting `ursa.graph_max_edges`, 5,000,000 by default.
+Measured in the shell, headless Chromium 153 on SwiftShader (WebGL2), 4
+shared cores and no GPU; times are from Enter unless said.
+
+**On rmat** (46,318 nodes, 1,000,000 edges; `web/tests/e2e.ts` and three
+runs by hand):
+
+| | live layout (`.graph rmat`) | saved positions |
+|---|---|---|
+| the engine's answer | 0.39 to 0.43 s | 0.30 to 0.57 s |
+| first frame, after the engine's answer | 0.5 to 0.6 s (a coarse level) | 0.35 to 0.47 s (the graph itself, every node in place) |
+| the layout done | 5.1 to 6.3 s | none runs |
+| the layout worker holds | 53.0 MiB | 17.6 MiB |
+
+`CREATE TABLE pos AS SELECT * FROM layout_fa2(rmat)` takes the engine 4.5
+to 5.0 s, once. Its rows are the live layout's end state: read back from the
+view, all 46,318 nodes are at the same bits (after the centring `layout_fa2`
+applies to what it returns), and the frame has the same count of inked
+pixels (73,461 of 639×708).
+
+**At 5M edges**: an R-MAT graph generated for the run and not shipped
+(Graph500's parameters, 5,000,000 edges among 2^20 ids from a fixed seed:
+471,716 nodes), by `bun tests/graph-positions-bench.ts <url>` in `web/`: one
+run with the live layout, and one more of saved positions alone (`LIVE=0`),
+whose figures follow the first's where they differ.
+
+| | live layout (`.graph big`) | saved positions |
+|---|---|---|
+| the engine's answer | 2.8 s | 2.7 s |
+| first frame, after the engine's answer | 4.4 s (a coarse level; 7.2 s from Enter) | **1.24 s, 1.48 s** (the graph itself; 1.37 s and 1.62 s until the page's thread was free of it) |
+| the graph itself first drawn | 37.6 s | with the first frame |
+| the layout done | 50.3 s | none runs; the worker is at the positions 4.6 s after Enter |
+| a frame with every edge (in slices, #496) | | 17.7 s in 1,076 slices, the longest 50 ms (15.6 s in 956): SwiftShader rasterising 5M lines |
+| a wheel zoom's frames | | 20.3 ms apart at the median, 26.0 ms at the 95th percentile, 28.8 ms at most (120 intervals; the target is 50 ms; 27.9 and 43.2 ms in the second run); each drew 512 to 753 edges and 170 to 251 nodes, as the budget allows with no GPU |
+| the page's view (WebAssembly memory) | 129.8 MiB, 27 bytes an edge | the same instance: 129.8 MiB |
+| the layout worker | 340.5 MiB, 71 bytes an edge | 85.1 MiB, 18 bytes an edge |
+| the engine's worker | 334.0 MiB | 743.7 MiB (731.0 MiB without the live drawing first): the edge table, the 60 MiB CSV it was read from, `layout_fa2`'s index, the positions and the drawing (a memory only grows) |
+| page and workers, as the browser measures them | 885 MiB | 1,070 MiB (1,021 MiB), the engine's among them |
+| the page's JS heap | 73.6 MiB | 104.6 MiB (67.9 MiB) |
+
+`layout_fa2(big)` took the engine 33.0 s and 30.9 s, on one thread; the native engine
+runs it on every core. Read back, all 471,716 nodes are at the bits the live
+layout ended on.
+
+What this says and does not:
+
+- **The issue's first frame, 2 s at most after the engine returns, is met
+  here at 5M edges without a GPU** (1.24 and 1.48 s), because the first frame is a
+  moving frame: within the frame budget (#495), then everything at rest.
+  Of that, 1.06 and 1.31 s are making the view (reading the result,
+  counting degrees), with tasks of up to 228 ms on the page.
+- **The moving-frame target is held here, by the budget drawing few edges.**
+  What a laptop's GPU draws in those frames, and how long its frame with
+  every edge takes, is not measured: this machine has none.
+- **Memory is within reason and is the layout's, as the design says**: the
+  worker's 340 MiB for a live layout against 85 MiB at saved positions
+  (the adjacency, for an expansion to grow from, and the edges it orders).
+  The view's 130 MiB is 27 bytes an edge where it is 19 at 1M: this graph
+  has ten times the nodes for five times the edges, and the keys and the
+  key index are by node.
+- With saved positions the edges are ordered by degree, not by the
+  hierarchy (there is none), so a moving frame's prefix is the hubs' edges;
+  and the view has no coarse levels to draw.
+
 ## Caveats
 
 - **No GPU.** WebGL2 runs on SwiftShader, on the same 4 cores as the layout

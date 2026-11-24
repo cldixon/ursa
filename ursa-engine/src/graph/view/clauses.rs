@@ -4,6 +4,7 @@
 //! [SOURCE] [ON graph]
 //!          [AS edges(src, dst [, weight]) | nodes(id) | path(nodes [, edges]) | hops(seed, id, distance)]
 //!          [NODES (query)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers]
+//!          [POSITIONS (query)]
 //! ```
 //!
 //! [`parse`] splits it into the source and a [`Style`]; [`identifier`] says
@@ -28,6 +29,9 @@ pub struct Style {
     pub on: Option<Name>,
     /// `LAYOUT …`: the layout, whatever the rule chose.
     pub layout: Option<Layout>,
+    /// `POSITIONS (query)`: the query that says where each node is (#502).
+    /// With it, no layout runs.
+    pub positions: Option<String>,
 }
 
 /// An `AS …` clause: the shape of a result's rows, and its columns by name.
@@ -173,7 +177,8 @@ fn tokens(text: &str) -> Vec<(Tok, usize, usize)> {
 /// `.graph`'s clauses, as a message that goes wrong shows them.
 pub const USAGE: &str = ".graph [SOURCE] [ON graph] [AS edges(src, dst [, weight]) | nodes(id) | \
                          path(nodes [, edges]) | hops(seed, id, distance)] [NODES (SELECT id, … \
-                         FROM …)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers]";
+                         FROM …)] [SIZE BY x] [COLOR BY y] [LAYOUT force|rings|layers] \
+                         [POSITIONS (SELECT id, x, y FROM …)]";
 
 /// The words a statement begins with: a source that begins with one is a
 /// query, not a name with clauses after it.
@@ -235,11 +240,11 @@ fn layout_of(word: &str) -> Option<Layout> {
 
 /// Split `.graph`'s text into its source (empty for the last result) and
 /// the clauses after it: `ON graph`, `AS shape(columns)`, `NODES (query)`,
-/// `SIZE BY x`, `COLOR BY y` and `LAYOUT l`, in any order, each at most
-/// once. The clauses start at the first of these outside parentheses,
+/// `SIZE BY x`, `COLOR BY y`, `LAYOUT l` and `POSITIONS (query)`, in any
+/// order, each at most once. The clauses start at the first of these outside parentheses,
 /// strings and comments:
 ///
-/// - `SIZE BY`, `COLOR BY` (or `COLOUR BY`), `NODES (`;
+/// - `SIZE BY`, `COLOR BY` (or `COLOUR BY`), `NODES (`, `POSITIONS (`;
 /// - `AS edges(`, `AS nodes(`, `AS path(` or `AS hops(`. (SQL's own
 ///   `FROM t AS edges(a, b)`, a table alias with column names, is read as the
 ///   clause: give such an alias another name.)
@@ -271,7 +276,7 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
     ) -> bool {
         match word(i).as_deref() {
             Some("SIZE" | "COLOR" | "COLOUR") => word(i + 1).as_deref() == Some("BY"),
-            Some("NODES") => kind(i + 1) == Some(Tok::Open),
+            Some("NODES" | "POSITIONS") => kind(i + 1) == Some(Tok::Open),
             Some("AS") => {
                 i == 0
                     || (matches!(
@@ -376,6 +381,30 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
                 }
                 style.nodes = Some(query.to_string());
                 i = close + 1;
+            }
+            "POSITIONS" if kind(i + 1) == Some(Tok::Open) => {
+                const FORM: &str = "POSITIONS (SELECT id, x, y FROM …)";
+                if style.positions.is_some() {
+                    return plan_err(format!("POSITIONS is given twice; give it once: {USAGE}"));
+                }
+                let open = toks[i + 1];
+                let Some(close) = closing(i + 1) else {
+                    return plan_err(format!("POSITIONS ( is not closed: {FORM}"));
+                };
+                let query = text[open.2..toks[close].1].trim();
+                if query.is_empty() {
+                    return plan_err(format!(
+                        "POSITIONS () is empty; give the query that places the nodes: {FORM}"
+                    ));
+                }
+                style.positions = Some(query.to_string());
+                i = close + 1;
+            }
+            "POSITIONS" => {
+                return plan_err(
+                    "POSITIONS needs the query that places the nodes, in parentheses: POSITIONS \
+                     (SELECT id, x, y FROM …), as POSITIONS (SELECT * FROM 'pos.parquet')",
+                );
             }
             "SIZE" | "COLOR" | "COLOUR" if word(i + 1).as_deref() == Some("BY") => {
                 let clause = if keyword == "SIZE" {
@@ -558,7 +587,7 @@ pub fn parse(text: &str) -> Result<(String, Style)> {
             _ => {
                 return plan_err(format!(
                     "unexpected '{shown}' after the graph's source; the clauses are ON graph, \
-                     AS …, NODES (…), SIZE BY x, COLOR BY y and LAYOUT l: {USAGE}"
+                     AS …, NODES (…), SIZE BY x, COLOR BY y, LAYOUT l and POSITIONS (…): {USAGE}"
                 ));
             }
         }

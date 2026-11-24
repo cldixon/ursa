@@ -8,6 +8,7 @@
 //                                             ahead of the graph: graph.js preload)
 //   {type: "start", module, n, src, dst, layout?}
 //   {type: "start", module, n, adjacency: {offsets, targets}, src, dst, layout?}
+//   {type: "start", module, n, src, dst, positions}
 //     -> {type: "positions", xy, iterations, level, levels, total} ..., then {type: "done", iterations}
 //     (a large graph: "level" and "levelPositions" first, see below)
 //     or {type: "error", message}
@@ -53,6 +54,12 @@
 //     each batch.
 // Both carry `epoch`, `iterations`, `total` and `memory` as "positions"
 // does. The layout ends on the same positions, bit for bit.
+//
+// `positions` (x then y, one per node each) says where the nodes are
+// already (saved positions, .graph … POSITIONS (query), #502): no layout
+// runs. The page has drawn them; the layout here is at them, for a later
+// "grow" to start from, and the answer is the "order" (by degree: there is
+// no hierarchy) and then "done", with no "positions".
 //
 // The aggregated view (#498): once the layout has reached the graph
 // itself, the page asks for a cut through its hierarchy when its camera
@@ -138,6 +145,17 @@ async function handle(data) {
       times = { workerStart: performance.now() };
       const { Layout } = await load(data.module);
       times.workerLoaded = performance.now();
+      if (data.positions) {
+        // Saved positions: the nodes are where the page drew them, and
+        // nothing runs.
+        layout?.free();
+        layout = Layout.fromPositions(data.n, data.src, data.dst, data.positions);
+        times.hierarchy = performance.now();
+        coarse = false;
+        postOrder(data);
+        send({ type: "done" });
+        return;
+      }
       layout = make(Layout, data);
       prepareMs = null;
       times.hierarchy = performance.now();

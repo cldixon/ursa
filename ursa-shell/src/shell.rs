@@ -347,9 +347,19 @@ impl<O: Write, E: Write> Shell<O, E> {
     ///
     /// An error is returned, not printed, and leaves the graph that was open.
     pub async fn open_graph(&mut self, text: &str) -> Result<usize> {
+        Ok(self.open_graph_placed(text).await?.0)
+    }
+
+    /// [`Self::open_graph`], and where `POSITIONS (query)` puts the graph's
+    /// nodes, if `text` has the clause (`GraphView::positions`): a host
+    /// draws them there and runs no layout.
+    pub async fn open_graph_placed(
+        &mut self,
+        text: &str,
+    ) -> Result<(usize, Option<view::Positions>)> {
         let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, self.last.clone()).await?;
         self.explorer = Some(ExploreSession::new(drawn.result));
-        Ok(drawn.skipped)
+        Ok((drawn.skipped, drawn.positions))
     }
 
     /// Close the graph: the explore commands have nothing to act on.
@@ -1528,10 +1538,16 @@ Then any of these clauses, in any order:
   SIZE BY x  COLOR BY y          a column or an algorithm: SIZE BY pagerank COLOR BY louvain
   LAYOUT force|rings|layers      the layout: by the edges' pull, or by distance or step
                                  on circles or in rows
+  POSITIONS (SELECT id, x, y …)  where each node is: drawn there, with no layout to run
 
 AS names the columns when the result's own names do not say what they are:
   .graph SELECT a.id AS x, b.id AS y FROM … AS edges(x, y)
   .graph AS hops(start, reached, steps) ON karate LAYOUT layers
+
+A graph too large to lay out while you wait is laid out once and drawn from that:
+  COPY (SELECT * FROM layout_fa2(g)) TO 'pos.parquet';
+  .graph g POSITIONS (SELECT * FROM 'pos.parquet')
+The view draws at most ursa.graph_max_edges edges (SET ursa.graph_max_edges = 8000000).
 ";
 
 /// The dot-command `name` was meant to be, if one is close enough to be a
@@ -2424,6 +2440,8 @@ mod tests {
             "AS hops(seed, id, distance)",
             "ON graph",
             "LAYOUT force|rings|layers",
+            "POSITIONS (SELECT id, x, y …)",
+            "ursa.graph_max_edges",
         ] {
             assert!(out.contains(needle), "{needle} missing from:\n{out}");
         }

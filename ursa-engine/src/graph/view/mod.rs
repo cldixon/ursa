@@ -3,7 +3,7 @@
 //! and the notebook after it.
 //!
 //! [`of_command`] reads `.graph`'s text, `[SOURCE] [ON graph] [AS …]
-//! [NODES (query)] [SIZE BY x] [COLOR BY y] [LAYOUT l]`:
+//! [NODES (query)] [SIZE BY x] [COLOR BY y] [LAYOUT l] [POSITIONS (query)]`:
 //!
 //! 1. [`clauses`] splits the text into its source and its [`Style`].
 //! 2. A [`Source`] is found: the last result, a query's, a table's rows, or a
@@ -21,6 +21,11 @@
 //!    seen, so the same rows always give the same graph.
 //! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's
 //!    encodings name.
+//! 6. `POSITIONS (query)` gives the result positions ([`positions`], #502):
+//!    a front end draws it there and runs no layout.
+//!
+//! A drawing has at most `ursa.graph_max_edges` edges ([`MAX_EDGES`] by
+//! default): more is refused, with a message that names the setting.
 //!
 //! The result's provenance says the SQL it came from, the rule that drew
 //! it, the columns the rule read and what it left out ([`drawn_as`] is the
@@ -64,6 +69,7 @@ mod build;
 pub mod clauses;
 pub mod find;
 pub mod inspect;
+mod positions;
 pub mod rules;
 pub mod session;
 mod style;
@@ -71,7 +77,7 @@ mod style;
 #[cfg(test)]
 mod tests;
 
-use build::{build_indexed, EdgeList, NodeIndex};
+use build::{build_within, EdgeList, NodeIndex};
 pub use clauses::{identifier, parse, As, Name, Style, USAGE};
 pub use rules::Rule;
 use rules::{MatchEdge, Shape};
@@ -80,10 +86,13 @@ use style::{
     color_by, degree_column, resolve, run_algorithms, size_by, vertex_column, ColorBy, Found,
     NodeValues,
 };
+/// A place per node: what [`GraphView::positions`] holds.
+pub use ursa_viz::model::Positions;
 
-/// The most edges a view draws: about what a laptop's browser lays out and
-/// draws, and 16 MB of node indexes to hand it.
-pub const MAX_EDGES: usize = 2_000_000;
+/// The most edges a view draws unless `ursa.graph_max_edges` says otherwise
+/// (#502): what a desktop browser draws within its frame budget, and 40 MB
+/// of node indexes to hand it. A front end on a phone sets less.
+pub const MAX_EDGES: usize = 5_000_000;
 /// The most nodes, for a property graph whose vertex tables are large.
 pub const MAX_NODES: usize = 4_000_000;
 /// The most categories `COLOR BY` colours; the rest are drawn as "other". A
@@ -139,6 +148,13 @@ pub(crate) fn thousands(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// The `SET` that lets a drawing of `edges` edges through: the limit
+/// raised to the next million.
+pub(crate) fn raise_max_edges(edges: usize) -> String {
+    let limit = edges.div_ceil(1_000_000).max(1) * 1_000_000;
+    format!("SET ursa.graph_max_edges = {limit}")
 }
 
 /// What `.graph` draws: a property graph, or rows.
@@ -204,9 +220,30 @@ pub struct GraphView {
     pub result: GraphResult,
     /// Rows left out because an endpoint is NULL.
     pub skipped: usize,
+    /// Where `POSITIONS (query)` puts each node (#502), one place per node
+    /// of `result`: a front end draws them there and runs no layout. They
+    /// are beside the result, not in it, because an explore session's deltas
+    /// are of a result without positions: a view keeps where its nodes are,
+    /// and moves them as the drawing grows. [`GraphView::placed`] is the
+    /// result with them, for a front end that only shows it.
+    pub positions: Option<Positions>,
 }
 
 impl GraphView {
+    /// The result with `POSITIONS`'s positions in it (UGR's `nodes.x` and
+    /// `nodes.y`): a drawing that opens drawn. The result as it is when
+    /// there are none.
+    pub fn placed(&self) -> GraphResult {
+        let mut result = self.result.clone();
+        if let Some(positions) = &self.positions {
+            let op = result.set_positions_op(Some(positions.clone()));
+            result
+                .apply(&GraphDelta::new(vec![op]))
+                .expect("a place per node");
+        }
+        result
+    }
+
     /// The legend of `COLOR BY`, if it was asked.
     pub fn legend(&self) -> Option<Legend> {
         Legend::of(&self.result)
@@ -334,6 +371,14 @@ pub async fn draw(
     source: Source,
     style: &Style,
 ) -> Result<GraphView> {
+    if let (Some(_), Some(layout)) = (&style.positions, style.layout) {
+        return plan_err(format!(
+            "POSITIONS (…) and LAYOUT {} both say where the nodes go; give one. POSITIONS \
+             draws the nodes where its query puts them, and no layout runs",
+            layout_name(layout)
+        ));
+    }
+    let max_edges = crate::options::graph_max_edges(ctx.state().config());
     let (mut drawing, text) = match source {
         Source::Graph(g) => {
             // A property graph is drawn whole: there is nothing to read.
@@ -356,19 +401,33 @@ pub async fn draw(
                     on.shown, g.name, g.name, on.shown
                 ));
             }
-            let (edges, index) = property_graph_indexed(ctx, &g).await?;
+            let (edges, index) = property_graph_indexed(ctx, &g, max_edges).await?;
             (Drawing::of_graph(edges, index, g), None)
         }
         Source::Rows {
             schema,
             batches,
             sql: text,
-        } => (read_rows(ctx, sql, schema, batches, style).await?, text),
+        } => (
+            read_rows(ctx, sql, schema, batches, style, max_edges).await?,
+            text,
+        ),
     };
     apply_style(ctx, sql, &mut drawing, style).await?;
     if let Some(layout) = style.layout {
         set_layout(&mut drawing, layout)?;
     }
+    let saved = match &style.positions {
+        Some(query) => {
+            let saved = positions::saved(ctx, sql, query, &drawing.edges, &drawing.index).await?;
+            // The nodes are where the query puts them, whatever layout the
+            // rule would have asked for.
+            drawing.edges.layout = ursa_viz::model::Layout::Force;
+            drawing.notes.extend(saved.notes);
+            Some(saved.positions)
+        }
+        None => None,
+    };
     let provenance = Provenance {
         sql: text,
         rule: Some(drawing.rule.name().to_string()),
@@ -380,7 +439,18 @@ pub async fn draw(
         notes: std::mem::take(&mut drawing.notes),
     };
     let graph = drawing.graph.as_ref().map(|g| g.name.clone());
-    to_view(drawing.edges, &drawing.index.key_type, graph, provenance)
+    let mut view = to_view(drawing.edges, &drawing.index.key_type, graph, provenance)?;
+    view.positions = saved;
+    Ok(view)
+}
+
+fn layout_name(layout: ursa_viz::model::Layout) -> &'static str {
+    use ursa_viz::model::Layout;
+    match layout {
+        Layout::Force => "force",
+        Layout::Rings => "rings",
+        Layout::Layers => "layers",
+    }
 }
 
 /// What the result → graph rules (design §3, [`rules`]) make of a result:
@@ -418,11 +488,7 @@ pub async fn interpret_with(
 /// a drawing without one cannot have them.
 fn set_layout(drawing: &mut Drawing, layout: ursa_viz::model::Layout) -> Result<()> {
     use ursa_viz::model::Layout;
-    let name = match layout {
-        Layout::Force => "force",
-        Layout::Rings => "rings",
-        Layout::Layers => "layers",
-    };
+    let name = layout_name(layout);
     if layout != Layout::Force && drawing.edges.level.is_none() {
         let what = match drawing.rule {
             Rule::Graph => "a property graph",
@@ -546,6 +612,7 @@ async fn read_rows(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     style: &Style,
+    max_edges: usize,
 ) -> Result<Drawing> {
     // Rule 0: what `AS …` says; else the first rule that matches.
     let reading = match &style.shape {
@@ -598,9 +665,9 @@ async fn read_rows(
                     directed: true,
                     label: reading.edge_label.clone().unwrap_or_default(),
                 };
-                build::matches_of(&batch, &key_labels, &labels, &[edge])?
+                build::matches_of(&batch, &key_labels, &labels, &[edge], max_edges)?
             } else {
-                let (mut edges, index) = build::edges_of(&batches, *src, *dst)?;
+                let (mut edges, index) = build::edges_of(&batches, *src, *dst, max_edges)?;
                 if reading.marked {
                     edges.labels = labels;
                     edges.edge_labels = reading.edge_label.iter().cloned().collect();
@@ -630,7 +697,7 @@ async fn read_rows(
             elements,
         } => {
             let (mut drawn, index) =
-                build::paths_of(&whole()?, *nodes, *edges, *elements, &reading)?;
+                build::paths_of(&whole()?, *nodes, *edges, *elements, &reading, max_edges)?;
             let anchor = nodes.or(*elements).expect("a path column");
             if reading.label_of(anchor).is_some() {
                 drawn.labels = label_names(&[anchor]).0;
@@ -662,7 +729,7 @@ async fn read_rows(
                 edges.labels = label_names(&[*id]).0;
             }
             let read = match &graph {
-                Some(g) => induced(ctx, sql, g, &mut edges, &index).await,
+                Some(g) => induced(ctx, sql, g, &mut edges, &index, max_edges).await,
                 None => Err("there is no property graph to read the edges from".to_string()),
             };
             if let Err(why) = read {
@@ -685,7 +752,7 @@ async fn read_rows(
         Shape::Matches { keys, edges } => {
             let (labels, of_key) = label_names(keys);
             key_labels = keys.iter().copied().zip(of_key).collect();
-            build::matches_of(&whole()?, &key_labels, &labels, edges)?
+            build::matches_of(&whole()?, &key_labels, &labels, edges, max_edges)?
         }
         Shape::Nodes { id } => {
             let batch = whole()?;
@@ -694,7 +761,7 @@ async fn read_rows(
                 edges.labels = label_names(&[*id]).0;
             }
             let read = match &graph {
-                Some(g) => induced(ctx, sql, g, &mut edges, &index).await,
+                Some(g) => induced(ctx, sql, g, &mut edges, &index, max_edges).await,
                 None => Err("there is no property graph to read the edges from".to_string()),
             };
             if let Err(why) = read {
@@ -780,6 +847,7 @@ async fn induced(
     graph: &PropertyGraph,
     edges: &mut EdgeList,
     index: &NodeIndex,
+    max_edges: usize,
 ) -> std::result::Result<(), String> {
     use crate::graph::provenance as meta;
     let quoted = !index.key_type.is_integer();
@@ -799,7 +867,7 @@ async fn induced(
     let query = format!(
         "SELECT src, dst, edge FROM induced_edges(\"{}\", nodes => [{list}]) LIMIT {}",
         graph.name.replace('"', "\"\""),
-        MAX_EDGES + 1
+        max_edges.saturating_add(1)
     );
     drop(list);
     let (schema, batches) = sql.run(ctx, &query).await.map_err(|e| {
@@ -810,10 +878,11 @@ async fn induced(
         )
     })?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if rows > MAX_EDGES {
+    if rows > max_edges {
         return Err(format!(
-            "there are more than {} edges among the nodes, the most the graph view draws",
-            thousands(MAX_EDGES)
+            "there are more than {} edges among the nodes, the most the graph view draws \
+             (ursa.graph_max_edges)",
+            thousands(max_edges)
         ));
     }
     let fail = |e: DataFusionError| crate::user_message(&e);
@@ -985,6 +1054,7 @@ pub const LABEL: &str = "label";
 async fn property_graph_indexed(
     ctx: &SessionContext,
     graph: &PropertyGraph,
+    max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
     let state = ctx.state();
     let mut vertices = Vec::new();
@@ -1016,7 +1086,7 @@ async fn property_graph_indexed(
             graph.name
         ));
     }
-    build_indexed(&vertices, &edges)
+    build_within(&vertices, &edges, max_edges)
 }
 
 /// The columns `columns` of one of `graph`'s tables, every row.
@@ -1184,5 +1254,9 @@ fn to_view(
         let op = result.set_encodings_op(encodings);
         result.apply(&GraphDelta::new(vec![op])).map_err(model)?;
     }
-    Ok(GraphView { result, skipped })
+    Ok(GraphView {
+        result,
+        skipped,
+        positions: None,
+    })
 }
