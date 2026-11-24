@@ -393,7 +393,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   times.view = performance.now();
   if (mine !== seq) {
     worker.terminate();
-    view.free();
+    freeView(view);
     canvas.remove();
     throw new Error("replaced by a newer drawing");
   }
@@ -981,7 +981,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       setScene();
     } catch (e) {
       worker.terminate();
-      view.free();
+      freeView(view);
       canvas.remove();
       current = null;
       throw new Error(String(e?.message ?? e));
@@ -1082,6 +1082,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const hover = () => {
     hoverFrame = 0;
     if (current !== state || !state.positioned) return;
+    // Not while a snapshot reads the view (inked): the view is borrowed.
+    if (state.paused) return void hoverSoon();
     let node = null;
     // Not while a button or a finger is down: that is a drag.
     if (pointerAt && pointers.size === 0) {
@@ -1887,6 +1889,20 @@ export function setNotShown(counts) {
   return current?.setNotShown?.(counts) ?? false;
 }
 
+/**
+ * Free a view that is done with. A view that cannot be freed (a call that
+ * found it borrowed leaves it so, for good: wasm-bindgen counts the caller
+ * and throws before it uncounts) is left to the page's memory: the pane it
+ * was drawn in is closed or drawn again all the same.
+ */
+function freeView(view) {
+  try {
+    view.free();
+  } catch (e) {
+    console.warn(`a graph view could not be freed: ${String(e?.message ?? e)}`);
+  }
+}
+
 /** Stop the layout and drop the view and its canvas. */
 export function close() {
   seq++;
@@ -1896,7 +1912,10 @@ export function close() {
   if (state.frame) cancelAnimationFrame(state.frame);
   state.worker?.terminate();
   for (const undo of state.cleanup) undo();
-  state.view.free();
+  // Not under a read-back (inked): the view is borrowed until it settles,
+  // and freeing a borrowed view throws.
+  if (state.reading) state.reading.finally(() => freeView(state.view));
+  else freeView(state.view);
   state.canvas.remove();
   state.tip.remove();
   state.inspector?.remove();
@@ -2004,7 +2023,14 @@ export async function inked() {
   const state = current;
   if (!state) return null;
   state.paused = true;
+  // The view is borrowed until the pixels come: frames, slices and the
+  // hover wait (state.paused), and close() frees it afterwards.
+  let read;
+  state.reading = new Promise((resolve) => (read = resolve));
   try {
+    // The view as it is now, not as its last frame was: a level's or a
+    // cut's discs are given to the GPU by a frame.
+    state.view.refreshLevel();
     const px = await state.view.snapshot();
     const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
     const { background, palette } = theme();
@@ -2027,7 +2053,9 @@ export async function inked() {
     return { width: state.canvas.width, height: state.canvas.height, inked: count, corner: [px[0], px[1], px[2]], palette: counts };
   } finally {
     state.paused = false;
-    state.redraw?.(false);
+    state.reading = null;
+    read();
+    if (current === state) state.redraw?.(false);
   }
 }
 

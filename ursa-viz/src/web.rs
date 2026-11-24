@@ -589,12 +589,16 @@ impl GraphView {
     /// the top (`new ImageData(new Uint8ClampedArray(px), width)`). Call no
     /// other method until it resolves.
     ///
-    /// It is the view as it is now, whether or not a frame has been drawn
-    /// since it last changed: a level's or a cut's discs (#497, #498,
-    /// #499) are given to the GPU by a frame, so they are given again
-    /// here, with the selection's rings as they are now.
-    pub async fn snapshot(&mut self) -> Result<Vec<u8>, JsValue> {
-        self.view.refresh_level(&self.device, &self.queue);
+    /// A level's or a cut's discs (#497, #498, #499) are given to the GPU
+    /// by a frame, so of those this is the last frame's: call
+    /// [`GraphView::refresh_level`] first for the view as it is now.
+    ///
+    /// The view is borrowed, shared, until the promise settles: a method
+    /// that reads the view may be called meanwhile, and one that changes
+    /// it, or `free()`, throws. (It must not borrow the view to change it:
+    /// then every call made meanwhile would throw, and each one that does
+    /// leaves the view unable to be freed.)
+    pub async fn snapshot(&self) -> Result<Vec<u8>, JsValue> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let pixels = self
             .view
@@ -604,6 +608,15 @@ impl GraphView {
             return Err(js_err(format!("snapshot: {e}")));
         }
         pixels.map_err(js_err)
+    }
+
+    /// Give the GPU the discs of the level or the cut being drawn as they
+    /// are now (their places, colours and selection rings), as a frame
+    /// does: for a [`GraphView::snapshot`] taken before the next frame.
+    /// Nothing, when the graph itself is drawn.
+    #[wasm_bindgen(js_name = refreshLevel)]
+    pub fn refresh_level(&mut self) {
+        self.view.refresh_level(&self.device, &self.queue);
     }
 
     /// The node under the pixel `(x, y)`, or `undefined`. With the
