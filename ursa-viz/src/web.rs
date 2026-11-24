@@ -179,6 +179,7 @@ const SELECTION_EDGES_MOST_NODES: usize = 10_000;
 const LEVELS_FROM: usize = 200_000;
 
 async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, JsValue> {
+    crate::probe("v:begin");
     let (width, height) = (canvas.width().max(1), canvas.height().max(1));
     let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
@@ -240,6 +241,7 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
         config.format = plain;
     }
     surface.configure(&device, &config);
+    crate::probe("v:device");
     // In pieces, with a turn of the event loop between them: the page's
     // thread is never held for long.
     let view = match scene {
@@ -266,6 +268,7 @@ async fn view_on(canvas: HtmlCanvasElement, scene: Scene) -> Result<GraphView, J
     // What the caller does with the view is a task of its own, not the
     // tail of the last piece here (the level's first draw, or the last
     // run of edges): on the shell's page that is 12 to 27 ms more (#520).
+    crate::probe("v:warm");
     crate::pace::yield_now().await;
     Ok(GraphView {
         view,

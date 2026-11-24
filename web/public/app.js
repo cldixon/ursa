@@ -1026,6 +1026,11 @@ async function drawGraph(text) {
     status.textContent = "Loading graph view…";
     loadGraphModule().then((m) => m.preload(), () => {});
   };
+  // The graph view's code, here and in a layout worker, starts loading now,
+  // while the engine works: the engine answers a large graph that has an
+  // index sooner than the pane opens (#525). The pane itself still waits a
+  // moment, so that a typo does not flash it.
+  loadGraphModule().then((m) => m.preload(), () => {});
   const soon = setTimeout(open, 150);
   let graph;
   try {

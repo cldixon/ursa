@@ -514,6 +514,7 @@ impl View {
         // The header says how many nodes and edges to make room for; the
         // sections are read with it.
         let result = GraphResult::read_paced(ugr, &room_of, &mut pace).await?;
+        crate::probe("v:read");
         let scene = Scene::Result(Box::new(result));
         Ok(Self::make(device, queue, format, scene, width, height, &mut pace).await)
     }
@@ -592,7 +593,9 @@ impl View {
             Some(_) => (starting_capacity(n), starting_capacity(m)),
             None => (n, m),
         };
+        crate::probe("v:pairs+live");
         let renderer = Renderer::new_paced(device, format, &x, &y, &style, m, room, pace).await;
+        crate::probe("v:renderer");
         // The edges, a run at a time: each is in the GPU's hands, and its
         // staging freed, before the next is made.
         let mut start = 0;
@@ -620,6 +623,7 @@ impl View {
                 pace.breathe().await;
             }
         }
+        crate::probe("v:edges");
         let mut view = Self {
             graph,
             adjacency: None,
@@ -1661,7 +1665,7 @@ impl View {
             let _ = device.poll(wgpu::PollType::Poll);
             match rx.try_recv() {
                 Ok(Some(r)) => break r,
-                Ok(None) => yield_now().await,
+                Ok(None) => crate::pace::wait_a_turn().await,
                 Err(_) => break Err(wgpu::BufferAsyncError),
             }
         };
