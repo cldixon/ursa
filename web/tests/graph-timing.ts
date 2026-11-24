@@ -73,9 +73,11 @@ console.log(`${browser.browserType().name()} ${browser.version()}${process.env.C
 // (#501): 20 MiB and 60 MB of WebAssembly memory.
 const VIEW_BYTES = 20 * 2 ** 20;
 const LAYOUT_BYTES = 60e6;
-// When a large graph's first frame should be shown, from Enter (#497):
-// reported, not failed, since the engine's answer and the layout's
-// hierarchy alone take longer than this here.
+// When a large graph's first frame should be shown, from Enter (#497,
+// #525): reported, not failed. It is 0.65 to 0.75 s here on a busy
+// machine, where it was 1.0 to 1.4 s (ursa-viz/BENCH.md, "The first
+// frame"): making the view and building the hierarchy each take about
+// 0.4 s of a fresh page's time, side by side.
 const FIRST_FRAME_MS = 600;
 const all: Record<string, number>[] = [];
 // What took too long: the run fails if anything did.
@@ -127,7 +129,7 @@ for (let r = 0; r < runs; r++) {
   const lf = drawn.levelFrames;
   if (lf?.count) {
     console.log(
-      `  coarse levels: the first frame shown ${Math.round(shown?.frame)} ms after Enter${shown?.frame > FIRST_FRAME_MS ? ` (over the ${FIRST_FRAME_MS} ms asked for: the engine answered at ${Math.round(rel.engine)} ms and the hierarchy was built at ${Math.round(rel.hierarchy)} ms)` : ""}; ` +
+      `  coarse levels: the first frame shown ${Math.round(shown?.frame)} ms after Enter${shown?.frame > FIRST_FRAME_MS ? ` (over the ${FIRST_FRAME_MS} ms asked for: the engine answered at ${Math.round(rel.engine)} ms, the view was made at ${Math.round(rel.view)} ms and the hierarchy was built at ${Math.round(rel.hierarchy)} ms)` : ""}; ` +
         `levels ${JSON.stringify(drawn.hierarchy)} as [level, nodes]; ${lf.count} frames before the graph itself (at ${Math.round(rel.graphDrawn)} ms), each to the next p50 ${lf.p50} ms, p95 ${lf.p95} ms, max ${lf.max} ms`,
     );
     if (lf.p95 > 50) slow.push(`run ${r + 1}: the frames of the coarse levels cost ${lf.p95} ms at the 95th percentile; at most 50 ms are allowed`);

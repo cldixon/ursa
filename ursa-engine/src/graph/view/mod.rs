@@ -17,6 +17,9 @@
 //!    alone, on a result. `AS …` is rule 0 (#434): it names the shape and
 //!    its columns, and nothing is inferred. `ON graph` names the graph the
 //!    ids belong to, and `LAYOUT` the layout, whatever the rule chose.
+//!    A property graph that is one edge table is read from the session's
+//!    index of it, the one its algorithms run over, where that says what
+//!    its rows would ([`from_index`], #525): nothing is scanned.
 //! 4. Ids become dense node indexes `0..n`, in the order they are first
 //!    seen, so the same rows always give the same graph.
 //! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's

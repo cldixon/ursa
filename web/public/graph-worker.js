@@ -6,6 +6,7 @@
 //
 //   {type: "init", module}                 -> {type: "ready"}  (ursa-viz loaded,
 //                                             ahead of the graph: graph.js preload)
+//     Then, until a graph comes, the layout's code is warmed: see warm().
 //   {type: "start", module, n, src, dst, layout?}
 //   {type: "start", module, n, adjacency: {offsets, targets}, src, dst, layout?}
 //   {type: "start", module, n, src, dst, positions}
