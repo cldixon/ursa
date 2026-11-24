@@ -212,6 +212,7 @@ export function createInspector(host) {
           shown.rows = found.rows.map((row) => found.columns.map((c, j) => [c.name, row[j]]));
           shown.rowMs = performance.now() - started;
           shown.engineMs = found.ms ?? null;
+          shown.indexed = found.indexed ?? null;
         },
         (e) => {
           if (mine !== seq) return;
@@ -402,7 +403,9 @@ export function createInspector(host) {
     /**
      * What is shown, or null: {kind, title, table, rows (each a list of
      * [name, value] pairs; null until they are read), note, sql, rowMs (from
-     * show to the row drawn), text (the panel's text), focused, …}.
+     * show to the row drawn), engineMs (the engine's part of it), indexed
+     * (an edge's rows came through the graph's index, not a scan), text
+     * (the panel's text), focused, …}.
      */
     state() {
       if (!shown) return null;
