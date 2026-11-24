@@ -217,9 +217,6 @@ pub struct Shell<O: Write, E: Write> {
     last: Option<(SchemaRef, Vec<RecordBatch>)>,
     /// The explore session of the graph the host draws ([`Self::open_graph`]).
     explorer: Option<ExploreSession>,
-    /// The adjacency of the graph just opened, until a host takes it
-    /// ([`Self::take_graph_adjacency`]).
-    adjacency: Option<Arc<view::UndirectedCsr>>,
     timer: bool,
     /// CSV and TSV start with a header row (`.headers on|off`).
     headers: bool,
@@ -264,7 +261,6 @@ impl<O: Write, E: Write> Shell<O, E> {
             keep_last: false,
             last: None,
             explorer: None,
-            adjacency: None,
             timer: false,
             headers: true,
             redirect: None,
@@ -372,23 +368,12 @@ impl<O: Write, E: Write> Shell<O, E> {
             Some(groups) => ExploreSession::grouped(drawn.result, groups),
             None => ExploreSession::new(drawn.result),
         });
-        self.adjacency = drawn.adjacency;
         Ok((drawn.skipped, drawn.positions))
-    }
-
-    /// The undirected adjacency of the graph [`Self::open_graph`] just
-    /// opened, if the engine made one (`GraphView::adjacency`: a large
-    /// graph's, for a host's layout to use as it is). It is given once, and
-    /// is of the graph as opened: an explore command changes the graph, not
-    /// this.
-    pub fn take_graph_adjacency(&mut self) -> Option<Arc<view::UndirectedCsr>> {
-        self.adjacency.take()
     }
 
     /// Close the graph: the explore commands have nothing to act on.
     pub fn close_graph(&mut self) {
         self.explorer = None;
-        self.adjacency = None;
     }
 
     /// The explore session of the open graph: what is shown, and the steps.

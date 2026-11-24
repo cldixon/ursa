@@ -561,13 +561,19 @@ impl Adjacency {
 /// (the spec's own example) shares the single build instead of rebuilding a fresh
 /// `Vec<Vec<u32>>` per call, and the flat layout has far better locality than a
 /// vector-of-vectors.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct UndirectedCsr {
     /// Prefix-summed undirected degrees; length `n_nodes + 1`.
     pub offsets: Vec<u64>,
     /// Sorted, deduplicated neighbours per node segment.
     pub targets: Vec<u32>,
 }
+
+/// [`UndirectedCsr::from_edges`] sorts a node's edge ends when they are
+/// fewer than this (or than an eighth of the words of the bitmap's
+/// summary, which reading a run off the bitmap scans), and reads a longer
+/// run off the bitmap.
+const UNSORTED_FROM: usize = 48;
 
 impl UndirectedCsr {
     /// Sorted, deduplicated undirected neighbours of node `u`.
@@ -627,19 +633,50 @@ impl UndirectedCsr {
         }
         // Sort and deduplicate each segment, sliding it left over the slots
         // the earlier segments gave up.
+        // A long segment is not sorted: its targets are marked in a bitmap
+        // of the nodes (`met`, with a bit in `any` for each of its words
+        // that has one) and read back off it, ascending and once each, for
+        // what the marking costs and the words it touched. The result is
+        // the sort's.
+        let words = n_nodes.div_ceil(64);
+        let mut met = vec![0u64; words];
+        let mut any = vec![0u64; words.div_ceil(64)];
         let mut write = 0usize;
         let mut start = 0usize;
         for u in 0..n_nodes {
             let end = bound[u + 1] as usize;
-            targets[start..end].sort_unstable();
             bound[u] = write as u64;
-            let mut last = None;
-            for i in start..end {
-                let v = targets[i];
-                if last != Some(v) {
-                    targets[write] = v;
-                    write += 1;
-                    last = Some(v);
+            if end - start >= UNSORTED_FROM.max(any.len() / 8) {
+                for &v in &targets[start..end] {
+                    let word = v as usize / 64;
+                    met[word] |= 1 << (v % 64);
+                    any[word / 64] |= 1 << (word % 64);
+                }
+                // The marks are all made before any is written back, and
+                // there are no more of them than the segment had.
+                for (top, some) in any.iter_mut().enumerate() {
+                    let mut some = std::mem::take(some);
+                    while some != 0 {
+                        let word = top * 64 + some.trailing_zeros() as usize;
+                        some &= some - 1;
+                        let mut bits = std::mem::take(&mut met[word]);
+                        while bits != 0 {
+                            targets[write] = (word * 64) as u32 + bits.trailing_zeros();
+                            write += 1;
+                            bits &= bits - 1;
+                        }
+                    }
+                }
+            } else {
+                targets[start..end].sort_unstable();
+                let mut last = None;
+                for i in start..end {
+                    let v = targets[i];
+                    if last != Some(v) {
+                        targets[write] = v;
+                        write += 1;
+                        last = Some(v);
+                    }
                 }
             }
             start = end;
@@ -651,80 +688,6 @@ impl UndirectedCsr {
             offsets: bound,
             targets,
         }
-    }
-
-    /// [`UndirectedCsr::from_edges`] without sorting: the same adjacency,
-    /// bit for bit, for a builder with memory to spare and none of the
-    /// time. Every entry is written twice over, so it holds twice what
-    /// `from_edges` does while it builds (16 bytes an edge beyond the
-    /// result at most, where that is 8).
-    ///
-    /// Two scatters stand in for the sort. The first puts each edge end in
-    /// its node's row, in the edges' order. The second reads those rows in
-    /// node order and gives each neighbour `v` of `u` to row `v`: a row is
-    /// then written by ascending `u`, a repeat is the entry written just
-    /// before it, and nothing is compared but neighbours in a row.
-    pub fn from_edges_unsorted(n_nodes: usize, src: &[u32], dst: &[u32]) -> UndirectedCsr {
-        assert_eq!(src.len(), dst.len(), "src/dst length mismatch");
-        let mut start = vec![0u32; n_nodes + 1];
-        for (&s, &d) in src.iter().zip(dst) {
-            if s != d {
-                start[s as usize + 1] += 1;
-                start[d as usize + 1] += 1;
-            }
-        }
-        let mut total = 0u64;
-        for slot in &mut start[1..] {
-            let len = u64::from(*slot);
-            // (Past u32 entries the offsets below would not hold them.)
-            assert!(total + len <= u64::from(u32::MAX), "too many edge ends");
-            *slot = total as u32;
-            total += len;
-        }
-        // As in `from_edges`: filling moves each node's start to its end.
-        let mut ends = vec![0u32; total as usize];
-        for (&s, &d) in src.iter().zip(dst) {
-            if s != d {
-                for (u, v) in [(s, d), (d, s)] {
-                    let next = &mut start[u as usize + 1];
-                    ends[*next as usize] = v;
-                    *next += 1;
-                }
-            }
-        }
-        // Each row's length without its repeats: the ends are symmetric, so
-        // reading the rows in node order meets each row's entries in
-        // ascending order of the node they name.
-        const NONE: u32 = u32::MAX;
-        let mut last = vec![NONE; n_nodes];
-        let mut offsets = vec![0u64; n_nodes + 1];
-        for u in 0..n_nodes {
-            for &v in &ends[start[u] as usize..start[u + 1] as usize] {
-                if last[v as usize] != u as u32 {
-                    last[v as usize] = u as u32;
-                    offsets[v as usize + 1] += 1;
-                }
-            }
-        }
-        let mut kept = 0u64;
-        for slot in &mut offsets[1..] {
-            let len = *slot;
-            *slot = kept;
-            kept += len;
-        }
-        last.fill(NONE);
-        let mut targets = vec![0u32; kept as usize];
-        for u in 0..n_nodes {
-            for &v in &ends[start[u] as usize..start[u + 1] as usize] {
-                if last[v as usize] != u as u32 {
-                    last[v as usize] = u as u32;
-                    let next = &mut offsets[v as usize + 1];
-                    targets[*next as usize] = u as u32;
-                    *next += 1;
-                }
-            }
-        }
-        UndirectedCsr { offsets, targets }
     }
 
     /// An undirected adjacency from its parts, as another holder of the
@@ -1588,10 +1551,6 @@ mod tests {
                 (src.clone(), dst.clone())
             };
             let direct = UndirectedCsr::from_edges(n_nodes, &src, &dst);
-            // Without sorting: the same, bit for bit.
-            let unsorted = UndirectedCsr::from_edges_unsorted(n_nodes, &src, &dst);
-            assert_eq!(unsorted.offsets, direct.offsets);
-            assert_eq!(unsorted.targets, direct.targets);
             let topology = Topology::build(n_nodes, src, dst);
             let built = topology.undirected();
             assert_eq!(direct.offsets, built.offsets);
@@ -1602,6 +1561,72 @@ mod tests {
                     .unwrap();
             assert_eq!(parts.offsets, built.offsets);
             assert_eq!(parts.targets, built.targets);
+        }
+    }
+
+    #[test]
+    fn undirected_from_edges_is_the_same_sorted_or_read_off_the_bitmap() {
+        // By sorting every pair: what `from_edges` gives whether a node's
+        // run is long (a hub's, read off the bitmap), short (sorted), or
+        // long but among so many nodes that scanning the bitmap's summary
+        // would cost more than the sort (#525).
+        let reference = |n: usize, src: &[u32], dst: &[u32]| {
+            let mut pairs: Vec<(u32, u32)> = src
+                .iter()
+                .zip(dst)
+                .filter(|(s, d)| s != d)
+                .flat_map(|(&s, &d)| [(s, d), (d, s)])
+                .collect();
+            pairs.sort_unstable();
+            pairs.dedup();
+            let mut offsets = vec![0u64; n + 1];
+            for &(u, _) in &pairs {
+                offsets[u as usize + 1] += 1;
+            }
+            for u in 0..n {
+                offsets[u + 1] += offsets[u];
+            }
+            (
+                offsets,
+                pairs.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+            )
+        };
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n) as u32
+        };
+        // A hub of 5,000 ends (with repeats and loops) among 400 nodes,
+        // and 3,000,000 nodes (a summary of 733 words: a run is sorted
+        // below 91 ends) with runs of 60 and of 200.
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for _ in 0..5_000 {
+            src.push(7);
+            dst.push(next(400));
+        }
+        for _ in 0..2_000 {
+            src.push(next(400));
+            dst.push(next(400));
+        }
+        let small = (400usize, src, dst);
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for (hub, ends) in [(11u32, 60), (2_999_999, 200), (1_500_000, 200)] {
+            for _ in 0..ends {
+                src.push(hub);
+                dst.push(next(3_000_000));
+                // Repeats, in both directions.
+                dst.push(hub);
+                src.push(*dst.first().unwrap());
+            }
+        }
+        let large = (3_000_000usize, src, dst);
+        for (n, src, dst) in [small, large] {
+            let built = UndirectedCsr::from_edges(n, &src, &dst);
+            let (offsets, targets) = reference(n, &src, &dst);
+            assert_eq!(built.offsets, offsets);
+            assert_eq!(built.targets, targets);
         }
     }
 

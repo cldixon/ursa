@@ -57,8 +57,6 @@ use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::SessionContext;
-/// An undirected adjacency: what [`GraphView::adjacency`] holds.
-pub use ursa_core::topology::UndirectedCsr;
 use ursa_viz::model::{
     Column as ModelColumn, ColumnRole, EdgeBatch, Encodings, GraphDelta, GraphResult, Highlights,
     KeyType, NodeBatch, NodeLabel, Op, Provenance, Role, Strings, Target, Values, NO_ROW, NULL,
@@ -102,11 +100,6 @@ pub const MAX_NODES: usize = 4_000_000;
 /// The most categories `COLOR BY` colours; the rest are drawn as "other". A
 /// front end's palette has as many colours, then other's.
 pub const MAX_CATEGORIES: usize = 8;
-
-/// A drawing of this many edges or more carries its undirected adjacency
-/// ([`GraphView::adjacency`]): below it a layout builds one in a few
-/// milliseconds, and the bytes are not worth sending.
-pub const ADJACENCY_FROM: usize = 100_000;
 
 /// What the colour column is called when `SIZE BY` and `COLOR BY` name the
 /// same thing: the name, then this. A result's node columns have distinct
@@ -236,14 +229,6 @@ pub struct GraphView {
     /// and moves them as the drawing grows. [`GraphView::placed`] is the
     /// result with them, for a front end that only shows it.
     pub positions: Option<Positions>,
-    /// The undirected adjacency of `result`'s edges, for a result large
-    /// enough that a front end's layout should not have to build it again
-    /// ([`ADJACENCY_FROM`] edges; #525): what
-    /// `GraphResult::to_bytes_with_adjacency` writes beside the edges.
-    /// `UndirectedCsr::from_edges` of the result's nodes and edges, bit for
-    /// bit. `None` for a smaller result, a grouped one, and one with
-    /// positions, which no layout runs on.
-    pub adjacency: Option<Arc<UndirectedCsr>>,
     /// With `GROUP BY` (#499): which of the drawing's nodes each group of
     /// `result` has. They are not in the result until a group is opened,
     /// which an explore session does with this ([`Session::grouped`]).
@@ -251,15 +236,6 @@ pub struct GraphView {
 }
 
 impl GraphView {
-    /// The result as one UGR buffer (`ursa-viz/UGR.md`), with its
-    /// adjacency beside the edges if it has one ([`Self::adjacency`]).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match &self.adjacency {
-            Some(adjacency) => self.result.to_bytes_with_adjacency(adjacency),
-            None => self.result.to_bytes(),
-        }
-    }
-
     /// The result with `POSITIONS`'s positions in it (UGR's `nodes.x` and
     /// `nodes.y`): a drawing that opens drawn. The result as it is when
     /// there are none.
@@ -387,6 +363,7 @@ pub async fn of_command(
     last: Option<Rows>,
 ) -> Result<GraphView> {
     let (text, style) = parse(text)?;
+    crate::probe::mark("start");
     let source = if !text.is_empty() {
         Source::of_text(ctx, sql, &text).await?
     } else {
@@ -398,6 +375,7 @@ pub async fn of_command(
         };
         Source::of_rows(rows)
     };
+    crate::probe::mark("source");
     draw(ctx, sql, source, &style).await
 }
 
@@ -454,7 +432,9 @@ pub async fn draw(
     if let Some(by) = &style.group {
         return group(ctx, sql, drawing, style, by, text).await;
     }
+    crate::probe::mark("drawing");
     apply_style(ctx, sql, &mut drawing, style).await?;
+    crate::probe::mark("style");
     if let Some(layout) = style.layout {
         set_layout(&mut drawing, layout)?;
     }
@@ -480,19 +460,9 @@ pub async fn draw(
         notes: std::mem::take(&mut drawing.notes),
     };
     let graph = drawing.graph.as_ref().map(|g| g.name.clone());
-    // The adjacency a layout of the result will want, while the edges are
-    // here: without sorting, which the engine has the memory for.
-    let edges = &drawing.edges;
-    let adjacency = (saved.is_none() && edges.src.len() >= ADJACENCY_FROM).then(|| {
-        Arc::new(UndirectedCsr::from_edges_unsorted(
-            edges.n as usize,
-            &edges.src,
-            &edges.dst,
-        ))
-    });
     let mut view = to_view(drawing.edges, &drawing.index.key_type, graph, provenance)?;
     view.positions = saved;
-    view.adjacency = adjacency;
+    crate::probe::mark("to_view");
     Ok(view)
 }
 
@@ -1268,10 +1238,19 @@ async fn from_index(
         "SELECT id FROM degree(\"{}\")",
         graph.name.replace('"', "\"\"")
     );
-    let physical = ctx.sql(&query).await.ok()?.create_physical_plan().await.ok()?;
+    crate::probe::mark("fi:edges_plan");
+    let physical = ctx
+        .sql(&query)
+        .await
+        .ok()?
+        .create_physical_plan()
+        .await
+        .ok()?;
+    crate::probe::mark("fi:planned");
     let index = crate::graph::index_under(&physical, &ctx.task_ctx())
         .await
         .ok()??;
+    crate::probe::mark("fi:index");
     let edges = index.topology.n_edges();
     if index.n_dropped() > 0 || edges == 0 || edges > max_edges {
         return None;
@@ -1449,6 +1428,5 @@ fn to_view(
         skipped,
         positions: None,
         groups: None,
-        adjacency: None,
     })
 }

@@ -614,17 +614,23 @@ fn busy() -> DataFusionError {
     reason = "as feed: one call at a time, and the others fail instead of panicking"
 )]
 async fn graph_data(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphData> {
+    *ursa_engine::probe::NOW.lock().unwrap() = Some(js_sys::Date::now);
     let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
     let (skipped, positions) = shell.open_graph_placed(text).await?;
-    let adjacency = shell.take_graph_adjacency();
+    ursa_engine::probe::mark("opened");
     // The bytes are written from the shell's own result: it is not copied
     // first (8 bytes an edge).
     let result = shell.explorer().expect("a graph was opened").result();
+    let ugr = result.to_bytes();
+    ursa_engine::probe::mark("bytes");
+    let log = ursa_engine::probe::take();
+    let console = js_sys::Reflect::get(&js_sys::global(), &"console".into()).unwrap();
+    let f: js_sys::Function = js_sys::Reflect::get(&console, &"log".into())
+        .unwrap()
+        .into();
+    let _ = f.call1(&console, &format!("PROBE {log}").into());
     Ok(GraphData {
-        ugr: match &adjacency {
-            Some(adjacency) => result.to_bytes_with_adjacency(adjacency),
-            None => result.to_bytes(),
-        },
+        ugr,
         skipped: skipped as u32,
         positions: positions.map(|mut p| {
             p.x.append(&mut p.y);
@@ -643,14 +649,12 @@ async fn graph_data(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Resul
 async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphView> {
     let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
     let (skipped, positions) = shell.open_graph_placed(text).await?;
-    let adjacency = shell.take_graph_adjacency();
     let result = shell.explorer().expect("a graph was opened").result();
     Ok(GraphView {
         result: result.clone(),
         skipped,
         positions,
         groups: None,
-        adjacency,
     })
 }
 
@@ -658,7 +662,7 @@ async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<
 impl From<GraphView> for GraphData {
     fn from(view: GraphView) -> Self {
         GraphData {
-            ugr: view.to_bytes(),
+            ugr: view.result.to_bytes(),
             skipped: view.skipped as u32,
             positions: view.positions.map(|mut p| {
                 p.x.append(&mut p.y);
