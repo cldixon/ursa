@@ -653,6 +653,80 @@ impl UndirectedCsr {
         }
     }
 
+    /// [`UndirectedCsr::from_edges`] without sorting: the same adjacency,
+    /// bit for bit, for a builder with memory to spare and none of the
+    /// time. Every entry is written twice over, so it holds twice what
+    /// `from_edges` does while it builds (16 bytes an edge beyond the
+    /// result at most, where that is 8).
+    ///
+    /// Two scatters stand in for the sort. The first puts each edge end in
+    /// its node's row, in the edges' order. The second reads those rows in
+    /// node order and gives each neighbour `v` of `u` to row `v`: a row is
+    /// then written by ascending `u`, a repeat is the entry written just
+    /// before it, and nothing is compared but neighbours in a row.
+    pub fn from_edges_unsorted(n_nodes: usize, src: &[u32], dst: &[u32]) -> UndirectedCsr {
+        assert_eq!(src.len(), dst.len(), "src/dst length mismatch");
+        let mut start = vec![0u32; n_nodes + 1];
+        for (&s, &d) in src.iter().zip(dst) {
+            if s != d {
+                start[s as usize + 1] += 1;
+                start[d as usize + 1] += 1;
+            }
+        }
+        let mut total = 0u64;
+        for slot in &mut start[1..] {
+            let len = u64::from(*slot);
+            // (Past u32 entries the offsets below would not hold them.)
+            assert!(total + len <= u64::from(u32::MAX), "too many edge ends");
+            *slot = total as u32;
+            total += len;
+        }
+        // As in `from_edges`: filling moves each node's start to its end.
+        let mut ends = vec![0u32; total as usize];
+        for (&s, &d) in src.iter().zip(dst) {
+            if s != d {
+                for (u, v) in [(s, d), (d, s)] {
+                    let next = &mut start[u as usize + 1];
+                    ends[*next as usize] = v;
+                    *next += 1;
+                }
+            }
+        }
+        // Each row's length without its repeats: the ends are symmetric, so
+        // reading the rows in node order meets each row's entries in
+        // ascending order of the node they name.
+        const NONE: u32 = u32::MAX;
+        let mut last = vec![NONE; n_nodes];
+        let mut offsets = vec![0u64; n_nodes + 1];
+        for u in 0..n_nodes {
+            for &v in &ends[start[u] as usize..start[u + 1] as usize] {
+                if last[v as usize] != u as u32 {
+                    last[v as usize] = u as u32;
+                    offsets[v as usize + 1] += 1;
+                }
+            }
+        }
+        let mut kept = 0u64;
+        for slot in &mut offsets[1..] {
+            let len = *slot;
+            *slot = kept;
+            kept += len;
+        }
+        last.fill(NONE);
+        let mut targets = vec![0u32; kept as usize];
+        for u in 0..n_nodes {
+            for &v in &ends[start[u] as usize..start[u + 1] as usize] {
+                if last[v as usize] != u as u32 {
+                    last[v as usize] = u as u32;
+                    let next = &mut offsets[v as usize + 1];
+                    targets[*next as usize] = u as u32;
+                    *next += 1;
+                }
+            }
+        }
+        UndirectedCsr { offsets, targets }
+    }
+
     /// An undirected adjacency from its parts, as another holder of the
     /// graph hands them over (the fields of an [`UndirectedCsr`] it built):
     /// nothing is sorted and nothing is copied.
@@ -1514,6 +1588,10 @@ mod tests {
                 (src.clone(), dst.clone())
             };
             let direct = UndirectedCsr::from_edges(n_nodes, &src, &dst);
+            // Without sorting: the same, bit for bit.
+            let unsorted = UndirectedCsr::from_edges_unsorted(n_nodes, &src, &dst);
+            assert_eq!(unsorted.offsets, direct.offsets);
+            assert_eq!(unsorted.targets, direct.targets);
             let topology = Topology::build(n_nodes, src, dst);
             let built = topology.undirected();
             assert_eq!(direct.offsets, built.offsets);
