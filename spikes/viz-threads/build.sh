@@ -50,7 +50,7 @@ if [[ $what == threads || $what == all ]]; then
   CARGO_TARGET_DIR="$TARGET/spike-threads" \
   RUSTFLAGS="-C target-feature=+atomics,+bulk-memory \
     -C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=$MAX_MEMORY \
-    -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size \
+    -C link-arg=--export=__heap_base -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size \
     -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base" \
     cargo "+$NIGHTLY" build --lib --features threads --target wasm32-unknown-unknown \
       -Z build-std=std,panic_abort --profile wasm-release --locked
