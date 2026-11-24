@@ -9,6 +9,8 @@
 // It has no DOM and no wasm in it, so tests/graph-data.test.ts runs it on the
 // fixtures the engine's own tests write.
 
+import { X, Y, groupsOf } from "./graph-groups.js";
+
 /** The most categories COLOR BY colours; the palette has as many, then "other". */
 export const MAX_CATEGORIES = 8;
 /** The null of a dictionary column's codes: a node with no value. */
@@ -65,6 +67,8 @@ function valuesOf(columns, i) {
  *   edgeOf(e)      edge e, for the inspector: {label, row, values}, its edge
  *                  table (or null), its row in that table (a string, or null
  *                  where the engine did not know it) and its edge columns
+ *   grouped        with GROUP BY: the result's groups (graph-groups.js's
+ *                  groupsOf), and `result` itself; else both null
  *   skipped        rows left out because an endpoint is NULL
  *   name           the property graph drawn, or null
  *   provenance     {sql, rule, roles?, notes?}: the SQL it came from, the
@@ -87,7 +91,14 @@ function valuesOf(columns, i) {
  */
 export function drawingOf(result, skipped = 0) {
   const { nodes, edges, encodings } = result;
+  // A grouped result (#499): its groups, and the result itself, which the
+  // scene that draws them is made from. A member's place in its group's
+  // disc is not a value to show.
+  const grouped = groupsOf(result);
+  const shownColumns = grouped ? nodes.columns.filter((c) => c.name !== X && c.name !== Y) : nodes.columns;
   const graph = {
+    grouped,
+    result: grouped ? result : null,
     n: nodes.count,
     src: edges.src,
     dst: edges.dst,
@@ -100,7 +111,7 @@ export function drawingOf(result, skipped = 0) {
     provenance: result.provenance,
     labelOf: (i) => nodes.labelNames[nodes.labels[i]]?.name || null,
     keyTypeOf: (i) => nodes.labelNames[nodes.labels[i]]?.key ?? "text",
-    valuesOf: (i) => valuesOf(nodes.columns, i),
+    valuesOf: (i) => valuesOf(shownColumns, i),
     edgeOf: (e) => {
       const row = edges.rows?.[e];
       return {
@@ -183,6 +194,7 @@ export function drawnAs(result) {
       rings: ["rings", " on "],
       pattern: ["pattern matches", " on "],
       nodes: ["nodes", " of "],
+      groups: ["groups", " of "],
     }[rule] ?? [rule, " on "];
   let out = what;
   if (result.graph != null) out += joins + result.graph;

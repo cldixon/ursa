@@ -575,6 +575,14 @@ impl GraphView {
         self.view.fit();
     }
 
+    /// Leave `pixels` free at each side of the canvas when the camera
+    /// fits: for discs drawn larger around a node than a node is
+    /// (`GROUP BY`'s groups, #499). 0 is the fit as it was.
+    #[wasm_bindgen(js_name = setFitPadding)]
+    pub fn set_fit_padding(&mut self, pixels: f32) {
+        self.view.set_fit_padding(pixels);
+    }
+
     /// A frame drawn offscreen: RGBA pixels, canvas-sized, row by row from
     /// the top (`new ImageData(new Uint8ClampedArray(px), width)`). Call no
     /// other method until it resolves.
@@ -1264,6 +1272,12 @@ impl GraphView {
     /// No disc is drawn with a radius over `maxRadius` pixels, if given:
     /// the discs of a cut stand a known distance apart.
     ///
+    /// `kinds`, if given, says how each group is drawn where it is not by
+    /// its mass (`GROUP BY`'s groups, #499, one value per group): `0` by
+    /// its mass; above 0, an open disc of that radius in the layout's
+    /// units, a rim under the others; below 0, a point of that many
+    /// pixels' radius over them; NaN, not at all, nor its edges.
+    ///
     /// The camera is not moved: the cut is the graph's own drawing,
     /// coarser. A group's disc takes the colour of most of its nodes
     /// ([`GraphView::color_by`]) and carries a ring in the selection
@@ -1283,6 +1297,7 @@ impl GraphView {
         weight: Vec<f32>,
         total_edges: Option<u32>,
         max_radius: Option<f32>,
+        kinds: Option<Vec<f32>>,
     ) -> Result<(), JsValue> {
         let groups = mass.len();
         if xy.length() as usize != 2 * groups {
@@ -1296,6 +1311,7 @@ impl GraphView {
         let mut scene =
             crate::levels::LevelScene::new(0, 1, mass, src, dst, weight, total).map_err(js_err)?;
         scene.set_max_radius(max_radius.unwrap_or(0.0));
+        scene.set_kinds(kinds.unwrap_or_default()).map_err(js_err)?;
         let (x, y) = scene.positions_mut();
         let n = groups as u32;
         xy.subarray(0, n).copy_to(x);
@@ -1333,6 +1349,13 @@ impl GraphView {
     #[wasm_bindgen(js_name = pickGroup)]
     pub fn pick_group(&self, x: f32, y: f32) -> Option<u32> {
         self.view.pick_group(x, y)
+    }
+
+    /// The radius group `group` of the cut drawn has on the canvas now,
+    /// in pixels, or `undefined`.
+    #[wasm_bindgen(js_name = groupRadius)]
+    pub fn group_radius(&self, group: u32) -> Option<f32> {
+        self.view.group_radius(group)
     }
 
     /// The graph's nodes that group `group` of the cut drawn stands for,

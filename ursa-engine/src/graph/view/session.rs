@@ -17,6 +17,8 @@
 //! | command | what it does | its SQL |
 //! |---|---|---|
 //! | `.expand ID [in\|out\|both] [LIMIT n]` | adds the node's neighbours that are not shown, and the graph's edges among every node | `hop`, then `induced_edges` |
+//! | `.expand group:N` | in a drawing grouped by `GROUP BY`: opens group N, adding its members and the graph's edges among the members of the open groups | `induced_edges` |
+//! | `.collapse group:N` | closes group N: its members are hidden | none |
 //! | `.hide ID…` | hides nodes | none |
 //! | `.show ID…` or `.show all` | shows hidden nodes again | none |
 //! | `.undo`, `.redo` | steps the history | none |
@@ -50,6 +52,23 @@
 //! statement 2, so their edges to newer nodes are in the session when
 //! `.show` brings them back, with no query.
 //!
+//! # Groups
+//!
+//! A drawing made with `GROUP BY` ([`super::groups`], #499) has a node for
+//! each group and none of the groups' members; a session on it
+//! ([`Session::grouped`]) knows which nodes each group has. `.expand
+//! group:3` opens the group keyed 3, in one statement: `induced_edges` over
+//! its members and the members of the groups already open. The delta adds
+//! the members (in the drawing's node order, each with its group's value in
+//! the column the result is grouped by and its place in the group's disc in `group x` and
+//! `group y`: [`super::groups::disc_layout`] of the group's members and the
+//! edges among them) and then the edges the session does not have. The
+//! group's own node stays, with the edges to the other groups: a view
+//! draws the members in its disc. `.collapse group:3` hides the members,
+//! and opening the group again shows them, with no query. `.undo` of the
+//! step that opened a group takes its members and their edges away again.
+//! In such a session `.expand` opens groups only.
+//!
 //! # Undo
 //!
 //! Every op of a delta carries what its inverse needs, so `.undo` applies
@@ -59,15 +78,19 @@
 
 use std::collections::{HashMap, HashSet};
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, StringArray};
 use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::datatypes::{DataType, Int64Type, UInt64Type};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
 use ursa_viz::model::{
-    EdgeBatch, GraphDelta, GraphResult, Key, KeyType, NodeBatch, Op, Provenance, NO_ROW,
+    BatchValues, EdgeBatch, GraphDelta, GraphResult, Key, KeyType, NodeBatch, Op, Provenance,
+    Strings, Values, NO_ROW,
 };
 
+use super::groups::{self, Grouping};
 use super::{plan_err, thousands, RunSql};
 use crate::graph::provenance as meta;
 
@@ -103,6 +126,8 @@ pub enum Command {
         direction: Direction,
         limit: usize,
     },
+    /// `.collapse group:N`: the group to close.
+    Collapse(String),
     Hide(Vec<String>),
     /// The ids to show; none for `.show all`.
     Show(Vec<String>),
@@ -164,7 +189,8 @@ fn words(text: &str) -> Result<Vec<String>> {
 impl Command {
     /// The names of the explore commands, as typed: `.graph` is one only as
     /// `.graph history`.
-    pub const NAMES: [&'static str; 5] = [".expand", ".hide", ".show", ".undo", ".redo"];
+    pub const NAMES: [&'static str; 6] =
+        [".expand", ".collapse", ".hide", ".show", ".undo", ".redo"];
 
     /// Read `line`. `Ok(None)` when it is not an explore command (`.graph
     /// karate`, `.tables`); an error when it is one that cannot be read.
@@ -228,6 +254,12 @@ impl Command {
                     direction: direction.unwrap_or(Direction::Both),
                     limit: limit.unwrap_or(EXPAND_LIMIT),
                 }
+            }
+            ".collapse" => {
+                if args.len() != 1 {
+                    return plan_err("usage: .collapse group:N");
+                }
+                Command::Collapse(args.remove(0))
             }
             ".hide" => {
                 if args.is_empty() {
@@ -470,6 +502,8 @@ pub struct Session {
     /// ([`Session::not_shown`]); [`NO_DEGREE`] for a node the graph has no
     /// row for.
     degrees: Vec<u32>,
+    /// Of a drawing made with `GROUP BY`: which nodes each group has.
+    groups: Option<Grouping>,
 }
 
 /// The degree of a node the graph's `degree` has no row for.
@@ -487,7 +521,23 @@ impl Session {
             done: 0,
             edges: None,
             degrees: Vec::new(),
+            groups: None,
         }
+    }
+
+    /// A session on what `.graph … GROUP BY` drew: `base` is the grouped
+    /// result and `groups` its groups' members (`GraphView::groups`), which
+    /// `.expand group:N` opens.
+    pub fn grouped(base: GraphResult, groups: Grouping) -> Session {
+        Session {
+            groups: Some(groups),
+            ..Session::new(base)
+        }
+    }
+
+    /// The groups of a session on a grouped drawing.
+    pub fn grouping(&self) -> Option<&Grouping> {
+        self.groups.as_ref()
     }
 
     /// The graph as it stands: the base with every applied step.
@@ -527,6 +577,10 @@ impl Session {
     /// [`DEGREES_BY_KEY`] of them, else the whole graph's), and the shown
     /// edges are counted each time.
     pub async fn not_shown(&mut self, ctx: &SessionContext, sql: &dyn RunSql) -> Result<Vec<u32>> {
+        // A group is no node of the graph: it has no degree there.
+        if self.groups.is_some() {
+            return Ok(Vec::new());
+        }
         let Some(graph) = self.result.graph() else {
             return Ok(Vec::new());
         };
@@ -587,10 +641,24 @@ impl Session {
 
     fn find(&self, id: &str) -> Option<u32> {
         let r = &self.result;
-        r.node_labels().iter().zip(0u16..).find_map(|(label, l)| {
-            let key = Key::parse(label.key, id).ok()?;
-            r.node(l, &key)
-        })
+        // In a grouped drawing `group:3` is a group, and any other id a
+        // member of an open one.
+        let skip = if self.groups.is_some() {
+            if let Some(group) = group_id(id) {
+                return group.and_then(|g| r.node(0, &Key::Int(g)));
+            }
+            1
+        } else {
+            0
+        };
+        r.node_labels()
+            .iter()
+            .zip(0u16..)
+            .skip(skip)
+            .find_map(|(label, l)| {
+                let key = Key::parse(label.key, id).ok()?;
+                r.node(l, &key)
+            })
     }
 
     fn resolve(&self, id: &str) -> Result<u32> {
@@ -665,8 +733,8 @@ impl Session {
     ) -> Result<Outcome> {
         let Some(parsed) = Command::parse(line)? else {
             return plan_err(format!(
-                "'{}' is not an explore command; they are .expand, .hide, .show, .undo, .redo \
-                 and .graph history",
+                "'{}' is not an explore command; they are .expand, .collapse, .hide, .show, \
+                 .undo, .redo and .graph history",
                 line.trim()
             ));
         };
@@ -681,6 +749,9 @@ impl Session {
                 direction,
                 limit,
             } => {
+                if self.groups.is_some() {
+                    return self.open(ctx, sql, &text, &id, sql_only).await;
+                }
                 self.expand(ctx, sql, &text, &id, direction, limit, sql_only)
                     .await
             }
@@ -690,6 +761,7 @@ impl Session {
                     "-- {name} runs no SQL: it changes what is shown of the graph"
                 )))
             }
+            Command::Collapse(id) => self.collapse(&text, &id),
             Command::Hide(ids) => self.set_hidden(&text, &ids, true),
             Command::Show(ids) => self.set_hidden(&text, &ids, false),
             Command::Undo => self.undo(),
@@ -918,16 +990,6 @@ impl Session {
         }
         let (schema, batches) = sql.run(ctx, &among).await?;
         let edges = self.edges.get_or_insert_with(|| EdgeIndex::of(r));
-        let edge_label = schema.field(2).metadata().get(meta::LABEL);
-        let at = edge_label.and_then(|name| r.edge_labels().iter().position(|l| l == name));
-        let new_label = match (edge_label, at) {
-            (Some(name), None) => Some(name.clone()),
-            _ => None,
-        };
-        let e_label = match (&new_label, at) {
-            (Some(_), _) => r.edge_labels().len() as u16,
-            (None, at) => at.unwrap_or(0) as u16,
-        };
         let node_of = |ids: &Ids, i: usize| -> Option<u32> {
             let found = r.node_labels().iter().zip(0u16..).find_map(|(l, at)| {
                 let key = ids.key(i, l.key)?;
@@ -935,36 +997,7 @@ impl Session {
             });
             found.or_else(|| new.get(&ids.key(i, key_type)?).copied())
         };
-        let mut batch = EdgeBatch::new();
-        let mut rows = Vec::new();
-        // How many of each pair's edges with no row this pass has matched.
-        let mut matched: HashMap<(u32, u32), u32> = HashMap::new();
-        for b in &batches {
-            let (s, d) = (Ids::of(b.column(0))?, Ids::of(b.column(1))?);
-            let row = cast(b.column(2), &DataType::UInt64)?;
-            let row = row.as_primitive::<UInt64Type>();
-            for i in 0..b.num_rows() {
-                let (Some(s), Some(d)) = (node_of(&s, i), node_of(&d, i)) else {
-                    continue;
-                };
-                let row = row.is_valid(i).then(|| row.value(i));
-                if row.is_some_and(|row| edges.rows.contains(&(e_label, row))) {
-                    continue;
-                }
-                if let Some(&have) = edges.pairs.get(&pair(s, d)) {
-                    let used = matched.entry(pair(s, d)).or_insert(0);
-                    if *used < have {
-                        *used += 1;
-                        continue;
-                    }
-                }
-                batch.src.push(s);
-                batch.dst.push(d);
-                batch.labels.push(e_label);
-                rows.push(row.unwrap_or(NO_ROW));
-            }
-        }
-        batch.rows = Some(rows);
+        let (batch, new_label) = new_edges(edges, r, &schema, &batches, node_of, |_, _| {})?;
 
         let mut ops = Vec::new();
         if !restored.is_empty() {
@@ -1013,6 +1046,308 @@ impl Session {
         }
         Ok(outcome)
     }
+
+    /// The group `id` names in a grouped session (`group:3`), as its key
+    /// and its node.
+    fn group(&self, command: &str, id: &str) -> Result<usize> {
+        let Some(groups) = &self.groups else {
+            return plan_err(format!(
+                "{command} closes a group of a grouped drawing, and this one is not grouped; \
+                 draw one with .graph NAME GROUP BY column"
+            ));
+        };
+        match group_id(id) {
+            Some(Some(g)) if (g as usize) < groups.len() => Ok(g as usize),
+            Some(_) => plan_err(format!(
+                "no group '{id}' in the graph that is drawn; its groups are group:0 to group:{}",
+                groups.len() - 1
+            )),
+            None => plan_err(format!(
+                "this drawing is grouped by {}, and {command} takes one of its groups, as \
+                 {command} group:0 (group:0 to group:{}); a group's key is in its tooltip",
+                groups.by(),
+                groups.len() - 1
+            )),
+        }
+    }
+
+    /// Each node's group in a grouped session, by slot: a group's own, and
+    /// a member's.
+    fn group_codes(&self) -> &[u32] {
+        let r = &self.result;
+        let column = r.encodings().group_by.as_deref();
+        match column
+            .and_then(|name| r.node_column(name))
+            .map(|c| &c.values)
+        {
+            Some(Values::Dict { codes, .. }) => codes,
+            _ => &[],
+        }
+    }
+
+    /// `.expand group:N` in a grouped session: see the [module](self).
+    async fn open(
+        &mut self,
+        ctx: &SessionContext,
+        sql: &dyn RunSql,
+        command: &str,
+        id: &str,
+        sql_only: bool,
+    ) -> Result<Outcome> {
+        let g = self.group(".expand", id)?;
+        let groups = self.groups.as_ref().expect("a grouped session");
+        let r = &self.result;
+        if r.node_is_removed(g) {
+            return plan_err(format!("group {g} is hidden; .show group:{g} first"));
+        }
+        let members = groups.members(g);
+        if members.len() > groups::MAX_OPEN {
+            return plan_err(format!(
+                "group {g} has {} members, and a group of more than {} is not opened in place; \
+                 draw it on its own: .graph SELECT … WHERE … on its members",
+                thousands(members.len()),
+                thousands(groups::MAX_OPEN)
+            ));
+        }
+        // The group's members: the node each is, here already or new, and
+        // its place among them.
+        let n_groups = groups.len();
+        let mut restored: Vec<u32> = Vec::new();
+        let mut added = NodeBatch::new();
+        let mut new: HashMap<(u16, Key), u32> = HashMap::new();
+        let mut place: HashMap<u32, u32> = HashMap::with_capacity(members.len());
+        let mut added_at: Vec<u32> = Vec::new();
+        for (local, &v) in members.iter().enumerate() {
+            let label = groups.label(v);
+            let Ok(key) = Key::parse(r.node_labels()[label as usize].key, groups.key(v)) else {
+                continue;
+            };
+            let slot = match r.node(label, &key) {
+                Some(at) => {
+                    if r.node_is_removed(at as usize) {
+                        restored.push(at);
+                    }
+                    at
+                }
+                None => {
+                    let at = (r.n_nodes() + added.len()) as u32;
+                    added.push(label, &key);
+                    added_at.push(local as u32);
+                    new.insert((label, key), at);
+                    at
+                }
+            };
+            place.insert(slot, local as u32);
+        }
+        if restored.is_empty() && added.is_empty() {
+            return Ok(Outcome::said(format!(
+                "Nothing changed: group {g} is open already; .collapse group:{g} closes it"
+            )));
+        }
+        if added.is_empty() {
+            // Closed by .collapse: its members and their edges are here.
+            if sql_only {
+                return Ok(Outcome::said(format!(
+                    "-- .expand group:{g} runs no SQL: the group's members are in the session"
+                )));
+            }
+            return self.step(
+                command,
+                Vec::new(),
+                GraphDelta::new(vec![Op::RestoreNodes(restored)]),
+            );
+        }
+        let Some(graph) = r.graph() else {
+            return plan_err(
+                "opening a group reads the edges among its members from a property graph, and \
+                 this drawing is of rows that name none; group a graph (.graph NAME GROUP BY \
+                 column), or say which graph the ids are of (ON graph)",
+            );
+        };
+        let graph = format!("\"{}\"", graph.replace('"', "\"\""));
+
+        // The graph's edges among the members of every open group and this
+        // one's.
+        let mut all = String::with_capacity((r.n_nodes() - n_groups + added.len()) * 8);
+        for i in n_groups..r.n_nodes() {
+            if !all.is_empty() {
+                all.push_str(", ");
+            }
+            literal(&mut all, r.node_keys().get(i), self.key_type(i));
+        }
+        for (key, &label) in added.keys.iter().zip(&added.labels) {
+            if !all.is_empty() {
+                all.push_str(", ");
+            }
+            literal(&mut all, key, r.node_labels()[label as usize].key);
+        }
+        let max_edges = crate::options::graph_max_edges(ctx.state().config());
+        let among = format!(
+            "SELECT src, dst, edge FROM induced_edges({graph}, nodes => [{all}]) LIMIT {}",
+            max_edges.saturating_add(1)
+        );
+        drop(all);
+        if sql_only {
+            return Ok(Outcome::said(format!("{among};")));
+        }
+        let (schema, batches) = sql.run(ctx, &among).await?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if rows > max_edges {
+            return plan_err(format!(
+                "there are more than {} edges among the members of the open groups, the most \
+                 the graph view draws; close a group (.collapse group:N), or raise the limit: {}",
+                thousands(max_edges),
+                super::raise_max_edges(rows)
+            ));
+        }
+        let edges = self.edges.get_or_insert_with(|| EdgeIndex::of(r));
+        // A member's id is a key of a vertex table, never of `group`.
+        let node_of = |ids: &Ids, i: usize| -> Option<u32> {
+            r.node_labels()
+                .iter()
+                .zip(0u16..)
+                .skip(1)
+                .find_map(|(l, at)| {
+                    let key = ids.key(i, l.key)?;
+                    r.node(at, &key).or_else(|| new.get(&(at, key)).copied())
+                })
+        };
+        // The edges among this group's members, for their places in its disc.
+        let (mut inner_src, mut inner_dst) = (Vec::new(), Vec::new());
+        let (batch, new_label) = new_edges(edges, r, &schema, &batches, node_of, |s, d| {
+            if let (Some(&a), Some(&b)) = (place.get(&s), place.get(&d)) {
+                inner_src.push(a);
+                inner_dst.push(b);
+            }
+        })?;
+        drop(batches);
+        let (x, y) = groups::disc_layout(members.len(), inner_src, inner_dst);
+        let count = added.len();
+        let added = added
+            .with_column(
+                r.encodings().group_by.clone().unwrap_or_default(),
+                BatchValues::Dict {
+                    new_values: Strings::new(),
+                    codes: vec![g as u32; count],
+                },
+            )
+            .with_column(
+                groups::X,
+                BatchValues::F32(added_at.iter().map(|&i| x[i as usize]).collect()),
+            )
+            .with_column(
+                groups::Y,
+                BatchValues::F32(added_at.iter().map(|&i| y[i as usize]).collect()),
+            );
+
+        let mut ops = Vec::new();
+        if !restored.is_empty() {
+            ops.push(Op::RestoreNodes(restored));
+        }
+        ops.push(Op::AddNodes(added));
+        if !batch.is_empty() {
+            if let Some(name) = new_label {
+                ops.push(Op::AddEdgeLabel(name));
+            }
+            ops.push(Op::AddEdges(batch));
+        }
+        let statements = vec![among];
+        let delta = GraphDelta::new(ops).with_provenance(Provenance {
+            sql: Some(statements.join(";\n")),
+            ..Provenance::default()
+        });
+        self.step(command, statements, delta)
+    }
+
+    /// `.collapse group:N`: hide the members of group N that are shown.
+    fn collapse(&mut self, command: &str, id: &str) -> Result<Outcome> {
+        let g = self.group(".collapse", id)?;
+        let groups = self.groups.as_ref().expect("a grouped session");
+        let r = &self.result;
+        let codes = self.group_codes();
+        let nodes: Vec<u32> = (groups.len()..r.n_nodes())
+            .filter(|&i| codes.get(i) == Some(&(g as u32)) && !r.node_is_removed(i))
+            .map(|i| i as u32)
+            .collect();
+        if nodes.is_empty() {
+            return Ok(Outcome::said(format!(
+                "Nothing changed: group {g} is not open; .expand group:{g} opens it"
+            )));
+        }
+        self.step(
+            command,
+            Vec::new(),
+            GraphDelta::new(vec![Op::RemoveNodes(nodes)]),
+        )
+    }
+}
+
+/// `id` as a group's: `Some(Some(3))` for `group:3`, `Some(None)` for
+/// `group:` and something that is no number, `None` for any other id.
+fn group_id(id: &str) -> Option<Option<i64>> {
+    let (label, key) = id.split_once(':')?;
+    if !label.eq_ignore_ascii_case(groups::GROUP) {
+        return None;
+    }
+    Some(key.parse::<i64>().ok().filter(|&g| g >= 0))
+}
+
+/// The rows of an `induced_edges` result (`src`, `dst`, `edge`) that the
+/// session does not have (`edges` is its index, of `r`'s), as a batch to
+/// add, and the name of its edge label if the result has none of that name
+/// yet (the batch's edges are then of the label after `r`'s last).
+/// `node_of` says which node an id is, if any; `seen` is told each row's
+/// two nodes, whether or not the session has the edge.
+fn new_edges(
+    edges: &EdgeIndex,
+    r: &GraphResult,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    node_of: impl Fn(&Ids, usize) -> Option<u32>,
+    mut seen: impl FnMut(u32, u32),
+) -> Result<(EdgeBatch, Option<String>)> {
+    let edge_label = schema.field(2).metadata().get(meta::LABEL);
+    let at = edge_label.and_then(|name| r.edge_labels().iter().position(|l| l == name));
+    let new_label = match (edge_label, at) {
+        (Some(name), None) => Some(name.clone()),
+        _ => None,
+    };
+    let e_label = match (&new_label, at) {
+        (Some(_), _) => r.edge_labels().len() as u16,
+        (None, at) => at.unwrap_or(0) as u16,
+    };
+    let mut batch = EdgeBatch::new();
+    let mut rows = Vec::new();
+    // How many of each pair's edges with no row this pass has matched.
+    let mut matched: HashMap<(u32, u32), u32> = HashMap::new();
+    for b in batches {
+        let (s, d) = (Ids::of(b.column(0))?, Ids::of(b.column(1))?);
+        let row = cast(b.column(2), &DataType::UInt64)?;
+        let row = row.as_primitive::<UInt64Type>();
+        for i in 0..b.num_rows() {
+            let (Some(s), Some(d)) = (node_of(&s, i), node_of(&d, i)) else {
+                continue;
+            };
+            seen(s, d);
+            let row = row.is_valid(i).then(|| row.value(i));
+            if row.is_some_and(|row| edges.rows.contains(&(e_label, row))) {
+                continue;
+            }
+            if let Some(&have) = edges.pairs.get(&pair(s, d)) {
+                let used = matched.entry(pair(s, d)).or_insert(0);
+                if *used < have {
+                    *used += 1;
+                    continue;
+                }
+            }
+            batch.src.push(s);
+            batch.dst.push(d);
+            batch.labels.push(e_label);
+            rows.push(row.unwrap_or(NO_ROW));
+        }
+    }
+    batch.rows = Some(rows);
+    Ok((batch, new_label))
 }
 
 /// How many nodes an expansion's delta restored.

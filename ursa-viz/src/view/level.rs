@@ -304,6 +304,25 @@ impl View {
         cut.of.get(node as usize).copied()
     }
 
+    /// The radius group `group` of the cut is drawn with now, in pixels,
+    /// if a cut is drawn and has the group.
+    pub fn group_radius(&self, group: u32) -> Option<f32> {
+        if !self.draws_cut() {
+            return None;
+        }
+        let scene = self.level()?;
+        let (w, h) = self.camera.viewport;
+        ((group as usize) < scene.n_nodes()).then(|| {
+            scene.radius_at(
+                group as usize,
+                w,
+                h,
+                self.level_zoom(),
+                self.camera.pixels_per_unit,
+            )
+        })
+    }
+
     /// What is drawn of a cut, if one is.
     pub fn cut_info(&self) -> Option<CutInfo> {
         let level = self.level.as_ref()?;
@@ -338,10 +357,15 @@ impl View {
             if labels.len() >= most {
                 break;
             }
-            let radius = scene.radius(i as usize, w, h, zoom);
-            // The discs are heaviest first, and so largest first.
+            let kind = scene.kind(i as usize);
+            let radius = scene.radius_at(i as usize, w, h, zoom, self.camera.pixels_per_unit);
             if radius < min_radius {
-                break;
+                // The discs by mass are heaviest first, and so largest
+                // first; an open one is as large as it is.
+                if kind == crate::levels::Kind::Mass {
+                    break;
+                }
+                continue;
             }
             let members = cut.members[i as usize];
             let (px, py) = self.camera.to_pixel(x[i as usize], y[i as usize]);
@@ -440,6 +464,7 @@ impl View {
         // As the graph's nodes do: larger as the view zooms in past the fit.
         let zoom = self.level_zoom();
         let color = self.theme.node;
+        let ppu = self.camera.pixels_per_unit;
         // The groups with a selected node, if a cut is drawn.
         let selected: Option<Vec<bool>> =
             (self.level.as_ref())
@@ -461,12 +486,14 @@ impl View {
                 return;
             };
             let d = match (&level.cut, &selected) {
-                (Some(cut), Some(selected)) => scene.discs_by(discs, w, h, zoom, |i| {
-                    (
-                        theme.color(cut.category[i]),
-                        selected[i].then_some(theme.selection),
-                    )
-                }),
+                (Some(cut), Some(selected)) => {
+                    scene.discs_at(discs, w, h, zoom, ppu, theme.background, |i| {
+                        (
+                            theme.color(cut.category[i]),
+                            selected[i].then_some(theme.selection),
+                        )
+                    })
+                }
                 _ => scene.discs(discs, w, h, zoom, color),
             };
             let l = scene.links(links);

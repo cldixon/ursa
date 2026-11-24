@@ -41,6 +41,14 @@ pub const MAX_RADIUS_SHARE: f32 = 0.12;
 /// How wide the ring around a marked disc is, in pixels
 /// ([`LevelScene::discs_by`]).
 pub const RING_WIDTH: f32 = 3.0;
+/// How wide the rim of an open disc is, in pixels ([`LevelScene::set_kinds`]).
+pub const OPEN_RIM: f32 = 2.0;
+/// How much of its own colour the inside of an open disc keeps over the
+/// background.
+pub const OPEN_TINT: f32 = 0.14;
+/// A point is picked within this many pixels of its middle, if its own
+/// radius is less.
+pub const POINT_REACH: f32 = 4.0;
 /// A merged edge's width, in pixels: the lightest and the heaviest.
 pub const MIN_WIDTH: f32 = 1.0;
 pub const MAX_WIDTH: f32 = 5.0;
@@ -113,6 +121,23 @@ pub struct LevelScene {
     /// The greatest radius a disc is drawn with, in pixels, if less than
     /// [`MAX_RADIUS_SHARE`] allows ([`LevelScene::set_max_radius`]).
     max_radius: f32,
+    /// How each node is drawn where it is not by its mass
+    /// ([`LevelScene::set_kinds`]); empty when every one is.
+    kinds: Vec<f32>,
+}
+
+/// How a node of a scene is drawn ([`LevelScene::set_kinds`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Kind {
+    /// A disc, its area by the node's mass.
+    Mass,
+    /// An open disc of this radius in the layout's units: a rim, and the
+    /// nodes inside it drawn over it.
+    Open(f32),
+    /// A point of this radius in pixels, drawn over the discs.
+    Point(f32),
+    /// Not drawn, nor its edges.
+    Hidden,
 }
 
 impl LevelScene {
@@ -158,6 +183,7 @@ impl LevelScene {
             total_mass,
             total_edges: total_edges.max(src.len()),
             max_radius: f32::INFINITY,
+            kinds: Vec::new(),
             src,
             dst,
             weight,
@@ -194,6 +220,55 @@ impl LevelScene {
     /// apart (a cut's, `crate::cut`), which larger ones would cover.
     pub fn set_max_radius(&mut self, pixels: f32) {
         self.max_radius = if pixels > 0.0 { pixels } else { f32::INFINITY };
+    }
+
+    /// Draw some nodes otherwise than by their mass (`GROUP BY`'s groups
+    /// opened in place, #499), one value per node: `0` for a disc by its
+    /// mass; above 0, an open disc of that radius in the layout's units,
+    /// drawn under everything as a rim [`OPEN_RIM`] pixels wide around a
+    /// tint of its colour; below 0, a point of that many pixels' radius,
+    /// drawn over everything; NaN, a node that is not drawn, nor its
+    /// edges. An empty list is every node by its mass. Or why that is not
+    /// one per node.
+    pub fn set_kinds(&mut self, kinds: Vec<f32>) -> Result<(), String> {
+        if !kinds.is_empty() && kinds.len() != self.n_nodes() {
+            return Err(format!(
+                "a scene of {} nodes has {} kinds",
+                self.n_nodes(),
+                kinds.len()
+            ));
+        }
+        self.kinds = kinds;
+        Ok(())
+    }
+
+    /// How node `node` is drawn.
+    pub fn kind(&self, node: usize) -> Kind {
+        match self.kinds.get(node) {
+            None => Kind::Mass,
+            Some(k) if k.is_nan() => Kind::Hidden,
+            Some(&k) if k > 0.0 => Kind::Open(k),
+            Some(&k) if k < 0.0 => Kind::Point(-k),
+            Some(_) => Kind::Mass,
+        }
+    }
+
+    /// A node's radius in pixels as it is drawn at `pixels_per_unit`:
+    /// [`LevelScene::radius`] for a disc by its mass.
+    pub fn radius_at(
+        &self,
+        node: usize,
+        width: f32,
+        height: f32,
+        zoom: f32,
+        pixels_per_unit: f32,
+    ) -> f32 {
+        match self.kind(node) {
+            Kind::Mass => self.radius_of(self.mass[node], width, height, zoom),
+            Kind::Open(r) => r * pixels_per_unit,
+            Kind::Point(r) => r,
+            Kind::Hidden => 0.0,
+        }
     }
 
     /// The nodes' positions, to write: `x` and `y`, one per node each.
@@ -257,11 +332,28 @@ impl LevelScene {
         zoom: f32,
         ink: impl Fn(usize) -> (u32, Option<u32>),
     ) -> Vec<Disc> {
+        self.discs_at(count, width, height, zoom, 1.0, 0, ink)
+    }
+
+    /// [`LevelScene::discs_by`] of a scene whose nodes are not all drawn by
+    /// their mass ([`LevelScene::set_kinds`]), at `pixels_per_unit` and on
+    /// `background` (`0xRRGGBBAA`): the open discs first, the largest
+    /// under the others, each a rim in its colour around a tint of it;
+    /// then the discs by mass; then the points.
+    #[allow(clippy::too_many_arguments)]
+    pub fn discs_at(
+        &self,
+        count: usize,
+        width: f32,
+        height: f32,
+        zoom: f32,
+        pixels_per_unit: f32,
+        background: u32,
+        ink: impl Fn(usize) -> (u32, Option<u32>),
+    ) -> Vec<Disc> {
         let count = count.min(self.n_nodes());
         let mut discs = Vec::with_capacity(count);
-        for &i in self.by_mass[..count].iter().rev() {
-            let i = i as usize;
-            let radius = self.radius_of(self.mass[i], width, height, zoom);
+        let mut push = |i: usize, radius: f32, open: bool| {
             let (color, ring) = ink(i);
             let (x, y) = (self.x[i], self.y[i]);
             if let Some(ring) = ring {
@@ -278,6 +370,39 @@ impl LevelScene {
                 radius,
                 color: color.to_be_bytes(),
             });
+            if open && radius > OPEN_RIM {
+                discs.push(Disc {
+                    x,
+                    y,
+                    radius: radius - OPEN_RIM,
+                    color: tint(background, color).to_be_bytes(),
+                });
+            }
+        };
+        if !self.kinds.is_empty() {
+            let mut open: Vec<(f32, usize)> = (0..self.n_nodes())
+                .filter_map(|i| match self.kind(i) {
+                    Kind::Open(r) => Some((r, i)),
+                    _ => None,
+                })
+                .collect();
+            open.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            for (r, i) in open {
+                push(i, r * pixels_per_unit, true);
+            }
+        }
+        for &i in self.by_mass[..count].iter().rev() {
+            let i = i as usize;
+            if self.kind(i) == Kind::Mass {
+                push(i, self.radius_of(self.mass[i], width, height, zoom), false);
+            }
+        }
+        if !self.kinds.is_empty() {
+            for &i in &self.by_mass[..count] {
+                if let Kind::Point(r) = self.kind(i as usize) {
+                    push(i as usize, r, false);
+                }
+            }
         }
         discs
     }
@@ -285,7 +410,9 @@ impl LevelScene {
     /// The node whose disc covers the point `(x, y)` of the layout, on a
     /// `width` x `height` canvas at `pixels_per_unit` (and `zoom`, as
     /// [`LevelScene::radius`] has it): the one drawn last of those that
-    /// do, which is the heaviest.
+    /// do, which is the heaviest. With [`LevelScene::set_kinds`]: a point
+    /// within [`POINT_REACH`] pixels first, the nearest; then a disc; then
+    /// the smallest open disc.
     pub fn pick(
         &self,
         (x, y): (f32, f32),
@@ -294,12 +421,44 @@ impl LevelScene {
         height: f32,
         zoom: f32,
     ) -> Option<u32> {
-        self.by_mass.iter().copied().find(|&i| {
+        let far = |i: usize| {
+            let (dx, dy) = (self.x[i] - x, self.y[i] - y);
+            dx * dx + dy * dy
+        };
+        if self.kinds.is_empty() {
+            return self.by_mass.iter().copied().find(|&i| {
+                let i = i as usize;
+                let r = self.radius_of(self.mass[i], width, height, zoom) / pixels_per_unit;
+                far(i) <= r * r
+            });
+        }
+        let mut point: Option<(f32, u32)> = None;
+        let mut open: Option<(f32, u32)> = None;
+        for i in 0..self.n_nodes() {
+            match self.kind(i) {
+                Kind::Point(r) => {
+                    let (r, d) = (r.max(POINT_REACH) / pixels_per_unit, far(i));
+                    if d <= r * r && point.is_none_or(|(best, _)| d < best) {
+                        point = Some((d, i as u32));
+                    }
+                }
+                Kind::Open(r) => {
+                    if far(i) <= r * r && open.is_none_or(|(best, _)| r < best) {
+                        open = Some((r, i as u32));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, i)) = point {
+            return Some(i);
+        }
+        let disc = self.by_mass.iter().copied().find(|&i| {
             let i = i as usize;
             let r = self.radius_of(self.mass[i], width, height, zoom) / pixels_per_unit;
-            let (dx, dy) = (self.x[i] - x, self.y[i] - y);
-            dx * dx + dy * dy <= r * r
-        })
+            self.kind(i) == Kind::Mass && far(i) <= r * r
+        });
+        disc.or(open.map(|(_, i)| i))
     }
 
     /// The nodes, heaviest first (then by index).
@@ -313,6 +472,11 @@ impl LevelScene {
         let heaviest = self.weight.first().copied().unwrap_or(1.0).max(1.0);
         (0..count)
             .rev()
+            .filter(|&e| {
+                self.kinds.is_empty()
+                    || (self.kind(self.src[e] as usize) != Kind::Hidden
+                        && self.kind(self.dst[e] as usize) != Kind::Hidden)
+            })
             .map(|e| {
                 let (a, b) = (self.src[e] as usize, self.dst[e] as usize);
                 // By the square root: a weight is a count of edges, and
@@ -327,6 +491,16 @@ impl LevelScene {
             })
             .collect()
     }
+}
+
+/// `color` (`0xRRGGBBAA`) over `background`, [`OPEN_TINT`] of it: the
+/// inside of an open disc.
+fn tint(background: u32, color: u32) -> u32 {
+    let (b, c) = (background.to_be_bytes(), color.to_be_bytes());
+    let mix = |i: usize| {
+        (f32::from(b[i]) + (f32::from(c[i]) - f32::from(b[i])) * OPEN_TINT).round() as u8
+    };
+    u32::from_be_bytes([mix(0), mix(1), mix(2), 0xff])
 }
 
 /// What a view is drawing of a level, for a status line and for tests
@@ -453,6 +627,58 @@ mod tests {
         assert_eq!(s.pick((20.0, 2.0), 1.0, w, h, 1.0), Some(1));
         assert_eq!(s.pick((20.0, 2.0), 100.0, w, h, 1.0), Some(2));
         assert_eq!(s.pick((500.0, 500.0), 1.0, w, h, 1.0), None);
+    }
+
+    #[test]
+    fn an_open_disc_is_under_the_others_and_points_are_over_them() {
+        let mut s = scene();
+        let (w, h) = (1000.0, 800.0);
+        assert!(s.set_kinds(vec![0.0; 3]).is_err());
+        // Node 1 open, 5 units wide; node 0 a point of 3 pixels; node 3
+        // hidden.
+        s.set_kinds(vec![-3.0, 5.0, 0.0, f32::NAN]).unwrap();
+        assert_eq!(
+            [s.kind(0), s.kind(1), s.kind(2), s.kind(3)],
+            [Kind::Point(3.0), Kind::Open(5.0), Kind::Mass, Kind::Hidden]
+        );
+        let discs = s.discs_at(4, w, h, 1.0, 4.0, 0xffffffff, |i| {
+            (
+                0x000000ff + ((i as u32) << 24),
+                (i == 1).then_some(0x11111111),
+            )
+        });
+        // The open disc first: its ring, its rim (5 units at 4 pixels a
+        // unit), its inside; then node 2 by its mass; then the point.
+        let radii: Vec<f32> = discs.iter().map(|d| d.radius).collect();
+        let by_mass = s.radius(2, w, h, 1.0);
+        assert_eq!(
+            radii,
+            [20.0 + RING_WIDTH, 20.0, 20.0 - OPEN_RIM, by_mass, 3.0]
+        );
+        assert_eq!(discs[0].color, [0x11; 4]);
+        assert_eq!(discs[1].color, [1, 0, 0, 0xff]);
+        // The inside is mostly the background.
+        assert_eq!(discs[2].color, [219, 219, 219, 0xff]);
+        assert_eq!((discs[4].x, discs[4].color), (0.0, [0, 0, 0, 0xff]));
+        assert_eq!(s.radius_at(1, w, h, 1.0, 4.0), 20.0);
+        assert_eq!(s.radius_at(0, w, h, 1.0, 4.0), 3.0);
+        assert_eq!(s.radius_at(3, w, h, 1.0, 4.0), 0.0);
+        // The edges at the hidden node are not drawn.
+        assert_eq!(s.links(3).len(), 2);
+
+        // A click: the point within its reach, then a disc, then the open
+        // disc; never the hidden node.
+        assert_eq!(s.pick((0.05, 0.0), 40.0, w, h, 1.0), Some(0));
+        assert_eq!(s.pick((10.0, 4.0), 40.0, w, h, 1.0), Some(1));
+        assert_eq!(s.pick((20.0, 2.0), 40.0, w, h, 1.0), Some(2));
+        assert_eq!(s.pick((30.0, 3.0), 40.0, w, h, 1.0), None);
+        // With no kinds, as before.
+        s.set_kinds(Vec::new()).unwrap();
+        assert_eq!(s.kind(1), Kind::Mass);
+        assert_eq!(
+            s.discs_at(4, w, h, 1.0, 4.0, 0, |_| (7, None)),
+            s.discs(4, w, h, 1.0, 7)
+        );
     }
 
     #[test]

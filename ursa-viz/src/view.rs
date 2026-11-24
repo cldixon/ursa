@@ -68,6 +68,8 @@ pub struct View {
     /// The camera's zoom when last fitted: nodes grow back toward full size
     /// as the user zooms in past it.
     fitted_zoom: f32,
+    /// Pixels a fit leaves free at each side ([`View::set_fit_padding`]).
+    fit_padding: f32,
     /// Draw nodes as well as edges.
     pub draw_nodes: bool,
     /// The result drawn, for a view made from one ([`View::from_result`]):
@@ -631,6 +633,7 @@ impl View {
             renderer,
             follow: true,
             fitted_zoom: 1.0,
+            fit_padding: 0.0,
             draw_nodes: true,
             live,
             layout_stale: false,
@@ -1215,6 +1218,17 @@ impl View {
         self.fit_camera();
     }
 
+    /// Leave `pixels` free at each side of the canvas when the camera fits
+    /// ([`View::fit`], and while it follows): for what is drawn larger
+    /// around a node than a node is, as the discs of `GROUP BY`'s groups
+    /// are (#499). 0, the default, is the fit as it was.
+    pub fn set_fit_padding(&mut self, pixels: f32) {
+        self.fit_padding = if pixels > 0.0 { pixels } else { 0.0 };
+        if self.follow {
+            self.fit_camera();
+        }
+    }
+
     fn fit_camera(&mut self) {
         // A level's nodes, while one is drawn: the graph's have no place yet.
         if let Some(b) = self.level_bounds() {
@@ -1232,6 +1246,15 @@ impl View {
         if let Some(b) = bounds {
             self.moved();
             self.camera.fit(b);
+            if self.fit_padding > 0.0 {
+                // As if the canvas were that much smaller at each side.
+                let (w, h) = self.camera.viewport;
+                let room = |side: f32| ((side - 2.0 * self.fit_padding) / side).max(0.1);
+                let (x0, y0, x1, y1) = b;
+                let (bw, bh) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
+                let padded = (w * room(w) / bw).min(h * room(h) / bh) * 0.92;
+                self.camera.pixels_per_unit = self.camera.pixels_per_unit.min(padded);
+            }
             self.fitted_zoom = self.camera.pixels_per_unit;
             self.uncull();
         }
