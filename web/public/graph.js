@@ -1192,8 +1192,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   };
   const roomMove = () => {
     roomTimer = 0;
-    // A pointer is down: when it is up again (release).
+    // A pointer is down: when it is up again (release). The view is being
+    // read back (state.paused): when it has been.
     if (current !== state || pointers.size) return;
+    if (state.paused) return void (roomTimer = setTimeout(roomMove, 50));
     const [from, to] = [state.room, state.inspector.inset()];
     if (to.every((v, i) => v === from[i])) return;
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) return setRoom(to);
@@ -1201,6 +1203,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     const tick = (now) => {
       roomFrame = 0;
       if (current !== state) return;
+      if (state.paused) return void (roomFrame = requestAnimationFrame(tick));
       const t = Math.min(1, Math.max(0, (now - start) / FIT_MS));
       const p = 1 - (1 - t) ** 3;
       setRoom(t < 1 ? to.map((v, i) => from[i] + (v - from[i]) * p) : to);
@@ -1210,6 +1213,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   };
   /** Room for the panel as it is now, once the pointer has rested. */
   const roomSoon = () => {
+    console.error("ROOMSOON", new Error().stack.split("\n").slice(1, 4).join(" | "));
     roomStop();
     roomTimer = setTimeout(roomMove, ROOM_WAIT_MS);
   };

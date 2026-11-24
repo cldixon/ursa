@@ -865,6 +865,8 @@ async function graphSettled(p: Page) {
     throw new Error(`the graph view did not settle: ${JSON.stringify(seen)}`, { cause: e });
   }
 }
+/** Wait until the camera has made room for the inspector's panel, or given it back (#493). */
+const roomSettled = (p: Page) => p.waitForFunction(() => (window as any).ursaShell.graph()?.room.waits === false, null, { timeout: 10_000, polling: 50 }).catch(() => {});
 /** The terminal's columns, once a resize has settled. */
 async function settledCols(p: Page) {
   let last = -1;
@@ -1546,7 +1548,7 @@ for (const scheme of ["light", "dark"] as const) {
       return squeezed(await after(line, s));
     };
     const status = async () => (await s.locator("#graph-status").textContent()) ?? "";
-    // The selection's box, in CSS pixels of the canvas, once the camera rests.
+    // The selection's box, in CSS pixels, once the camera rests.
     const fitted = async () => {
       await s.waitForFunction(() => !(window as any).ursaShell.graph()?.fitting, null, { timeout: 10_000 });
       await s.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))));
@@ -1557,7 +1559,10 @@ for (const scheme of ["light", "dark"] as const) {
         const xs = at.map((p: any) => p.x);
         const ys = at.map((p: any) => p.y);
         const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
-        return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth, height: canvas.clientHeight, ids: shell.graph().selection.map((n: any) => String(n.id)) };
+        // In the part of the canvas the inspector's panel leaves clear (#493).
+        const ratio = shell.graph().width / canvas.clientWidth;
+        const [left, top, right, bottom] = shell.graph().room.inset.map((v: number) => v / ratio);
+        return { cx: (x0 + x1) / 2 - left, cy: (y0 + y1) / 2 - top, w: x1 - x0, h: y1 - y0, width: canvas.clientWidth - left - right, height: canvas.clientHeight - top - bottom, ids: shell.graph().selection.map((n: any) => String(n.id)) };
       });
     };
     const centred = (b: any) => Math.abs(b.cx - b.width / 2) <= 2 && Math.abs(b.cy - b.height / 2) <= 2;
