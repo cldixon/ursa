@@ -3,8 +3,8 @@ name: CLI package
 # Proves the `ursa` binary still packages and runs, on pull requests that touch
 # the SQL engine's crates or their packaging: a release build for Linux
 # x86_64 (the same command cli-build.yml runs per platform), `ursa
-# --version`, one query, and a crates.io dry run of the five crates ursa-cli
-# needs. Publishes nothing. Also tests the one-line installers (docs/install.sh
+# --version`, one query, and a crates.io dry run of ursa-cli and the crates it
+# needs (ursa-server, behind its `serve` feature, among them). Publishes nothing. Also tests the one-line installers (docs/install.sh
 # and docs/install.ps1) against that binary, packaged as a release and served
 # locally.
 
@@ -18,6 +18,7 @@ on:
       - "ursa-io/**"
       - "ursa-core/**"
       - "ursa-viz/**"
+      - "ursa-server/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/cli-package.yml"
@@ -71,7 +72,7 @@ jobs:
         run: |
           # ursa-cli needs these from crates.io; a release publishes them together.
           versions=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '
-            .packages[] | select(.name | IN("ursa-core","ursa-io","ursa-viz","ursa-engine","ursa-sql","ursa-shell","ursa-cli"))
+            .packages[] | select(.name | IN("ursa-core","ursa-io","ursa-viz","ursa-engine","ursa-sql","ursa-shell","ursa-server","ursa-cli"))
             | "\(.name) \(.version)"')
           echo "$versions"
           test "$(echo "$versions" | cut -d' ' -f2 | sort -u | wc -l)" -eq 1
@@ -116,8 +117,10 @@ jobs:
 
       # Packages each crate as crates.io would receive it, resolving the
       # unpublished ones against each other. --no-verify: the build above
-      # already compiled them.
+      # already compiled them. ursa-server is in it although the build above
+      # leaves `serve` off: ursa-cli's optional dependency on it must resolve
+      # for ursa-cli to publish at all.
       - name: crates.io dry run
         run: >
           cargo publish --dry-run --no-verify --locked
-          -p ursa-core -p ursa-io -p ursa-viz -p ursa-engine -p ursa-sql -p ursa-shell -p ursa-cli
+          -p ursa-core -p ursa-io -p ursa-viz -p ursa-engine -p ursa-sql -p ursa-shell -p ursa-server -p ursa-cli

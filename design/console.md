@@ -259,7 +259,7 @@ The `graph` and `activity` events matter once a second client is attached. With 
 ### 4.5 Ordering and concurrency
 
 - **One request runs at a time per session.** Others queue in arrival order, across all clients. The engine is not re-entrant, and a single order is what makes undo, history and paired work make sense.
-- **`cancel` and `hello` bypass the queue.**
+- **`cancel` and `hello` bypass the queue.** Natively, `memory` does too. `cancel {target}` names one of the same connection's requests, queued or running; it replies `cancelled`, and a request that has already replied makes `cancel` a no-op, not an error. A closed connection cancels what it had queued or running. Cancelling drops the request's future, which is DataFusion's cancellation; a graph kernel that does not yield finishes first. *(URSA-3.)*
 - **The reply to a request comes after every event it caused.**
 - **The browser demo's worker keeps the same order** as today.
 
@@ -283,14 +283,15 @@ ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
 - **`--read-only`** refuses statements that write: `COPY TO`, `CREATE` in an attached database, `INSERT`, and the rest. It is meant for pairing with an agent (§9).
-- **One session per server process.** A second browser tab attaches to the same session.
+- **Sessions:** `hello {session: "new"}` (the shell's choice) gives a tab a session of its own; `hello {session: "shared"}` (the default) attaches it to the server's one shared session, which every tab and agent that asks for it sees (§9). A shared session's requests from every connection run in one queue. *(Changed by the spike, #536, and URSA-3: one session per process did not fit the shell, whose `start` replaces its session.)*
+- **Ctrl+C stops it gracefully:** no new connections, every running request cancelled, every WebSocket closed (code 1001, "the server stopped"), and the sessions ended.
 
 ### Security
 
 The native engine reads any file and any bucket the user's credentials reach, so the server must be reachable only by the user's own browser tab.
 
 - **Bind to `127.0.0.1` and `::1` only.** There is no flag to bind elsewhere in v1.
-- **A token:** 32 random bytes, base64url, made at startup. It is required on the page's URL (`/?token=…`, then kept in `sessionStorage`) and on the WebSocket (`/session?token=…`). Static assets need no token: they hold no data.
+- **A token:** 32 random bytes, base64url, made at startup, in the printed link (`/?token=…`). The server takes it from the URL once: it answers with an `HttpOnly`, `SameSite=Strict` cookie named for its port (`ursa_token_4280`; cookies are shared across a host's ports) and a redirect to the same address without it, so the token never reaches the page's scripts or its share links. The WebSocket (`/session`) and the served directory's files (`/data/`, with byte ranges) need it: the cookie, or `?token=` for clients that are not browsers. The page's own files need no token: they hold no data. *(Changed by the spike, #536: it was kept in `sessionStorage`.)*
 - **`Origin` must be the server's own,** `http://127.0.0.1:PORT` or `http://localhost:PORT`, on every WebSocket upgrade. This stops other sites' pages from connecting, even ones that learned the token.
 - **`Host` must be `127.0.0.1:PORT` or `localhost:PORT`.** This stops DNS rebinding.
 - **The same security headers as the deploy:** `web/src/headers.ts` (a CSP with `connect-src 'self'`, COOP, COEP and CORP). The console works cross-origin isolated, as the shell does.
@@ -298,7 +299,7 @@ The native engine reads any file and any bucket the user's credentials reach, so
 
 ### Shipping the UI
 
-The UI's files (about 3–4 MB, most of it the graph view's wasm) are embedded in the binary with `rust-embed`, behind the `serve` feature, built by `bun run build` before `cargo build`. Release binaries and the Homebrew formula have the feature on. A `cargo install ursa-cli` from crates.io gets the CLI without it, unless the crate ships the built assets. The spike decides between shipping prebuilt assets in the published crate and leaving `serve` to the release binaries (§12).
+The UI's files (about 3–4 MB, most of it the graph view's wasm) are embedded in the binary with `rust-embed`, behind `ursa-server`'s `embed` feature (ursa-cli's `serve-embed`), built by `bun run build` before `cargo build`; the wasm engine's files are left out. Release binaries and the Homebrew formula have it on (URSA-4). *Decided by the spike (§12, question 1):* the published crates ship no assets. `ursa-server` is published without them, and `ursa-cli`'s `serve` feature, from crates.io, serves the page from a directory (`--assets DIR`, a `web/dist` its user built). `ursa-server` is published with the other crates, before `ursa-cli`: `cargo publish` of `ursa-cli` fails while an optional dependency is not on crates.io, even with the feature off.
 
 ## 6. The console
 

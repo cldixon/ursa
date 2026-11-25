@@ -27,6 +27,8 @@ use datafusion::prelude::SessionContext;
 mod interrupt;
 mod notices;
 mod repl;
+#[cfg(feature = "serve")]
+mod serve;
 mod startup;
 
 use ursa_shell::print::{is_broken_pipe, OutputFormat, DEFAULT_MAX_ROWS};
@@ -131,6 +133,12 @@ enum Source {
 }
 
 fn main() -> ExitCode {
+    // `ursa serve [DIR]`: a database file ends in .ursa, so `serve` is never
+    // one.
+    #[cfg(feature = "serve")]
+    if std::env::args_os().nth(1).is_some_and(|a| a == "serve") {
+        return serve::main(std::env::args_os().skip(1));
+    }
     let matches = Args::command().get_matches_from(single_dash_longs(std::env::args_os()));
     let args = match Args::from_arg_matches(&matches) {
         Ok(args) => args,
