@@ -14,7 +14,8 @@
 //! A relative path resolves against the session's [`Root`]: a directory
 //! natively, a URL in the browser, or, natively with none, the working
 //! directory. A session with a directory root also writes only under it
-//! ([`write_target`], [`check_write`]).
+//! ([`write_target`], [`check_write`]), and a read-only session writes
+//! nothing ([`set_read_only`]).
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -215,11 +216,46 @@ fn resolve_under(root: Option<&Root>, location: &str) -> Result<String> {
     }
 }
 
+/// Whether a session writes no files ([`set_read_only`]).
+#[derive(Debug)]
+struct ReadOnly(bool);
+
+/// Make the session `ctx` read-only (`ursa serve --read-only`): it writes no
+/// files. [`write_target`] and [`check_write`] refuse every write, and
+/// `ursa-sql` refuses `COPY … TO` (also to the session's files in memory),
+/// `INSERT INTO` a table that is not in memory, and `ATTACH` of a database
+/// that does not exist; it opens one that does read-only. Reads, and what a
+/// session defines in memory (views, tables, graphs), are as before.
+pub fn set_read_only(ctx: &SessionContext, on: bool) {
+    let state = ctx.state_ref();
+    let mut state = state.write();
+    state.config_mut().set_extension(Arc::new(ReadOnly(on)));
+}
+
+/// Whether the session with `config` is read-only ([`set_read_only`]).
+pub fn is_read_only(config: &SessionConfig) -> bool {
+    config.get_extension::<ReadOnly>().is_some_and(|on| on.0)
+}
+
+/// Refuse a write in a read-only session ([`set_read_only`]), with a reason
+/// that does not name what was refused, for the caller to say that.
+pub fn check_writable(config: &SessionConfig) -> Result<()> {
+    if is_read_only(config) {
+        return Err(DataFusionError::Plan(READ_ONLY.into()));
+    }
+    Ok(())
+}
+
+/// Why a read-only session refuses a write.
+pub const READ_ONLY: &str =
+    "this session is read-only (ursa serve --read-only), and writes no files";
+
 /// Where a write to `target` (`COPY … TO 'target'`, `.output target`) goes in
 /// the session with `config`: `Ok(None)` to write it as named, in a session
 /// with no directory [`Root`]; in a session with one, the absolute path under
 /// the root that `target` names, or why it may not be written (a reason
 /// that does not repeat `target`, for the caller to say what was refused).
+/// A read-only session ([`set_read_only`]) refuses every target.
 ///
 /// A rooted session writes only under its root. `target` must be a relative
 /// path with no `..` (not absolute, not `~/…`, not a URL), and no part of it
@@ -228,6 +264,7 @@ fn resolve_under(root: Option<&Root>, location: &str) -> Result<String> {
 /// (a page, an agent) inside the root, not another process that swaps a
 /// directory for a link in between.
 pub fn write_target(config: &SessionConfig, target: &str) -> Result<Option<String>> {
+    check_writable(config)?;
     match root(config) {
         Some(Root::Dir(dir)) => under_root(&dir, target).map(Some),
         _ => Ok(None),
@@ -295,8 +332,13 @@ fn under_root(dir: &Path, target: &str) -> Result<String> {
 /// Refuse a write to the files at `url` (an `INSERT INTO` a table of files)
 /// in a session with a directory [`Root`], unless they are under it: a local
 /// path whose links stay inside the root. Any write is allowed in a session
-/// without one.
+/// without one, unless it is read-only ([`set_read_only`]).
 pub fn check_write(config: &SessionConfig, url: &Url) -> Result<()> {
+    if is_read_only(config) {
+        return Err(DataFusionError::Plan(format!(
+            "cannot write to {url}: {READ_ONLY}"
+        )));
+    }
     let Some(Root::Dir(dir)) = root(config) else {
         return Ok(());
     };
@@ -527,5 +569,26 @@ mod tests {
         let s3 = Url::parse("s3://bucket/t.csv").unwrap();
         assert!(check_write(&config, &s3).is_err());
         check_write(&SessionConfig::new(), &s3).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_session_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_only = |config: SessionConfig| config.with_extension(Arc::new(ReadOnly(true)));
+        for config in [
+            read_only(rooted(dir.path())),
+            read_only(SessionConfig::new()),
+        ] {
+            assert!(is_read_only(&config));
+            let e = write_target(&config, "out.csv").unwrap_err().to_string();
+            assert!(e.contains("read-only"), "{e}");
+            let inside = Url::from_file_path(dir.path().join("t.csv")).unwrap();
+            let e = check_write(&config, &inside).unwrap_err().to_string();
+            assert!(e.contains("read-only"), "{e}");
+        }
+        assert!(!is_read_only(&rooted(dir.path())));
+        assert!(write_target(&rooted(dir.path()), "out.csv")
+            .unwrap()
+            .is_some());
     }
 }
