@@ -244,11 +244,14 @@ pub fn shortest_path_weighted_with_cost_masked(
     dist[source as usize] = 0.0;
     parent[source as usize] = source as i64;
 
-    // Min-heap on tentative distance.
+    // Min-heap on tentative distance, ties by original id
+    // (`Topology::original_ids`), so a locality relabel (#172) settles the
+    // nodes in the same order and picks the same path among equal ones.
     let mut heap = BinaryHeap::new();
-    heap.push(Reverse((TotalF64(0.0), source)));
+    heap.push(Reverse((TotalF64(0.0), topo.original_id(source))));
 
-    while let Some(Reverse((TotalF64(du), u))) = heap.pop() {
+    while let Some(Reverse((TotalF64(du), o))) = heap.pop() {
+        let u = topo.node_of_original(o);
         if settled[u as usize] {
             continue; // stale heap entry
         }
@@ -262,7 +265,7 @@ pub fn shortest_path_weighted_with_cost_masked(
                 if nd < dist[v as usize] {
                     dist[v as usize] = nd;
                     parent[v as usize] = u as i64;
-                    heap.push(Reverse((TotalF64(nd), v)));
+                    heap.push(Reverse((TotalF64(nd), topo.original_id(v))));
                 }
             }
         });

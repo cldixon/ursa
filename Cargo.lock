@@ -4749,6 +4749,7 @@ dependencies = [
  "regex",
  "tempfile",
  "tokio",
+ "ursa-core",
  "ursa-engine",
  "ursa-viz",
 ]

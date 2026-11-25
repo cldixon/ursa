@@ -12,8 +12,13 @@
 //!   overflow the native call stack), from each unvisited node in id order. A
 //!   component's label is its Tarjan root: the member the DFS reached first.
 //!
-//! Neither label is the component's smallest id, and both depend on the order
-//! of the work, so each parallel form splits the job into a part that runs in
+//! Neither root is the component's smallest id, and both depend on the order
+//! of the work. The labels the public kernels return are canonical instead
+//! (#150): each component is relabelled, in one linear pass, by the smallest
+//! original id among its nodes ([`Topology::original_ids`]), so they depend
+//! on the partition alone and survive a locality relabel of the nodes (#172).
+//! The roots still fix which work the parallel forms must reproduce, so each
+//! parallel form splits the job into a part that runs in
 //! parallel and a short serial part that fixes the labels the serial form
 //! would give:
 //!
@@ -213,16 +218,22 @@ impl Bits {
     }
 }
 
-/// Weak connected component label per node, dense-indexed. Labels are the dense
-/// index of each component's representative (not necessarily contiguous `0..k`);
-/// callers that want canonical small ids can densify the output.
+/// Weak connected component label per node, dense-indexed. A component's
+/// label is the smallest **original** id among its nodes (see
+/// [`Topology::original_ids`]): its first node in first-seen order, which is
+/// its smallest dense id when the nodes were not relabelled. Labels are not
+/// contiguous `0..k`. They depend only on the partition and the original
+/// numbering, never on the order the kernel did its work in, nor on a
+/// locality relabel (#150, #172).
 pub fn connected_components_weak(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     let linked = linked_nodes(topo, mask);
-    if parallel(topo.n_edges()) {
+    let mut labels = if parallel(topo.n_edges()) {
         weak_parallel(topo, mask, linked.as_ref())
     } else {
         weak_over(topo, mask, linked.as_ref())
-    }
+    };
+    topo.canonical_labels(&mut labels);
+    labels
 }
 
 /// [`connected_components_weak`], serially, compact over `linked` when given.
@@ -455,18 +466,18 @@ fn weak_parallel(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linke
 
 /// Strongly connected component label per node, dense-indexed. Two nodes share
 /// a label iff each is reachable from the other. Follows out-edges only — the
-/// transpose is not needed. Labels are the dense index of each SCC's Tarjan
-/// root (the member an iterative Tarjan from each unvisited node in id order
-/// reaches first): an arbitrary but stable representative, matching the
-/// weak-component labeling convention. `O(n + m)` serially; the parallel form
-/// returns the same labels.
+/// transpose is not needed. A component's label is the smallest original id
+/// among its nodes, as for [`connected_components_weak`]. `O(n + m)`
+/// serially; the parallel form finds the same components.
 pub fn connected_components_strong(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<u32> {
     let linked = linked_nodes(topo, mask);
-    if parallel(topo.n_edges()) {
+    let mut labels = if parallel(topo.n_edges()) {
         strong_parallel(topo, mask, linked.as_ref())
     } else {
         strong_over(topo, mask, linked.as_ref())
-    }
+    };
+    topo.canonical_labels(&mut labels);
+    labels
 }
 
 /// [`connected_components_strong`], serially, compact over `linked` when given.
@@ -1291,7 +1302,9 @@ mod tests {
         }
 
         /// (weak hash, strong hash) per graph of [`graphs`], from the serial
-        /// kernels before #383.
+        /// kernels before #383: the roots (union-find, Tarjan) that the serial
+        /// and parallel forms still find. The public kernels relabel them
+        /// canonically since #150/#172 (see [`canonical`]).
         const PINNED: &[(&str, u64, u64)] = &[
             ("uniform sparse", 0xd969d63f3e302fac, 0x5b35d2f40009d715),
             ("uniform dense", 0x35da70bdb324c525, 0x2c36c2471ceec525),
@@ -1313,17 +1326,37 @@ mod tests {
             assert_eq!(graphs.len(), PINNED.len());
             for ((name, t, m), &(pname, weak, strong)) in graphs.iter().zip(PINNED) {
                 assert_eq!(*name, pname);
-                let w = connected_components_weak(t, m.as_ref());
-                let s = connected_components_strong(t, m.as_ref());
-                assert_eq!(fnv(&w), weak, "weak labels changed: {name}");
-                assert_eq!(fnv(&s), strong, "strong labels changed: {name}");
-                // The parallel forms, whatever the graph's size.
                 let l = linked_nodes(t, m.as_ref());
+                let w = weak_over(t, m.as_ref(), l.as_ref());
+                let s = strong_over(t, m.as_ref(), l.as_ref());
+                assert_eq!(fnv(&w), weak, "weak roots changed: {name}");
+                assert_eq!(fnv(&s), strong, "strong roots changed: {name}");
+                // The public kernels: the same partitions, labelled canonically.
+                let public_w = connected_components_weak(t, m.as_ref());
+                let public_s = connected_components_strong(t, m.as_ref());
+                assert_eq!(public_w, canonical(&w), "weak labels: {name}");
+                assert_eq!(public_s, canonical(&s), "strong labels: {name}");
+                // The parallel forms, whatever the graph's size.
                 let w = weak_parallel(t, m.as_ref(), l.as_ref());
                 let s = strong_parallel(t, m.as_ref(), l.as_ref());
                 assert_eq!(fnv(&w), weak, "parallel weak labels differ: {name}");
                 assert_eq!(fnv(&s), strong, "parallel strong labels differ: {name}");
             }
+        }
+
+        /// `labels` relabelled by the smallest node of each part, checked to
+        /// be the same partition.
+        fn canonical(labels: &[u32]) -> Vec<u32> {
+            let mut least = std::collections::HashMap::new();
+            let out: Vec<u32> = labels
+                .iter()
+                .enumerate()
+                .map(|(v, &l)| *least.entry(l).or_insert(v as u32))
+                .collect();
+            for (v, (&a, &b)) in labels.iter().zip(&out).enumerate() {
+                assert_eq!(labels[b as usize], a, "node {v}");
+            }
+            out
         }
 
         #[test]
@@ -1349,12 +1382,14 @@ mod tests {
                 connected_components_strong(&t, None),
                 vec![0, 1, 2, 3, 4, 5]
             );
-            // A DFS that enters the cycle {2,4,5} at 4, not at its smallest id.
+            // A DFS that enters the cycle {2,4,5} at 4, not at its smallest
+            // id: its Tarjan root is 4, its label 2 (#150).
             let t = Topology::build(6, vec![0, 1, 4, 5, 2, 1], vec![1, 4, 5, 2, 4, 3]);
             assert_eq!(connected_components_weak(&t, None), vec![0, 0, 0, 0, 0, 0]);
+            assert_eq!(strong_over(&t, None, None), vec![0, 1, 4, 3, 4, 4]);
             assert_eq!(
                 connected_components_strong(&t, None),
-                vec![0, 1, 4, 3, 4, 4]
+                vec![0, 1, 2, 3, 2, 2]
             );
         }
     }

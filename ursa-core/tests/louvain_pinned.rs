@@ -13,7 +13,7 @@
 //! hash is checked again on pools of 1, 2, 4 and 8 threads.
 
 use ursa_core::algo::{louvain, louvain_weighted};
-use ursa_core::{EdgeMask, Topology};
+use ursa_core::{EdgeMask, NodeOrder, Topology};
 
 /// Zachary's karate club (78 edges, each listed once from the lower id).
 #[rustfmt::skip]
@@ -250,10 +250,25 @@ fn compute_large() -> Vec<(&'static str, bool, u64)> {
         ("rmat18", rmat(1_000_000, 18, 42)),
         ("planted", planted(2_200_000, 30)),
     ] {
-        let t = Topology::build(e.n, e.src, e.dst);
+        let t = Topology::build(e.n, e.src.clone(), e.dst.clone());
         for parallel in [false, true] {
             let labels = louvain(&t, None, 1.0, Some(1), parallel);
             got.push((name, parallel, fnv(labels.iter().map(|&c| u64::from(c)))));
+        }
+        // The same graph relabelled by in-degree, as the SQL engine builds
+        // an index this size (#172): other communities for the seed, since
+        // the visit order follows the numbering, pinned here in their own
+        // right. Read in original-id order.
+        let t = Topology::build_ordered(e.n, e.src, e.dst, NodeOrder::InDegree);
+        let relabelled = match name {
+            "rmat18" => "rmat18, relabelled",
+            _ => "planted, relabelled",
+        };
+        for parallel in [false, true] {
+            let labels = louvain(&t, None, 1.0, Some(1), parallel);
+            let by_original =
+                (0..t.n_nodes() as u32).map(|o| labels[t.node_of_original(o) as usize]);
+            got.push((relabelled, parallel, fnv(by_original.map(u64::from))));
         }
     }
     got
@@ -262,8 +277,12 @@ fn compute_large() -> Vec<(&'static str, bool, u64)> {
 const GOLDEN_LARGE: &[(&str, bool, u64)] = &[
     ("rmat18", false, 0xaa57b292dfc64d40),
     ("rmat18", true, 0x3131f1aa5d828be8),
+    ("rmat18, relabelled", false, 0xc139ad82384c0df4),
+    ("rmat18, relabelled", true, 0x784f9d393bd85ac9),
     ("planted", false, 0x8f5802282bb165a4),
     ("planted", true, 0x78172d275afe1cec),
+    ("planted, relabelled", false, 0x37cdae96a09737aa),
+    ("planted, relabelled", true, 0x7946274668d4673a),
 ];
 
 #[test]
