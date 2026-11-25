@@ -353,7 +353,61 @@ async fn a_label_on_two_tables() {
 }
 
 #[tokio::test]
-async fn a_property_must_be_on_every_table_with_one_type() {
+async fn a_property_some_tables_lack_is_null_in_their_rows() {
+    let ctx = school().await;
+    // Schools have no name: their rows read NULL, as the standard says.
+    assert_eq!(
+        ok(&ctx, &pg("(a) COLUMNS (element_id(a) AS id, a.name))")).await,
+        "\
++----+---------+
+| id | name    |
++----+---------+
+| 0  |         |
+| 0  | Daniel  |
+| 1  |         |
+| 1  | Tavneet |
+| 2  | Gabor   |
+| 3  | Peter   |
+| 4  | David   |
++----+---------+"
+    );
+    // The standard's own case (match/11): a.id is a student's, NULL for a school.
+    assert_eq!(
+        value(
+            &ctx,
+            "SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a) COLUMNS (a.id)) WHERE id IS NULL"
+        )
+        .await,
+        "2"
+    );
+    // An edge property, and in a condition: NULL is not > 10.
+    assert_eq!(
+        value(
+            &ctx,
+            "SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a:Person)-[e]->(b)
+               WHERE e.createDate > 10 COLUMNS (e.createDate))"
+        )
+        .await,
+        "7"
+    );
+    // A property no table has is a mistake, and the error names the tables.
+    assert_contains(
+        &err(&ctx, &pg("(a) COLUMNS (a.nmae))")).await,
+        "in GRAPH_TABLE: node 'a' can be a row of vertex tables student and school, and none \
+         of them has property 'nmae'; their properties are id, name, school_name, school_id, \
+         school_kind (#412)",
+    );
+    // a.* is what every table has.
+    assert_contains(
+        &err(&ctx, &pg("(a))")).await,
+        "a.* returns the properties every table 'a' can be a row of has, and its tables have \
+         none in common; list what to return, as COLUMNS (element_id(a)), or give 'a' a label \
+         (#412)",
+    );
+}
+
+#[tokio::test]
+async fn a_property_must_have_one_type_where_it_is() {
     let ctx = messages().await;
     assert_contains(
         &err(
@@ -362,8 +416,7 @@ async fn a_property_must_be_on_every_table_with_one_type() {
         )
         .await,
         "in GRAPH_TABLE: node 'm' can be a row of vertex tables post and comment, and property \
-         'len' is Int64 in post but Utf8 in comment, which do not mix; read a property they all \
-         have (id, content), or give 'm' a label (#412)",
+         'len' is Int64 in post but Utf8 in comment, which do not mix; give 'm' a label (#412)",
     );
     // In a condition too.
     assert_contains(
@@ -373,24 +426,6 @@ async fn a_property_must_be_on_every_table_with_one_type() {
         )
         .await,
         "property 'len' is Int64 in post but Utf8 in comment",
-    );
-    let ctx = school().await;
-    assert_contains(
-        &err(&ctx, &pg("(a) COLUMNS (a.name))")).await,
-        "in GRAPH_TABLE: node 'a' can be a row of vertex tables student and school, and school \
-         has no property 'name'; read a property they all have (they have none in common), or \
-         give 'a' a label (#412)",
-    );
-    assert_contains(
-        &err(&ctx, &pg("(a:Person)-[e]->(b) COLUMNS (e.createDate))")).await,
-        "edge 'e' can be a row of edge tables know and studyat, and studyat has no property \
-         'createdate'",
-    );
-    assert_contains(
-        &err(&ctx, &pg("(a))")).await,
-        "a.* returns the properties every table 'a' can be a row of has, and its tables have \
-         none in common; list what to return, as COLUMNS (element_id(a)), or give 'a' a label \
-         (#412)",
     );
 }
 

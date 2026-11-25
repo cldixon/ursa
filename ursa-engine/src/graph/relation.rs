@@ -1534,7 +1534,23 @@ impl GraphFunctions {
         // (#412); one combination is planned as it always was.
         let mut plans = Vec::new();
         for lowered in &combinations {
-            plans.push(self.plan_lowered(pattern, graph, analysis, lowered, context)?);
+            plans.push(self.plan_lowered(pattern, graph, analysis, lowered, None, context)?);
+        }
+        // Each column says what every combination agrees it is: planned
+        // again with those marks, so the UNION's inputs say the same.
+        if plans.len() > 1 {
+            let marks = common_marks(&plans);
+            plans.clear();
+            for lowered in &combinations {
+                plans.push(self.plan_lowered(
+                    pattern,
+                    graph,
+                    analysis,
+                    lowered,
+                    Some(&marks),
+                    context,
+                )?);
+            }
         }
         let plan = match plans.len() {
             1 => plans.pop().expect("one plan"),
@@ -1552,13 +1568,16 @@ impl GraphFunctions {
         }))
     }
 
-    /// The plan of one combination of element tables of a match.
+    /// The plan of one combination of element tables of a match. `marks`,
+    /// when given, is each column's field metadata, in place of what the
+    /// combination alone says (see [`common_marks`]).
     fn plan_lowered(
         &self,
         pattern: &super::pattern::Pattern,
         graph: &PropertyGraph,
         analysis: &Analysis,
         lowered: &super::pattern::Lowered,
+        marks: Option<&[BTreeMap<String, String>]>,
         context: &mut dyn RelationPlannerContext,
     ) -> Result<LogicalPlan> {
         use super::path_search::{END, START};
@@ -1624,6 +1643,19 @@ impl GraphFunctions {
                 scan = scan.project(columns.iter().map(|(column, name)| {
                     Expr::Column(Column::new_unqualified(column)).alias(name)
                 }))?;
+            }
+            // Another of the variable's tables' properties: NULL here (#412).
+            if !source.nulls.is_empty() {
+                let mut projection: Vec<Expr> = scan
+                    .schema()
+                    .iter()
+                    .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                    .collect();
+                for (name, data_type) in &source.nulls {
+                    let null = datafusion::common::ScalarValue::try_from(data_type)?;
+                    projection.push(Expr::Literal(null, None).alias(name));
+                }
+                scan = scan.project(projection)?;
             }
             scan.alias(source.var.as_str())?.build()
         };
@@ -1947,18 +1979,22 @@ impl GraphFunctions {
             }
             // Each column says what it is (`provenance`): a variable's key,
             // a property, a path's nodes. A computed column says nothing.
-            let projection = projection.into_iter().map(|expr| {
+            let projection = projection.into_iter().enumerate().map(|(i, expr)| {
                 let column = match &expr {
                     Expr::Alias(alias) => alias.expr.as_ref(),
                     other => other,
                 };
-                let metadata = match column {
-                    Expr::Column(Column {
-                        relation: Some(TableReference::Bare { table }),
-                        name,
-                        ..
-                    }) => lowered.provenance(&graph.name, table, name),
-                    _ => None,
+                let metadata = match (marks, column) {
+                    (Some(marks), _) => marks.get(i).filter(|m| !m.is_empty()).cloned(),
+                    (
+                        None,
+                        Expr::Column(Column {
+                            relation: Some(TableReference::Bare { table }),
+                            name,
+                            ..
+                        }),
+                    ) => lowered.provenance(&graph.name, table, name),
+                    (None, _) => None,
                 };
                 match metadata {
                     Some(metadata) => provenance::marked(expr, metadata),
@@ -2655,6 +2691,34 @@ fn renamed_repeats(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// The plans of a match's combinations of element tables (#412), as one
 /// `UNION ALL`: each column under the first plan's name, and cast to the
 /// type its values have in every plan.
+/// Per column of the plans of a match's combinations of element tables, the
+/// field metadata they all give it: what is true of the column in every
+/// combination (a column a combination does not mark says nothing).
+fn common_marks(plans: &[LogicalPlan]) -> Vec<BTreeMap<String, String>> {
+    let width = plans.iter().map(|p| p.schema().fields().len()).min();
+    (0..width.unwrap_or(0))
+        .map(|i| {
+            let mut marks: Option<BTreeMap<String, String>> = None;
+            for p in plans {
+                let field = p.schema().field(i);
+                let these: BTreeMap<String, String> = field
+                    .metadata()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                marks = Some(match marks {
+                    None => these,
+                    Some(mut m) => {
+                        m.retain(|k, v| these.get(k) == Some(v));
+                        m
+                    }
+                });
+            }
+            marks.unwrap_or_default()
+        })
+        .collect()
+}
+
 fn union_combinations(plans: Vec<LogicalPlan>) -> Result<LogicalPlan> {
     let plans = plans
         .into_iter()
@@ -2702,7 +2766,20 @@ fn union_combinations(plans: Vec<LogicalPlan>) -> Result<LogicalPlan> {
                         let column = Expr::Column(Column::new(q.cloned(), f.name()));
                         match f.data_type() == t {
                             true => column,
-                            false => cast(column, t.clone()).alias(f.name()),
+                            // The cast keeps what the column says.
+                            false => {
+                                let cast = cast(column, t.clone()).alias(f.name());
+                                match f.metadata().is_empty() {
+                                    true => cast,
+                                    false => provenance::marked(
+                                        cast,
+                                        f.metadata()
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect(),
+                                    ),
+                                }
+                            }
                         }
                     })
                     .collect();

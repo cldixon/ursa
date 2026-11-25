@@ -1285,10 +1285,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     are combined with `UNION ALL`; combinations the edges rule out are left
     out. When every variable has one table, the plan is the same as before.
     More than 64 combinations is refused with a request for labels.
-  - A property of a variable over several tables is read when every table
-    has it with one type (numbers with numbers, text with text); otherwise
-    the error names the table that lacks it or the types that differ.
-    `a.*` and `COLUMNS (*)` return the properties they share.
+  - A property of a variable over several tables reads as NULL in the rows
+    of the tables that lack it, as in SQL/PGQ and GQL: `MATCH (a) COLUMNS
+    (a.name)` gives the students' names and NULL for the schools. A property
+    no table has is an error that names the tables (so a typo is caught),
+    and so are tables that have it with types that do not mix (numbers mix
+    with numbers, text with text). `a.*` and `COLUMNS (*)` return only the
+    properties every table has; name the others to get them.
     `element_id(a)`, `SAME` and `IS LABELED` work per table.
   - A quantified edge, or the edge of a searched path, that can be a row of
     several edge tables is refused: label it.

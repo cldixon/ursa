@@ -20,20 +20,6 @@ reason = "The standard matches nothing; Ursa refuses the pattern, as DuckPGQ doe
 error  = "no edge of 'know' connects them"
 
 [[difference]]
-id     = "match/11"
-kind   = "deliberate"
-issue  = 412
-reason = "'a' is a row of Student or School, and only Student has 'id'. Ursa reads a property of a variable over several tables only when every one of them has it with one type (#412); the case expects the rows of both. multi/1 counts the same nodes with element_id(a)."
-error  = "node 'a' can be a row of vertex tables student and school, and school has no property 'id'"
-
-[[difference]]
-id     = "match/11b"
-kind   = "deliberate"
-issue  = 412
-reason = "As match/11: School has no 'id'. multi/2 reads the same nodes with element_id(a)."
-error  = "node 'a' can be a row of vertex tables student and school, and school has no property 'id'"
-
-[[difference]]
 id     = "multi/10"
 kind   = "unsupported"
 issue  = 412

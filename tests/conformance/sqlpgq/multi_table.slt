@@ -99,3 +99,19 @@ query I
 SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id = 4)-[e]->{1,2}(b) COLUMNS (element_id(b)));
 ----
 4
+
+# id: multi/11  a property only some tables have: NULL in the others' rows
+query IT rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a) COLUMNS (element_id(a) AS id, a.name));
+----
+0 Daniel
+1 Tavneet
+2 Gabor
+3 Peter
+4 David
+0 NULL
+1 NULL
+
+# id: multi/12  a property no table has is an error
+statement error none of them has property 'nmae'
+SELECT * FROM GRAPH_TABLE (pg MATCH (a) COLUMNS (a.nmae));

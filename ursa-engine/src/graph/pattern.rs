@@ -69,7 +69,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -1225,6 +1225,9 @@ pub struct Source {
     /// For a node of a vertex table: the table's element name and its key,
     /// which must identify one row (#411).
     pub vertex: Option<(String, String)>,
+    /// Properties of another of the variable's tables that this one lacks,
+    /// read as NULLs of these types (#412).
+    pub nulls: Vec<(String, DataType)>,
 }
 
 /// A variable's columns, as [`Source::columns`] lists them.
@@ -1625,9 +1628,18 @@ pub fn lower(
         )?);
     }
     if lowered.len() > 1 {
-        let shared = shared_properties(&order, &combinations, schema_of, usage)?;
-        for l in &mut lowered {
+        let (shared, fills) = shared_properties(&order, &combinations, schema_of, usage)?;
+        for (l, combination) in lowered.iter_mut().zip(&combinations) {
             l.shared = shared.clone();
+            // A property of another of the variable's tables is NULL here.
+            for (var, table) in order.iter().zip(combination) {
+                let Some(nulls) = fills.get(var).and_then(|f| f.get(table.name())) else {
+                    continue;
+                };
+                if let Some(source) = l.sources.iter_mut().find(|s| &s.var == var) {
+                    source.nulls = nulls.clone();
+                }
+            }
         }
     }
     Ok(lowered)
@@ -1758,18 +1770,25 @@ fn no_combination(
     "no combination of the tables its variables can be fits every edge of the pattern, so it can match nothing; check the labels and the directions".to_string()
 }
 
-/// The properties a variable over several tables can read: per such named
-/// variable, those every one of its tables has with one type (see
-/// [`Lowered::shared`]). Refuses a property the query reads that some of
-/// them lack, or that they have with types that do not mix.
+/// The properties a variable over several tables reads as NULL, per variable
+/// and table: those some of its other tables have, typed as they read them.
+type Fills = BTreeMap<String, BTreeMap<String, Vec<(String, DataType)>>>;
+
+/// The properties of each named variable over several tables (#412). A
+/// property one of its tables has reads as NULL in the rows of the tables
+/// that lack it, typed as the tables that have it read it together: the
+/// second result, per variable and table, the NULLs to add. The first is,
+/// per variable, the properties every table has (see [`Lowered::shared`]).
+/// Refuses a property the query reads that no table has, or that tables
+/// have with types that do not mix.
 fn shared_properties(
     order: &[String],
     combinations: &[Vec<Table>],
     schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
     usage: &Usage,
-) -> Result<BTreeMap<String, Vec<String>>> {
-    use datafusion::arrow::datatypes::DataType;
+) -> Result<(BTreeMap<String, Vec<String>>, Fills)> {
     let mut shared = BTreeMap::new();
+    let mut fills: Fills = BTreeMap::new();
     for (i, var) in order.iter().enumerate() {
         if var.starts_with("__ursa_") {
             continue;
@@ -1828,75 +1847,87 @@ fn shared_properties(
                 .find(|(n, _)| n == name)
                 .map(|(_, t)| t.clone())
         };
-        // A property's type in every table, if they all have it and the
-        // types mix; else why not.
-        let common = |name: &str| -> std::result::Result<DataType, String> {
-            let lacking: Vec<&str> = typed
-                .iter()
-                .filter(|(_, list)| type_in(list, name).is_none())
-                .map(|(t, _)| *t)
-                .collect();
-            if !lacking.is_empty() {
-                return Err(format!(
-                    "{} has no property '{name}'",
-                    lacking.join(" and ")
-                ));
-            }
-            let mut result: Option<DataType> = None;
+        // A property's type in the tables that have it, read together:
+        // `None` when no table has it; an error when the types do not mix.
+        let common = |name: &str| -> std::result::Result<Option<DataType>, String> {
+            // (the common type, the first table with it, its type there)
+            let mut result: Option<(DataType, &str, DataType)> = None;
             for (table, list) in &typed {
-                let t = type_in(list, name).expect("checked");
+                let Some(t) = type_in(list, name) else {
+                    continue;
+                };
                 result = match result {
-                    None => Some(t),
-                    Some(r) => match common_type(&r, &t) {
-                        Some(c) => Some(c),
+                    None => Some((t.clone(), table, t)),
+                    Some((r, first, first_type)) => match common_type(&r, &t) {
+                        Some(c) => Some((c, first, first_type)),
                         None => {
-                            let first = typed[0].0;
-                            let first_type = type_in(&typed[0].1, name).expect("checked");
                             return Err(format!(
                                 "property '{name}' is {first_type} in {first} but {t} in {table}, which do not mix"
-                            ));
+                            ))
                         }
                     },
                 };
             }
-            Ok(result.expect("two tables or more"))
+            Ok(result.map(|(t, ..)| t))
         };
+        let in_every = |name: &str| typed.iter().all(|(_, l)| type_in(l, name).is_some());
         let visible: Vec<String> = typed[0]
             .1
             .iter()
             .map(|(n, _)| n.clone())
-            .filter(|n| common(n).is_ok())
+            .filter(|n| in_every(n) && common(n).is_ok())
             .collect();
+        // Every property some table has, in the order the tables give them.
+        let mut every: Vec<String> = Vec::new();
+        for (_, list) in &typed {
+            for (n, _) in list {
+                if !every.contains(n) {
+                    every.push(n.clone());
+                }
+            }
+        }
+        for name in &every {
+            let Ok(Some(t)) = common(name) else {
+                continue;
+            };
+            for (table, list) in &typed {
+                if type_in(list, name).is_none() {
+                    fills
+                        .entry(var.clone())
+                        .or_default()
+                        .entry(table.to_string())
+                        .or_default()
+                        .push((name.clone(), t.clone()));
+                }
+            }
+        }
         let what = describe_var(var, bindings_is_edge(&tables));
+        let kind = match bindings_is_edge(&tables) {
+            true => "edge",
+            false => "vertex",
+        };
+        let tables_named = names(typed.iter().map(|(t, _)| *t)).replace(", ", " and ");
         if let Some(Some(read)) = usage.reads.get(var) {
             for property in read {
-                // A property no table has is reported as any unknown one.
-                if typed
-                    .iter()
-                    .all(|(_, list)| type_in(list, property).is_none())
-                {
-                    continue;
-                }
-                if let Err(why) = common(property) {
-                    let kind = if bindings_is_edge(&tables) {
-                        "edge"
-                    } else {
-                        "vertex"
-                    };
-                    return pattern_err(format!(
-                        "{what} can be a row of {kind} tables {}, and {why}; read a property they all have ({}), or give '{var}' a label (#412)",
-                        names(typed.iter().map(|(t, _)| *t)).replace(", ", " and "),
-                        match visible.is_empty() {
-                            true => "they have none in common".to_string(),
-                            false => visible.join(", "),
-                        },
-                    ));
+                match common(property) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return pattern_err(format!(
+                            "{what} can be a row of {kind} tables {tables_named}, and none of them has property '{property}'; their properties are {} (#412)",
+                            names(every.iter().map(String::as_str))
+                        ))
+                    }
+                    Err(why) => {
+                        return pattern_err(format!(
+                            "{what} can be a row of {kind} tables {tables_named}, and {why}; give '{var}' a label (#412)"
+                        ))
+                    }
                 }
             }
         }
         shared.insert(var.clone(), visible);
     }
-    Ok(shared)
+    Ok((shared, fills))
 }
 
 /// Whether the tables are edge tables.
@@ -1911,7 +1942,6 @@ pub fn common_type(
     a: &datafusion::arrow::datatypes::DataType,
     b: &datafusion::arrow::datatypes::DataType,
 ) -> Option<datafusion::arrow::datatypes::DataType> {
-    use datafusion::arrow::datatypes::DataType;
     use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
     let string =
         |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
@@ -2307,6 +2337,7 @@ fn lower_one(
                 true => None,
                 false => vertex_table(b).map(|v| (v.name.clone(), v.key.clone())),
             },
+            nulls: Vec::new(),
         });
     }
 
