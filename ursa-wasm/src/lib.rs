@@ -75,18 +75,23 @@ impl Session {
     pub fn new() -> Session {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
+        let ctx = ursa_engine::new_session();
+        ursa_engine::paths::set_root(&ctx, page_root());
         Session {
-            ctx: Arc::new(ursa_engine::new_session()),
+            ctx: Arc::new(ctx),
             last: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Set the URL relative paths resolve against, such as
-    /// `https://example.com/data/` (end a directory with `/`). Applies to every
-    /// session on the page.
+    /// `https://example.com/data/` (end a directory with `/`): this
+    /// session's root, and the page's, which every session and shell made
+    /// after this takes.
     #[wasm_bindgen(js_name = setBaseUrl)]
     pub fn set_base_url(&self, base: &str) -> Result<(), JsError> {
-        set_base_url(base)
+        set_base_url(base)?;
+        ursa_engine::paths::set_root(&self.ctx, page_root());
+        Ok(())
     }
 
     /// Run `sql` (one or more statements) and resolve to every result as the
@@ -163,14 +168,24 @@ impl Session {
     }
 }
 
-/// Set the URL relative paths resolve against, for every session on the page.
+thread_local! {
+    /// The page's root: the URL a new session's relative paths resolve
+    /// against (`setBaseUrl`). Each session keeps its own root
+    /// (`ursa_engine::paths::Root`), taken from this when it is made; the page
+    /// runs on one thread.
+    static PAGE_ROOT: std::cell::RefCell<Option<Url>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Set the page's root, which sessions and shells made after take.
 fn set_base_url(base: &str) -> Result<(), JsError> {
     let base = Url::parse(base).map_err(|e| JsError::new(&format!("'{base}': {e}")))?;
-    #[cfg(target_arch = "wasm32")]
-    ursa_engine::paths::browser::set_base_url(Some(base));
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = base;
+    PAGE_ROOT.with(|root| *root.borrow_mut() = Some(base));
     Ok(())
+}
+
+/// The page's root, for a new session.
+fn page_root() -> Option<ursa_engine::paths::Root> {
+    PAGE_ROOT.with(|root| root.borrow().clone().map(ursa_engine::paths::Root::Url))
 }
 
 fn js_error(err: DataFusionError) -> JsValue {

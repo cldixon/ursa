@@ -33,7 +33,7 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 
 use crate::error::user_message;
-use crate::paths::{looks_like_location, table_url};
+use crate::paths::{looks_like_location, session_table_url};
 use crate::stores::ensure_object_store;
 
 /// Opens a location named in `FROM` as a listing table.
@@ -68,7 +68,8 @@ impl UrlTableFactory for FileTableFactory {
 /// Open `location` (a path, glob, directory or URL) as a listing table. The
 /// format and compression come from the file extension; Hive-style partition
 /// directories (`year=2024/`) become columns. A relative path is relative to
-/// the current directory, in a session with a database too: a stored
+/// the session's root ([`crate::paths::Root`]), or with none to the current
+/// directory, in a session with a database too: a stored
 /// definition's paths are made relative to the database's directory when it is
 /// stored, and resolved against it on replay (see [`crate::database`]).
 pub async fn open_file_table(
@@ -154,8 +155,8 @@ pub async fn open_files(
     for location in locations {
         // A file the session keeps under this name (#517) is the one read.
         let url = match crate::session_files::existing(state.runtime_env(), location).await {
-            Some(kept) => table_url(&kept)?,
-            None => table_url(location)?,
+            Some(kept) => session_table_url(state.config(), &kept)?,
+            None => session_table_url(state.config(), location)?,
         };
         ensure_object_store(state.runtime_env(), url.get_url()).await?;
         let store = state.runtime_env().object_store(&url)?;
