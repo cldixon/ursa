@@ -30,6 +30,15 @@
 //! planted-partition one: `edges / 16` nodes in communities of 16 to 79 nodes,
 //! with P% of the edges drawn between communities.
 //!
+//! `--kernel louvain` is `louvain(g, seed => 1)` (resolution 1), serially or,
+//! with `--parallel`, in parallel sub-rounds (#387), and prints the community
+//! count and modularity with the hash, as label propagation does (#268):
+//!
+//! ```text
+//! cargo run --release -p ursa-core --example rmat_kernel -- \
+//!     --kernel louvain --edges 16000000 --scale 20
+//! ```
+//!
 //! `--kernel closeness` is exact unweighted closeness from every node, along
 //! `--direction` (`out`, the default, `in` or `both`).
 //!
@@ -49,7 +58,7 @@ use std::time::Instant;
 
 use ursa_core::algo::{
     betweenness, bfs_distances, closeness_directed, k_hop_distances_masked, label_propagation,
-    triangle_count,
+    louvain, triangle_count,
 };
 use ursa_core::catalog::stats::avg_path_length;
 use ursa_core::{Direction, Topology};
@@ -245,6 +254,10 @@ fn main() {
             communities = Some(label_propagation(&t, None, 20, Some(1), parallel));
             String::new()
         }
+        "louvain" => {
+            communities = Some(louvain(&t, None, 1.0, Some(1), parallel));
+            String::new()
+        }
         "bfs" => {
             let dists: Vec<Vec<i32>> = picked.iter().map(|&s| bfs_distances(&t, s, dir)).collect();
             stop = Some((start.elapsed().as_secs_f64(), cpu_seconds()));
@@ -279,8 +292,8 @@ fn main() {
         }
         other => {
             panic!(
-                "--kernel is triangles, betweenness, label-propagation, closeness, bfs, \
-                 hop, apl or none, not {other}"
+                "--kernel is triangles, betweenness, label-propagation, louvain, closeness, \
+                 bfs, hop, apl or none, not {other}"
             )
         }
     };
