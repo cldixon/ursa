@@ -10,6 +10,7 @@ import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
 import { setup as setupSearch } from "./graph-search.js";
+import { connect, defaultTransport } from "./engine-client.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...children) => {
@@ -21,57 +22,31 @@ const el = (tag, props = {}, ...children) => {
 
 // ---------------------------------------------------------------- engine
 
-// The worker that runs the engine. If the engine crashes (a WebAssembly trap,
-// such as running out of memory), the page replaces the worker and starts a
-// fresh session: see `crashed`.
-let worker;
+// The engine: the session protocol, through engine-client.js. In the demo
+// it runs in a Web Worker (ursa-wasm). If the engine crashes (a WebAssembly
+// trap, such as running out of memory), the page connects again and starts
+// a fresh session: see `crashed`.
+let client;
 let engineStarted;
-let nextId = 0;
-const calls = new Map();
 
-function startWorker() {
-  worker?.terminate();
-  for (const call of calls.values()) call.reject(Object.assign(new Error("the engine stopped"), { crash: true }));
-  calls.clear();
-  let started;
-  engineStarted = new Promise((resolve, reject) => (started = { resolve, reject }));
+function startEngine() {
+  client?.close();
+  client = connect(defaultTransport(), { name: "shell", kind: "human" });
+  engineStarted = client.ready;
   engineStarted.catch(() => {});
-  worker = new Worker(new URL("./engine-worker.js", import.meta.url), { type: "module" });
-  worker.onmessage = ({ data }) => {
-    if ("ready" in data) {
-      if (data.ready) started.resolve(data);
-      else started.reject(new Error(data.error));
-      return;
-    }
-    const call = calls.get(data.id);
-    calls.delete(data.id);
-    if (!call) return;
-    if (data.ok) call.resolve(data);
-    else call.reject(Object.assign(new Error(data.error), { crash: call.crashes }));
-  };
-  // An error the worker didn't catch: it may be in any state.
-  worker.onerror = (e) => {
-    e.preventDefault();
-    for (const call of calls.values()) call.reject(Object.assign(new Error(e.message || "the engine stopped"), { crash: true }));
-    calls.clear();
-  };
 }
-startWorker();
+startEngine();
 
 // The calls whose failure means the engine itself broke: the shell reports
 // SQL and command errors in what it prints, so `feed` only rejects when the
 // engine trapped. `export` and `addFile` reject for ordinary mistakes.
-const CRASHES = new Set(["start", "feed", "cancel", "width", "highlight"]);
+const CRASHES = new Set(["start", "feed", "cancelInput", "width", "highlightAnsi"]);
 
-function engine(op, args = {}, transfer = []) {
-  return engineStarted.then(
-    () =>
-      new Promise((resolve, reject) => {
-        const id = nextId++;
-        calls.set(id, { resolve, reject, crashes: CRASHES.has(op) });
-        worker.postMessage({ id, op, ...args }, transfer);
-      }),
-  );
+/** Run the session's operation `op` (engine-client.js), and resolve to its result. */
+function engine(op, args = {}, parts = []) {
+  return client.call(op, args, parts).catch((e) => {
+    throw Object.assign(e, { crash: e.crash || CRASHES.has(op) });
+  });
 }
 
 // ---------------------------------------------------------------- theme
@@ -349,7 +324,7 @@ function highlight() {
   if (highlighting?.text === text) return highlighting.done;
   const asked = text;
   const seq = ++highlightSeq;
-  const done = engine("highlight", { text: asked }).then(
+  const done = engine("highlightAnsi", { text: asked }).then(
     ({ text: ansi }) => {
       if (seq !== highlightSeq || asked !== text) return false;
       colored = { text: asked, ansi };
@@ -698,7 +673,7 @@ async function failed(e) {
     return;
   }
   await write(`\x1b[31mError: the engine stopped (${e.message}). Starting a fresh session: what was defined is gone.\x1b[0m\r\n`);
-  startWorker();
+  startEngine();
   generation++;
   await restart({ clear: false });
 }
@@ -829,7 +804,7 @@ function fitLines(sql, width) {
 
 /** Drop the statement the shell holds, unrun. */
 async function cancelPending() {
-  const r = await engine("cancel");
+  const r = await engine("cancelInput");
   prompt = r.prompt;
   statement = [];
 }
@@ -844,7 +819,7 @@ async function feed(line, { echo, from = "" }) {
     // shared link cannot rewrite the screen as it is echoed. The shell's
     // highlighter leaves comments plain: the page greys them.
     const shown = visible(line);
-    const { text: ansi } = /^\s*--/.test(line) ? { text: `\x1b[90m${shown}\x1b[0m` } : await engine("highlight", { text: shown });
+    const { text: ansi } = /^\s*--/.test(line) ? { text: `\x1b[90m${shown}\x1b[0m` } : await engine("highlightAnsi", { text: shown });
     // `from` says where a command the user did not type came from, dimmed.
     await write(`${from ? `\x1b[2m${from}\x1b[0m ` : ""}${promptColor[0]}${prompt}${promptColor[1]}${ansi}\r\n`);
   }
@@ -954,7 +929,7 @@ async function hostCommand(line) {
       const first = Math.max(0, history.length - n);
       const width = String(history.length).length;
       for (let i = first; i < history.length; i++) {
-        const { text: ansi } = await engine("highlight", { text: history[i], alone: true });
+        const { text: ansi } = await engine("highlightAnsi", { text: history[i], alone: true });
         await write(`\x1b[90m${String(i + 1).padStart(width)}\x1b[0m  ${ansi.replace(/\n/g, "\n" + " ".repeat(width + 2))}\r\n`);
       }
       return true;
@@ -1029,7 +1004,7 @@ async function drawGraph(text) {
   const soon = setTimeout(open, 150);
   let graph;
   try {
-    graph = await engine("graph", { text });
+    graph = await engine("graph.open", { text });
     times.engine = performance.now();
   } catch (e) {
     clearTimeout(soon);
@@ -1091,7 +1066,7 @@ async function drawGraph(text) {
  * the answer is for whatever is drawn when it comes, or it is dropped.
  */
 function countNotShown() {
-  engine("notShown").then(
+  engine("graph.notShown").then(
     ({ counts }) => graphOpen() && graphLoaded?.setNotShown(counts),
     () => {},
   );
@@ -1172,7 +1147,7 @@ function fromGraph(command, drawing) {
 // a node's or an edge's row of the graph's tables, from the engine.
 const inspectorHooks = {
   run: (command) => run(command),
-  inspect: (args) => engine("inspect", args),
+  inspect: (args) => engine("graph.inspect", args),
 };
 
 // The last explore command's answer, for tests: its `command`, how many
@@ -1191,7 +1166,7 @@ let explored = null;
  */
 async function explore(line) {
   const at = performance.now();
-  const r = await engine("explore", { command: line });
+  const r = await engine("graph.explore", { command: line });
   const command = line.trim().replace(/;\s*$/, "");
   explored = { command: line, nodes: r.nodes, edges: r.edges, deltaBytes: r.delta?.byteLength ?? 0, drawn: null };
   let lost = null;
@@ -1243,7 +1218,7 @@ const search = setupSearch({
  */
 async function find(line) {
   const start = performance.now();
-  const r = await engine("find", { command: line });
+  const r = await engine("graph.find", { command: line });
   found = { command: line, ms: performance.now() - start, matched: r.matches, selected: r.selected.length, notShown: r.notShown, notShownTotal: r.notShownTotal };
   await write(r.out + r.err);
   if (r.err) return false;
@@ -1258,7 +1233,7 @@ function closeGraph() {
   search.close(false);
   search.clear();
   // The engine's graph closes with the pane's: .expand then says none is open.
-  engine("closeGraph").catch(() => {});
+  engine("graph.close").catch(() => {});
   const hadFocus = graphPane.contains(document.activeElement);
   graphPane.hidden = true;
   graphModule?.then((m) => m.close(), () => {});
@@ -1467,7 +1442,7 @@ function confirmShared(shared, session) {
   enqueue(async () => {
     await write(`This link runs ${n}:\r\n`);
     for (const command of shared) {
-      const { text: ansi } = await engine("highlight", { text: visible(command), alone: true });
+      const { text: ansi } = await engine("highlightAnsi", { text: visible(command), alone: true });
       await write(`  ${ansi.replace(/\n/g, "\r\n  ")}\r\n`);
     }
     const reply = await ask(`Run ${n}? [y/N] `);
@@ -1508,7 +1483,7 @@ fileInput.onchange = () => {
       // prompt and what was typed are drawn again after it.
       setAside();
       const buffer = await file.arrayBuffer();
-      const { url } = await engine("addFile", { name: file.name, bytes: buffer }, [buffer]);
+      const { url } = await engine("addFile", { name: file.name }, [{ kind: "bytes", name: "file", bytes: buffer }]);
       uploads.push({ name: file.name, url, bytes: file.size });
       runAll([`CREATE OR REPLACE VIEW ${quoted} AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM ${quoted} LIMIT 10;`]);
     });

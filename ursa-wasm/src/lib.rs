@@ -28,20 +28,17 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use arrow::ipc::writer::StreamWriter;
 use arrow::util::display::FormatOptions;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use js_sys::{Promise, Uint8Array};
 use serde_json::{json, Value};
 use url::Url;
-use ursa_shell::print::{json_array_writer, DelimitedWriter};
 use ursa_shell::table::{Rows, Style, DEFAULT_MAX_ROWS};
 
 mod shell;
-pub use shell::{GraphData, WebShell};
+pub use shell::WebShell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -331,45 +328,9 @@ fn describe(
     }))
 }
 
-/// `stored` written as `format`.
+/// `stored` written as `format`: the shell's export.
 fn encode(stored: &Stored, format: &str) -> Result<Vec<u8>> {
-    let schema = &stored.schema;
-    let mut bytes = Vec::new();
-    match format {
-        "csv" => {
-            let mut writer = DelimitedWriter::new(&mut bytes, b',', schema)?;
-            for batch in &stored.batches {
-                writer.write(batch)?;
-            }
-        }
-        "json" => {
-            let mut writer = json_array_writer(&mut bytes);
-            for batch in &stored.batches {
-                writer.write(batch)?;
-            }
-            writer.finish()?;
-        }
-        "arrow" => {
-            let mut writer = StreamWriter::try_new(&mut bytes, schema)?;
-            for batch in &stored.batches {
-                writer.write(batch)?;
-            }
-            writer.finish()?;
-        }
-        "parquet" => {
-            let mut writer = ArrowWriter::try_new(&mut bytes, Arc::clone(schema), None)?;
-            for batch in &stored.batches {
-                writer.write(batch)?;
-            }
-            writer.close()?;
-        }
-        other => {
-            return Err(DataFusionError::Plan(format!(
-                "cannot export as '{other}'; use csv, json, arrow or parquet"
-            )))
-        }
-    }
-    Ok(bytes)
+    ursa_shell::session::encode(&stored.schema, &stored.batches, format)
 }
 
 #[cfg(test)]

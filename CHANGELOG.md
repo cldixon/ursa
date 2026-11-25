@@ -1023,6 +1023,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The web shell talks to its engine through the session protocol**
+  (#536, `design/console.md` §4). The per-operation glue of `ursa-wasm`'s
+  `WebShell` (output capture, UGR encoding, inspect's JSON, uploads,
+  export) is `ursa_shell::session::Session`, with every operation behind
+  `Session::handle(op, args, parts)`; `WebShell` is wasm-bindgen glue over
+  it, with one method, `handle`. The page calls the engine through
+  `web/public/engine-client.js` (`connect(WorkerTransport)`), and the
+  operations take their protocol names (`graph.open`, `graph.explore`,
+  `cancelInput`, `highlightAnsi`, …). Nothing a user sees changes.
+
 - **Default (serial) Louvain is about a third faster, with the same
   communities** (#268). Local moving, the serial core of `louvain(g)`, took
   70% of a run. Each node visit sorted every neighbouring community by id
