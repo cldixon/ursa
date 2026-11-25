@@ -7,7 +7,8 @@ small JavaScript API. Part of #277; the Ursa Shell in `web/` is built on it.
 import init, { Session, version } from "./ursa_wasm.js";
 await init();
 const session = new Session();
-// Relative paths in SQL resolve against this URL (the browser has no current directory).
+// Relative paths in SQL resolve against this URL (the browser has no current
+// directory): this session's root, and the page's, which later sessions take.
 session.setBaseUrl(new URL("data/", location.href).href);
 console.log(await session.sql("SELECT * FROM 'karate_edges.csv' LIMIT 3"));
 ```
@@ -28,6 +29,7 @@ same code `ursa serve` runs natively over a WebSocket:
 ```js
 import init, { WebShell } from "./ursa_wasm.js";
 await init();
+// The page's root: a shell made after this resolves relative paths against it.
 WebShell.setBaseUrl(new URL("data/", location.href).href);
 const shell = new WebShell();
 await shell.handle("hello", JSON.stringify({ protocol: 1, session: "new" }), []); // first, always

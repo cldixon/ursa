@@ -714,6 +714,46 @@ impl<O: Write, E: Write> Shell<O, E> {
         }
     }
 
+    /// `path` as `.read` reads it: relative to the session's root, if it has
+    /// a directory root (`ursa_engine::paths::Root`), else to the working
+    /// directory.
+    fn read_path(&self, path: PathBuf) -> PathBuf {
+        match ursa_engine::paths::root(self.ctx.state().config()) {
+            Some(ursa_engine::paths::Root::Dir(dir)) if path.is_relative() => dir.join(path),
+            _ => path,
+        }
+    }
+
+    /// `path` as `.output` and `.once` write it: in a session with a
+    /// directory root, under the root, as `COPY … TO` writes
+    /// (`ursa_engine::paths::write_target`). `None`, said as an error, if it
+    /// may not be written.
+    fn written_path(&mut self, path: PathBuf) -> Option<PathBuf> {
+        let config = self.ctx.state().config().clone();
+        let Some(text) = path.to_str() else {
+            if ursa_engine::paths::root(&config).is_none() {
+                return Some(path);
+            }
+            self.error(&format!(
+                "cannot write to '{}': not valid UTF-8",
+                path.display()
+            ));
+            return None;
+        };
+        match ursa_engine::paths::write_target(&config, text) {
+            Ok(Some(under_root)) => Some(PathBuf::from(under_root)),
+            Ok(None) => Some(path),
+            Err(e) => {
+                let why = match e {
+                    datafusion::error::DataFusionError::Plan(why) => why,
+                    e => ursa_engine::user_message(&e),
+                };
+                self.error(&format!("cannot write to '{text}': {why}"));
+                None
+            }
+        }
+    }
+
     /// Send output to `path` from now on (`.output`), or for the next step
     /// only (`.once`). The file is created, or emptied if it exists.
     fn redirect_to(&mut self, path: &Path, once: bool) {
@@ -839,11 +879,19 @@ impl<O: Write, E: Write> Shell<O, E> {
                 _ => self.error("usage: .headers on|off"),
             },
             ".output" => match path_arg(arg) {
-                Some(path) => self.redirect_to(&path, false),
+                Some(path) => {
+                    if let Some(path) = self.written_path(path) {
+                        self.redirect_to(&path, false)
+                    }
+                }
                 None => self.end_redirect(),
             },
             ".once" => match path_arg(arg) {
-                Some(path) => self.redirect_to(&path, true),
+                Some(path) => {
+                    if let Some(path) = self.written_path(path) {
+                        self.redirect_to(&path, true)
+                    }
+                }
                 None => self.error("usage: .once FILE"),
             },
             ".schema" => self.schema(arg).await,
@@ -851,7 +899,7 @@ impl<O: Write, E: Write> Shell<O, E> {
             ".graphs" => self.run_sql("SHOW GRAPHS;", 0).await,
             ".describe" => self.describe(arg).await,
             ".read" => match path_arg(arg) {
-                Some(path) => return self.run_file(&path).await,
+                Some(path) => return self.run_file(&self.read_path(path)).await,
                 None => self.error("usage: .read FILE"),
             },
             ".open" => self.open(arg).await,

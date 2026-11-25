@@ -54,6 +54,8 @@ use crate::highlight;
 use crate::print::{json_array_writer, DelimitedWriter, OutputFormat};
 use crate::shell::{Flow, Shell};
 
+pub use ursa_engine::paths::Root;
+
 /// The protocol's version: what `hello` reports, and the only one it
 /// accepts.
 pub const PROTOCOL: u32 = 1;
@@ -214,9 +216,19 @@ pub struct Options {
     pub capabilities: Vec<&'static str>,
     /// Keep the session's files in memory, at `memory://uploads/`: `addFile`
     /// puts them there, and `COPY … TO 'name'` writes there
-    /// (`ursa_engine::session_files`). The browser has no disk, so the demo
-    /// always has them.
+    /// (`ursa_engine::session_files`), unless `copy_to_disk`. The browser
+    /// has no disk, so the demo always has them.
     pub uploads: bool,
+    /// Where relative paths resolve ([`Root`]): a directory natively (`ursa
+    /// serve DIR`), a URL in the browser. A session with a directory root
+    /// writes files only under it. `None`: natively, the process's working
+    /// directory, as the CLI; in the browser, nowhere.
+    pub root: Option<Root>,
+    /// Write `COPY … TO 'name'` to disk (under `root`, if it is a
+    /// directory), as DataFusion's `COPY` does, though the session has
+    /// `uploads`: these are then for the files a page adds only. Native only:
+    /// the browser always keeps a copy in memory.
+    pub copy_to_disk: bool,
 }
 
 impl Default for Options {
@@ -226,6 +238,8 @@ impl Default for Options {
             transport: "native",
             capabilities: Vec::new(),
             uploads: true,
+            root: None,
+            copy_to_disk: false,
         }
     }
 }
@@ -453,6 +467,8 @@ impl Session {
             ctx.register_object_store(&uploads_url(), Arc::clone(&store) as Arc<dyn ObjectStore>);
             store
         });
+        ursa_engine::paths::set_root(&ctx, options.root.clone());
+        ursa_engine::session_files::set_copy_to_disk(&ctx, options.copy_to_disk);
         let (out, err) = (Buffer::default(), Buffer::default());
         let width = Rc::new(Cell::new(80));
         let mut shell = Shell::new(ctx, OutputFormat::Table, out.clone(), err.clone());

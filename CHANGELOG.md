@@ -1143,6 +1143,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   250 lines of graph glue; the graph view behaves as before. A second host,
   `web/tests/pane-host/` (never deployed), proves it in the e2e test.
 
+- **A root per session, and `COPY … TO` to disk under it** (URSA-6,
+  `design/console.md` §5). Relative paths resolve against the session's
+  root (`ursa_engine::paths::Root`), which travels with the session's
+  config, in place of a base URL global to the process: a directory
+  natively, a URL in the browser. Two sessions in one process each read
+  their own files. A session with no root is the CLI's: relative to the
+  working directory, as before. The root covers `FROM 'x.csv'`,
+  `read_*()`, `CREATE EXTERNAL TABLE … LOCATION`, `COPY … TO`, `ATTACH`
+  (and `.open`), `.read`, `.output` and `.once`. A session with a directory
+  root reads anything (an absolute path, `~/…` or a URL reads what it
+  names), but writes only under the root: a `COPY … TO`, `.output` or
+  `.once` target must be a relative path with no `..`, and no symbolic link
+  in it may lead out; an `INSERT INTO` a table of files must be into files
+  under the root. `ursa_shell::session::Options` gains `root` and
+  `copy_to_disk`: a native session can keep `memory://uploads` for the
+  files a page adds and write its copies to disk, as `ursa serve` will.
+  The browser demo is unchanged: `WebShell.setBaseUrl` sets the page's
+  root, which each session takes when it is made.
+
 - **Default (serial) Louvain is about a third faster, with the same
   communities** (#268). Local moving, the serial core of `louvain(g)`, took
   70% of a run. Each node visit sorted every neighbouring community by id
