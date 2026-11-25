@@ -31,4 +31,4 @@ SIZES=100k,1m THREADS=1,2,4 REPEATS=3 bun bench.ts bench
 
 `CHROME=/path/to/chrome` uses that browser and not Playwright's Chromium.
 Set `CARGO_TARGET_DIR` as for any build here; the script keeps its four
-builds apart under it (about 1.5 GB in all).
+builds apart under it (about 1.7 GB in all).

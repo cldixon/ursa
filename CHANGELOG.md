@@ -245,6 +245,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   what sizes the nodes and each colour's category and count. The engine does
   it all (`WebShell.graph` returns `size`, `color` and the legend; with no
   clause, the graph as before).
+- **A spike: the graph view's layout on threads in the browser** (#503).
+  Nothing in the release changes. `spikes/viz-threads` builds `ursa-viz`'s
+  layout twice from one source, unthreaded on stable and threaded on a
+  pinned nightly (`+atomics`, a rebuilt `std`), and runs the threaded one on a
+  pool of Web Workers over one shared `WebAssembly.Memory`. On four cores in
+  Chromium the layout is 2.0 to 2.3 times faster, with the same bits as the
+  unthreaded build at every thread count, for 33 KB more gzipped and about
+  25 ms more start-up. The report and its recommendation (yes, as an
+  optional build) are `design/threaded-layout-spike.md`. A CI job of its
+  own, `Threaded layout spike`, runs the determinism check when the spike
+  changes.
 - **Ursa Web Shell: the page runs cross-origin isolated** (#429). Every
   response, from the Worker and the local preview alike, carries
   `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
