@@ -1041,7 +1041,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker answered itself before) and the console's `query` (typed
   columns, the schema's metadata such as `ursa.pattern`, and the first rows
   as an Arrow IPC part). `ursa_shell::session::OPS` lists the operations;
-  the new reference page, [Session protocol](docs/reference/protocol.md), is
+  the new reference page, `docs/reference/protocol.md`, is
   generated from it and tested against it.
 
 - **Default (serial) Louvain is about a third faster, with the same
