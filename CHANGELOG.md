@@ -1987,6 +1987,14 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   then threw and left the view unable to be freed, so the next `.graph`
   failed to start); the pane's hover waits for a read-back, and a pane
   closed or drawn again during one frees its view when the pixels have come.
+  A read-back also gives the view the layout's newest positions first
+  (URSA-10): a small grouped layout's last positions can come with its
+  "done", before the frame that draws them, and a read-back then drew the
+  discs where the frame before had them (the flaky e2e check `GROUP BY:
+  .undo restores the closed drawing`, at 28409 px for 28729). And where the
+  page gives the view those positions ahead of a frame (a test hook's
+  lookup, a fit to the selection), a grouped drawing's discs move with
+  them; they stayed where they were until the layout's next positions.
 
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
