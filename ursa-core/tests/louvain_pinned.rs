@@ -207,6 +207,83 @@ fn louvain_results_match_the_golden_hashes() {
     check(&compute());
 }
 
+/// A planted-partition graph, as `examples/rmat_kernel.rs --planted` makes
+/// it: `edges / 16` nodes in consecutive communities of 16 to 79 nodes, and
+/// `percent`% of the edges drawn between communities.
+fn planted(edges: usize, percent: u64) -> Edges {
+    let n = (edges / 16).max(16);
+    let mut st = 7u64;
+    let mut start = vec![0u32; n];
+    let mut size = vec![0u32; n];
+    let mut lo = 0usize;
+    while lo < n {
+        let len = (16 + (next(&mut st) % 64) as usize).min(n - lo);
+        for u in lo..lo + len {
+            start[u] = lo as u32;
+            size[u] = len as u32;
+        }
+        lo += len;
+    }
+    let (src, dst) = (0..edges)
+        .map(|_| {
+            let s = (next(&mut st) % n as u64) as usize;
+            let d = if (next(&mut st) % 100) < percent {
+                (next(&mut st) % n as u64) as u32
+            } else {
+                start[s] + (next(&mut st) % u64::from(size[s])) as u32
+            };
+            (s as u32, d)
+        })
+        .unzip();
+    Edges { n, src, dst }
+}
+
+/// Larger graphs, past the sizes at which Louvain's setup, renumbering and
+/// shuffles go parallel: R-MAT, 1M edges over 2^18 node slots (most of them
+/// isolated), and a planted partition of 137,500 nodes with 2.2M edges,
+/// serial and parallel Louvain, seed 1. The hashes are those
+/// `examples/rmat_kernel.rs --kernel louvain` printed for the same graphs
+/// before #268 (main at d9496af): FNV-1a over the labels.
+fn compute_large() -> Vec<(&'static str, bool, u64)> {
+    let mut got = Vec::new();
+    for (name, e) in [
+        ("rmat18", rmat(1_000_000, 18, 42)),
+        ("planted", planted(2_200_000, 30)),
+    ] {
+        let t = Topology::build(e.n, e.src, e.dst);
+        for parallel in [false, true] {
+            let labels = louvain(&t, None, 1.0, Some(1), parallel);
+            got.push((name, parallel, fnv(labels.iter().map(|&c| u64::from(c)))));
+        }
+    }
+    got
+}
+
+const GOLDEN_LARGE: &[(&str, bool, u64)] = &[
+    ("rmat18", false, 0xaa57b292dfc64d40),
+    ("rmat18", true, 0x3131f1aa5d828be8),
+    ("planted", false, 0x8f5802282bb165a4),
+    ("planted", true, 0x78172d275afe1cec),
+];
+
+#[test]
+fn large_louvain_results_match_the_golden_hashes() {
+    assert_eq!(compute_large(), GOLDEN_LARGE);
+}
+
+#[cfg(feature = "rayon")]
+#[test]
+fn large_louvain_results_match_the_golden_hashes_on_1_2_4_and_8_threads() {
+    for threads in [1, 2, 4, 8] {
+        let got = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(compute_large);
+        assert_eq!(got, GOLDEN_LARGE, "{threads} threads");
+    }
+}
+
 #[cfg(feature = "rayon")]
 #[test]
 fn louvain_results_match_the_golden_hashes_on_1_2_4_and_8_threads() {
