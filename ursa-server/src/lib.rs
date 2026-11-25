@@ -26,7 +26,7 @@
 //! let config = ursa_server::Config {
 //!     root: ".".into(),
 //!     port: ursa_server::DEFAULT_PORT,
-//!     assets: ursa_server::Assets::Dirs(vec!["web/dist".into()]),
+//!     assets: ursa_server::Assets::Dirs(vec!["web/dist-console".into(), "web/dist".into()]),
 //!     version: "0.13.0".into(),
 //! };
 //! let bound = ursa_server::bind(config).await?;
