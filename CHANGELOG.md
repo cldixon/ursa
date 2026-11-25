@@ -1039,6 +1039,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   built in with `rust-embed` (`serve-embed`, from a checkout). `ursa-server`
   is published with the other crates, before `ursa-cli`. Release binaries
   do not have `serve` yet.
+- **The shell's e2e suite runs in CI over both transports** (URSA-5).
+  `.github/workflows/shell-e2e.yml` runs a second leg, "Ursa Shell (browser
+  e2e over ursa serve)", beside the worker one: it builds `ursa-cli
+  --features serve` (debug) and runs `web/scripts/e2e-serve.ts`, on the same
+  triggers plus changes to `ursa-server` and `ursa-cli/src/serve.rs`. The
+  socket run skips exactly the suite's 6 browser-only checks, which the suite
+  now lists and holds it to: a run that skips any other check fails.
 
 - **`ursa serve` in the release binaries, with a database file,
   `--read-only` and `--no-open`** (URSA-4, `design/console.md` §5). The

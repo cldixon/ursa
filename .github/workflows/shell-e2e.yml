@@ -5,10 +5,19 @@ name: Ursa Shell e2e
 # (web/scripts/preview.ts) and run web/tests/e2e.ts in headless Chromium. No
 # Cloudflare credentials: nothing here touches the account.
 #
+# Over both transports (URSA-5), so the browser demo and the native server stay
+# one product: `worker` is the page with the wasm engine in a worker, as
+# deployed; `socket` is the same page over a WebSocket to `ursa serve`'s native
+# session (web/scripts/e2e-serve.ts), which skips exactly the suite's 6
+# browser-only checks (the suite fails if it skips any other). The legs share
+# the engine and datasets caches; each keeps its own cargo cache.
+#
 # Runs when the page, the crates compiled into it, or the datasets' inputs
 # change: web/, ursa-wasm and ursa-shell (the engine), ursa-viz (the graph
 # view), the engine crates under them, the workspace's Cargo files and
-# toolchain (profiles, versions), the bundled CSVs and the R-MAT generator.
+# toolchain (profiles, versions), the bundled CSVs and the R-MAT generator;
+# and the native server's own code: ursa-server and `ursa serve` (ursa-cli's
+# serve.rs).
 on:
   pull_request:
     paths:
@@ -21,6 +30,8 @@ on:
       - "ursa-engine/**"
       - "ursa-sql/**"
       - "ursa-plan/**"
+      - "ursa-server/**"
+      - "ursa-cli/src/serve.rs"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
@@ -39,6 +50,8 @@ on:
       - "ursa-engine/**"
       - "ursa-sql/**"
       - "ursa-plan/**"
+      - "ursa-server/**"
+      - "ursa-cli/src/serve.rs"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
@@ -63,9 +76,15 @@ env:
 
 jobs:
   e2e:
-    name: Ursa Shell (browser e2e)
+    # The worker leg keeps the job's original name (the check PRs know).
+    name: ${{ matrix.transport == 'socket' && 'Ursa Shell (browser e2e over ursa serve)' || 'Ursa Shell (browser e2e)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      # One transport failing says nothing about the other: let both finish.
+      fail-fast: false
+      matrix:
+        transport: [worker, socket]
     defaults:
       run:
         # bash -eo pipefail, so the tee'd e2e run fails the step.
@@ -80,9 +99,13 @@ jobs:
           targets: wasm32-unknown-unknown
 
       # Dependencies only: rust-cache drops the workspace's own crates (cargo
-      # would rebuild them anyway, checkout gives them new mtimes).
+      # would rebuild them anyway, checkout gives them new mtimes). A key per
+      # leg, as the socket leg also builds the native ursa-cli's dependencies;
+      # the worker leg's key is the one this job always had.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.transport == 'socket' && 'serve' || '' }}
 
       - name: Read the wasm-bindgen version from Cargo.lock
         id: wb
@@ -162,6 +185,7 @@ jobs:
           key: ${{ steps.data.outputs.cache-primary-key }}
 
       - name: Serve the shell
+        if: matrix.transport == 'worker'
         run: |
           mkdir -p e2e-out
           nohup bun scripts/preview.ts "$PORT" > e2e-out/preview.log 2>&1 &
@@ -175,16 +199,42 @@ jobs:
       # engine's graph::view writes (ursa-engine's fixtures), read by
       # ursa-viz/ui/ugr.js and shaped by public/graph-data.js.
       - name: The engine's graphs, read by the page
+        if: matrix.transport == 'worker'
         run: bun test tests/graph-data.test.ts
 
       - name: Run the e2e suite
+        if: matrix.transport == 'worker'
         run: bun run test:e2e "http://localhost:$PORT" e2e-out 2>&1 | tee e2e-out/e2e.log
+
+      # The native server: `ursa serve` with the page's files from dist/.
+      # A debug build: with cargo's dependencies cached, the workspace's crates
+      # build in about two minutes in debug, against 25 in release (thin LTO,
+      # one codegen unit), and the suite takes about a minute longer on the
+      # debug server (measured for URSA-5).
+      - name: Build ursa serve
+        if: matrix.transport == 'socket'
+        working-directory: .
+        # No debug info: a smaller build and cache, and quicker links.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo build -p ursa-cli --features serve --locked
+
+      # e2e-serve.ts starts `ursa serve .data --port PORT --no-open --assets dist`, reads
+      # the token from the link it prints, runs the suite with it, and stops
+      # the server with Ctrl+C, failing if it does not stop gracefully.
+      - name: Run the e2e suite over ursa serve
+        if: matrix.transport == 'socket'
+        env:
+          URSA_BIN: ${{ github.workspace }}/target/debug/ursa
+        run: |
+          mkdir -p e2e-out
+          bun scripts/e2e-serve.ts "$PORT" "$URSA_BIN" e2e-out 2>&1 | tee e2e-out/e2e.log
 
       - name: Upload screenshots and logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: shell-e2e
+          name: ${{ matrix.transport == 'socket' && 'shell-e2e-serve' || 'shell-e2e' }}
           path: web/e2e-out/
           if-no-files-found: ignore
           retention-days: 14

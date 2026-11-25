@@ -128,5 +128,7 @@ reach, so only the user's own browser tab may reach it (§5):
 token, a wrong token or cookie, a foreign `Origin`, a wrong `Host`, loopback
 only, `/data/`), the protocol's (`tests/protocol.rs`: the shell over a
 socket, sessions, `cancel`, stopping), and the sessions' (`tests/roots.rs`:
-the root, a database file, and each write `--read-only` refuses). In `web/`, `bun scripts/e2e-serve.ts
-PORT` runs the browser e2e suite against `ursa serve`.
+the root, a database file, and each write `--read-only` refuses). In `web/`,
+`bun scripts/e2e-serve.ts PORT` runs the browser e2e suite against `ursa
+serve`, as CI does on every change to this crate
+(`.github/workflows/shell-e2e.yml`).
