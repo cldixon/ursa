@@ -49,7 +49,11 @@ static assets and an R2 bucket.
     `engine-client.js` then picks `SocketTransport` (`socket-transport.js`):
     the same messages over a WebSocket at `/session` to a native session,
     the JSON in a text frame and each part in a binary frame after an 8-byte
-    header (`design/console.md` §4.2). The page's token travels in an
+    header (`design/console.md` §4.2). The socket is held in a worker of its
+    own (`socket-worker.js`), so a large part (`.graph rmat`'s 8.4 MB of
+    UGR) is received off the page's thread and reaches the page in one
+    `postMessage`, its buffer transferred and not copied: a part is its
+    frame's buffer, from byte 8 (URSA-7). The page's token travels in an
     `HttpOnly` cookie, which the script never sees. `bun
     scripts/e2e-serve.ts PORT` runs the e2e suite that way (see Test).
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
