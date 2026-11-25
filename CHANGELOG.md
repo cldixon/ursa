@@ -1131,6 +1131,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the new reference page, `docs/reference/protocol.md`, is
   generated from it and tested against it.
 
+- **The session keeps results, by id** (URSA-9). `query` gives its result
+  an id (`"r4"`) and keeps it: `fetch {result, offset, rows}` pages through
+  it as Arrow IPC, `export {result}` writes it, `graph.open {result}` draws
+  it, and `close {result}` drops it, so the console can keep several
+  results open. A session keeps its last 16 results within 256 MB, the
+  oldest dropped first; a result over 256 MB on its own keeps only its
+  first rows. A result that has gone, or rows past those kept, fail with
+  `not_found` and a message to run the query again. The shell's last result
+  (`.graph`, `.export`) is unchanged.
+
 - **The graph pane is a module any page can embed** (URSA-8,
   `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
   engine, commands, status})` makes the Graph view's pane: its markup, the

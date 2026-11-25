@@ -16,7 +16,7 @@ A **request**, from a client:
 A **reply**, exactly one per request, with the request's `id`:
 
 ```json
-{"id": 17, "ok": true, "result": {"columns": [...], "metadata": {}, "rows": 5, "more": false, "ms": 12, "notices": []},
+{"id": 17, "ok": true, "result": {"result": "r4", "columns": [...], "metadata": {}, "rows": 5, "more": false, "ms": 12, "notices": []},
  "parts": [{"name": "arrow", "kind": "arrow", "bytes": 1832}]}
 ```
 
@@ -65,6 +65,12 @@ Over `postMessage`, a part's `bytes` is the `ArrayBuffer` itself, transferred. O
 
 A message is complete when its text frame and every part it lists have arrived.
 
+## Results
+
+`query` keeps the result it gives, by an id such as `"r4"`, so that a client can keep several open: `fetch` pages through one, `export` writes it, `graph.open` draws it, and `close` drops it. Each session keeps its last 16 results, within 256 MB, and drops the oldest first; ids are not reused. A result over 256 MB on its own keeps only the rows `query` sent; `fetch` past them, and `export` or `graph.open` of it, fail with `not_found` and say to run the query again, as they do for a result that was closed or dropped. A result's size is what its Arrow buffers hold, each counted once: 1M rows of two `Int64`s is 16 MB.
+
+The shell's last result is apart from these: `feed`'s statements and `query` both set it, and `export` and `graph.open` without a `result` use it, as `.export` and `.graph` do.
+
 ## Order
 
 One request runs at a time, in arrival order. A reply comes after every event its request caused. `cancel` and `hello` go ahead of the queue on a host that can cancel (capability `cancel`); the browser demo cannot.
@@ -90,11 +96,13 @@ The table is generated from `ursa_shell::session::OPS`, and a test keeps the two
 | `width` | `columns` | `{}` | The terminal's width: tables are drawn no wider (0: no limit). |
 | `highlightAnsi` | `text`, `alone?` | `{text}` | `text` coloured as the shell colours what is typed: after what is pending, or with `alone`, as a statement of its own. |
 | `memory` | — | `{bytes, kind: "wasm" \| "rss"}` | The engine's memory: its WebAssembly memory in the browser, the process's resident set natively (`bytes` is `null` where it cannot be read). |
-| `query` | `sql`, `rows?` (1,000) | `{columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`) | Runs `sql` for the console; the last statement's result becomes the last result (`graph.open`, `export`). `columns` are `[{name, type, nullable, metadata}]`, `metadata` is the schema's (`ursa.pattern`), `rows` the whole result's count; the part holds the first `rows` rows as an Arrow IPC stream. |
+| `query` | `sql`, `rows?` (1,000) | `{result, columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`) | Runs `sql` for the console. The last statement's result is kept as `result` (`"r4"`; `null` for a statement with no columns) for `fetch`, `export` and `graph.open`, and becomes the last result too. `columns` are `[{name, type, nullable, metadata}]`, `metadata` is the schema's (`ursa.pattern`), `rows` the whole result's count; the part holds the first `rows` rows as an Arrow IPC stream. The session keeps its last 16 results, within 256 MB, and drops the oldest first; a result over 256 MB on its own keeps only the rows the reply sent. |
+| `fetch` | `result`, `offset?` (0), `rows?` (1,000) | `{rows, more}`; `arrow` (`arrow`) | A page of a kept result: `rows` rows from `offset`, as an Arrow IPC stream, and whether more follow. `not_found` for a result closed or dropped, or for rows past those a result over the cap kept: run the query again. |
+| `close` | `result` | `{}` | Drops a kept result; `not_found` if it has gone already. |
 | `addFile` | `name`; the file as the request's one part | `{url}` | Puts a file in the session's files, at `memory://uploads/`. |
 | `files` | — | `{files: [{name, url, bytes}]}` | The session's files: added ones, and those `COPY … TO 'name'` wrote. |
-| `export` | `format` | `{}`; `bytes` (`bytes`) | The last result, every row, as `csv`, `json`, `arrow` or `parquet`. |
-| `graph.open` | `text` | `{skipped}`; `ugr` (`ugr`), `positions?` (`f32`) | Opens a graph to draw (`.graph TEXT`). `positions`, every `x` then every `y`, only with `POSITIONS`. |
+| `export` | `format`, `result?` | `{}`; `bytes` (`bytes`) | A kept result, or without `result` the last result, every row, as `csv`, `json`, `arrow` or `parquet`. `not_found` for a result that has gone, or that kept only its first rows. |
+| `graph.open` | `text?`, `result?` | `{skipped}`; `ugr` (`ugr`), `positions?` (`f32`) | Opens a graph to draw (`.graph TEXT`). A `text` that names no source draws the kept `result`, or without it the last result. `positions`, every `x` then every `y`, only with `POSITIONS`. |
 | `graph.explore` | `command` | `{out, err, nodes, edges, delta: null}`; `delta?` (`ugr`) | Runs `.expand`, `.hide`, `.show`, `.undo`, `.redo` or `.graph history` on the open graph; `delta` only when the graph changed. |
 | `graph.find` | `command` | `{out, err, matches, notShown, notShownTotal}`; `selected` (`u32`) | Runs `.find`: the matches shown, as node slots, the best first. |
 | `graph.notShown` | — | `{}`; `counts` (`u32`) | For each node slot, its edges to nodes not shown: the view's `+N`. |
