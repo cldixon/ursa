@@ -1,0 +1,85 @@
+name: Threaded layout spike
+
+# The threaded-layout spike (#503, design/threaded-layout-spike.md): build
+# ursa-viz's layout for wasm32 twice, unthreaded on the workspace's stable
+# toolchain and threaded (+atomics, a rebuilt std) on the spike's pinned
+# nightly, and check in headless Chromium and natively that the positions are
+# the same bits at every thread count.
+#
+# Separate from every other workflow on purpose: it is the only one that
+# installs a nightly toolchain, it builds only spikes/viz-threads (a cargo
+# workspace of its own), and it runs only when the spike itself changes or
+# when started by hand. It is not a required check, and nothing it builds is
+# released or deployed.
+on:
+  pull_request:
+    paths:
+      - "spikes/viz-threads/**"
+      - ".github/workflows/viz-threads-spike.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PLAYWRIGHT_VERSION: "1.63.0"
+
+jobs:
+  determinism:
+    name: Threaded layout (determinism)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: spikes/viz-threads
+    steps:
+      - uses: actions/checkout@v4
+
+      # The stable toolchain, for the unthreaded build and the native benches.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The nightly, with rust-src: the date is pinned in build.sh.
+      - name: Install the spike's nightly
+        run: ./build.sh toolchain
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/viz-threads
+
+      - name: Read the wasm-bindgen version from the spike's Cargo.lock
+        id: wb
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Playwright and Chromium
+        run: |
+          bun add --no-save "playwright@$PLAYWRIGHT_VERSION"
+          bunx playwright install --with-deps chromium
+
+      - name: Build (unthreaded, threaded, native)
+        run: ./build.sh all
+
+      # Every pool size against the unthreaded build, in Chromium under the
+      # shell's own security headers and natively; and that a page that is
+      # not cross-origin isolated runs the unthreaded build.
+      - name: Determinism check
+        run: bun bench.ts check

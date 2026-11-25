@@ -1,0 +1,33 @@
+100k native serial/1 build 21.2 ms, layout 3549 ms, c4b1159a9ad2f93f, busy 2.0 (not clean)
+100k native threads/1 build 29.8 ms, layout 3716.3 ms, c4b1159a9ad2f93f, busy 2.0 (not clean)
+100k native threads/2 build 19.3 ms, layout 2193.9 ms, c4b1159a9ad2f93f, busy 2.9 (not clean)
+100k native threads/4 build 15.5 ms, layout 1454.2 ms, c4b1159a9ad2f93f, busy 2.9
+100k native serial/1 build 23.8 ms, layout 3662.5 ms, c4b1159a9ad2f93f, busy 1.1
+100k native threads/1 build 20.8 ms, layout 3680.3 ms, c4b1159a9ad2f93f, busy 1.1
+100k native threads/2 build 23.4 ms, layout 2687.1 ms, c4b1159a9ad2f93f, busy 3.3 (not clean)
+100k native threads/4 build 21 ms, layout 1647.6 ms, c4b1159a9ad2f93f, busy 3.5
+100k native serial/1 build 20.4 ms, layout 3525.6 ms, c4b1159a9ad2f93f, busy 2.1 (not clean)
+100k native threads/1 build 20.5 ms, layout 3730.8 ms, c4b1159a9ad2f93f, busy 2.7 (not clean)
+100k native threads/2 build 17.6 ms, layout 3056.6 ms, c4b1159a9ad2f93f, busy 3.9 (not clean)
+100k native threads/4 build 14.9 ms, layout 1614 ms, c4b1159a9ad2f93f, busy 3.5
+  100k native serial/1: layout median 3663 ms (min 3663; 1 of 3 runs clean), x1.00
+  100k native threads/1: layout median 3680 ms (min 3680; 1 of 3 runs clean), x1.00
+  100k native threads/2: layout median 2687 ms (min 2194; 0 of 3 runs clean), x1.36
+  100k native threads/4: layout median 1614 ms (min 1454; 3 of 3 runs clean), x2.27
+1m native serial/1 build 292.9 ms, layout 5908.2 ms, 0bea4355c4f4999a, busy 2.0 (not clean)
+1m native threads/1 build 320.8 ms, layout 5410 ms, 0bea4355c4f4999a, busy 1.7 (not clean)
+1m native threads/2 build 240.8 ms, layout 3367.5 ms, 0bea4355c4f4999a, busy 3.8 (not clean)
+1m native threads/4 build 195.4 ms, layout 2380.2 ms, 0bea4355c4f4999a, busy 3.2
+1m native serial/1 build 287.6 ms, layout 5535.4 ms, 0bea4355c4f4999a, busy 2.0 (not clean)
+1m native threads/1 build 282 ms, layout 5222.2 ms, 0bea4355c4f4999a, busy 2.5 (not clean)
+1m native threads/2 build 235.4 ms, layout 3603.9 ms, 0bea4355c4f4999a, busy 3.4 (not clean)
+1m native threads/4 build 185.9 ms, layout 2309.2 ms, 0bea4355c4f4999a, busy 2.8
+1m native serial/1 build 283.4 ms, layout 5300.1 ms, 0bea4355c4f4999a, busy 1.0
+1m native threads/1 build 282.7 ms, layout 5209 ms, 0bea4355c4f4999a, busy 1.0
+1m native threads/2 build 238.5 ms, layout 3073.1 ms, 0bea4355c4f4999a, busy 2.4
+1m native threads/4 build 232.7 ms, layout 3032.9 ms, 0bea4355c4f4999a, busy 3.4
+  1m native serial/1: layout median 5300 ms (min 5300; 1 of 3 runs clean), x1.00
+  1m native threads/1: layout median 5209 ms (min 5209; 1 of 3 runs clean), x1.02
+  1m native threads/2: layout median 3073 ms (min 3073; 1 of 3 runs clean), x1.72
+  1m native threads/4: layout median 2380 ms (min 2309; 3 of 3 runs clean), x2.23
+wrote results/native.json
