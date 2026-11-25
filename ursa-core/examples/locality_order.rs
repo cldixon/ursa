@@ -229,6 +229,25 @@ fn partition(t: &Topology, labels: &[u32]) -> String {
     )
 }
 
+/// Modularity (resolution 1) of `labels`, the edges read as undirected.
+fn modularity(t: &Topology, labels: &[u32]) -> f64 {
+    let out = t.out();
+    let mut sums = std::collections::HashMap::new();
+    let mut intra = 0.0f64;
+    for u in 0..t.n_nodes() as u32 {
+        for &v in out.neighbors(u) {
+            let (a, b) = (labels[u as usize], labels[v as usize]);
+            *sums.entry(a).or_insert(0.0f64) += 1.0;
+            *sums.entry(b).or_insert(0.0f64) += 1.0;
+            if a == b {
+                intra += 2.0;
+            }
+        }
+    }
+    let m2 = 2.0 * t.n_edges() as f64;
+    intra / m2 - sums.values().map(|s| (s / m2) * (s / m2)).sum::<f64>()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let number = |name: &str| arg(&args, name).map(|v| v.parse::<usize>().expect("a number"));
@@ -324,9 +343,21 @@ fn main() {
             }
             "wcc" => partition(&t, &connected_components_weak(&t, None)),
             "scc" => partition(&t, &connected_components_strong(&t, None)),
-            "louvain" => partition(&t, &louvain(&t, None, 1.0, Some(1), parallel)),
+            "louvain" => {
+                let labels = louvain(&t, None, 1.0, Some(1), parallel);
+                format!(
+                    "{}, modularity {:.5}",
+                    partition(&t, &labels),
+                    modularity(&t, &labels)
+                )
+            }
             "label-propagation" => {
-                partition(&t, &label_propagation(&t, None, 20, Some(1), parallel))
+                let labels = label_propagation(&t, None, 20, Some(1), parallel);
+                format!(
+                    "{}, modularity {:.5}",
+                    partition(&t, &labels),
+                    modularity(&t, &labels)
+                )
             }
             "hop" => {
                 let (s, r, d) = k_hop_distances_masked(&t, None, &[hub], 2, Direction::Out);
