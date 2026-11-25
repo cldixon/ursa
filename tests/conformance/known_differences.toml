@@ -20,18 +20,11 @@ reason = "The standard matches nothing; Ursa refuses the pattern, as DuckPGQ doe
 error  = "no edge of 'know' connects them"
 
 [[difference]]
-id     = "match/11"
+id     = "multi/10"
 kind   = "unsupported"
 issue  = 412
-reason = "A variable over several element tables."
-error  = "cannot be told from the pattern"
-
-[[difference]]
-id     = "match/11b"
-kind   = "unsupported"
-issue  = 412
-reason = "Label expressions."
-error  = "label expressions .* are not supported yet; use one label \\(#412\\)"
+reason = "A quantified edge, or the edge of a searched path, runs over one edge table's index; one that can be a row of several edge tables is refused."
+error  = "a path search runs over one edge table for now, so give it a label, as .* \\(#412\\)"
 
 [[difference]]
 id     = "edges/3"

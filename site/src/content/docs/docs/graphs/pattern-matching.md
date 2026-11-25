@@ -68,7 +68,8 @@ GRAPH_TABLE ( graph
   [COLUMNS ( expression [AS name], … ) | COLUMNS (*)] )
 
 path := node (edge node)*
-node := ( [variable] [:label | IS label] [WHERE condition] )
+node := ( [variable] [:labels | IS labels] [WHERE condition] )
+labels := label [| label …]  |  %
 edge := -[ … ]->               from left to right
       | <-[ … ]-               from right to left
       | -[ … ]-  |  <-[ … ]->  either way
@@ -76,9 +77,11 @@ edge := -[ … ]->               from left to right
 ```
 
 - **Variables** name what a node or edge binds to, so conditions and `COLUMNS` can refer to it. A variable used twice is the same node: `MATCH (a)-[]->(b)-[]->(c), (a)-[]->(c)` finds triangles.
-- **Labels** say which table a variable reads: `(p:person)` or `(p IS person)`. A table's labels are its name and the labels its definition gives. Without a label, a variable reads the only table it can: the one its edges `REFERENCES`, or the graph's only vertex or edge table. When that cannot be told, the query is refused and asks for a label. A label that contradicts the edge is refused too: an edge matches only between the vertex tables its edge table `REFERENCES`, so `(a:person)-[:knows]->(s:school)` is an error when `knows` goes from `person` to `person`. The standard gives such a pattern no rows; Ursa reports it, as DuckPGQ does, because it is almost always a mistake.
+- **Labels** say which tables a variable reads: `(p:person)` or `(p IS person)`. A table's labels are its name and the labels its definition gives, and one label may be on several tables (LDBC's `Message` on `Post` and `Comment`). `(p:person|school)` reads the tables with either label, and `%` is any label. A variable without a label reads every table of its kind that fits its edges: an edge matches only between the vertex tables its edge table `REFERENCES`, so in `(a:person)-[e]->(b)`, `e` is any edge table that starts at `person`, and `b` the table that edge table ends at.
+- **Several tables.** A variable over several tables matches a row of any of them. The pattern runs once for each combination of tables its edges allow, and the rows are combined with `UNION ALL`; combinations the edges' `REFERENCES` rule out are left out. When every variable has one table, there is one combination, planned as a single query. A pattern may expand into at most 64 combinations; more is refused, with a request for labels. An undirected edge between two different tables follows the one way its edge table goes.
+- **Contradictions.** A label that contradicts the edge is refused: `(a:person)-[:knows]->(s:school)` is an error when `knows` goes from `person` to `person`. The standard gives such a pattern no rows; Ursa reports it, as DuckPGQ does, because it is almost always a mistake.
 - **Conditions** go inside a node or edge (`(a WHERE a.age > 30)`), or after the pattern, where they can use every variable.
-- **Properties.** A variable's properties are its table's columns, or what its labels' `PROPERTIES` clauses give, under their property names.
+- **Properties.** A variable's properties are its table's columns, or what its labels' `PROPERTIES` clauses give, under their property names. A variable over several tables reads any property one of them has: in the rows of a table without it, the property is NULL, as the standard says. Where several tables have it, they must have one type (two kinds of number, or of text, are read as the type both fit); otherwise the query is refused, naming the types. A property none of its tables has is refused as a mistake, with the tables named. `a.*`, and `COLUMNS` left out, return only the properties all its tables share: name a property only some of them have to get it. `element_id(a)` works on any table, and `a IS LABELED school` tells which table a row came from.
 - **Either way.** `-[e]-` matches each edge in both directions, so each friendship of two members is two matches; an edge from a node to itself matches once. `<-[e]->` is the standard's "left or right", and means the same, since every edge of an Ursa graph is directed. The standard's undirected edges (`~[e]~`) are refused for that reason.
 - **COLUMNS.** Left out, or written `COLUMNS (*)`, it returns every property of each named node and edge, in the order they first appear, as `COLUMNS (a.*, e.*, b.*)` would; a repeated name gets a suffix (`id`, `id:1`). This is DuckPGQ's form.
 
@@ -116,7 +119,7 @@ SQL/PGQ's predicates on elements work in conditions and in `COLUMNS`:
 |---|---|
 | `SAME(a, b, …)` | the nodes are one node |
 | `ALL_DIFFERENT(a, b, …)` | no two of the nodes are one node |
-| `x IS [NOT] LABELED l` | `x`'s table has the label `l` |
+| `x IS [NOT] LABELED l` | `x`'s table has the label `l` (`l\|m`: either) |
 | `a IS [NOT] SOURCE OF e` | edge `e` starts at node `a` |
 | `a IS [NOT] DESTINATION OF e` | edge `e` ends at node `a` |
 
@@ -354,8 +357,8 @@ These are refused with a message:
 
 - a path variable, selector or path mode on a path of more than one edge, and `KEEP` on a pattern of several paths;
 - a condition inside a quantified edge, an edge variable of one in `COLUMNS` (use `edges(p)`), and aggregates in `COLUMNS` (aggregate outside: `SELECT count(*) FROM GRAPH_TABLE (…)`);
-- a quantified edge between two vertex tables;
-- label expressions (`:a|b`) and parenthesized path patterns (`((a)-[e]->(b))*`);
+- a quantified edge between two vertex tables, and a quantified edge (or the edge of a path with a variable, selector or mode) that can be a row of several edge tables: give it a label;
+- label expressions with `&`, `!` or parentheses (`|` and `%` work), and parenthesized path patterns (`((a)-[e]->(b))*`);
 - `ONE ROW PER VERTEX` and `ONE ROW PER STEP`: return `vertices(p)` or `edges(p)` and `unnest` them;
 - a pattern that refers to a table outside the `GRAPH_TABLE`, with `LATERAL` or by a column of another table in the `FROM`: join on the `GRAPH_TABLE`'s columns instead;
 - `SAME` and `ALL_DIFFERENT` on edges.

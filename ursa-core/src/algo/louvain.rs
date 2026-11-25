@@ -141,11 +141,11 @@ fn louvain_over(
         } else {
             one_level(&graph, resolution, seed, level.as_ref(), pace)
         };
-        let c = comm.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let c = comm.par_iter().copied().max().map_or(0, |m| m as usize + 1);
         // Compose this level's assignment onto the original nodes.
-        for label in node_comm.iter_mut() {
-            *label = comm[*label as usize];
-        }
+        node_comm
+            .par_iter_mut()
+            .for_each(|label| *label = comm[*label as usize]);
         // No community merged (every super-node stayed distinct) → converged.
         if c == graph.n() {
             break;
@@ -329,6 +329,8 @@ fn one_level_in<W: Weight>(
     let mut weight_to = vec![0.0f64; n];
     let mut seen = vec![false; n];
     let mut touched: Vec<u32> = Vec::new();
+    // The touched communities a move to could beat staying, with their gains.
+    let mut better: Vec<(u32, f64)> = Vec::new();
 
     // Work is counted in adjacency slots visited (plus one per node visit), so a
     // sweep is `n + 2m` slots whatever the order in which nodes are visited.
@@ -363,16 +365,44 @@ fn one_level_in<W: Weight>(
             work = end;
         }
         queued[u as usize] = false;
+        // The visit order is random, so each visit starts with cache misses:
+        // ask for the next node's adjacency, and for the one after it its
+        // place in the adjacency, community and degree (#268).
+        if let Some(&next) = queue.get(1) {
+            prefetch(&graph.offsets, next as usize);
+            prefetch(&comm, next as usize);
+            prefetch(&graph.k, next as usize);
+        }
+        if let Some(&next) = queue.front() {
+            let s = graph.offsets[next as usize];
+            if s < graph.targets.len() {
+                prefetch(&graph.targets, s);
+                prefetch(ws, s);
+            }
+        }
         let ci = comm[u as usize];
         let ku = graph.k[u as usize];
         let (nbrs, wts) = graph.neighbors(ws, u);
         work += nbrs.len() + 1;
 
-        // Weight from u into each neighbouring community.
-        for (&v, &w) in nbrs.iter().zip(wts) {
+        // Weight from u into each neighbouring community. Each slot reads a
+        // neighbour's community, then that community's entries, all at
+        // random: ask for the community `PREFETCH` slots ahead, for its
+        // entries half as far ahead (by then the community has arrived), and
+        // for the total of each community met, which the scan below reads.
+        for (i, (&v, &w)) in nbrs.iter().zip(wts).enumerate() {
+            if let Some(&ahead) = nbrs.get(i + PREFETCH) {
+                prefetch(&comm, ahead as usize);
+            }
+            if let Some(&ahead) = nbrs.get(i + PREFETCH / 2) {
+                let c = comm[ahead as usize] as usize;
+                prefetch(&weight_to, c);
+                prefetch(&seen, c);
+            }
             let c = comm[v as usize];
             if !std::mem::replace(&mut seen[c as usize], true) {
                 touched.push(c);
+                prefetch(&tot, c as usize);
             }
             weight_to[c as usize] += w.get();
         }
@@ -382,14 +412,19 @@ fn one_level_in<W: Weight>(
 
         // Gain of staying in ci (the baseline every move must strictly beat).
         let stay = weight_to[ci as usize] - resolution * tot[ci as usize] * ku / graph.m2;
-        // Scan neighbour communities in ascending-id order, never in the order
-        // they were met: with the epsilon, "tie" is non-transitive, so scan
-        // order could change the partition. Ascending order with a strict
-        // improvement (> best + eps) keeps the smallest id on a tie (it's seen
-        // first) without letting chained near-ties drag the anchor.
-        touched.sort_unstable();
-        let mut best_c = ci;
-        let mut best_gain = stay;
+        // Neighbour communities are scanned in ascending-id order, never in
+        // the order they were met: with the epsilon, "tie" is non-transitive,
+        // so scan order could change the partition. Ascending order with a
+        // strict improvement (> best + eps) keeps the smallest id on a tie
+        // (it's seen first) without letting chained near-ties drag the anchor.
+        //
+        // The best gain so far never drops below `stay`, so a community whose
+        // gain is not above `stay + eps` can never be taken, wherever it falls
+        // in the scan, and leaves the scan's state as it was. So only the
+        // others (usually none, or one or two) are kept, sorted and scanned:
+        // the same comparisons on the same values, in the same order, give
+        // the same choice as scanning every touched community (#268).
+        let bar = stay + 1e-12;
         for &c in &touched {
             let w_in = std::mem::take(&mut weight_to[c as usize]);
             seen[c as usize] = false;
@@ -397,12 +432,23 @@ fn one_level_in<W: Weight>(
                 continue;
             }
             let gain = w_in - resolution * tot[c as usize] * ku / graph.m2;
+            if gain > bar {
+                better.push((c, gain));
+            }
+        }
+        touched.clear();
+        if better.len() > 1 {
+            better.sort_unstable_by_key(|&(c, _)| c);
+        }
+        let mut best_c = ci;
+        let mut best_gain = stay;
+        for &(c, gain) in &better {
             if gain > best_gain + 1e-12 {
                 best_gain = gain;
                 best_c = c;
             }
         }
-        touched.clear();
+        better.clear();
 
         // Commit (re-insert into the chosen community).
         tot[best_c as usize] += ku;
@@ -425,7 +471,28 @@ fn one_level_in<W: Weight>(
             next_check = work + sweep;
         }
     }
+    // The scratch goes before renumbering allocates its own map.
+    drop((tot, queue, queued, weight_to, seen));
     renumber(&comm)
+}
+
+/// How far ahead in a node's adjacency [`one_level`] asks for a neighbour's
+/// community to be fetched into cache.
+const PREFETCH: usize = 16;
+
+/// Ask the CPU to bring `xs[i]` into cache (a hint only: it reads nothing and
+/// changes nothing, so results cannot depend on it). `i` must be in bounds.
+#[inline(always)]
+fn prefetch<T>(xs: &[T], i: usize) {
+    debug_assert!(i < xs.len());
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, and the address is inside `xs`.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(xs.as_ptr().add(i).cast::<i8>(), _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (xs, i);
 }
 
 /// One local-moving phase in parallel sub-rounds (#387), returning a

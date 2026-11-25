@@ -1033,6 +1033,32 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   operations take their protocol names (`graph.open`, `graph.explore`,
   `cancelInput`, `highlightAnsi`, …). Nothing a user sees changes.
 
+- **Default (serial) Louvain is about a third faster, with the same
+  communities** (#268). Local moving, the serial core of `louvain(g)`, took
+  70% of a run. Each node visit sorted every neighbouring community by id
+  before scanning them for the best move; it now keeps only the communities
+  whose gain beats staying (usually none, or one or two) and sorts those.
+  The others could never be chosen, so the choice is the same. Local moving
+  also prefetches the next node's adjacency, each neighbour's community and
+  its accumulator entry a few slots ahead, and each community's total. The
+  visit order, the tie rule and the order of every floating-point sum are
+  unchanged: labels are the same bit for bit, for every seed, on any thread
+  count. A new test, `tests/louvain_pinned.rs`, pins them with golden hashes
+  recorded before the change (karate, R-MAT, isolated nodes, weighted and
+  masked graphs, serial and `parallel => true`) on 1, 2, 4 and 8 threads and
+  without `rayon`. R-MAT, `seed => 1`, 4 shared cores, best of 3
+  interleaved runs:
+
+  | edges | before | after | peak RSS |
+  |---|---|---|---|
+  | 16M (2^20 slots) | 6.44 s, 5.14 CPU-s | 4.72 s, 3.77 CPU-s | 480 → 476 MB |
+  | 64M (2^22 slots) | 43.1 s, 32.5 CPU-s | 27.4 s, 21.1 CPU-s | 1,909 → 1,897 MB |
+
+  At 64M edges, local moving went from 21.7 to 11.6 CPU-s (70% of the run
+  to 50%). It stays serial, as its result depends on the visit order; the
+  graph build (now a third of the run) and the aggregation (a sixth) were
+  already parallel. `examples/rmat_kernel.rs` gains
+  `--kernel louvain`.
 - **Benchmarks: memory is the process's footprint, with peak RSS beside it**
   (#533). `benchmarks/bluesky_cloud/run.py` recorded each step's peak
   memory as `ru_maxrss`, which since #382 counts the pages of the
@@ -1280,6 +1306,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - A SQL/PGQ and DuckPGQ conformance suite (#299), `tests/conformance/`,
     in sqllogictest's format, with a reviewed list of known differences;
     `cargo test -p ursa-sql --test conformance` runs it.
+- **SQL: a `GRAPH_TABLE` variable can be a row of several element tables**
+  (#412). Each form was an error before, so no query that ran changes,
+  except one that returned wrong rows (below).
+  - A variable without a label is any table of its kind that its edges'
+    `REFERENCES` allow: on DuckPGQ's `pg`, `MATCH (a)` is every student and
+    school, and `(a:Person)-[e]->(b)` follows both `know` and `studyAt`.
+  - A label on several vertex or edge tables (LDBC's `Message` on `Post`
+    and `Comment`) matches all of them.
+  - Label disjunctions, `(a:Person|School)`, and `%`, any label;
+    `x IS LABELED a|b` too. `&`, `!` and parentheses are still refused, with
+    a message.
+  - The pattern is planned once per combination of tables, and the plans
+    are combined with `UNION ALL`; combinations the edges rule out are left
+    out. When every variable has one table, the plan is the same as before.
+    More than 64 combinations is refused with a request for labels.
+  - A property of a variable over several tables reads as NULL in the rows
+    of the tables that lack it, as in SQL/PGQ and GQL: `MATCH (a) COLUMNS
+    (a.name)` gives the students' names and NULL for the schools. A property
+    no table has is an error that names the tables (so a typo is caught),
+    and so are tables that have it with types that do not mix (numbers mix
+    with numbers, text with text). `a.*` and `COLUMNS (*)` return only the
+    properties every table has; name the others to get them.
+    `element_id(a)`, `SAME` and `IS LABELED` work per table.
+  - A quantified edge, or the edge of a searched path, that can be a row of
+    several edge tables is refused: label it.
+  - Fixed: an undirected edge between two different vertex tables,
+    `(a:Person)-[s:studyAt]-(b:School)`, also joined the reverse
+    orientation on key values that happened to be equal, and returned rows
+    for edges that are not in the graph. It now follows the one way its edge
+    table goes.
 
 - **Triangle counting uses about a third of the CPU, with the same counts**
   (#420). `triangle_count`, and so `clustering_coefficient` and the SQL
