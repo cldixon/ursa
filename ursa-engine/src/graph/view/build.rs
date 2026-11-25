@@ -252,6 +252,12 @@ pub(crate) fn of_index(
     } else {
         cast(ids, &key_type)?
     };
+    // A relabelled index (#172) is read back in its original (first-seen)
+    // numbering, the one the rows give.
+    let keys = match topology.nodes_in_original_order() {
+        Some(order) => take(keys.as_ref(), &UInt32Array::from(order.to_vec()), None)?,
+        None => keys,
+    };
     if keys.len() != n || keys.null_count() > 0 {
         return Ok(None);
     }
@@ -274,8 +280,8 @@ pub(crate) fn of_index(
     let out = topology.out();
     for u in 0..n as u32 {
         for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
-            src[e as usize] = u;
-            dst[e as usize] = v;
+            src[e as usize] = topology.original_id(u);
+            dst[e as usize] = topology.original_id(v);
         }
     }
     Ok(Some((

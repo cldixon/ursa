@@ -272,10 +272,19 @@ fn candidate_sources(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Vec<u32
     touched(topo, mask)
 }
 
-/// [`sample_sources`] over `candidates` (`None`: every node of `topo`).
+/// [`sample_sources`] over `candidates` (`None`: every node of `topo`), in
+/// original id order ([`Topology::original_ids`]), so that a locality relabel
+/// (#172) picks the same nodes, in the same order.
 fn pick_sources(topo: &Topology, candidates: Option<&[u32]>, frac: Option<f64>) -> Vec<u32> {
+    let mut candidates = candidates.map(<[u32]>::to_vec);
+    if let (Some(c), Some(_)) = (candidates.as_mut(), topo.original_ids()) {
+        c.sort_unstable_by_key(|&v| topo.original_id(v));
+    }
     match candidates {
-        None => sample_sources(topo.n_nodes(), frac),
+        None => sample_sources(topo.n_nodes(), frac)
+            .into_iter()
+            .map(|o| topo.node_of_original(o))
+            .collect(),
         Some(c) => sample_sources(c.len(), frac)
             .into_iter()
             .map(|i| c[i as usize])

@@ -329,7 +329,7 @@ pub fn betweenness(
     if n == 0 {
         return Vec::new();
     }
-    let sources = sample_sources(n, sample, seed);
+    let sources = sample_sources(topo, sample, seed);
     let k = sources.len();
     if k == 0 {
         return vec![0.0; n];
@@ -448,7 +448,7 @@ pub fn betweenness_weighted(
     if n == 0 {
         return Vec::new();
     }
-    let sources = sample_sources(n, sample, seed);
+    let sources = sample_sources(topo, sample, seed);
     let k = sources.len();
     if k == 0 {
         return vec![0.0; n];
@@ -538,8 +538,11 @@ fn brandes_from_weighted(
 /// first-seen input order, which correlates with data layout (files sorted by
 /// community / crawl order), so a stride would be a *biased* sample for the
 /// Brandes–Pich `n/k` estimator. `shuffled_order(n, seed)[..k]` is unbiased and
-/// still fully reproducible given the seed.
-fn sample_sources(n: usize, frac: Option<f64>, seed: Option<u64>) -> Vec<u32> {
+/// still fully reproducible given the seed. The subset is drawn over the
+/// original node ids ([`Topology::original_ids`]), so a locality relabel
+/// (#172) samples the same nodes.
+fn sample_sources(topo: &Topology, frac: Option<f64>, seed: Option<u64>) -> Vec<u32> {
+    let n = topo.n_nodes();
     match frac {
         None => (0..n as u32).collect(),
         Some(f) => {
@@ -549,7 +552,10 @@ fn sample_sources(n: usize, frac: Option<f64>, seed: Option<u64>) -> Vec<u32> {
                 return Vec::new();
             }
             let order = shuffled_order(n, seed.unwrap_or(DEFAULT_SEED));
-            order[..k].to_vec()
+            order[..k]
+                .iter()
+                .map(|&o| topo.node_of_original(o))
+                .collect()
         }
     }
 }
@@ -644,7 +650,7 @@ mod tests {
         use std::collections::VecDeque;
         let n = t.n_nodes();
         let out = t.out();
-        let sources = sample_sources(n, sample, seed);
+        let sources = sample_sources(t, sample, seed);
         let mut bc = vec![0.0f64; n];
         for chunk in sources.chunks(SRC_CHUNK) {
             let mut acc = vec![0.0f64; n];
@@ -791,8 +797,8 @@ mod tests {
         );
         // sample_sources picks a seed-shuffled subset, so different seeds generally
         // pick different sources (and here different estimates).
-        let a = sample_sources(7, Some(0.5), Some(1));
-        let b = sample_sources(7, Some(0.5), Some(2));
+        let a = sample_sources(&Topology::build(7, vec![], vec![]), Some(0.5), Some(1));
+        let b = sample_sources(&Topology::build(7, vec![], vec![]), Some(0.5), Some(2));
         assert_eq!(a.len(), b.len());
         assert_ne!(a, b);
     }

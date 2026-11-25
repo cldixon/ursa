@@ -24,7 +24,7 @@
 //! [`IdMap`]: crate::id_map::IdMap
 
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, BooleanArray};
 use arrow::buffer::ScalarBuffer;
@@ -817,6 +817,301 @@ pub struct Topology {
     /// Set on a symmetric view: its transpose is its own out-CSR, so `incoming`
     /// returns `out` rather than building a copy.
     self_transpose: bool,
+    /// The node ids this topology's nodes had before a locality relabel
+    /// ([`Topology::build_ordered`], #172); `None` when they were not
+    /// relabelled. Shared by every view derived from the topology.
+    relabel: Option<Arc<Relabel>>,
+}
+
+/// How the nodes of a topology are numbered (#172).
+///
+/// The ids given to [`Topology::build_ordered`] are the *original* ids (an
+/// [`IdMap`]'s first-seen order). A locality order renumbers the nodes so the
+/// ones the kernels read most often sit together in memory, and keeps the
+/// original id of each node, so that what must not depend on the numbering
+/// (component labels, the visit orders of the seeded community kernels,
+/// sampled sources) is defined on the original ids instead.
+///
+/// [`IdMap`]: crate::id_map::IdMap
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeOrder {
+    /// The ids as given: no relabel.
+    AsGiven,
+    /// By in-degree, highest first, ties in original id order: the nodes that
+    /// are most often a neighbour (a pull PageRank's reads, a traversal's
+    /// targets) come first and share cache lines. From 4,194,304 edges the
+    /// in-degrees are counted on an eighth of the rows (fixed blocks), which
+    /// keeps the relabel's cost within a quarter of the build's.
+    InDegree,
+}
+
+/// A topology's original node ids (see [`NodeOrder`]).
+#[derive(Debug)]
+struct Relabel {
+    /// `original[v]`: the original id of node `v`.
+    original: ScalarBuffer<u32>,
+    /// `node[o]`: the node whose original id is `o`, built on first use.
+    node: OnceLock<Vec<u32>>,
+}
+
+impl Relabel {
+    /// The inverse permutation.
+    fn nodes(&self) -> &[u32] {
+        self.node.get_or_init(|| {
+            let mut node = vec![0u32; self.original.len()];
+            for (v, &o) in self.original.iter().enumerate() {
+                node[o as usize] = v as u32;
+            }
+            node
+        })
+    }
+}
+
+/// `adj` renumbered by its original ids (see [`Topology::in_original_order`]):
+/// original node `o`'s segment is the segment of node `relabel.nodes()[o]`,
+/// its targets renamed to their original ids, its edge ids as they are.
+fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
+    use crate::parallel::*;
+    let node = relabel.nodes();
+    let n = node.len();
+    let mut offsets = vec![0u64; n + 1];
+    for (o, &v) in node.iter().enumerate() {
+        offsets[o + 1] = offsets[o] + u64::from(adj.degree(v));
+    }
+    let m = adj.targets.len();
+    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
+    let (t_addr, e_addr) = (
+        targets.as_mut_ptr() as usize,
+        edge_ids.as_mut_ptr() as usize,
+    );
+    let offsets_ref = &offsets;
+    let copy = |o: usize| {
+        let v = node[o];
+        let (lo, hi) = (
+            adj.offsets[v as usize] as usize,
+            adj.offsets[v as usize + 1] as usize,
+        );
+        let at = offsets_ref[o] as usize;
+        for (i, k) in (lo..hi).enumerate() {
+            // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
+            // across nodes and inside both buffers, which outlive the pass.
+            unsafe {
+                *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
+                *(e_addr as *mut u32).add(at + i) = adj.edge_ids[k];
+            }
+        }
+    };
+    if in_worker() || m < (1 << 16) {
+        (0..n).for_each(copy);
+    } else {
+        (0..n).into_par_iter().for_each(copy);
+    }
+    Adjacency {
+        offsets: offsets.into(),
+        targets: targets.into(),
+        edge_ids: edge_ids.into(),
+    }
+}
+
+/// Whether `ids` is a permutation of `0..ids.len()`.
+fn is_permutation(ids: &[u32]) -> bool {
+    let mut seen = vec![false; ids.len()];
+    ids.iter().all(|&o| match seen.get_mut(o as usize) {
+        Some(s) if !*s => {
+            *s = true;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The out-adjacency of `src -> dst` (original ids) with its nodes numbered
+/// by in-degree, highest first, ties by original id (#172): the adjacency,
+/// the original id of each node, and the node of each original id. From
+/// 4,194,304 edges, the in-degrees are counted on one block of 4,096 rows in
+/// eight (an estimate: the order is a heuristic, and the hubs it is for are
+/// counted closely).
+///
+/// The relabel is fused into the counting sort rather than run as passes of
+/// its own. The first pass counts, per chunk of rows, both endpoints' degrees
+/// over the original ids. The in-degrees give the order (a counting sort by
+/// degree); the out-degrees, gathered into it, give the offsets,
+/// and each chunk's counts become its cursors, still indexed by original id.
+/// The targets are renamed in place, in one streaming pass, and the scatter
+/// places each row by its source's original id, so the sources are never
+/// renamed. Each
+/// segment holds its rows in row order: the output is exactly
+/// [`Adjacency::build`] over the renamed endpoints, on any thread count.
+fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u32>, Vec<u32>) {
+    // See pass 1.
+    const SAMPLE_MIN_EDGES: usize = 1 << 22;
+    const SAMPLE_BLOCK: usize = 1 << 12;
+    const SAMPLE: usize = 8;
+    use crate::parallel::*;
+    let m = src.len();
+    assert!(
+        m <= u32::MAX as usize,
+        "more than u32::MAX (~4.29B) edges is beyond the v0.1 edge-id cap"
+    );
+    // The chunking rule of `Adjacency::build`; one chunk when serial.
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    let threads = current_num_threads().min((m / n.max(1)).max(4));
+    let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || n == 0 || in_worker();
+    let n_chunks = if serial { 1 } else { threads };
+    let chunk = m.div_ceil(n_chunks).max(1);
+    // Disjoint blocks of nodes for the per-node passes.
+    const BLOCK: usize = 1 << 14;
+    let blocks = n.div_ceil(BLOCK);
+    let par_blocks = |f: &(dyn Fn(std::ops::Range<usize>) + Sync)| {
+        let run = |b: usize| f(b * BLOCK..((b + 1) * BLOCK).min(n));
+        if serial {
+            (0..blocks).for_each(run);
+        } else {
+            (0..blocks).into_par_iter().for_each(run);
+        }
+    };
+
+    // Pass 1: per chunk, out- and in-degree over original ids. The
+    // in-degrees only order the nodes, so a large graph counts them on one
+    // block of rows in `SAMPLE` (fixed blocks of the row order, so the same
+    // on any thread count): the random increments are most of this pass.
+    let sampled = m >= SAMPLE_MIN_EDGES;
+    let count = |c: usize| {
+        let (lo, hi) = (c * chunk, ((c + 1) * chunk).min(m));
+        let (mut out, mut inc) = (vec![0u32; n], vec![0u32; n]);
+        for &k in &src[lo..hi] {
+            out[k as usize] += 1;
+        }
+        let mut r = lo;
+        while r < hi {
+            let block = r / SAMPLE_BLOCK;
+            let end = ((block + 1) * SAMPLE_BLOCK).min(hi);
+            if !sampled || block.is_multiple_of(SAMPLE) {
+                for &d in &dst[r..end] {
+                    inc[d as usize] += 1;
+                }
+            }
+            r = end;
+        }
+        (out, inc)
+    };
+    let (mut outs, incs): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if serial {
+        (0..n_chunks).map(count).unzip()
+    } else {
+        (0..n_chunks).into_par_iter().map(count).unzip()
+    };
+
+    // The in-degree of each node.
+    let mut degree = vec![0u32; n];
+    let d_addr = degree.as_mut_ptr() as usize;
+    par_blocks(&|range| {
+        for k in range {
+            // SAFETY: blocks are disjoint and inside `degree`.
+            unsafe { *(d_addr as *mut u32).add(k) = incs.iter().map(|h| h[k]).sum() };
+        }
+    });
+    drop(incs);
+    // The order: a counting sort by degree, highest first, each degree's
+    // nodes in original id order (a stable scatter in id order). The
+    // buckets run to the highest degree, at most the edge count.
+    let top = degree.iter().copied().max().unwrap_or(0) as usize;
+    let mut start = vec![0u32; top + 2];
+    for &d in &degree {
+        start[top - d as usize + 1] += 1;
+    }
+    for b in 0..=top {
+        start[b + 1] += start[b];
+    }
+    let mut original = vec![0u32; n];
+    for (k, &d) in degree.iter().enumerate() {
+        let slot = &mut start[top - d as usize];
+        original[*slot as usize] = k as u32;
+        *slot += 1;
+    }
+    drop((degree, start));
+
+    // The node of each original id, and the offsets in the new order (each
+    // node's out-degree, prefix-summed below), in one pass.
+    let mut node = vec![0u32; n];
+    let mut offsets = vec![0u64; n + 1];
+    let (n_addr, o_addr) = (node.as_mut_ptr() as usize, offsets.as_mut_ptr() as usize);
+    let original_ref = &original;
+    par_blocks(&|range| {
+        for v in range {
+            let k = original_ref[v] as usize;
+            let d: u64 = outs.iter().map(|h| u64::from(h[k])).sum();
+            // SAFETY: `original` is a permutation, so each `node` slot is
+            // written once; blocks are disjoint and `v + 1 <= n`.
+            unsafe {
+                *(n_addr as *mut u32).add(k) = v as u32;
+                *(o_addr as *mut u64).add(v + 1) = d;
+            }
+        }
+    });
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    // Each chunk's counts become its cursors into every segment, in place,
+    // still indexed by original id.
+    let addrs: Vec<usize> = outs.iter_mut().map(|h| h.as_mut_ptr() as usize).collect();
+    let (offsets_ref, node_ref) = (&offsets, &node);
+    par_blocks(&|range| {
+        for k in range {
+            let mut at = offsets_ref[node_ref[k] as usize] as u32;
+            for &a in &addrs {
+                // SAFETY: blocks of `k` are disjoint, inside every histogram.
+                unsafe {
+                    let slot = (a as *mut u32).add(k);
+                    let cnt = *slot;
+                    *slot = at;
+                    at += cnt;
+                }
+            }
+        }
+    });
+
+    // The targets renamed in place: a streaming pass whose lookups overlap,
+    // where the scatter's would wait on its writes.
+    if serial {
+        dst.iter_mut().for_each(|d| *d = node_ref[*d as usize]);
+    } else {
+        dst.par_chunks_mut(1 << 16)
+            .for_each(|c| c.iter_mut().for_each(|d| *d = node_ref[*d as usize]));
+    }
+    let dst = &*dst;
+
+    // Pass 2: scatter each row by its source's original id, its target
+    // (renamed above). Positions are disjoint across chunks (the cursors partition
+    // each segment), as in `build_parallel`.
+    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
+    let (t_addr, e_addr) = (
+        targets.as_mut_ptr() as usize,
+        edge_ids.as_mut_ptr() as usize,
+    );
+    let scatter = |(c, mut base): (usize, Vec<u32>)| {
+        let (lo, hi) = (c * chunk, ((c + 1) * chunk).min(m));
+        for r in lo..hi {
+            let k = src[r] as usize;
+            let pos = base[k] as usize;
+            base[k] += 1;
+            // SAFETY: `pos < m` and is claimed by exactly one (chunk, row).
+            unsafe {
+                *(t_addr as *mut u32).add(pos) = dst[r];
+                *(e_addr as *mut u32).add(pos) = r as u32;
+            }
+        }
+    };
+    if serial {
+        outs.into_iter().enumerate().for_each(scatter);
+    } else {
+        outs.into_par_iter().enumerate().for_each(scatter);
+    }
+    let adjacency = Adjacency {
+        offsets: offsets.into(),
+        targets: targets.into(),
+        edge_ids: edge_ids.into(),
+    };
+    (adjacency, original, node)
 }
 
 impl Topology {
@@ -856,7 +1151,189 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         }
+    }
+
+    /// [`Self::build`], with the nodes renumbered in `order` for locality
+    /// (#172): the dense ids given are the *original* ids, and node `v` of
+    /// the result is the node whose original id is
+    /// [`Self::original_id`]`(v)`. The relabel is fused into the counting
+    /// sort (its first pass counts the in-degrees too, a counting sort
+    /// orders the nodes, one streaming pass renames the targets in place),
+    /// parallel where the build is. Each node's out-segment keeps its edges in row order, and
+    /// `edge_ids` still names the original rows, so weights and edge masks
+    /// apply unchanged.
+    ///
+    /// A caller that maps dense ids to anything (an [`IdMap`]) renumbers it
+    /// the same way, through [`Self::original_ids`].
+    ///
+    /// [`IdMap`]: crate::id_map::IdMap
+    pub fn build_ordered(
+        n_nodes: usize,
+        src_dense: Vec<u32>,
+        dst_dense: Vec<u32>,
+        order: NodeOrder,
+    ) -> Topology {
+        match order {
+            NodeOrder::AsGiven => Self::build(n_nodes, src_dense, dst_dense),
+            NodeOrder::InDegree => {
+                let mut dst_dense = dst_dense;
+                let (out, original, node) = build_in_degree(n_nodes, &src_dense, &mut dst_dense);
+                drop((src_dense, dst_dense));
+                let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
+                Topology {
+                    n_nodes,
+                    n_edges: out.targets.len(),
+                    out,
+                    inc: OnceLock::new(),
+                    inc_loader: LazyIncoming::default(),
+                    undirected: OnceLock::new(),
+                    symmetric: OnceLock::new(),
+                    self_transpose: false,
+                    relabel: (!identity).then(|| {
+                        Arc::new(Relabel {
+                            original: original.into(),
+                            node: OnceLock::from(node),
+                        })
+                    }),
+                }
+            }
+        }
+    }
+
+    /// [`Self::build`] with the nodes renumbered by `original`, a permutation
+    /// of `0..n_nodes` that gives the original id of each new node (see
+    /// [`Self::build_ordered`]). The identity is no relabel at all.
+    ///
+    /// # Panics
+    ///
+    /// If `original` is not a permutation of `0..n_nodes`.
+    pub fn build_relabelled(
+        n_nodes: usize,
+        mut src_dense: Vec<u32>,
+        mut dst_dense: Vec<u32>,
+        original: Vec<u32>,
+    ) -> Topology {
+        use crate::parallel::*;
+        assert_eq!(original.len(), n_nodes, "the order must name every node");
+        assert!(is_permutation(&original), "the order must be a permutation");
+        if original.iter().enumerate().all(|(v, &o)| v as u32 == o) {
+            return Self::build(n_nodes, src_dense, dst_dense);
+        }
+        let mut node = vec![0u32; n_nodes];
+        for (v, &o) in original.iter().enumerate() {
+            node[o as usize] = v as u32;
+        }
+        let rename = |ids: &mut [u32]| {
+            ids.par_chunks_mut(1 << 16)
+                .for_each(|chunk| chunk.iter_mut().for_each(|x| *x = node[*x as usize]));
+        };
+        rename(&mut src_dense);
+        rename(&mut dst_dense);
+        let relabel = Relabel {
+            original: original.into(),
+            node: OnceLock::from(node),
+        };
+        let mut topology = Self::build(n_nodes, src_dense, dst_dense);
+        topology.relabel = Some(Arc::new(relabel));
+        topology
+    }
+
+    /// This topology, its nodes known to carry the original ids `original`
+    /// (`original[v]` for node `v`; see [`Self::build_ordered`]): how a
+    /// stored index that was relabelled is read back. An error if `original`
+    /// is not a permutation of the nodes.
+    pub fn with_original_ids(mut self, original: ScalarBuffer<u32>) -> Result<Topology, String> {
+        if original.len() != self.n_nodes || !is_permutation(&original) {
+            return Err("the original node ids are not a permutation of the nodes".into());
+        }
+        self.relabel = (!original.iter().enumerate().all(|(v, &o)| v as u32 == o)).then(|| {
+            Arc::new(Relabel {
+                original,
+                node: OnceLock::new(),
+            })
+        });
+        Ok(self)
+    }
+
+    /// A topology over the same nodes, numbered as `other`'s are (a view
+    /// built from it).
+    pub(crate) fn numbered_as(mut self, other: &Topology) -> Topology {
+        self.relabel = other.relabel.clone();
+        self
+    }
+
+    /// The original id of each node, if the nodes were relabelled
+    /// ([`Self::build_ordered`]); `None` when each node's id is its original
+    /// one.
+    pub fn original_ids(&self) -> Option<&[u32]> {
+        self.relabel.as_ref().map(|r| &r.original[..])
+    }
+
+    /// The nodes in original id order (the node of each original id), if the
+    /// nodes were relabelled ([`Self::build_ordered`]): the order to emit
+    /// per-node results in so that they come out as an unrelabelled index
+    /// gives them. Built on first use.
+    pub fn nodes_in_original_order(&self) -> Option<&[u32]> {
+        self.relabel.as_ref().map(|r| r.nodes())
+    }
+
+    /// The original id of node `v` (`v` itself without a relabel).
+    #[inline]
+    pub fn original_id(&self, v: u32) -> u32 {
+        self.relabel.as_ref().map_or(v, |r| r.original[v as usize])
+    }
+
+    /// The node whose original id is `o` (`o` itself without a relabel).
+    #[inline]
+    pub fn node_of_original(&self, o: u32) -> u32 {
+        self.relabel.as_ref().map_or(o, |r| r.nodes()[o as usize])
+    }
+
+    /// Per-node labels made canonical: each node's label becomes the
+    /// smallest original id among the nodes that share its label, so the
+    /// labels name the same partition whatever the numbering (#150, #172).
+    /// Linear in the nodes. Labels must be below the node count.
+    pub(crate) fn canonical_labels(&self, labels: &mut [u32]) {
+        let mut least = vec![u32::MAX; labels.len()];
+        for (v, &l) in labels.iter().enumerate() {
+            let o = self.original_id(v as u32);
+            let m = &mut least[l as usize];
+            *m = (*m).min(o);
+        }
+        for l in labels.iter_mut() {
+            *l = least[*l as usize];
+        }
+    }
+
+    /// This topology numbered by its original ids, as [`Self::build`] gives
+    /// it from the same rows: `None` when it was not relabelled. The layouts
+    /// run over it (their starting positions follow the node ids), and a test
+    /// can compare a relabelled build with a first-seen one through it.
+    ///
+    /// No sort is needed: node `o`'s segment, in either direction, is the
+    /// segment of the node whose original id is `o`, in the same row order,
+    /// its neighbours renamed. So this is one streaming pass per direction
+    /// (the in-adjacency too, when this topology has it built), parallel.
+    pub fn in_original_order(&self) -> Option<Topology> {
+        let relabel = self.relabel.as_ref()?;
+        let out = in_original(&self.out, relabel);
+        let inc = OnceLock::new();
+        if let Some(incoming) = self.incoming_if_built() {
+            let _ = inc.set(in_original(incoming, relabel));
+        }
+        Some(Topology {
+            n_nodes: self.n_nodes,
+            n_edges: self.n_edges,
+            out,
+            inc,
+            inc_loader: LazyIncoming::default(),
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+            relabel: None,
+        })
     }
 
     /// A symmetric topology taken directly from an undirected CSR: node `u`'s
@@ -895,6 +1372,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: true,
+            relabel: None,
         }
     }
 
@@ -942,6 +1420,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         })
     }
 
@@ -969,6 +1448,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         })
     }
 
@@ -1083,6 +1563,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: self.relabel.clone(),
         }
     }
 
@@ -1101,11 +1582,10 @@ impl Topology {
     pub fn symmetric(&self) -> &Topology {
         self.symmetric.get_or_init(|| {
             let u = self.undirected();
-            Box::new(Topology::from_undirected(
-                self.n_nodes,
-                u.offsets.clone(),
-                u.targets.clone(),
-            ))
+            Box::new(
+                Topology::from_undirected(self.n_nodes, u.offsets.clone(), u.targets.clone())
+                    .numbered_as(self),
+            )
         })
     }
 
