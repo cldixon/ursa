@@ -1296,6 +1296,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   - A SQL/PGQ and DuckPGQ conformance suite (#299), `tests/conformance/`,
     in sqllogictest's format, with a reviewed list of known differences;
     `cargo test -p ursa-sql --test conformance` runs it.
+- **SQL: a `GRAPH_TABLE` variable can be a row of several element tables**
+  (#412). Each form was an error before, so no query that ran changes,
+  except one that returned wrong rows (below).
+  - A variable without a label is any table of its kind that its edges'
+    `REFERENCES` allow: on DuckPGQ's `pg`, `MATCH (a)` is every student and
+    school, and `(a:Person)-[e]->(b)` follows both `know` and `studyAt`.
+  - A label on several vertex or edge tables (LDBC's `Message` on `Post`
+    and `Comment`) matches all of them.
+  - Label disjunctions, `(a:Person|School)`, and `%`, any label;
+    `x IS LABELED a|b` too. `&`, `!` and parentheses are still refused, with
+    a message.
+  - The pattern is planned once per combination of tables, and the plans
+    are combined with `UNION ALL`; combinations the edges rule out are left
+    out. When every variable has one table, the plan is the same as before.
+    More than 64 combinations is refused with a request for labels.
+  - A property of a variable over several tables reads as NULL in the rows
+    of the tables that lack it, as in SQL/PGQ and GQL: `MATCH (a) COLUMNS
+    (a.name)` gives the students' names and NULL for the schools. A property
+    no table has is an error that names the tables (so a typo is caught),
+    and so are tables that have it with types that do not mix (numbers mix
+    with numbers, text with text). `a.*` and `COLUMNS (*)` return only the
+    properties every table has; name the others to get them.
+    `element_id(a)`, `SAME` and `IS LABELED` work per table.
+  - A quantified edge, or the edge of a searched path, that can be a row of
+    several edge tables is refused: label it.
+  - Fixed: an undirected edge between two different vertex tables,
+    `(a:Person)-[s:studyAt]-(b:School)`, also joined the reverse
+    orientation on key values that happened to be equal, and returned rows
+    for edges that are not in the graph. It now follows the one way its edge
+    table goes.
 
 - **Triangle counting uses about a third of the CPU, with the same counts**
   (#420). `triangle_count`, and so `clustering_coefficient` and the SQL

@@ -1368,8 +1368,13 @@ impl GraphFunctions {
             false => match self.plan_match(&pattern, &graph, &analysis, context) {
                 Ok(plan) => plan,
                 Err(_) => {
+                    // Joins only; what the query reads still checks the
+                    // properties of a variable over several tables (#412).
                     let joins = Analysis {
-                        usage: super::pattern::Usage::default(),
+                        usage: super::pattern::Usage {
+                            reads: analysis.usage.reads.clone(),
+                            ..super::pattern::Usage::default()
+                        },
                         ..analysis
                     };
                     self.plan_match(&pattern, &graph, &joins, context)?
@@ -1518,16 +1523,66 @@ impl GraphFunctions {
         analysis: &Analysis,
         context: &mut dyn RelationPlannerContext,
     ) -> Result<LogicalPlan> {
+        let combinations = {
+            let context: &dyn RelationPlannerContext = context;
+            let schema_of = |table: &TableReference| -> Result<Arc<Schema>> {
+                Ok(self.graph_source(graph, table, context)?.schema())
+            };
+            super::pattern::lower(pattern, graph, &schema_of, &analysis.usage)?
+        };
+        // One plan per combination of element tables, under a UNION ALL
+        // (#412); one combination is planned as it always was.
+        let mut plans = Vec::new();
+        for lowered in &combinations {
+            plans.push(self.plan_lowered(pattern, graph, analysis, lowered, None, context)?);
+        }
+        // Each column says what every combination agrees it is: planned
+        // again with those marks, so the UNION's inputs say the same.
+        if plans.len() > 1 {
+            let marks = common_marks(&plans);
+            plans.clear();
+            for lowered in &combinations {
+                plans.push(self.plan_lowered(
+                    pattern,
+                    graph,
+                    analysis,
+                    lowered,
+                    Some(&marks),
+                    context,
+                )?);
+            }
+        }
+        let plan = match plans.len() {
+            1 => plans.pop().expect("one plan"),
+            _ => union_combinations(plans)?,
+        };
+        // The schema says which pattern was matched.
+        let edges = provenance_edges(&combinations);
+        let pattern = provenance::pattern_json(&edges);
+        let node = SchemaMetadataNode::try_new(
+            Arc::new(plan),
+            BTreeMap::from([(provenance::PATTERN.to_string(), pattern)]),
+        )?;
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(node),
+        }))
+    }
+
+    /// The plan of one combination of element tables of a match. `marks`,
+    /// when given, is each column's field metadata, in place of what the
+    /// combination alone says (see [`common_marks`]).
+    fn plan_lowered(
+        &self,
+        pattern: &super::pattern::Pattern,
+        graph: &PropertyGraph,
+        analysis: &Analysis,
+        lowered: &super::pattern::Lowered,
+        marks: Option<&[BTreeMap<String, String>]>,
+        context: &mut dyn RelationPlannerContext,
+    ) -> Result<LogicalPlan> {
         use super::path_search::{END, START};
         let source_of = |table: &TableReference, context: &dyn RelationPlannerContext| {
             self.graph_source(graph, table, context)
-        };
-        let lowered = {
-            let context: &dyn RelationPlannerContext = context;
-            let schema_of = |table: &TableReference| -> Result<Arc<Schema>> {
-                Ok(source_of(table, context)?.schema())
-            };
-            super::pattern::lower(pattern, graph, &schema_of, &analysis.usage)?
         };
         let mut conditions = lowered
             .conditions
@@ -1543,7 +1598,7 @@ impl GraphFunctions {
             .collect();
         let mut used: HashMap<String, PathColumns> = HashMap::new();
         for condition in &mut conditions {
-            super::predicates::rewrite(condition, &lowered, graph, context)?;
+            super::predicates::rewrite(condition, lowered, graph, context)?;
             path_functions(condition, &paths, &mut used, context)?;
         }
         for item in &mut columns {
@@ -1562,7 +1617,7 @@ impl GraphFunctions {
                     };
                 }
             }
-            super::predicates::rewrite(item, &lowered, graph, context)?;
+            super::predicates::rewrite(item, lowered, graph, context)?;
             path_functions(item, &paths, &mut used, context)?;
         }
 
@@ -1588,6 +1643,19 @@ impl GraphFunctions {
                 scan = scan.project(columns.iter().map(|(column, name)| {
                     Expr::Column(Column::new_unqualified(column)).alias(name)
                 }))?;
+            }
+            // Another of the variable's tables' properties: NULL here (#412).
+            if !source.nulls.is_empty() {
+                let mut projection: Vec<Expr> = scan
+                    .schema()
+                    .iter()
+                    .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                    .collect();
+                for (name, data_type) in &source.nulls {
+                    let null = datafusion::common::ScalarValue::try_from(data_type)?;
+                    projection.push(Expr::Literal(null, None).alias(name));
+                }
+                scan = scan.project(projection)?;
             }
             scan.alias(source.var.as_str())?.build()
         };
@@ -1851,11 +1919,34 @@ impl GraphFunctions {
                                 .and_then(|p| p.as_ident().cloned())
                                 .unwrap_or_else(|| ast::Ident::new(name.to_string())),
                         );
-                        let columns: Vec<Expr> = schema
-                            .iter()
-                            .filter(|(q, _)| q.is_some_and(|q| q.table() == var))
-                            .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
-                            .collect();
+                        let of_var = |(q, _): &(Option<&TableReference>, &Arc<Field>)| {
+                            q.is_some_and(|q| q.table() == var)
+                        };
+                        let columns: Vec<Expr> = match lowered.shared.get(&var) {
+                            // A variable over several tables: the properties
+                            // they all have, in one order (#412).
+                            Some(shared) => {
+                                if shared.is_empty() {
+                                    return Err(plan(format!(
+                                        "in GRAPH_TABLE: {var}.* returns the properties every table '{var}' can be a row of has, and its tables have none in common; list what to return, as COLUMNS (element_id({var})), or give '{var}' a label (#412)"
+                                    )));
+                                }
+                                shared
+                                    .iter()
+                                    .filter_map(|name| {
+                                        schema
+                                            .iter()
+                                            .find(|(q, f)| of_var(&(*q, *f)) && f.name() == name)
+                                    })
+                                    .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                                    .collect()
+                            }
+                            None => schema
+                                .iter()
+                                .filter(|(q, f)| of_var(&(*q, *f)))
+                                .map(|(q, f)| Expr::Column(Column::new(q.cloned(), f.name())))
+                                .collect(),
+                        };
                         if columns.is_empty() {
                             if let Some(refusal) = several_edges(pattern, &var) {
                                 return Err(refusal);
@@ -1888,18 +1979,22 @@ impl GraphFunctions {
             }
             // Each column says what it is (`provenance`): a variable's key,
             // a property, a path's nodes. A computed column says nothing.
-            let projection = projection.into_iter().map(|expr| {
+            let projection = projection.into_iter().enumerate().map(|(i, expr)| {
                 let column = match &expr {
                     Expr::Alias(alias) => alias.expr.as_ref(),
                     other => other,
                 };
-                let metadata = match column {
-                    Expr::Column(Column {
-                        relation: Some(TableReference::Bare { table }),
-                        name,
-                        ..
-                    }) => lowered.provenance(&graph.name, table, name),
-                    _ => None,
+                let metadata = match (marks, column) {
+                    (Some(marks), _) => marks.get(i).filter(|m| !m.is_empty()).cloned(),
+                    (
+                        None,
+                        Expr::Column(Column {
+                            relation: Some(TableReference::Bare { table }),
+                            name,
+                            ..
+                        }),
+                    ) => lowered.provenance(&graph.name, table, name),
+                    (None, _) => None,
                 };
                 match metadata {
                     Some(metadata) => provenance::marked(expr, metadata),
@@ -1913,47 +2008,14 @@ impl GraphFunctions {
         // expanded keeps those names.
         if branches.len() == 1 && lowered.union {
             let branch = branches.pop().expect("one branch");
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            let mut renamed = false;
-            let projection: Vec<Expr> = branch
-                .schema()
-                .iter()
-                .map(|(q, f)| {
-                    let column = Expr::Column(Column::new(q.cloned(), f.name()));
-                    match counts.get_mut(f.name()) {
-                        Some(count) => {
-                            *count += 1;
-                            renamed = true;
-                            column.alias(format!("{}_{count}", f.name()))
-                        }
-                        None => {
-                            counts.insert(f.name().clone(), 0);
-                            column
-                        }
-                    }
-                })
-                .collect();
-            branches.push(match renamed {
-                true => LogicalPlanBuilder::from(branch)
-                    .project(projection)?
-                    .build()?,
-                false => branch,
-            });
+            branches.push(renamed_repeats(branch)?);
         }
         let mut branches = branches.into_iter();
         let mut plan = LogicalPlanBuilder::from(branches.next().expect("one branch at least"));
         for branch in branches {
             plan = plan.union(branch)?;
         }
-        // The schema says which pattern was matched.
-        let pattern = provenance::pattern_json(&lowered.edges);
-        let node = SchemaMetadataNode::try_new(
-            Arc::new(plan.build()?),
-            BTreeMap::from([(provenance::PATTERN.to_string(), pattern)]),
-        )?;
-        Ok(LogicalPlan::Extension(Extension {
-            node: Arc::new(node),
-        }))
+        plan.build()
     }
 
     fn first_argument_is_a_graph(
@@ -2595,6 +2657,159 @@ fn plan_reads_only_files(plan: &LogicalPlan) -> bool {
         Ok(TreeNodeRecursion::Continue)
     });
     files
+}
+
+/// `plan` with its repeated column names made unique, as a `UNION ALL`
+/// names them: `id`, `id_1`, `id_2`.
+fn renamed_repeats(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut renamed = false;
+    let projection: Vec<Expr> = plan
+        .schema()
+        .iter()
+        .map(|(q, f)| {
+            let column = Expr::Column(Column::new(q.cloned(), f.name()));
+            match counts.get_mut(f.name()) {
+                Some(count) => {
+                    *count += 1;
+                    renamed = true;
+                    column.alias(format!("{}_{count}", f.name()))
+                }
+                None => {
+                    counts.insert(f.name().clone(), 0);
+                    column
+                }
+            }
+        })
+        .collect();
+    match renamed {
+        true => LogicalPlanBuilder::from(plan).project(projection)?.build(),
+        false => Ok(plan),
+    }
+}
+
+/// The plans of a match's combinations of element tables (#412), as one
+/// `UNION ALL`: each column under the first plan's name, and cast to the
+/// type its values have in every plan.
+/// Per column of the plans of a match's combinations of element tables, the
+/// field metadata they all give it: what is true of the column in every
+/// combination (a column a combination does not mark says nothing).
+fn common_marks(plans: &[LogicalPlan]) -> Vec<BTreeMap<String, String>> {
+    let width = plans.iter().map(|p| p.schema().fields().len()).min();
+    (0..width.unwrap_or(0))
+        .map(|i| {
+            let mut marks: Option<BTreeMap<String, String>> = None;
+            for p in plans {
+                let field = p.schema().field(i);
+                let these: BTreeMap<String, String> = field
+                    .metadata()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                marks = Some(match marks {
+                    None => these,
+                    Some(mut m) => {
+                        m.retain(|k, v| these.get(k) == Some(v));
+                        m
+                    }
+                });
+            }
+            marks.unwrap_or_default()
+        })
+        .collect()
+}
+
+fn union_combinations(plans: Vec<LogicalPlan>) -> Result<LogicalPlan> {
+    let plans = plans
+        .into_iter()
+        .map(renamed_repeats)
+        .collect::<Result<Vec<_>>>()?;
+    let first = plans[0].schema().clone();
+    let width = first.fields().len();
+    if plans.iter().any(|p| p.schema().fields().len() != width) {
+        return Err(plan(
+            "in GRAPH_TABLE: the pattern's combinations of element tables return different numbers of columns; list the columns to return, or give the variables labels (#412)"
+                .to_string(),
+        ));
+    }
+    let mut types = Vec::with_capacity(width);
+    for i in 0..width {
+        let mut common = first.field(i).data_type().clone();
+        for p in &plans[1..] {
+            let t = p.schema().field(i).data_type();
+            common = super::pattern::common_type(&common, t).ok_or_else(|| {
+                plan(format!(
+                    "in GRAPH_TABLE: column '{}' is {} for one combination of the pattern's element tables and {t} for another, which do not mix; give the variables labels, or cast the column (#412)",
+                    first.field(i).name(),
+                    first.field(i).data_type()
+                ))
+            })?;
+        }
+        types.push(common);
+    }
+    let mut union: Option<LogicalPlanBuilder> = None;
+    for p in plans {
+        let same = p
+            .schema()
+            .fields()
+            .iter()
+            .zip(&types)
+            .all(|(f, t)| f.data_type() == t);
+        let p = match same {
+            true => p,
+            false => {
+                let projection: Vec<Expr> = p
+                    .schema()
+                    .iter()
+                    .zip(&types)
+                    .map(|((q, f), t)| {
+                        let column = Expr::Column(Column::new(q.cloned(), f.name()));
+                        match f.data_type() == t {
+                            true => column,
+                            // The cast keeps what the column says.
+                            false => {
+                                let cast = cast(column, t.clone()).alias(f.name());
+                                match f.metadata().is_empty() {
+                                    true => cast,
+                                    false => provenance::marked(
+                                        cast,
+                                        f.metadata()
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect(),
+                                    ),
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+                LogicalPlanBuilder::from(p).project(projection)?.build()?
+            }
+        };
+        union = Some(match union {
+            None => LogicalPlanBuilder::from(p),
+            Some(u) => u.union(p)?,
+        });
+    }
+    union.expect("two plans or more").build()
+}
+
+/// The pattern's edges for `ursa.pattern`: the same in every combination of
+/// element tables but for their tables, which are listed as `a|b` when they
+/// differ (#412).
+fn provenance_edges(combinations: &[super::pattern::Lowered]) -> Vec<provenance::PatternEdge> {
+    let mut edges = combinations[0].edges.clone();
+    for (i, edge) in edges.iter_mut().enumerate() {
+        let mut labels: Vec<&str> = Vec::new();
+        for c in combinations {
+            let label = c.edges[i].label.as_str();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        edge.label = labels.join("|");
+    }
+    edges
 }
 
 /// `e`, said in the pattern's terms when it is a property a variable does
