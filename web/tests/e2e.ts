@@ -1236,11 +1236,13 @@ for (const scheme of ["light", "dark"] as const) {
 
     // Several nodes: the counts, and a WHERE clause to copy. Node 33 and the
     // node furthest left, which the panel (on the right) is never over.
+    // Where they are once the camera has given back the panel's room.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    await roomSettled(g);
     const now33 = (await place(33))!;
     const all = await Promise.all(Array.from({ length: 34 }, (_, id) => place(id).then((at) => ({ id, ...at! }))));
     const left = all.filter((n) => n.id !== 33).reduce((a, b) => (b.x < a.x ? b : a));
-    await g.focus("#graph-stage canvas");
-    await g.keyboard.press("Escape");
     await g.mouse.click(box.x + now33.x, box.y + now33.y);
     const clear = await onCanvas(left.x, left.y);
     await g.keyboard.down("Shift");
@@ -1256,13 +1258,17 @@ for (const scheme of ["light", "dark"] as const) {
     if (shots) await g.screenshot({ path: `${shots}/graph-inspector-nodes.png` });
 
     // The panel never covers what was just selected: a node on the right
-    // of the view puts it on the left.
+    // of the view puts it on the left. The rightmost node once the camera
+    // has given back the room it made for the last panel (URSA-11: under
+    // load it had made it first, and the rightmost node was left of the
+    // panel).
     {
+      await g.focus("#graph-stage canvas");
+      await g.keyboard.press("Escape");
+      await roomSettled(g);
       const ids = Array.from({ length: 34 }, (_, i) => i);
       const places = await Promise.all(ids.map((id) => place(id)));
       const rightmost = places.reduce((a, b) => (b!.x > a!.x ? b : a))!;
-      await g.focus("#graph-stage canvas");
-      await g.keyboard.press("Escape");
       await g.mouse.click(box.x + rightmost.x, box.y + rightmost.y);
       const side = (await inspector())?.side;
       const covered = !(await onCanvas(rightmost.x, rightmost.y));
