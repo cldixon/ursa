@@ -22,6 +22,7 @@
 //! # async fn demo() {
 //! use ursa_shell::session::{Options, Session};
 //! let mut session = Session::new(Options::default());
+//! session.handle("hello", serde_json::json!({"protocol": 1}), Vec::new()).await.unwrap();
 //! let reply = session
 //!     .handle("feed", serde_json::json!({"line": "SELECT 42 AS answer;"}), Vec::new())
 //!     .await
@@ -53,8 +54,154 @@ use crate::highlight;
 use crate::print::{json_array_writer, DelimitedWriter, OutputFormat};
 use crate::shell::{Flow, Shell};
 
-/// The protocol's version, which `hello` reports.
+/// The protocol's version: what `hello` reports, and the only one it
+/// accepts.
 pub const PROTOCOL: u32 = 1;
+
+/// One operation of the protocol, as the protocol's document lists it
+/// (`docs/reference/protocol.md`, generated from [`OPS`]). Each field is
+/// Markdown for a table cell.
+#[derive(Debug, Clone, Copy)]
+pub struct Op {
+    /// The operation's name, as a request gives it in `op`.
+    pub name: &'static str,
+    /// Its arguments; `?` marks an optional one.
+    pub args: &'static str,
+    /// Its result, then its binary parts by name and kind.
+    pub result: &'static str,
+    /// What it does.
+    pub about: &'static str,
+}
+
+/// Every operation [`Session::handle`] runs, in the protocol document's
+/// order. `handle` refuses any other name, and a test runs each of these
+/// through it and checks the document against this list, so the three agree.
+pub const OPS: &[Op] = &[
+    Op {
+        name: "hello",
+        args: "`protocol`, `client?: {name, kind}`, `session?: \"new\" \\| \"shared\"`",
+        result: "`{protocol, version, transport, capabilities, session: {kind}}`",
+        about: "Must be the first request: any other before it fails with `protocol`. \
+                Refuses a `protocol` other than 1. `session` asks the host for a session \
+                of its own (`new`, the shell's) or the one it shares (`shared`, the \
+                default: the console's and agents')",
+    },
+    Op {
+        name: "cancel",
+        args: "`target`",
+        result: "`{}`",
+        about: "Stops the running request `target`, which then fails with `cancelled`. \
+                A host with capability `cancel` answers it ahead of the queue; a request \
+                that reaches the session has nothing running, so it answers `{}`",
+    },
+    Op {
+        name: "start",
+        args: "`commands?`, `shortcuts?`, `graphMaxEdges?`",
+        result: "`{version, prompt, promptColor}`",
+        about: "A fresh shell, with the host's dot-commands (`[[name, args, help]]`), \
+                its `.help shortcuts` text and its default `ursa.graph_max_edges`",
+    },
+    Op {
+        name: "feed",
+        args: "`line`",
+        result: "`{out, err, flow, command, prompt, continuation, pending}`",
+        about: "Runs one typed line, as the CLI does. `flow` is `continue`, `exit` \
+                (`.quit`) or `host` (a host's dot-command, in `command`)",
+    },
+    Op {
+        name: "cancelInput",
+        args: "—",
+        result: "`{prompt}`",
+        about: "Drops a half-typed statement (Ctrl-C at the prompt); \
+                `cancel` stops a running request",
+    },
+    Op {
+        name: "width",
+        args: "`columns`",
+        result: "`{}`",
+        about: "The terminal's width: tables are drawn no wider (0: no limit)",
+    },
+    Op {
+        name: "highlightAnsi",
+        args: "`text`, `alone?`",
+        result: "`{text}`",
+        about: "`text` coloured as the shell colours what is typed: after what is \
+                pending, or with `alone`, as a statement of its own",
+    },
+    Op {
+        name: "memory",
+        args: "—",
+        result: "`{bytes, kind: \"wasm\" \\| \"rss\"}`",
+        about: "The engine's memory: its WebAssembly memory in the browser, the \
+                process's resident set natively (`bytes` is `null` where it cannot be read)",
+    },
+    Op {
+        name: "query",
+        args: "`sql`, `rows?` (1,000)",
+        result: "`{columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`)",
+        about: "Runs `sql` for the console; the last statement's result becomes the \
+                last result (`graph.open`, `export`). `columns` are `[{name, type, \
+                nullable, metadata}]`, `metadata` is the schema's (`ursa.pattern`), \
+                `rows` the whole result's count; the part holds the first `rows` rows \
+                as an Arrow IPC stream",
+    },
+    Op {
+        name: "addFile",
+        args: "`name`; the file as the request's one part",
+        result: "`{url}`",
+        about: "Puts a file in the session's files, at `memory://uploads/`",
+    },
+    Op {
+        name: "files",
+        args: "—",
+        result: "`{files: [{name, url, bytes}]}`",
+        about: "The session's files: added ones, and those `COPY … TO 'name'` wrote",
+    },
+    Op {
+        name: "export",
+        args: "`format`",
+        result: "`{}`; `bytes` (`bytes`)",
+        about: "The last result, every row, as `csv`, `json`, `arrow` or `parquet`",
+    },
+    Op {
+        name: "graph.open",
+        args: "`text`",
+        result: "`{skipped}`; `ugr` (`ugr`), `positions?` (`f32`)",
+        about: "Opens a graph to draw (`.graph TEXT`). `positions`, every `x` then \
+                every `y`, only with `POSITIONS`",
+    },
+    Op {
+        name: "graph.explore",
+        args: "`command`",
+        result: "`{out, err, nodes, edges, delta: null}`; `delta?` (`ugr`)",
+        about: "Runs `.expand`, `.hide`, `.show`, `.undo`, `.redo` or `.graph \
+                history` on the open graph; `delta` only when the graph changed",
+    },
+    Op {
+        name: "graph.find",
+        args: "`command`",
+        result: "`{out, err, matches, notShown, notShownTotal}`; `selected` (`u32`)",
+        about: "Runs `.find`: the matches shown, as node slots, the best first",
+    },
+    Op {
+        name: "graph.notShown",
+        args: "—",
+        result: "`{}`; `counts` (`u32`)",
+        about: "For each node slot, its edges to nodes not shown: the view's `+N`",
+    },
+    Op {
+        name: "graph.inspect",
+        args: "`node, key, neighbours?` or `edge, src, dst`",
+        result: "inspect's JSON, with `ms`",
+        about: "What the graph's tables say of a node or an edge",
+    },
+    Op {
+        name: "graph.close",
+        args: "—",
+        result: "`{}`",
+        about: "Closes the open graph",
+    },
+];
 
 /// How a session is set up.
 #[derive(Debug, Clone)]
@@ -292,6 +439,8 @@ pub struct Session {
     /// The session's files, at `memory://uploads/`, if it has them.
     uploads: Option<Arc<InMemory>>,
     options: Options,
+    /// Whether `hello` came: every other operation waits for it.
+    greeted: bool,
 }
 
 impl Session {
@@ -320,29 +469,14 @@ impl Session {
             width,
             uploads,
             options,
+            greeted: false,
         }
     }
 
     /// Run the operation `op` with its JSON `args` and binary `parts`
-    /// (`design/console.md` §4.3). The operations:
-    ///
-    /// | op | args | result, parts |
-    /// |---|---|---|
-    /// | `hello` | `client?` | `{protocol, version, transport, capabilities}` |
-    /// | `start` | `commands?`, `shortcuts?`, `graphMaxEdges?` | a fresh session: `{version, prompt, promptColor}` |
-    /// | `feed` | `line` | `{out, err, flow, command, prompt, continuation, pending}` |
-    /// | `cancelInput` | — | drops a half-typed statement: `{prompt}` |
-    /// | `width` | `columns` | `{}` |
-    /// | `highlightAnsi` | `text`, `alone?` | `{text}` |
-    /// | `addFile` | `name`; the file as a part | `{url}` |
-    /// | `files` | — | `{files: [{name, url, bytes}]}` |
-    /// | `export` | `format` | `{}`; `bytes`: the last result |
-    /// | `graph.open` | `text` | `{skipped}`; `ugr`, and `positions` (`f32`) with `POSITIONS` |
-    /// | `graph.explore` | `command` | `{out, err, nodes, edges, delta: null}`; `delta` (`ugr`) if it changed |
-    /// | `graph.find` | `command` | `{out, err, matches, notShown, notShownTotal}`; `selected` (`u32`) |
-    /// | `graph.notShown` | — | `counts` (`u32`) |
-    /// | `graph.inspect` | `node, key, neighbours?` or `edge, src, dst` | inspect's JSON, with `ms` |
-    /// | `graph.close` | — | `{}` |
+    /// (`design/console.md` §4.3). [`OPS`] lists the operations, and
+    /// `docs/reference/protocol.md` is generated from it. The first request
+    /// must be `hello`.
     ///
     /// SQL and command errors are what `feed`, `graph.explore` and
     /// `graph.find` print; the other operations fail with an [`Error`].
@@ -353,15 +487,65 @@ impl Session {
         mut parts: Vec<Vec<u8>>,
     ) -> std::result::Result<Reply, Error> {
         let a = Args(&args);
+        if !OPS.iter().any(|o| o.name == op) {
+            return Err(Error::protocol(format!("unknown op {op}")));
+        }
+        if !self.greeted && op != "hello" {
+            return Err(Error::protocol(format!(
+                "the first request must be hello, not {op}"
+            )));
+        }
         match op {
-            "hello" => Ok(Reply::json(json!({
-                "protocol": PROTOCOL,
-                "version": self.options.version,
-                "transport": self.options.transport,
-                "capabilities": self.options.capabilities,
-            }))),
+            "hello" => {
+                let protocol = args.get("protocol").and_then(Value::as_u64);
+                if protocol != Some(u64::from(PROTOCOL)) {
+                    let asked = args.get("protocol").map_or("none".into(), Value::to_string);
+                    return Err(Error::protocol(format!(
+                        "this session speaks protocol {PROTOCOL}, not {asked}"
+                    )));
+                }
+                let kind = match args.get("session") {
+                    None | Some(Value::Null) => "shared",
+                    Some(v) => match v.as_str() {
+                        Some("new") => "new",
+                        Some("shared") => "shared",
+                        _ => {
+                            return Err(Error::protocol(format!(
+                                "hello's session is \"new\" or \"shared\", not {v}"
+                            )))
+                        }
+                    },
+                };
+                self.greeted = true;
+                Ok(Reply::json(json!({
+                    "protocol": PROTOCOL,
+                    "version": self.options.version,
+                    "transport": self.options.transport,
+                    "capabilities": self.options.capabilities,
+                    "session": {"kind": kind},
+                })))
+            }
+            // The host answers `cancel` while `target` runs; here nothing is
+            // running, so there is nothing to stop.
+            "cancel" => Ok(Reply::json(json!({}))),
+            "memory" => Ok(Reply::json(memory())),
+            "query" => {
+                let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(1_000);
+                let (result, arrow) = self.query(a.str("sql")?, rows as usize).await?;
+                Ok(Reply {
+                    result,
+                    parts: vec![Part {
+                        name: "arrow",
+                        kind: PartKind::Arrow,
+                        bytes: arrow,
+                    }],
+                })
+            }
             "start" => {
-                *self = Session::new(self.options.clone());
+                *self = Session {
+                    greeted: true,
+                    ..Session::new(self.options.clone())
+                };
                 if let Some(commands) = args.get("commands").and_then(Value::as_array) {
                     for command in commands {
                         let field = |i: usize| command.get(i).and_then(Value::as_str).unwrap_or("");
@@ -510,8 +694,71 @@ impl Session {
                 self.close_graph();
                 Ok(Reply::json(json!({})))
             }
-            other => Err(Error::protocol(format!("unknown op {other}"))),
+            other => unreachable!("{other} is in OPS but not handled"),
         }
+    }
+
+    /// Run `sql` (one or more statements) for the console: the last
+    /// statement's result becomes the shell's last result (`.graph`,
+    /// `export`). Gives `{columns, metadata, rows, more, ms, notices}`, where
+    /// `columns` are `[{name, type, nullable, metadata}]`, `metadata` is the
+    /// schema's own (`ursa.pattern` sits there for a `GRAPH_TABLE` result)
+    /// and `rows` the whole result's count; and the first `rows` rows as an
+    /// Arrow IPC stream, the metadata inside its schema.
+    pub async fn query(&mut self, sql: &str, rows: usize) -> Result<(Value, Vec<u8>)> {
+        let start = Instant::now();
+        let ctx = self.shell.context().clone();
+        let mut last = None;
+        for (statement, text) in ursa_sql::parse_sql_with_text_for(&ctx, sql)? {
+            let frame = ursa_sql::execute_with_text(&ctx, statement, &text).await?;
+            let schema: SchemaRef = Arc::clone(frame.schema().inner());
+            let batches = frame.collect().await?;
+            last = Some((schema, batches));
+        }
+        let (schema, batches) =
+            last.ok_or_else(|| DataFusionError::Plan("no statement to run".into()))?;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut first = Vec::new();
+        let mut left = rows;
+        for batch in &batches {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(batch.num_rows());
+            first.push(batch.slice(0, take));
+            left -= take;
+        }
+        let arrow = encode(&schema, &first, "arrow")?;
+        let columns: Vec<Value> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                json!({
+                    "name": f.name(),
+                    "type": f.data_type().to_string(),
+                    "nullable": f.is_nullable(),
+                    "metadata": f.metadata(),
+                })
+            })
+            .collect();
+        // A statement with no columns (CREATE, SET) says it ran.
+        let notices: Vec<&str> = if columns.is_empty() {
+            vec!["OK"]
+        } else {
+            vec![]
+        };
+        if !columns.is_empty() {
+            self.shell.set_last_result(Arc::clone(&schema), batches);
+        }
+        let result = json!({
+            "columns": columns,
+            "metadata": schema.metadata(),
+            "rows": total,
+            "more": total > rows,
+            "ms": start.elapsed().as_secs_f64() * 1000.0,
+            "notices": notices,
+        });
+        Ok((result, arrow))
     }
 
     /// The table width: tables are drawn no wider.
@@ -669,6 +916,27 @@ impl Session {
         self.uploads
             .as_deref()
             .ok_or_else(|| DataFusionError::Plan("this session keeps no files".into()))
+    }
+}
+
+/// The engine's memory, `{bytes, kind}`: in the browser its WebAssembly
+/// memory (`wasm`), natively the process's resident set (`rss`), which is
+/// `null` where it cannot be read (only Linux's `/proc` is).
+fn memory() -> Value {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pages = core::arch::wasm32::memory_size::<0>() as u64;
+        json!({"bytes": pages * 65_536, "kind": "wasm"})
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let rss = || -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let line = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?;
+            let kb: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+            Some(kb * 1024)
+        };
+        json!({"bytes": rss(), "kind": "rss"})
     }
 }
 

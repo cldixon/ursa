@@ -1585,3 +1585,195 @@ async fn path_searches_give_pinned_rows_from_a_built_and_a_stored_index() {
         "{message}"
     );
 }
+
+/// Write a vertex table (`id`) of `n` keys and an edge table (`src`, `dst`)
+/// of `m` edges between them, as Parquet in `dir` (`nodes_<tag>.parquet`,
+/// `edges_<tag>.parquet`), from a seeded generator. The keys are spread
+/// over 2^40 (so integer keys are hashed, not held in a direct table) in a
+/// scrambled order, a quarter of them are on no edge, and about one edge in
+/// 97 has an endpoint that is no key, so it is dropped. With `strings`, each
+/// key is `u` and its digits.
+fn write_vertex_graph(dir: &Path, tag: &str, n: u64, m: usize, strings: bool) {
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    let key = |i: u64| ((i * 2_654_435_761) % (1 << 40)) as i64;
+    let column = |values: Vec<i64>| -> ArrayRef {
+        match strings {
+            true => Arc::new(StringArray::from_iter_values(
+                values.iter().map(|v| format!("u{v}")),
+            )),
+            false => Arc::new(Int64Array::from(values)),
+        }
+    };
+    let id_type = if strings {
+        DataType::Utf8
+    } else {
+        DataType::Int64
+    };
+    let write = |path: PathBuf, names: &[&str], columns: Vec<ArrayRef>| {
+        let fields: Vec<Field> = names
+            .iter()
+            .map(|n| Field::new(*n, id_type.clone(), false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let rows = batch.num_rows();
+        let mut at = 0;
+        while at < rows {
+            let len = (rows - at).min(1 << 16);
+            writer.write(&batch.slice(at, len)).unwrap();
+            at += len;
+        }
+        writer.close().unwrap();
+    };
+    // The keys in a scrambled order: `i * 7919 mod n` visits each once (n
+    // is not a multiple of 7919).
+    assert_ne!(n % 7919, 0);
+    let nodes: Vec<i64> = (0..n).map(|i| key(i * 7919 % n)).collect();
+    write(
+        dir.join(format!("nodes_{tag}.parquet")),
+        &["id"],
+        vec![column(nodes)],
+    );
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    // Endpoints among the first three quarters of the keys, skewed toward
+    // the low ones; the rest of the keys are isolated nodes.
+    let reach = n * 3 / 4;
+    let mut endpoint = || {
+        let r = next() % reach;
+        key(r * (next() % reach) / reach)
+    };
+    let (mut src, mut dst) = (Vec::with_capacity(m), Vec::with_capacity(m));
+    for e in 0..m {
+        src.push(endpoint());
+        let d = endpoint();
+        dst.push(if e % 97 == 5 { (1 << 41) + e as i64 } else { d });
+    }
+    write(
+        dir.join(format!("edges_{tag}.parquet")),
+        &["src", "dst"],
+        vec![column(src), column(dst)],
+    );
+}
+
+/// A hash of a stored index's contents (#532): its topology, its ids in
+/// dense order, its id lookup table and the edges it dropped, FNV-1a over
+/// their little-endian bytes. The same for the same index on every
+/// platform and run.
+fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::Int64Type;
+    let stored = ursa_engine::database::index_file::read_file(path, key).unwrap();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    let topology = &stored.topology;
+    eat(&(topology.n_nodes() as u64).to_le_bytes());
+    eat(&(topology.n_edges() as u64).to_le_bytes());
+    let out = topology.out();
+    for &o in out.offsets.iter() {
+        eat(&o.to_le_bytes());
+    }
+    for (&t, &e) in out.targets.iter().zip(out.edge_ids.iter()) {
+        eat(&t.to_le_bytes());
+        eat(&e.to_le_bytes());
+    }
+    let ids = stored.ids.user_id_array();
+    match ids.data_type() {
+        DataType::Int64 => {
+            for &id in ids.as_primitive::<Int64Type>().values().iter() {
+                eat(&id.to_le_bytes());
+            }
+        }
+        _ => {
+            let ids = ids.as_string::<i32>();
+            for i in 0..ids.len() {
+                eat(ids.value(i).as_bytes());
+                eat(b"\n");
+            }
+        }
+    }
+    for &slot in stored.ids.lookup_table().unwrap().iter() {
+        eat(&slot.to_le_bytes());
+    }
+    eat(&stored.dropped.n_dropped.to_le_bytes());
+    if let Some(kept) = &stored.dropped.kept {
+        for keep in kept.iter() {
+            eat(&[keep as u8]);
+        }
+    }
+    h
+}
+
+/// The index built for a graph with a vertex table is pinned (#532): the
+/// `describe(g, full => true)` row and a hash of the stored index (its node
+/// numbering, topology, id lookup table and dropped edges), for integer and
+/// for string keys. The hashes were recorded before the vertex-table build
+/// was made faster, so the build gives the same index it gave before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vertex_table_build_gives_the_pinned_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n, m) = (60_001, 250_000);
+    write_vertex_graph(dir.path(), "int", n, m, false);
+    write_vertex_graph(dir.path(), "str", n, m, true);
+    let db = dir.path().join("pinned.ursa");
+    let ctx = open(&db).await;
+    for tag in ["int", "str"] {
+        let nodes = dir.path().join(format!("nodes_{tag}.parquet"));
+        let edges = dir.path().join(format!("edges_{tag}.parquet"));
+        ok(
+            &ctx,
+            &format!(
+                "CREATE VIEW n_{tag} AS FROM '{}';
+                 CREATE VIEW e_{tag} AS FROM '{}';
+                 CREATE PROPERTY GRAPH g_{tag} VERTEX TABLES (n_{tag})
+                   EDGE TABLES (e_{tag} SOURCE KEY (src) REFERENCES n_{tag} (id)
+                                        DESTINATION KEY (dst) REFERENCES n_{tag} (id));",
+                nodes.display(),
+                edges.display()
+            ),
+        )
+        .await;
+    }
+    let mut rows = Vec::new();
+    for tag in ["int", "str"] {
+        let row = ok(
+            &ctx,
+            &format!(
+                "SELECT n_nodes, n_edges, n_components, n_dropped_edges, round(density, 12)
+                 FROM describe(g_{tag}, full => true)"
+            ),
+        )
+        .await;
+        rows.push(row.join(";"));
+    }
+    close(ctx);
+    let index_dir = dir.path().join("pinned.ursa.d/indexes");
+    let entries = read_manifest(&index_dir);
+    let mut hashes = Vec::new();
+    for tag in ["int", "str"] {
+        let entry = entries
+            .iter()
+            .find(|e| e.graph == format!("g_{tag}"))
+            .unwrap_or_else(|| panic!("no stored index for g_{tag}"));
+        hashes.push(index_hash(&index_dir.join(&entry.file), &entry.key));
+    }
+    let row = "60001,247422,18810,2578,0.000068727188";
+    assert_eq!(rows, [row, row], "the describe rows changed");
+    assert_eq!(
+        hashes,
+        [236861135069851834, 8257638453979474348],
+        "the stored indexes changed"
+    );
+}

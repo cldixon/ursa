@@ -90,6 +90,16 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
       if (!reply.ok) throw new Error(`${op}: ${reply.error.message}`);
       return reply.result;
     };
+    // hello first: the session refuses anything else before it, and
+    // another version.
+    const early = JSON.parse((await shell.handle("width", JSON.stringify({ columns: 0 }), [])).message);
+    if (early.ok || early.error.kind !== "protocol") throw new Error("a request before hello was answered");
+    const v2 = JSON.parse((await shell.handle("hello", JSON.stringify({ protocol: 2 }), [])).message);
+    if (v2.ok || v2.error.kind !== "protocol") throw new Error("hello took protocol 2");
+    const hello = await call("hello", { protocol: 1, client: { name: "parity", kind: "agent" }, session: "new" });
+    if (hello.transport !== "wasm" || hello.protocol !== 1) throw new Error(`hello: ${JSON.stringify(hello)}`);
+    const memory = await call("memory", {});
+    if (memory.kind !== "wasm" || !(memory.bytes > 0)) throw new Error(`memory: ${JSON.stringify(memory)}`);
     await call("width", { columns: 0 });
     let shellOut = "";
     let shellErr = "";
