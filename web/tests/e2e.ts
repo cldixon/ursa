@@ -44,7 +44,22 @@ const launched = await chromium.launch(process.env.URSA_SERVE_TOKEN ? { args: ["
 const serveToken = process.env.URSA_SERVE_TOKEN ?? "";
 const overSocket = serveToken !== "";
 const serveCookie = overSocket ? `ursa_token_${new URL(base).port}=${serveToken}` : "";
-const skip = (label: string) => console.log(`skip ${label}: browser-only (the wasm engine)`);
+// The checks a socket run skips, and no others: the suite's end checks that
+// exactly these were skipped, so a check can't quietly drop out of the socket
+// run (CI runs both transports, .github/workflows/shell-e2e.yml).
+const SOCKET_SKIPS = [
+  "an engine crash is reported",
+  "the shell works after an engine crash",
+  "graphMemory: each wasm instance's memory, and the browser's measure of the page",
+  "cross-origin isolation headers on /engine/engine.json",
+  "cross-origin isolation headers on the engine's .wasm",
+  "the worker /engine-worker.js is cross-origin isolated",
+];
+const skipped: string[] = [];
+const skip = (label: string) => {
+  skipped.push(label);
+  console.log(`skip ${label}: browser-only (the wasm engine)`);
+};
 const withToken = async <C extends { addCookies(c: { name: string; value: string; url: string }[]): Promise<void> }>(c: C) => {
   if (overSocket) await c.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: serveToken, url: base }]);
   return c;
@@ -880,13 +895,17 @@ async function watchedContext(options: Parameters<typeof browser.newContext>[0])
 }
 const graphInfo = (p: Page): Promise<any> => p.evaluate(() => (window as any).ursaShell.graph());
 const graphOpen = (p: Page): Promise<boolean> => p.evaluate(() => (window as any).ursaShell.graphOpen());
-/** Wait until the view has drawn a frame and its layout has run to the end. */
+/**
+ * Wait until the view has drawn a frame, its layout has run to the end, and
+ * the layout's last positions are drawn: they can come with its "done",
+ * after the last frame (`pending`, URSA-10, URSA-11).
+ */
 async function graphSettled(p: Page) {
   try {
     await p.waitForFunction(
       () => {
         const g = (window as any).ursaShell.graph();
-        return g && g.frames > 0 && g.layoutDone;
+        return g && g.frames > 0 && g.layoutDone && !g.pending;
       },
       null,
       { timeout: 60_000, polling: 200 },
@@ -1066,24 +1085,33 @@ for (const scheme of ["light", "dark"] as const) {
     check(/^Selected node 33: (label \S+, )?degree 17 · 34 nodes · 78 edges$/.test(await statusText()) && live === "polite" && info.selection.length === 1 && info.picked?.index === n33.index && info.frames > drawnBefore, "a click on node 33 selects it, and the status names it", await statusText());
     const selectedInk = await g.evaluate(() => (window as any).ursaShell.graphInked());
 
-    // Shift+click adds node 0; Shift+click on it again takes it out.
+    // Shift+click adds node 0; Shift+click on it again takes it out. Each
+    // click where node 0 is once the camera has made room for the
+    // inspector's panel (#493), which a selection opens: under load the
+    // camera moved between a place and its click (URSA-11).
+    await roomSettled(g);
+    const n0Now = (await place(0))!;
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.mouse.click(box.x + n0Now.x, box.y + n0Now.y);
     await g.keyboard.up("Shift");
     info = await graphInfo(g);
     check(/^Selected 2 nodes: 33, 0 · 34 nodes · 78 edges$/.test(await statusText()) && info.selection.map((n: any) => n.index).join() === `${n33.index},${n0.index}`, "Shift+click selects two", await statusText());
+    await roomSettled(g);
+    const n0Then = (await place(0))!;
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.mouse.click(box.x + n0Then.x, box.y + n0Then.y);
     await g.keyboard.up("Shift");
     check(/^Selected node 33: /.test(await statusText()), "Shift+click on a selected node takes it out", await statusText());
 
     // A drag on empty space pans, and keeps the selection.
+    await roomSettled(g);
+    const from33 = (await place(33))!;
     await g.mouse.move(box.x + 4, box.y + 4);
     await g.mouse.down();
     await g.mouse.move(box.x + 24, box.y + 14, { steps: 4 });
     await g.mouse.up();
     const moved = (await place(33))!;
-    check(Math.abs(moved.x - n33.x - 20) <= 1.5 && Math.abs(moved.y - n33.y - 10) <= 1.5 && /^Selected node 33: /.test(await statusText()), "a drag on empty space pans, and keeps the selection", JSON.stringify(moved));
+    check(Math.abs(moved.x - from33.x - 20) <= 1.5 && Math.abs(moved.y - from33.y - 10) <= 1.5 && /^Selected node 33: /.test(await statusText()), "a drag on empty space pans, and keeps the selection", JSON.stringify(moved));
 
     // A click on empty space clears it, and the frame loses the selection's ink.
     await g.mouse.click(box.x + 4, box.y + 4);
@@ -1094,6 +1122,7 @@ for (const scheme of ["light", "dark"] as const) {
     check(selectedInk.inked > clearedInk.inked, "the selected node's ring and wide edges are drawn", `${selectedInk.inked} px inked selected, ${clearedInk.inked} cleared`);
 
     // Esc, with the focus in the pane, clears a selection and leaves the pane open.
+    await roomSettled(g);
     const again = (await place(33))!;
     await g.mouse.click(box.x + again.x, box.y + again.y);
     await g.focus("#graph-stage canvas");
@@ -1229,24 +1258,39 @@ for (const scheme of ["light", "dark"] as const) {
     check((await graphInfo(g)).pinned.length === 0, "unpin takes the pin off");
 
     // An edge: a click on it, with no node there, shows its ends and its row.
-    const [a0, a1] = [(await place(0))!, (await place(1))!];
-    const mid = { x: (a0.x + a1.x) / 2, y: (a0.y + a1.y) / 2 };
-    const under = await g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [mid.x, mid.y]);
-    // With nothing selected: the panel is over part of the view while it is open.
+    // With nothing selected: the panel is over part of the view while it is
+    // open. And once the camera has given back the room it made for the
+    // panel (#493), so that the edge is where it is clicked.
     await g.focus("#graph-stage canvas");
     await g.keyboard.press("Escape");
-    await g.mouse.click(box.x + mid.x, box.y + mid.y);
+    await roomSettled(g);
+    const tie = async () => {
+      const [a0, a1] = [(await place(0))!, (await place(1))!];
+      return { a0, a1, mid: { x: (a0.x + a1.x) / 2, y: (a0.y + a1.y) / 2 } };
+    };
+    const clicked = await tie();
+    const under = await g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [clicked.mid.x, clicked.mid.y]);
+    await g.mouse.click(box.x + clicked.mid.x, box.y + clicked.mid.y);
     await rowsRead();
     shown = await inspector();
     info = await graphInfo(g);
     check(under?.src == 0 && under?.dst == 1 && info.edge?.src.id == 0 && info.edge?.dst.id == 1 && info.selection.length === 0 && /^Selected edge 0 → 1 · 34 nodes · 78 edges$/.test(await statusText()), "a click on an edge selects it, and the status names it", `${JSON.stringify(under)} ${await statusText()}`);
     check(shown?.kind === "edge" && shown.title === "edge 0 → 1" && shown.table === "ties" && shown.rows.length === 1 && row(shown).src === "0" && row(shown).dst === "1" && /from\s*0/.test(shown.text) && /to\s*1/.test(shown.text), "clicking a tie shows its ends and its row", JSON.stringify(shown?.rows));
-    // 3 px off the edge is still the edge; 12 px off is empty space.
+    // 3 px off the edge is still the edge; 12 px off is empty space. Where
+    // the edge is now: 450 ms after the selection the camera makes room for
+    // the edge's panel, which can be on the other side from node 33's, and
+    // moves the edge (URSA-11: under load, that came before these picks).
+    await roomSettled(g);
+    const { a0, a1, mid } = await tie();
     const [ex, ey] = [a1.x - a0.x, a1.y - a0.y];
     const len = Math.hypot(ex, ey);
     const off = (d: number) => g.evaluate(([x, y]) => (window as any).ursaShell.graphEdgeAt(x, y), [mid.x - (ey / len) * d, mid.y + (ex / len) * d]);
-    const [near, far] = [await off(3), await off(12)];
-    check(near?.index === under?.index && far?.index !== under?.index, "an edge is picked within 4 px of it, and no further", `${JSON.stringify(near)} ${JSON.stringify(far)}`);
+    const [on, near, far] = [await off(0), await off(3), await off(12)];
+    check(
+      on?.index === under?.index && near?.index === under?.index && far?.index !== under?.index,
+      "an edge is picked within 4 px of it, and no further",
+      `${JSON.stringify(on)} ${JSON.stringify(near)} ${JSON.stringify(far)}; room ${JSON.stringify((await graphInfo(g)).room)}`,
+    );
     // An end's button selects that node.
     await press("select");
     await rowsRead();
@@ -1255,15 +1299,21 @@ for (const scheme of ["light", "dark"] as const) {
 
     // Several nodes: the counts, and a WHERE clause to copy. Node 33 and the
     // node furthest left, which the panel (on the right) is never over.
+    // Where they are once the camera has given back the panel's room.
+    await g.focus("#graph-stage canvas");
+    await g.keyboard.press("Escape");
+    await roomSettled(g);
     const now33 = (await place(33))!;
     const all = await Promise.all(Array.from({ length: 34 }, (_, id) => place(id).then((at) => ({ id, ...at! }))));
     const left = all.filter((n) => n.id !== 33).reduce((a, b) => (b.x < a.x ? b : a));
-    await g.focus("#graph-stage canvas");
-    await g.keyboard.press("Escape");
     await g.mouse.click(box.x + now33.x, box.y + now33.y);
-    const clear = await onCanvas(left.x, left.y);
+    // The left node where it is once the camera has made room for node
+    // 33's panel (under load it moved between the place and the click).
+    await roomSettled(g);
+    const leftNow = (await place(left.id))!;
+    const clear = await onCanvas(leftNow.x, leftNow.y);
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + left.x, box.y + left.y);
+    await g.mouse.click(box.x + leftNow.x, box.y + leftNow.y);
     await g.keyboard.up("Shift");
     shown = await inspector();
     const where = `WHERE id IN (33, ${left.id})`;
@@ -1275,13 +1325,17 @@ for (const scheme of ["light", "dark"] as const) {
     if (shots) await g.screenshot({ path: `${shots}/graph-inspector-nodes.png` });
 
     // The panel never covers what was just selected: a node on the right
-    // of the view puts it on the left.
+    // of the view puts it on the left. The rightmost node once the camera
+    // has given back the room it made for the last panel (URSA-11: under
+    // load it had made it first, and the rightmost node was left of the
+    // panel).
     {
+      await g.focus("#graph-stage canvas");
+      await g.keyboard.press("Escape");
+      await roomSettled(g);
       const ids = Array.from({ length: 34 }, (_, i) => i);
       const places = await Promise.all(ids.map((id) => place(id)));
       const rightmost = places.reduce((a, b) => (b!.x > a!.x ? b : a))!;
-      await g.focus("#graph-stage canvas");
-      await g.keyboard.press("Escape");
       await g.mouse.click(box.x + rightmost.x, box.y + rightmost.y);
       const side = (await inspector())?.side;
       const covered = !(await onCanvas(rightmost.x, rightmost.y));
@@ -1294,7 +1348,10 @@ for (const scheme of ["light", "dark"] as const) {
     check((await graphOpen(g)) && (await inspector()) === null && (await g.locator("#graph-stage .graph-inspector").isHidden()), "Esc clears the selection and closes the inspector, not the pane");
 
     // A button runs its command in the terminal: colour by redraws the graph.
-    await g.mouse.click(box.x + now33.x, box.y + now33.y);
+    // Node 33 where it is once the camera has given back the panel's room.
+    await roomSettled(g);
+    const back33 = (await place(33))!;
+    await g.mouse.click(box.x + back33.x, box.y + back33.y);
     await rowsRead();
     await g.locator("#graph-stage .graph-inspector dd", { hasText: "Officer" }).locator("button", { hasText: "colour by" }).click();
     await idle(g);
@@ -2654,12 +2711,6 @@ for (const scheme of ["light", "dark"] as const) {
   const ink = () => k.evaluate(() => (window as any).ursaShell.graphInked());
   const openIs = (groups: number[]) =>
     k.waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g?.grouped && g.grouped.open.join() === want && !(window as any).ursaShell.busy(); }, groups.join(), { timeout: 30_000, polling: 50 }).catch(() => {});
-  // The layout done, and its last positions drawn: they can come with its
-  // "done", after the frame graphSettled saw (URSA-10).
-  const groupsSettled = async () => {
-    await graphSettled(k);
-    await k.waitForFunction(() => !(window as any).ursaShell.graph().pending, null, { timeout: 30_000, polling: 50 }).catch(() => {});
-  };
   // What SQL says of the clubs: their sizes, and the ties between them.
   await type("SELECT club, count(*) AS n FROM members GROUP BY club ORDER BY n DESC, club;", k);
   const clubs = lastTable(await screen(k)).rows;
@@ -2669,7 +2720,7 @@ for (const scheme of ["light", "dark"] as const) {
   const inside = Object.fromEntries(lastTable(await screen(k)).rows);
 
   await type(".graph karate GROUP BY club", k);
-  await groupsSettled();
+  await graphSettled(k);
   let g = await graphInfo(k);
   const said = (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "");
   check(
@@ -2823,7 +2874,7 @@ for (const scheme of ["light", "dark"] as const) {
     window.requestAnimationFrame = (window as any).__raf;
     await (window as any).ursaShell.graphInked();
   });
-  await groupsSettled();
+  await graphSettled(k);
   check(
     ending.layoutDone && ending.pending && ending.frames > 0 && ended.inked === closed.inked && ended.palette.join() === closed.palette.join(),
     "GROUP BY: a read-back as the layout ends, before a frame has drawn its last positions, is of those",
@@ -3451,7 +3502,7 @@ for (const phone of [false, true]) {
       .waitForFunction(
         () => {
           const g = (window as any).paneHost.pane.view()?.info();
-          return g && g.frames > 0 && g.layoutDone;
+          return g && g.frames > 0 && g.layoutDone && !g.pending;
         },
         null,
         { timeout: 60_000, polling: 200 },
@@ -3634,6 +3685,11 @@ for (const path of [
   await ictx.close();
 }
 check(violations.length === 0, "no Content Security Policy violations", violations.slice(0, 3).join(" | "));
+check(
+  overSocket ? skipped.length === SOCKET_SKIPS.length && SOCKET_SKIPS.every((l) => skipped.includes(l)) : skipped.length === 0,
+  overSocket ? `the socket run skipped exactly the ${SOCKET_SKIPS.length} browser-only checks` : "the worker run skipped no check",
+  `skipped: ${JSON.stringify(skipped)}`,
+);
 
 await browser.close();
 console.log(failures.length ? `\n${failures.length} failures:\n- ${failures.join("\n- ")}` : "\nall passed");

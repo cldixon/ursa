@@ -182,8 +182,11 @@ export function createPane({ container, engine, commands, status: report, focus 
    * nothing for the last result), replacing what the pane drew.
    *
    * The pane opens with "Loading graph view…" as soon as the engine takes
-   * more than a moment (at once, for a big graph; not at all, for a typo),
-   * and graph.js starts loading then, while the engine still works.
+   * more than a moment (at once, for a big graph; not at all, for a quick
+   * typo). graph.js, and ursa-viz with it, is first downloaded once the
+   * engine has the graph: a `.graph` that fails downloads none of it,
+   * however long the engine took to say so (URSA-11). Once downloaded, its
+   * layout worker starts with the pane, while the engine still works.
    */
   async function draw(text, line = `.graph ${text}`) {
     const t = (times = { enter: performance.now(), command: `.graph ${text}`.trim() });
@@ -195,7 +198,7 @@ export function createPane({ container, engine, commands, status: report, focus 
       opened = true;
       ui.pane.hidden = false;
       ui.status.textContent = "Loading graph view…";
-      load().then((m) => m.preload(), () => {});
+      view?.preload();
     };
     const soon = setTimeout(open, 150);
     let graph;
