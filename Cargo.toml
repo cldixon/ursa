@@ -7,11 +7,12 @@
 #   ursa-py    — PyO3 bindings (thin)
 #   ursa-engine, ursa-sql, ursa-cli — the SQL engine and the `ursa` binary (#232)
 #   ursa-wasm  — the SQL engine in the browser (WebAssembly, #277)
+#   ursa-server — `ursa serve`: the shell over a local WebSocket to a native session
 [workspace]
 resolver = "2"
 members = [
     "ursa-core", "ursa-io", "ursa-plan", "ursa-py", "ursa-engine", "ursa-sql", "ursa-shell", "ursa-cli", "ursa-wasm",
-    "ursa-viz",
+    "ursa-viz", "ursa-server",
 ]
 
 [workspace.package]
