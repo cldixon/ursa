@@ -872,7 +872,7 @@ cargo build --release -p ursa-cli --features serve
 bun scripts/e2e-serve.ts 8901                 # [port] [ursa binary]; URSA_BIN= also names it
 ```
 
-It starts `ursa serve .data --port PORT --assets dist`, reads the token from
+It starts `ursa serve .data --port PORT --no-open --assets dist`, reads the token from
 the link it prints, and runs the suite with `URSA_SERVE_TOKEN` set: every
 browser context gets the token's cookie, and the suite skips (printing `skip`)
 the 6 checks of what only the browser demo has: the engine's crash (a

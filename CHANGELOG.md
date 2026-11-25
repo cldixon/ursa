@@ -1040,6 +1040,27 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   is published with the other crates, before `ursa-cli`. Release binaries
   do not have `serve` yet.
 
+- **`ursa serve` in the release binaries, with a database file,
+  `--read-only` and `--no-open`** (URSA-4, `design/console.md` §5). The
+  release and nightly binaries have `ursa serve` with its page built in
+  (`serve-embed`: `cli-build.yml` builds the page once, with `bun
+  scripts/build.ts --no-engine`, and every platform embeds it); the crates
+  on crates.io still have no page. `ursa serve club.ursa` opens the
+  database in every session as `ursa club.ursa` does, rooted in its
+  directory; `ursa serve DIR` roots the sessions in DIR (relative paths,
+  `.read`, `ATTACH` and writes resolve under it), and with neither the
+  session is in memory, in the current directory: the server no longer
+  changes the process's working directory. It opens its link in the
+  default browser unless `--no-open`, on port 4280 or the next free one.
+  `--read-only` writes no files, for pairing with an agent: `COPY … TO`,
+  `INSERT INTO` a table of files, `.output`, `.once`, `ATTACH` of a
+  database that does not exist, and what changes the database (opened
+  read-only) are refused by the engine (`ursa_engine::paths::set_read_only`,
+  `ursa_shell::session::Options::read_only`). The shell's page keeps
+  `COPY … TO 'name'` in memory, as in the browser demo; the shared session
+  (the console's) writes it to disk under the root. `web/scripts/build.ts
+  --no-engine` builds the page without the wasm engine.
+
 ### Changed
 
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**

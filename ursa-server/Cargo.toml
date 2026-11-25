@@ -13,7 +13,7 @@ categories = ["database", "web-programming::websocket"]
 
 [features]
 # The page's files built into the binary with rust-embed: this checkout's
-# `web/dist` (run `cd web && bun run engine && bun run build` first), without
+# `web/dist` (run `cd web && bun scripts/build.ts --no-engine` first), without
 # the wasm engine's files, which `ursa serve` does not use. The published crate
 # has no assets, so this builds only from a checkout; without it, the files
 # come from a directory (`Assets::Dirs`, `ursa serve --assets DIR`).

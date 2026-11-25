@@ -38,8 +38,14 @@ async fn a_directory_roots_the_sessions() {
         root.display().to_string(),
         "{hello}"
     );
-    assert_eq!(value(&mut shared, "SELECT count(*) FROM 'ties.csv';").await, "3");
-    assert_eq!(value(&mut shared, "SELECT count(*) FROM 'sub/n.csv';").await, "1");
+    assert_eq!(
+        value(&mut shared, "SELECT count(*) FROM 'ties.csv';").await,
+        "3"
+    );
+    assert_eq!(
+        value(&mut shared, "SELECT count(*) FROM 'sub/n.csv';").await,
+        "1"
+    );
     // The shared session (the console's, agents') copies to disk, under the
     // root.
     let (_, err) = feed(&mut shared, 4, "COPY (SELECT 1 AS a) TO 'out.csv';").await;
@@ -51,7 +57,10 @@ async fn a_directory_roots_the_sessions() {
     // The shell's own session reads the root too, and keeps its copies in
     // memory, as the browser demo does.
     let mut page = shell(&server).await;
-    assert_eq!(value(&mut page, "SELECT count(*) FROM 'ties.csv';").await, "3");
+    assert_eq!(
+        value(&mut page, "SELECT count(*) FROM 'ties.csv';").await,
+        "3"
+    );
     let (_, err) = feed(&mut page, 4, "COPY (SELECT 2 AS b) TO 'kept.csv';").await;
     assert_eq!(err, "");
     assert!(!root.join("kept.csv").exists());
@@ -71,7 +80,12 @@ async fn make_club(dir: &Path) {
     })
     .await;
     let mut page = shell(&server).await;
-    let (_, err) = feed(&mut page, 2, "CREATE VIEW ties AS SELECT * FROM 'ties.csv';").await;
+    let (_, err) = feed(
+        &mut page,
+        2,
+        "CREATE VIEW ties AS SELECT * FROM 'ties.csv';",
+    )
+    .await;
     assert_eq!(err, "");
     // Stopped, its sessions close the database.
     drop(page);
@@ -95,7 +109,10 @@ async fn a_database_file_is_attached_in_every_session() {
     let mut page = shell(&server).await;
     let (fed, _) = call(&mut page, 2, "feed", json!({"line": "SELECT 1;"}), &[]).await;
     assert!(
-        fed["result"]["prompt"].as_str().unwrap().starts_with("club"),
+        fed["result"]["prompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("club"),
         "{fed}"
     );
     assert_eq!(value(&mut page, "SELECT count(*) FROM ties;").await, "3");
@@ -140,9 +157,18 @@ async fn a_read_only_server_refuses_every_write() {
         // It reads the database.
         assert_eq!(value(socket, "SELECT count(*) FROM ties;").await, "3");
         let refusals = [
-            ("COPY (SELECT 1 AS a) TO 'x.csv';", "COPY … TO 'x.csv' cannot be written"),
-            ("COPY (SELECT 1 AS a) TO 'memory://uploads/x.csv';", "cannot be written"),
-            ("EXPLAIN COPY (SELECT 1 AS a) TO 'x.csv';", "cannot be written"),
+            (
+                "COPY (SELECT 1 AS a) TO 'x.csv';",
+                "COPY … TO 'x.csv' cannot be written",
+            ),
+            (
+                "COPY (SELECT 1 AS a) TO 'memory://uploads/x.csv';",
+                "cannot be written",
+            ),
+            (
+                "EXPLAIN COPY (SELECT 1 AS a) TO 'x.csv';",
+                "cannot be written",
+            ),
             ("CREATE VIEW v AS SELECT 1;", "is open read-only"),
             ("CREATE TABLE t AS SELECT 1 AS a;", "is open read-only"),
             ("DROP VIEW ties;", "is open read-only"),
@@ -191,7 +217,10 @@ async fn a_read_only_session_writes_no_files_but_works_in_memory() {
     assert_eq!(std::fs::read_dir(root.join("ext")).unwrap().count(), 0);
     // ATTACH creates no database, and opens one that exists read-only.
     let (_, err) = feed(&mut page, 5, "ATTACH 'new.ursa';").await;
-    assert!(err.contains("cannot ATTACH 'new.ursa': it does not exist"), "{err}");
+    assert!(
+        err.contains("cannot ATTACH 'new.ursa': it does not exist"),
+        "{err}"
+    );
     assert!(err.contains("read-only"), "{err}");
     assert!(!root.join("new.ursa").exists());
     assert!(!root.join("new.ursa.d").exists());
