@@ -826,7 +826,9 @@ pub enum NodeOrder {
     AsGiven,
     /// By in-degree, highest first, ties in original id order: the nodes that
     /// are most often a neighbour (a pull PageRank's reads, a traversal's
-    /// targets) come first and share cache lines.
+    /// targets) come first and share cache lines. From 4,194,304 edges the
+    /// in-degrees are counted on an eighth of the rows (fixed blocks), which
+    /// keeps the relabel's cost within a quarter of the build's.
     InDegree,
 }
 
@@ -912,18 +914,26 @@ fn is_permutation(ids: &[u32]) -> bool {
 
 /// The out-adjacency of `src -> dst` (original ids) with its nodes numbered
 /// by in-degree, highest first, ties by original id (#172): the adjacency,
-/// the original id of each node, and the node of each original id.
+/// the original id of each node, and the node of each original id. From
+/// 4,194,304 edges, the in-degrees are counted on one block of 4,096 rows in
+/// eight (an estimate: the order is a heuristic, and the hubs it is for are
+/// counted closely).
 ///
 /// The relabel is fused into the counting sort rather than run as passes of
 /// its own. The first pass counts, per chunk of rows, both endpoints' degrees
-/// over the original ids. The in-degrees give the order (a parallel sort of
-/// one key per node); the out-degrees, gathered into it, give the offsets,
+/// over the original ids. The in-degrees give the order (a counting sort by
+/// degree); the out-degrees, gathered into it, give the offsets,
 /// and each chunk's counts become its cursors, still indexed by original id.
-/// The scatter then places each row by its source's original id and renames
-/// only its target, so neither endpoint array is renamed in place. Each
+/// The targets are renamed in place, in one streaming pass, and the scatter
+/// places each row by its source's original id, so the sources are never
+/// renamed. Each
 /// segment holds its rows in row order: the output is exactly
 /// [`Adjacency::build`] over the renamed endpoints, on any thread count.
-fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, Vec<u32>) {
+fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u32>, Vec<u32>) {
+    // See pass 1.
+    const SAMPLE_MIN_EDGES: usize = 1 << 22;
+    const SAMPLE_BLOCK: usize = 1 << 12;
+    const SAMPLE: usize = 8;
     use crate::parallel::*;
     let m = src.len();
     assert!(
@@ -948,13 +958,27 @@ fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, 
         }
     };
 
-    // Pass 1: per chunk, out- and in-degree over original ids.
+    // Pass 1: per chunk, out- and in-degree over original ids. The
+    // in-degrees only order the nodes, so a large graph counts them on one
+    // block of rows in `SAMPLE` (fixed blocks of the row order, so the same
+    // on any thread count): the random increments are most of this pass.
+    let sampled = m >= SAMPLE_MIN_EDGES;
     let count = |c: usize| {
         let (lo, hi) = (c * chunk, ((c + 1) * chunk).min(m));
         let (mut out, mut inc) = (vec![0u32; n], vec![0u32; n]);
-        for r in lo..hi {
-            out[src[r] as usize] += 1;
-            inc[dst[r] as usize] += 1;
+        for &k in &src[lo..hi] {
+            out[k as usize] += 1;
+        }
+        let mut r = lo;
+        while r < hi {
+            let block = r / SAMPLE_BLOCK;
+            let end = ((block + 1) * SAMPLE_BLOCK).min(hi);
+            if !sampled || block % SAMPLE == 0 {
+                for &d in &dst[r..end] {
+                    inc[d as usize] += 1;
+                }
+            }
+            r = end;
         }
         (out, inc)
     };
@@ -964,48 +988,51 @@ fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, 
         (0..n_chunks).into_par_iter().map(count).unzip()
     };
 
-    // The order: one key per node, the in-degree complemented so the highest
-    // sorts first, above the original id (unique, so the order is total).
-    let mut keys = vec![0u64; n];
-    let k_addr = keys.as_mut_ptr() as usize;
+    // The in-degree of each node.
+    let mut degree = vec![0u32; n];
+    let d_addr = degree.as_mut_ptr() as usize;
     par_blocks(&|range| {
         for k in range {
-            let d: u32 = incs.iter().map(|h| h[k]).sum();
-            // SAFETY: blocks are disjoint and inside `keys`.
-            unsafe { *(k_addr as *mut u64).add(k) = (u64::from(!d) << 32) | k as u64 };
+            // SAFETY: blocks are disjoint and inside `degree`.
+            unsafe { *(d_addr as *mut u32).add(k) = incs.iter().map(|h| h[k]).sum() };
         }
     });
     drop(incs);
-    #[cfg(feature = "rayon")]
-    if serial {
-        keys.sort_unstable();
-    } else {
-        keys.par_sort_unstable();
+    // The order: a counting sort by degree, highest first, each degree's
+    // nodes in original id order (a stable scatter in id order). The
+    // buckets run to the highest degree, at most the edge count.
+    let top = degree.iter().copied().max().unwrap_or(0) as usize;
+    let mut start = vec![0u32; top + 2];
+    for &d in &degree {
+        start[top - d as usize + 1] += 1;
     }
-    #[cfg(not(feature = "rayon"))]
-    keys.sort_unstable();
-    let original: Vec<u32> = keys.iter().map(|&k| k as u32).collect();
-    drop(keys);
-    let mut node = vec![0u32; n];
-    let n_addr = node.as_mut_ptr() as usize;
-    let original_ref = &original;
-    par_blocks(&|range| {
-        for v in range {
-            // SAFETY: `original` is a permutation, so each slot is written
-            // once; it is inside `node`.
-            unsafe { *(n_addr as *mut u32).add(original_ref[v] as usize) = v as u32 };
-        }
-    });
+    for b in 0..=top {
+        start[b + 1] += start[b];
+    }
+    let mut original = vec![0u32; n];
+    for (k, &d) in degree.iter().enumerate() {
+        let slot = &mut start[top - d as usize];
+        original[*slot as usize] = k as u32;
+        *slot += 1;
+    }
+    drop((degree, start));
 
-    // Offsets in the new order: each node's out-degree, prefix-summed.
+    // The node of each original id, and the offsets in the new order (each
+    // node's out-degree, prefix-summed below), in one pass.
+    let mut node = vec![0u32; n];
     let mut offsets = vec![0u64; n + 1];
-    let o_addr = offsets.as_mut_ptr() as usize;
+    let (n_addr, o_addr) = (node.as_mut_ptr() as usize, offsets.as_mut_ptr() as usize);
+    let original_ref = &original;
     par_blocks(&|range| {
         for v in range {
             let k = original_ref[v] as usize;
             let d: u64 = outs.iter().map(|h| u64::from(h[k])).sum();
-            // SAFETY: blocks are disjoint; `v + 1 <= n`.
-            unsafe { *(o_addr as *mut u64).add(v + 1) = d };
+            // SAFETY: `original` is a permutation, so each `node` slot is
+            // written once; blocks are disjoint and `v + 1 <= n`.
+            unsafe {
+                *(n_addr as *mut u32).add(k) = v as u32;
+                *(o_addr as *mut u64).add(v + 1) = d;
+            }
         }
     });
     for v in 0..n {
@@ -1030,8 +1057,18 @@ fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, 
         }
     });
 
+    // The targets renamed in place: a streaming pass whose lookups overlap,
+    // where the scatter's would wait on its writes.
+    if serial {
+        dst.iter_mut().for_each(|d| *d = node_ref[*d as usize]);
+    } else {
+        dst.par_chunks_mut(1 << 16)
+            .for_each(|c| c.iter_mut().for_each(|d| *d = node_ref[*d as usize]));
+    }
+    let dst = &*dst;
+
     // Pass 2: scatter each row by its source's original id, its target
-    // renamed. Positions are disjoint across chunks (the cursors partition
+    // (renamed above). Positions are disjoint across chunks (the cursors partition
     // each segment), as in `build_parallel`.
     let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
     let (t_addr, e_addr) = (
@@ -1046,7 +1083,7 @@ fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, 
             base[k] += 1;
             // SAFETY: `pos < m` and is claimed by exactly one (chunk, row).
             unsafe {
-                *(t_addr as *mut u32).add(pos) = node_ref[dst[r] as usize];
+                *(t_addr as *mut u32).add(pos) = dst[r];
                 *(e_addr as *mut u32).add(pos) = r as u32;
             }
         }
@@ -1109,9 +1146,9 @@ impl Topology {
     /// (#172): the dense ids given are the *original* ids, and node `v` of
     /// the result is the node whose original id is
     /// [`Self::original_id`]`(v)`. The relabel is fused into the counting
-    /// sort (its first pass counts the in-degrees too; a parallel sort of
-    /// the nodes; its scatter renames each target), parallel where the build
-    /// is. Each node's out-segment keeps its edges in row order, and
+    /// sort (its first pass counts the in-degrees too, a counting sort
+    /// orders the nodes, one streaming pass renames the targets in place),
+    /// parallel where the build is. Each node's out-segment keeps its edges in row order, and
     /// `edge_ids` still names the original rows, so weights and edge masks
     /// apply unchanged.
     ///
@@ -1128,7 +1165,8 @@ impl Topology {
         match order {
             NodeOrder::AsGiven => Self::build(n_nodes, src_dense, dst_dense),
             NodeOrder::InDegree => {
-                let (out, original, node) = build_in_degree(n_nodes, &src_dense, &dst_dense);
+                let mut dst_dense = dst_dense;
+                let (out, original, node) = build_in_degree(n_nodes, &src_dense, &mut dst_dense);
                 drop((src_dense, dst_dense));
                 let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
                 Topology {

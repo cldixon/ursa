@@ -131,10 +131,25 @@ fn comparable(
 /// The fused in-degree build is the counting sort over the renamed endpoints.
 #[test]
 fn the_fused_build_is_the_renamed_build() {
-    for (seed, n, m) in [(7, 500, 4000), (8, 20_000, 300_000)] {
+    // The last is past 4,194,304 edges, where the in-degrees are sampled.
+    for (seed, n, m) in [
+        (7, 500, 4000),
+        (8, 20_000, 300_000),
+        (9, 200_000, 4_500_000),
+    ] {
         let (n, src, dst) = graph(n, m, seed);
         let fused = Topology::build_ordered(n, src.clone(), dst.clone(), NodeOrder::InDegree);
         let original = fused.original_ids().unwrap().to_vec();
+        // Serial (a build on a pool's worker is) and parallel alike.
+        #[cfg(feature = "rayon")]
+        {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build();
+            let serial = pool.unwrap().install(|| {
+                Topology::build_ordered(n, src.clone(), dst.clone(), NodeOrder::InDegree)
+            });
+            assert_eq!(serial.original_ids(), Some(&original[..]));
+            assert_eq!(serial.out().targets, fused.out().targets);
+        }
         let reference = Topology::build_relabelled(n, src, dst, original);
         assert_eq!(fused.out().offsets, reference.out().offsets);
         assert_eq!(fused.out().targets, reference.out().targets);
