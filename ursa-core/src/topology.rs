@@ -973,7 +973,7 @@ fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u3
         while r < hi {
             let block = r / SAMPLE_BLOCK;
             let end = ((block + 1) * SAMPLE_BLOCK).min(hi);
-            if !sampled || block % SAMPLE == 0 {
+            if !sampled || block.is_multiple_of(SAMPLE) {
                 for &d in &dst[r..end] {
                     inc[d as usize] += 1;
                 }

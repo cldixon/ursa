@@ -36,7 +36,11 @@ fn graph(n: u32, m: usize, seed: u64) -> (usize, Vec<u32>, Vec<u32>) {
     let (mut src, mut dst) = (Vec::with_capacity(m), Vec::with_capacity(m));
     for i in 0..m {
         let s = skewed() % (n - 5);
-        let d = if i % 97 == 0 { s } else { skewed() % (n - 5) };
+        let d = if i.is_multiple_of(97) {
+            s
+        } else {
+            skewed() % (n - 5)
+        };
         src.push(s);
         dst.push(d);
     }
@@ -319,7 +323,9 @@ fn counts_and_partitions_are_the_same() {
 fn a_subgraph_mask_applies_unchanged() {
     let (n, src, dst) = graph(800, 9000, 4);
     let (plain, relabelled) = builds(n, &src, &dst);
-    let keep: Vec<bool> = (0..src.len()).map(|e| e % 3 != 0).collect();
+    let keep: Vec<bool> = (0..src.len())
+        .map(|e: usize| !e.is_multiple_of(3))
+        .collect();
     let mask = EdgeMask::from_bools(&keep);
     assert_eq!(
         connected_components_weak(&plain, Some(&mask)),
