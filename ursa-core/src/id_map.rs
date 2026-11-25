@@ -1744,6 +1744,24 @@ impl IdMap {
         }
     }
 
+    /// This map with its dense indices renumbered as a topology's nodes were
+    /// ([`Topology::build_ordered`], #172): dense index `v` of the result
+    /// names the user id that dense index `original[v]` names here.
+    /// `original` must be a permutation of the dense indices (as
+    /// [`Topology::original_ids`] gives it).
+    ///
+    /// The result is a map of the kind a stored index reads back
+    /// ([`Self::from_stored_ids`]): its id column is gathered once, and its
+    /// lookup table is built the first time an id is looked up.
+    ///
+    /// [`Topology::build_ordered`]: crate::topology::Topology::build_ordered
+    /// [`Topology::original_ids`]: crate::topology::Topology::original_ids
+    pub fn reordered(&self, original: &[u32]) -> IdMap {
+        assert_eq!(original.len(), self.len(), "the order must name every node");
+        IdMap::from_stored_ids(self.gather_user(original), None)
+            .expect("a permutation of a map's ids is a map")
+    }
+
     /// User ids for a list of dense indices, as an Arrow array (`Int64Array` |
     /// `StringArray`) — for hop/path/walk output id columns. Panics on an
     /// out-of-range index (kernels never produce one).

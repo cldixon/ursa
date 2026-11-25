@@ -303,26 +303,28 @@ impl<'a> Evaluator<'a> {
                     jitter_tolerance: jitter_tolerance as f32,
                     seed,
                 };
-                if multilevel {
-                    xy(coarse_to_fine(topo, mask, fa2, iterations))
-                } else {
-                    xy(layout_fa2(topo, mask, fa2))
-                }
+                xy(in_original(topo, |topo| {
+                    if multilevel {
+                        coarse_to_fine(topo, mask, fa2, iterations)
+                    } else {
+                        layout_fa2(topo, mask, fa2)
+                    }
+                }))
             }
             Call::LayoutFr {
                 iterations,
                 k,
                 gravity,
                 seed,
-            } => xy(layout_fr(
-                topo,
-                mask,
-                layout_params(iterations, k, gravity, seed),
-            )),
-            Call::LayoutRandom { k, seed } => {
-                xy(layout_random(topo, layout_params(300, k, 0.02, seed)))
-            }
-            Call::LayoutCircle { k } => xy(layout_circle(topo, layout_params(300, k, 0.02, None))),
+            } => xy(in_original(topo, |topo| {
+                layout_fr(topo, mask, layout_params(iterations, k, gravity, seed))
+            })),
+            Call::LayoutRandom { k, seed } => xy(in_original(topo, |topo| {
+                layout_random(topo, layout_params(300, k, 0.02, seed))
+            })),
+            Call::LayoutCircle { k } => xy(in_original(topo, |topo| {
+                layout_circle(topo, layout_params(300, k, 0.02, None))
+            })),
             Call::Degree { direction } => {
                 one(Arc::new(UInt32Array::from(degree(topo, mask, direction))))
             }
@@ -520,6 +522,28 @@ fn coarse_to_fine(
     }
     state.step(adj, f64::INFINITY);
     state.into_positions()
+}
+
+/// A layout of `topo`, computed in its original numbering when its nodes were
+/// relabelled (#172): a layout's starting positions and its sums follow the
+/// node ids, so a seed then places every node where an unrelabelled index
+/// places it.
+fn in_original(
+    topo: &Topology,
+    layout: impl FnOnce(&Topology) -> (Vec<f32>, Vec<f32>),
+) -> (Vec<f32>, Vec<f32>) {
+    match topo.in_original_order() {
+        None => layout(topo),
+        Some(original) => {
+            let (x, y) = layout(&original);
+            let back = |p: Vec<f32>| -> Vec<f32> {
+                (0..topo.n_nodes() as u32)
+                    .map(|v| p[topo.original_id(v) as usize])
+                    .collect()
+            };
+            (back(x), back(y))
+        }
+    }
 }
 
 fn xy((x, y): (Vec<f32>, Vec<f32>)) -> Vec<ArrayRef> {

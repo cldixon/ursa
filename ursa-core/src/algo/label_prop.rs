@@ -29,9 +29,15 @@ use crate::topology::{Adjacency, EdgeMask, Topology};
 
 /// Community label per node. Communities are treated as undirected (a node votes
 /// over both its out- and in-neighbours). Iterates until a full sweep changes no
-/// label or `max_iter` sweeps have run. Labels are dense node indices (one
-/// representative per community), not necessarily a contiguous `0..k`. A subgraph
-/// `mask` restricts voting to kept edges.
+/// label or `max_iter` sweeps have run. Labels are original node ids (one
+/// representative per community; see [`Topology::original_ids`]), not
+/// necessarily a contiguous `0..k`. A subgraph `mask` restricts voting to kept
+/// edges.
+///
+/// The visit order and the ties are defined on the original ids: a topology
+/// whose nodes were relabelled for locality (#172) runs over
+/// [`Topology::in_original_order`], so a seed gives the same communities, and
+/// the same labels, as on an index that was not relabelled.
 ///
 /// An isolated node never votes and is never voted for, so it keeps its own
 /// label; a graph with many runs over its linked nodes only (#326), visited in
@@ -52,6 +58,12 @@ pub fn label_propagation(
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
+    // Relabelled nodes (#172): vote in the original numbering, whose visit
+    // order and ties give the labels an unrelabelled index gives.
+    if let Some(original) = topo.in_original_order() {
+        let labels = label_propagation(&original, mask, max_iter, seed, parallel);
+        return in_node_order(topo, &labels);
+    }
     topo.incoming();
     let linked = Linked::of(topo, mask);
     let linked = linked.worth_it().then_some(&linked);
@@ -60,6 +72,15 @@ pub fn label_propagation(
     } else {
         label_propagation_over(topo, mask, max_iter, seed, linked)
     }
+}
+
+/// Labels computed over [`Topology::in_original_order`], back in `topo`'s
+/// node order: node `v` takes the label of its original id. The label values
+/// are original ids, as an unrelabelled run gives them.
+pub(crate) fn in_node_order(topo: &Topology, labels: &[u32]) -> Vec<u32> {
+    (0..topo.n_nodes() as u32)
+        .map(|v| labels[topo.original_id(v) as usize])
+        .collect()
 }
 
 /// [`label_propagation`], compact over `linked` when given.

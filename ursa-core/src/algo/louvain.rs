@@ -45,7 +45,10 @@ macro_rules! by_weights {
     };
 }
 
-/// Community label per node (contiguous `0..k`). Deterministic given `seed`
+/// Community label per node (contiguous `0..k`, by first appearance in
+/// original id order: see [`Topology::original_ids`]; a relabelled topology
+/// runs in the original numbering, so a seed gives the same communities as on
+/// an index that was not relabelled, #172). Deterministic given `seed`
 /// (defaulting to a fixed seed when `None`, so an unseeded run is reproducible).
 /// A subgraph `mask` restricts the working graph to kept edges only.
 ///
@@ -91,6 +94,13 @@ fn louvain_impl(
     let n = topo.n_nodes();
     if n == 0 {
         return Vec::new();
+    }
+    // Relabelled nodes (#172): run in the original numbering, which fixes
+    // the visit order, the ties and the aggregation, so a seed gives the
+    // communities an unrelabelled index gives.
+    if let Some(original) = topo.in_original_order() {
+        let labels = louvain_impl(&original, weights, mask, resolution, seed, parallel);
+        return super::label_prop::in_node_order(topo, &labels);
     }
     // No edges: every node is its own community.
     if topo.n_edges() == 0 {

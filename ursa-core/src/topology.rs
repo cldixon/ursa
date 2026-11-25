@@ -24,7 +24,7 @@
 //! [`IdMap`]: crate::id_map::IdMap
 
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, BooleanArray};
 use arrow::buffer::ScalarBuffer;
@@ -804,6 +804,117 @@ pub struct Topology {
     /// Set on a symmetric view: its transpose is its own out-CSR, so `incoming`
     /// returns `out` rather than building a copy.
     self_transpose: bool,
+    /// The node ids this topology's nodes had before a locality relabel
+    /// ([`Topology::build_ordered`], #172); `None` when they were not
+    /// relabelled. Shared by every view derived from the topology.
+    relabel: Option<Arc<Relabel>>,
+}
+
+/// How the nodes of a topology are numbered (#172).
+///
+/// The ids given to [`Topology::build_ordered`] are the *original* ids (an
+/// [`IdMap`]'s first-seen order). A locality order renumbers the nodes so the
+/// ones the kernels read most often sit together in memory, and keeps the
+/// original id of each node, so that what must not depend on the numbering
+/// (component labels, the visit orders of the seeded community kernels,
+/// sampled sources) is defined on the original ids instead.
+///
+/// [`IdMap`]: crate::id_map::IdMap
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeOrder {
+    /// The ids as given: no relabel.
+    AsGiven,
+    /// By in-degree, highest first, ties in original id order: the nodes that
+    /// are most often a neighbour (a pull PageRank's reads, a traversal's
+    /// targets) come first and share cache lines.
+    InDegree,
+}
+
+/// A topology's original node ids (see [`NodeOrder`]).
+#[derive(Debug)]
+struct Relabel {
+    /// `original[v]`: the original id of node `v`.
+    original: ScalarBuffer<u32>,
+    /// `node[o]`: the node whose original id is `o`, built on first use.
+    node: OnceLock<Vec<u32>>,
+}
+
+impl Relabel {
+    /// The inverse permutation.
+    fn nodes(&self) -> &[u32] {
+        self.node.get_or_init(|| {
+            let mut node = vec![0u32; self.original.len()];
+            for (v, &o) in self.original.iter().enumerate() {
+                node[o as usize] = v as u32;
+            }
+            node
+        })
+    }
+}
+
+/// Whether `ids` is a permutation of `0..ids.len()`.
+fn is_permutation(ids: &[u32]) -> bool {
+    let mut seen = vec![false; ids.len()];
+    ids.iter().all(|&o| match seen.get_mut(o as usize) {
+        Some(s) if !*s => {
+            *s = true;
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The in-degree order of `n_nodes` nodes over the edge targets `dst`: the
+/// original id of each new node, highest in-degree first, ties by original id.
+fn in_degree_order(n_nodes: usize, dst: &[u32]) -> Vec<u32> {
+    use crate::parallel::*;
+    let m = dst.len();
+    // Per-chunk histograms, summed: the chunking rule of `Adjacency::build`.
+    let n_chunks = current_num_threads().min((m / n_nodes.max(1)).max(4));
+    let degree: Vec<u32> = if m < (1 << 16) || n_chunks <= 1 || in_worker() {
+        let mut h = vec![0u32; n_nodes];
+        for &d in dst {
+            h[d as usize] += 1;
+        }
+        h
+    } else {
+        let hists: Vec<Vec<u32>> = dst
+            .par_chunks(m.div_ceil(n_chunks))
+            .map(|chunk| {
+                let mut h = vec![0u32; n_nodes];
+                for &d in chunk {
+                    h[d as usize] += 1;
+                }
+                h
+            })
+            .collect();
+        let mut degree = vec![0u32; n_nodes];
+        degree
+            .par_chunks_mut(4096)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let base = i * 4096;
+                for h in &hists {
+                    for (k, d) in out.iter_mut().enumerate() {
+                        *d += h[base + k];
+                    }
+                }
+            });
+        degree
+    };
+    // One key per node: the in-degree, complemented so the highest sorts
+    // first, above the original id (unique, so the order is total).
+    let mut keys: Vec<u64> = degree
+        .iter()
+        .enumerate()
+        .map(|(v, &d)| (u64::from(!d) << 32) | v as u64)
+        .collect();
+    drop(degree);
+    #[cfg(feature = "rayon")]
+    keys.par_sort_unstable();
+    #[cfg(not(feature = "rayon"))]
+    keys.sort_unstable();
+    keys.iter().map(|&k| k as u32).collect()
 }
 
 impl Topology {
@@ -843,7 +954,175 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         }
+    }
+
+    /// [`Self::build`], with the nodes renumbered in `order` for locality
+    /// (#172): the dense ids given are the *original* ids, and node `v` of
+    /// the result is the node whose original id is
+    /// [`Self::original_id`]`(v)`. The relabel is one more pass over the
+    /// endpoints before the counting sort (an in-degree histogram, a sort of
+    /// the nodes, and each endpoint renamed in place), parallel where the
+    /// build is. Each node's out-segment keeps its edges in row order, and
+    /// `edge_ids` still names the original rows, so weights and edge masks
+    /// apply unchanged.
+    ///
+    /// A caller that maps dense ids to anything (an [`IdMap`]) renumbers it
+    /// the same way, through [`Self::original_ids`].
+    ///
+    /// [`IdMap`]: crate::id_map::IdMap
+    pub fn build_ordered(
+        n_nodes: usize,
+        src_dense: Vec<u32>,
+        dst_dense: Vec<u32>,
+        order: NodeOrder,
+    ) -> Topology {
+        match order {
+            NodeOrder::AsGiven => Self::build(n_nodes, src_dense, dst_dense),
+            NodeOrder::InDegree => {
+                let original = in_degree_order(n_nodes, &dst_dense);
+                Self::build_relabelled(n_nodes, src_dense, dst_dense, original)
+            }
+        }
+    }
+
+    /// [`Self::build`] with the nodes renumbered by `original`, a permutation
+    /// of `0..n_nodes` that gives the original id of each new node (see
+    /// [`Self::build_ordered`]). The identity is no relabel at all.
+    ///
+    /// # Panics
+    ///
+    /// If `original` is not a permutation of `0..n_nodes`.
+    pub fn build_relabelled(
+        n_nodes: usize,
+        mut src_dense: Vec<u32>,
+        mut dst_dense: Vec<u32>,
+        original: Vec<u32>,
+    ) -> Topology {
+        use crate::parallel::*;
+        assert_eq!(original.len(), n_nodes, "the order must name every node");
+        assert!(is_permutation(&original), "the order must be a permutation");
+        if original.iter().enumerate().all(|(v, &o)| v as u32 == o) {
+            return Self::build(n_nodes, src_dense, dst_dense);
+        }
+        let mut node = vec![0u32; n_nodes];
+        for (v, &o) in original.iter().enumerate() {
+            node[o as usize] = v as u32;
+        }
+        let rename = |ids: &mut [u32]| {
+            ids.par_chunks_mut(1 << 16)
+                .for_each(|chunk| chunk.iter_mut().for_each(|x| *x = node[*x as usize]));
+        };
+        rename(&mut src_dense);
+        rename(&mut dst_dense);
+        let relabel = Relabel {
+            original: original.into(),
+            node: OnceLock::from(node),
+        };
+        let mut topology = Self::build(n_nodes, src_dense, dst_dense);
+        topology.relabel = Some(Arc::new(relabel));
+        topology
+    }
+
+    /// This topology, its nodes known to carry the original ids `original`
+    /// (`original[v]` for node `v`; see [`Self::build_ordered`]): how a
+    /// stored index that was relabelled is read back. An error if `original`
+    /// is not a permutation of the nodes.
+    pub fn with_original_ids(mut self, original: ScalarBuffer<u32>) -> Result<Topology, String> {
+        if original.len() != self.n_nodes || !is_permutation(&original) {
+            return Err("the original node ids are not a permutation of the nodes".into());
+        }
+        self.relabel = (!original.iter().enumerate().all(|(v, &o)| v as u32 == o)).then(|| {
+            Arc::new(Relabel {
+                original,
+                node: OnceLock::new(),
+            })
+        });
+        Ok(self)
+    }
+
+    /// A topology over the same nodes, numbered as `other`'s are (a view
+    /// built from it).
+    pub(crate) fn numbered_as(mut self, other: &Topology) -> Topology {
+        self.relabel = other.relabel.clone();
+        self
+    }
+
+    /// The original id of each node, if the nodes were relabelled
+    /// ([`Self::build_ordered`]); `None` when each node's id is its original
+    /// one.
+    pub fn original_ids(&self) -> Option<&[u32]> {
+        self.relabel.as_ref().map(|r| &r.original[..])
+    }
+
+    /// The nodes in original id order (the node of each original id), if the
+    /// nodes were relabelled ([`Self::build_ordered`]): the order to emit
+    /// per-node results in so that they come out as an unrelabelled index
+    /// gives them. Built on first use.
+    pub fn nodes_in_original_order(&self) -> Option<&[u32]> {
+        self.relabel.as_ref().map(|r| r.nodes())
+    }
+
+    /// The original id of node `v` (`v` itself without a relabel).
+    #[inline]
+    pub fn original_id(&self, v: u32) -> u32 {
+        self.relabel.as_ref().map_or(v, |r| r.original[v as usize])
+    }
+
+    /// The node whose original id is `o` (`o` itself without a relabel).
+    #[inline]
+    pub fn node_of_original(&self, o: u32) -> u32 {
+        self.relabel.as_ref().map_or(o, |r| r.nodes()[o as usize])
+    }
+
+    /// Per-node labels made canonical: each node's label becomes the
+    /// smallest original id among the nodes that share its label, so the
+    /// labels name the same partition whatever the numbering (#150, #172).
+    /// Linear in the nodes. Labels must be below the node count.
+    pub(crate) fn canonical_labels(&self, labels: &mut [u32]) {
+        let mut least = vec![u32::MAX; labels.len()];
+        for (v, &l) in labels.iter().enumerate() {
+            let o = self.original_id(v as u32);
+            let m = &mut least[l as usize];
+            *m = (*m).min(o);
+        }
+        for l in labels.iter_mut() {
+            *l = least[*l as usize];
+        }
+    }
+
+    /// This topology numbered by its original ids, as [`Self::build`] gives
+    /// it from the same rows: `None` when it was not relabelled. The rows'
+    /// endpoints are read back from the out-CSR (`edge_ids`), so this costs a
+    /// build. The seeded community kernels run over it, so that their result
+    /// is the one the original numbering gives.
+    pub fn in_original_order(&self) -> Option<Topology> {
+        use crate::parallel::*;
+        let relabel = self.relabel.as_ref()?;
+        let (n, m) = (self.n_nodes, self.n_edges);
+        let (mut src, mut dst) = (vec![0u32; m], vec![0u32; m]);
+        let (s_addr, d_addr) = (src.as_mut_ptr() as usize, dst.as_mut_ptr() as usize);
+        let out = &self.out;
+        let write = |u: usize| {
+            let o = relabel.original[u];
+            let (lo, hi) = (out.offsets[u] as usize, out.offsets[u + 1] as usize);
+            for k in lo..hi {
+                let row = out.edge_ids[k] as usize;
+                // SAFETY: `edge_ids` is a permutation of the rows, so each row
+                // is written once, by one node; both arrays have `m` rows.
+                unsafe {
+                    *(s_addr as *mut u32).add(row) = o;
+                    *(d_addr as *mut u32).add(row) = relabel.original[out.targets[k] as usize];
+                }
+            }
+        };
+        if in_worker() {
+            (0..n).for_each(write);
+        } else {
+            (0..n).into_par_iter().for_each(write);
+        }
+        Some(Self::build(n, src, dst))
     }
 
     /// A symmetric topology taken directly from an undirected CSR: node `u`'s
@@ -882,6 +1161,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: true,
+            relabel: None,
         }
     }
 
@@ -929,6 +1209,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         })
     }
 
@@ -956,6 +1237,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: None,
         })
     }
 
@@ -1070,6 +1352,7 @@ impl Topology {
             undirected: OnceLock::new(),
             symmetric: OnceLock::new(),
             self_transpose: false,
+            relabel: self.relabel.clone(),
         }
     }
 
@@ -1088,11 +1371,10 @@ impl Topology {
     pub fn symmetric(&self) -> &Topology {
         self.symmetric.get_or_init(|| {
             let u = self.undirected();
-            Box::new(Topology::from_undirected(
-                self.n_nodes,
-                u.offsets.clone(),
-                u.targets.clone(),
-            ))
+            Box::new(
+                Topology::from_undirected(self.n_nodes, u.offsets.clone(), u.targets.clone())
+                    .numbered_as(self),
+            )
         })
     }
 
