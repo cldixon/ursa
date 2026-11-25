@@ -489,17 +489,39 @@ async fn planning_errors() {
     assert!(out.contains("| 3 |"), "{out}");
 }
 
+/// An edge with a NULL source or destination is not part of the graph, with
+/// or without a vertex table (#336): it is dropped and counted, and its other
+/// end is no node by it. (Until 0.13 this was an error without a vertex
+/// table.)
 #[tokio::test]
-async fn null_endpoints_are_an_error() {
+async fn null_endpoints_are_dropped_and_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("edges.csv");
-    std::fs::write(&path, "src,dst\n1,2\n2,\n").unwrap();
+    std::fs::write(&path, "src,dst\n1,2\n2,\n,3\n").unwrap();
     let ctx = new_session();
     define(&ctx, "g", "e", &path).await;
-    let message = error(&ctx, "SELECT * FROM degree(g)").await;
+    let out = table(&ctx, "SELECT * FROM degree(g) ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        "\
++----+--------+
+| id | degree |
++----+--------+
+| 1  | 1      |
+| 2  | 0      |
++----+--------+"
+    );
+    let out = table(
+        &ctx,
+        "SELECT n_nodes, n_edges, n_dropped_edges FROM describe(g)",
+    )
+    .await
+    .unwrap();
     assert!(
-        message.starts_with("graph 'g': an edge has a null source or destination"),
-        "{message}"
+        out.contains("| 2       | 1       | 2               |"),
+        "{out}"
     );
 }
 

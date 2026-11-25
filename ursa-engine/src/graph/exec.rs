@@ -31,6 +31,15 @@
 //! The keys' plan is part of the index's cache key: its fingerprint, and the
 //! identity of the files it reads, so a changed vertex table builds afresh.
 //!
+//! ## NULL endpoints
+//!
+//! An edge with a NULL source or destination is not part of the graph, with
+//! or without a vertex table (#336): the build drops it and counts it with
+//! the edges to no key, and keeps which rows it kept the same way
+//! ([`edge_interner`]). An inner join drops it too, so every path (the
+//! algorithms, `hop`, path search, and `GRAPH_TABLE` through the index or as
+//! joins) sees the same edges.
+//!
 //! ## Weights
 //!
 //! Weights are looked up by edge row, so they must be in the order of the
@@ -1706,9 +1715,10 @@ async fn read_aligned(
         let mut batch = batch?;
         let mut src = cast(batch.column(weighted.source), id_type)?;
         let mut dst = cast(batch.column(weighted.destination), id_type)?;
-        // With a vertex table, the index holds only the edges between
-        // keys: skip the others, as the build did.
-        if shape.vertices.is_some() {
+        // The index holds only the edges between its nodes (keys of a
+        // vertex table, and never a NULL end, #336): skip the others, as
+        // the build did.
+        if shape.vertices.is_some() || index.n_dropped() > 0 {
             let keep = between_nodes(index, &src, &dst)?;
             if keep.true_count() < keep.len() {
                 batch = filter_record_batch(&batch, &keep)?;
@@ -2078,7 +2088,7 @@ fn intern_keys(
     id_type: &DataType,
     unique: Option<&KeyNames>,
 ) -> Result<()> {
-    let mut interner = EdgeInterner::with_capacity(hint);
+    let mut interner = edge_interner(hint);
     while let Some(chunk) = rx.blocking_recv() {
         match chunk {
             Chunk::Nodes(keys) => interner
@@ -2119,7 +2129,7 @@ impl EdgeSide {
     fn new(nodes: Option<tokio::sync::oneshot::Receiver<EdgeInterner>>, hint: usize) -> Self {
         match nodes {
             None => Self {
-                interner: Some(EdgeInterner::with_capacity(hint)),
+                interner: Some(edge_interner(hint)),
                 provisional: None,
                 nodes: None,
             },
@@ -2317,7 +2327,7 @@ async fn build_streamed_with(
         let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
         let unique = shape.vertices.as_ref().and_then(|v| v.unique.clone());
         let interning = async move {
-            let mut interner = EdgeInterner::with_capacity(hint);
+            let mut interner = edge_interner(hint);
             while let Some(chunk) = rx.recv().await {
                 if let Some(index) =
                     take_chunk(&mut interner, chunk, &graph, &id_type, unique.as_ref())?
@@ -2454,14 +2464,22 @@ fn extend_weights(column: &ArrayRef, out: &mut Vec<f64>) -> Result<()> {
     Ok(())
 }
 
+/// An interner for an index build: the SQL engine's rule for an edge row
+/// (#336). An edge with a NULL source or destination is not part of the
+/// graph, with or without a vertex table: the build drops it, counts it in
+/// [`GraphIndex::n_dropped`] (`describe`'s `n_dropped_edges`) and leaves it
+/// out of [`GraphIndex::kept_rows`], as it does an edge to no vertex key.
+/// Neither end of such an edge is a node by it. This is what an inner join
+/// of the edges with their nodes does, so the index agrees with `GRAPH_TABLE`
+/// planned as joins and with `<graph>.nodes` (`super::schema`); the edges
+/// read before a vertex table's keys are in are held the same way
+/// ([`EdgeInterner::provisional`]).
+fn edge_interner(hint: usize) -> EdgeInterner {
+    EdgeInterner::with_capacity(hint).dropping_nulls()
+}
+
 fn build_error(graph: &str, e: IdError) -> DataFusionError {
-    DataFusionError::Execution(match e {
-        IdError::Null => format!(
-            "graph '{graph}': an edge has a null source or destination; filter those rows out \
-             of the edge table (for example, with a view that keeps rows WHERE both are NOT NULL)"
-        ),
-        other => format!("graph '{graph}': {other}"),
-    })
+    DataFusionError::Execution(format!("graph '{graph}': {e}"))
 }
 
 #[cfg(test)]

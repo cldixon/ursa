@@ -1049,6 +1049,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: an edge with a NULL source or destination is not part of the graph,
+  on every path** (behaviour change, #336). One rule now holds with or
+  without a vertex table, as DuckPGQ's inner join and #311's vertex keys
+  have it: such an edge is dropped and counted in `describe`'s
+  `n_dropped_edges`, with the edges to no vertex key, and neither of its
+  ends is a node by it. The index build drops it in one place
+  (`ursa_core::EdgeInterner::dropping_nulls`, used by every SQL build), and
+  `g.nodes` leaves out the ends of such edges, so the algorithms, `hop`,
+  `shortest_path`, path searches and `GRAPH_TABLE` through the index or as
+  joins all see the same edges and nodes. `ursa-sql/tests/null_endpoints.rs`
+  runs every path on one graph (integer and string keys, with and without
+  a vertex table), and `tests/conformance/sqlpgq/null_endpoints.slt` holds
+  the standard's cases. The Python library is unchanged: a NULL endpoint is
+  still an error unless `on_null="drop"`. What changes, on a graph **without
+  a vertex table** whose edge table has a NULL endpoint:
+  - **The algorithms, `hop`, `shortest_path`, `describe`, `GRAPH_TABLE` with
+    a bound node and `GRAPH_TABLE` path searches no longer fail** with
+    "graph 'g': an edge has a null source or destination; filter those rows
+    out …". They leave the edge out, and `describe(g)`'s `n_dropped_edges`
+    counts it (it was always 0 without a vertex table).
+  - **`g.nodes` and `GRAPH_TABLE (g MATCH (x) …)` no longer list a value
+    that is only the other end of a NULL-ended edge** (wrong answer: they
+    listed it as a node, while no edge pattern could reach it and the
+    algorithms refused the graph). `hop(g, seeds => [x])` from such a value
+    is refused as it is for any value that is no node.
+  - `GRAPH_TABLE` planned as joins (`(a)-[e]->(b)`, `-[e]-`) already left
+    the edge out, and a graph with a vertex table already dropped and
+    counted it: their answers do not change. A NULL vertex key is still
+    refused by every path (#411).
+
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
   (behaviour change: `louvain` and `label_propagation` communities, the
   last bits of floats and the order of unordered rows, #172). Dense node ids
