@@ -1023,6 +1023,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The web shell talks to its engine through the session protocol**
+  (#536, `design/console.md` §4). The per-operation glue of `ursa-wasm`'s
+  `WebShell` (output capture, UGR encoding, inspect's JSON, uploads,
+  export) is `ursa_shell::session::Session`, with every operation behind
+  `Session::handle(op, args, parts)`; `WebShell` is wasm-bindgen glue over
+  it, with one method, `handle`. The page calls the engine through
+  `web/public/engine-client.js` (`connect(WorkerTransport)`), and the
+  operations take their protocol names (`graph.open`, `graph.explore`,
+  `cancelInput`, `highlightAnsi`, …). Nothing a user sees changes.
+
 - **Benchmarks: memory is the process's footprint, with peak RSS beside it**
   (#533). `benchmarks/bluesky_cloud/run.py` recorded each step's peak
   memory as `ru_maxrss`, which since #382 counts the pages of the
