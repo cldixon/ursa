@@ -459,7 +459,7 @@ impl<O: Write, E: Write> Shell<O, E> {
         let Some(session) = &self.explorer else {
             return Err(DataFusionError::Plan(NO_GRAPH.into()));
         };
-        view::inspect::inspect(&self.ctx, session.result(), what).await
+        view::inspect::inspect(&self.ctx, &ursa_sql::Sql, session.result(), what).await
     }
 
     /// How many neighbours a node of the open graph has in the whole property graph

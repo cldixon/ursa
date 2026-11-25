@@ -1023,6 +1023,43 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The graph view's inspector shows an edge's row in 20 to 40 ms on a
+  million edges, not 90 to 160** (#489). An edge's rows were found by a
+  scan of the edge table for its two ends. They are now found through the
+  graph's index (`induced_edges` of the two ends gives their row numbers)
+  and read by number: from a Parquet file with a row selection, which
+  skips the pages before the row, with the bytes read kept for the
+  session (`ursa_engine::graph::view::rows`, 64 MiB at most); from any
+  other table by passing over the rows before. A table of the two key
+  columns alone, such as rmat's, is not read at all, and the drawing's
+  row number picks one of parallel edges among the rows found. The rows
+  are the ones the query by the two ends gives, in the same order, and
+  the scan remains for what the index cannot say: a graph of several edge
+  tables, or a table read as several partitions. `WebShell.inspectEdge`'s
+  JSON says `indexed`. On rmat in headless Chromium (medians of four
+  sessions of 5 to 7 runs, under a load of 2 to 7 on 4 cores) an edge's
+  row comes 21 to 41 ms after the click, 13 to 31 ms of it in the engine;
+  the first click of a page takes 54 to 83 ms, of which the engine's part
+  is 17 to 41 ms and the rest the page's first panel. Where the row is
+  read (a view of rmat with a third column) it is 31 to 43 ms, and 77 to
+  112 ms on the first click, which fetches the file's column chunks (see
+  `web/tests/inspector-timing.ts`). `inspect` takes a `RunSql`.
+- **The graph view keeps clear of its inspector** (#493). The inspector's
+  panel is drawn over the web shell's Graph view, and the nodes under it
+  could not be clicked, double-clicked or expanded. Now the camera makes
+  room: 450 ms after a selection opens the panel (once a second click or
+  tap would no longer be a double one), what was in sight moves into the
+  part of the view the panel leaves clear, over 200 ms, or in one step
+  under `prefers-reduced-motion`. Closing the panel puts the view back.
+  While the panel is open, `0`, `f` and a double-click on empty space fit
+  into the clear part, and a camera that follows the layout follows it
+  there. The panel opens at once after a tap too (it waited 350 ms): on a
+  phone, where it is a sheet across the bottom, it opens across the top
+  when the node tapped is drawn low, as it opens on the left on a desktop
+  when the node is on the right. The sheet is at most 45% of the view's
+  height (it was 55%). `ursa-viz`: `GraphView.setFitInset(left, top,
+  right, bottom)` keeps part of the canvas clear when the camera fits,
+  and `following()` says whether the camera follows the layout.
 - **SQL: graph function parameters and columns renamed, one name per role**
   (breaking, #415). The old names are not accepted. Each one gets a "did
   you mean" with its new name, and so do `k`, `max_hops` and `depth`:

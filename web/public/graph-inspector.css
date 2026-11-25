@@ -1,5 +1,7 @@
 /* The inspector (graph-inspector.js): a panel over the top right of the Graph
-   view's stage, or a sheet over its lower half where the view is narrow. It
+   view's stage, or a sheet over its lower part where the view is narrow. The
+   view keeps what it draws clear of it (graph.js: SHEET_QUERY, SHEET_SHARE
+   and PANEL_GAP there say the sizes here). It
    uses the page's tokens (--bg, --fg, --muted, --border, --accent), with
    fallbacks so it stands alone. */
 .graph-inspector {
@@ -23,7 +25,7 @@
   box-shadow: 0 2px 10px rgb(0 0 0 / 0.18);
   overflow: hidden;
 }
-/* On the left, when what is selected is drawn under the right. */
+/* On the left (a sheet: at the top), when what is selected is drawn under the right (the bottom). */
 .graph-inspector.left { right: auto; left: 8px; }
 .graph-inspector[hidden] { display: none; }
 .graph-inspector:focus-visible { outline: 2px solid var(--accent, #1f3e8c); outline-offset: -2px; }
@@ -109,7 +111,9 @@
 .inspector-copy { display: flex; align-items: flex-start; gap: 6px; }
 .inspector-copy .inspector-sql { flex: 1; min-width: 0; margin-top: 0; }
 
-/* A narrow view (a phone, a small window): a sheet over the lower half. */
+/* A narrow view (a phone, a small window): a sheet over the lower part, under
+   half of the view, so that it can be clear of any one node. */
 @media (max-width: 640px) {
-  .graph-inspector, .graph-inspector.left { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: 55%; }
+  .graph-inspector, .graph-inspector.left { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: calc(45% - 24px); }
+  .graph-inspector.left { top: 8px; bottom: auto; }
 }

@@ -27,11 +27,11 @@ permissions:
   contents: read
 
 env:
-  URSA_VERSION: "0.10.0"
+  URSA_VERSION: "0.12.0"
 
 jobs:
   smoke:
-    name: harness smoke (ursa 0.10.0)
+    name: harness smoke (ursa 0.12.0)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
