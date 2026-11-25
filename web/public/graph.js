@@ -36,7 +36,9 @@
 // (retheme).
 //
 // Time to the first drawing: preload() starts fetching ursa-viz and a layout
-// worker (which loads it too) while the engine is still running the query;
+// worker (which loads it too) while the engine is still running the query
+// (once this module is here: graph-pane.js first imports it when the engine
+// has a graph, so that a `.graph` that fails downloads none of it);
 // show() hands the worker the graph before it builds the view, so the
 // layout's hierarchy is built while the page sets up its canvas; and nothing
 // is drawn until the layout's first positions, not a random cloud first.
