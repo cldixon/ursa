@@ -1667,10 +1667,40 @@ fn write_vertex_graph(dir: &Path, tag: &str, n: u64, m: usize, strings: bool) {
 /// dense order, its id lookup table and the edges it dropped, FNV-1a over
 /// their little-endian bytes. The same for the same index on every
 /// platform and run.
-fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
-    use datafusion::arrow::array::{Array, AsArray};
+///
+/// With `first_seen`, of the index renumbered back to its first-seen node
+/// order (#172: an index this size is stored relabelled by in-degree), which
+/// is the index a build gave before the relabel; otherwise of the index as
+/// stored, its nodes' original ids included.
+fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey, first_seen: bool) -> u64 {
+    use datafusion::arrow::array::{Array, AsArray, UInt32Array};
+    use datafusion::arrow::compute::take;
     use datafusion::arrow::datatypes::Int64Type;
     let stored = ursa_engine::database::index_file::read_file(path, key).unwrap();
+    let (topology, ids) = match (first_seen, stored.topology.in_original_order()) {
+        (true, Some(topology)) => {
+            let order = stored.topology.nodes_in_original_order().unwrap().to_vec();
+            let column = take(
+                stored.ids.user_id_array().as_ref(),
+                &UInt32Array::from(order),
+                None,
+            )
+            .unwrap();
+            (
+                topology,
+                ursa_core::IdMap::from_user_ids(column.as_ref()).unwrap(),
+            )
+        }
+        _ => (
+            ursa_core::Topology::from_parts(
+                stored.topology.n_nodes(),
+                stored.topology.out().clone(),
+                None,
+            )
+            .unwrap(),
+            stored.ids.clone(),
+        ),
+    };
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for &b in bytes {
@@ -1678,7 +1708,6 @@ fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
     };
-    let topology = &stored.topology;
     eat(&(topology.n_nodes() as u64).to_le_bytes());
     eat(&(topology.n_edges() as u64).to_le_bytes());
     let out = topology.out();
@@ -1689,7 +1718,8 @@ fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
         eat(&t.to_le_bytes());
         eat(&e.to_le_bytes());
     }
-    let ids = stored.ids.user_id_array();
+    let lookup = ids.lookup_table().unwrap();
+    let ids = ids.user_id_array();
     match ids.data_type() {
         DataType::Int64 => {
             for &id in ids.as_primitive::<Int64Type>().values().iter() {
@@ -1704,8 +1734,13 @@ fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
             }
         }
     }
-    for &slot in stored.ids.lookup_table().unwrap().iter() {
+    for &slot in lookup.iter() {
         eat(&slot.to_le_bytes());
+    }
+    if !first_seen {
+        for &o in stored.topology.original_ids().unwrap_or(&[]) {
+            eat(&o.to_le_bytes());
+        }
     }
     eat(&stored.dropped.n_dropped.to_le_bytes());
     if let Some(kept) = &stored.dropped.kept {
@@ -1719,8 +1754,10 @@ fn index_hash(path: &Path, key: &ursa_engine::database::IndexKey) -> u64 {
 /// The index built for a graph with a vertex table is pinned (#532): the
 /// `describe(g, full => true)` row and a hash of the stored index (its node
 /// numbering, topology, id lookup table and dropped edges), for integer and
-/// for string keys. The hashes were recorded before the vertex-table build
-/// was made faster, so the build gives the same index it gave before.
+/// for string keys. The first-seen hashes were recorded before the
+/// vertex-table build was made faster, so the build gives the same index it
+/// gave before, read in first-seen order; the stored ones pin the in-degree
+/// relabel (#172) on top.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vertex_table_build_gives_the_pinned_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -1761,13 +1798,14 @@ async fn a_vertex_table_build_gives_the_pinned_index() {
     close(ctx);
     let index_dir = dir.path().join("pinned.ursa.d/indexes");
     let entries = read_manifest(&index_dir);
-    let mut hashes = Vec::new();
+    let (mut hashes, mut stored) = (Vec::new(), Vec::new());
     for tag in ["int", "str"] {
         let entry = entries
             .iter()
             .find(|e| e.graph == format!("g_{tag}"))
             .unwrap_or_else(|| panic!("no stored index for g_{tag}"));
-        hashes.push(index_hash(&index_dir.join(&entry.file), &entry.key));
+        hashes.push(index_hash(&index_dir.join(&entry.file), &entry.key, true));
+        stored.push(index_hash(&index_dir.join(&entry.file), &entry.key, false));
     }
     let row = "60001,247422,18810,2578,0.000068727188";
     assert_eq!(rows, [row, row], "the describe rows changed");
@@ -1775,5 +1813,10 @@ async fn a_vertex_table_build_gives_the_pinned_index() {
         hashes,
         [236861135069851834, 8257638453979474348],
         "the stored indexes changed"
+    );
+    assert_eq!(
+        stored,
+        [5853336306129075454, 17996850105661940950],
+        "the relabelled stored indexes changed"
     );
 }
