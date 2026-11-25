@@ -48,6 +48,7 @@ nav = [
     { "Statistics" = "reference/statistics.md" },
     { "Datasets" = "reference/datasets.md" },
     { "Errors" = "reference/errors.md" },
+    { "Session protocol" = "reference/protocol.md" },
     { "Limits" = "limits.md" },
     { "Changelog" = "changelog.md" },
   ] },

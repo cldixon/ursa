@@ -5,11 +5,11 @@
 // around it, as a real terminal is around the CLI: xterm.js draws the screen,
 // and the line editor here sends the shell each typed line and writes back
 // what it printed. The page adds what only a page can do: the Datasets menu,
-// Share, Import, downloads, the Graph view (graph.js) and the theme.
+// Share, Import, downloads, the Graph view (graph-pane.js) and the theme.
 import { Terminal } from "./vendor/xterm.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { DATASETS } from "./datasets.js";
-import { setup as setupSearch } from "./graph-search.js";
+import { createPane } from "./graph-pane.js";
 import { connect, defaultTransport } from "./engine-client.js";
 
 const $ = (id) => document.getElementById(id);
@@ -31,7 +31,7 @@ let engineStarted;
 
 function startEngine() {
   client?.close();
-  client = connect(defaultTransport(), { name: "shell", kind: "human" });
+  client = connect(defaultTransport(), { name: "shell", kind: "human" }, { session: "new" });
   engineStarted = client.ready;
   engineStarted.catch(() => {});
 }
@@ -95,17 +95,16 @@ function currentTheme() {
 const byPointer = (e) => e.detail > 0;
 $("theme").onclick = (e) => {
   const next = currentTheme() === "dark" ? "light" : "dark";
+  // The graph pane follows data-theme itself (graph-pane.js).
   document.documentElement.dataset.theme = next;
   try {
     localStorage.setItem("ursa-theme", next);
   } catch {}
   term.options.theme = xtermTheme(next);
-  graphLoaded?.retheme();
   if (byPointer(e)) term.focus();
 };
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   term.options.theme = xtermTheme(currentTheme());
-  graphLoaded?.retheme();
 });
 
 // ---------------------------------------------------------------- terminal
@@ -252,7 +251,7 @@ term.attachCustomKeyEventHandler((e) => {
   // Esc clears the Graph view's selection, or else closes the view, the
   // terminal keeping the focus.
   if (e.key === "Escape" && graphOpen()) {
-    if (e.type === "keydown" && !graphLoaded?.clearSelection()) closeGraph();
+    if (e.type === "keydown") pane.escape();
     return false;
   }
   // Shift+Enter starts a new line in what is typed. xterm would send Enter for
@@ -884,26 +883,18 @@ async function hostCommand(line) {
   const [name, ...rest] = line.trim().replace(/;\s*$/, "").split(/\s+/);
   const arg = rest.join(" ");
   switch (name) {
-    case ".graph": {
-      if (/^history\b/i.test(arg)) return explore(line);
+    case ".graph":
       if (/^echo\b/i.test(arg)) return graphEcho(rest.slice(1));
-      if (/^detail\b/i.test(arg)) return graphDetail(rest.slice(1));
-      // The query as typed: its spaces may be in a string.
-      const drawn = await drawGraph(line.trim().slice(name.length).trim());
-      // A drawing is part of the session a link replays: what is explored
-      // starts from it.
-      if (drawn && graphOpen()) ran.push(line.trim());
-      return drawn;
-    }
+      // A drawing, .graph detail or .graph history: the pane's.
+      return graphCommand(line);
     case ".find":
-      return find(line);
     case ".expand":
     case ".collapse":
     case ".hide":
     case ".show":
     case ".undo":
     case ".redo":
-      return explore(line);
+      return graphCommand(line);
     case ".clear":
       term.clear();
       await write("\x1b[H\x1b[2J");
@@ -955,125 +946,37 @@ async function hostCommand(line) {
 
 // ---------------------------------------------------------------- the Graph view
 
-// The pane beside the terminal (under it on a phone), and graph.js, which
-// draws in it: imported on the first `.graph`, so a session that draws no
-// graph downloads none of it (it loads ursa-viz, a few MB, in turn).
-const graphPane = $("graph-pane");
-let graphModule = null;
-// graph.js once loaded, for the test hooks.
-let graphLoaded = null;
-const graphOpen = () => !graphPane.hidden;
-const loadGraphModule = () =>
-  (graphModule ??= import("./graph.js").then(
-    (m) => (graphLoaded = m),
-    (e) => {
-      graphModule = null;
-      throw e;
-    },
-  ));
-
-// When each step of the last `.graph` ended (performance.now()), for tests
-// and tests/graph-timing.ts: enter, engine, viz, posted, view, the worker's
-// workerStart, workerLoaded and hierarchy, firstPositions, firstDraw, done;
-// and `command`, what was typed. graphTimings() (below) gives them.
-let graphTimes = null;
+// The pane beside the terminal (under it on a phone): graph-pane.js, which
+// draws in it with graph.js, imported on the first `.graph`, so a session
+// that draws no graph downloads none of it. The pane runs the graph commands
+// (.graph, .find, .expand, …); the terminal is its commands sink: what the
+// view, its inspector and its search ask for is typed here and run.
+const pane = createPane({
+  container: document.querySelector(".workspace"),
+  engine: { call: (op, args) => engine(op, args) },
+  commands: (command, { via, current }) => (via === "view" ? fromGraph(command, current) : run(command)),
+  // The view failed while drawing (a lost GPU, a layout that stopped): say so.
+  status: (message) =>
+    enqueue(async () => {
+      setAside();
+      await errorLine(message);
+    }),
+  focus: () => term.focus(),
+});
+const graphOpen = () => pane.isOpen();
 
 /**
- * `.graph ?SOURCE? ?NODES (query)? ?SIZE BY x? ?COLOR BY y?`: draw the last
- * result, a query's result, or a property graph (WebShell.graph says which
- * rows are edges, and what sizes and colours the nodes), replacing what the
- * pane drew. The terminal keeps the focus: queries can still be typed.
- *
- * The pane opens with "Loading graph view…" as soon as the engine takes more
- * than a moment (at once, for a big graph; not at all, for a typo), and the
- * graph view's code starts loading then, while the engine still works.
+ * A graph command (graph-pane.js's exec): .graph, .find and the explore
+ * commands. Writes what it printed (an explore command's only with the echo
+ * on, unless it failed), and keeps a command that changed the drawing for a
+ * shared link to replay. False if it failed.
  */
-async function drawGraph(text) {
-  const times = (graphTimes = { enter: performance.now(), command: `.graph ${text}`.trim() });
-  const wasOpen = graphOpen();
-  const status = $("graph-status");
-  const before = status.textContent;
-  let opened = false;
-  const open = () => {
-    if (opened) return;
-    opened = true;
-    graphPane.hidden = false;
-    status.textContent = "Loading graph view…";
-    loadGraphModule().then((m) => m.preload(), () => {});
-  };
-  const soon = setTimeout(open, 150);
-  let graph;
-  try {
-    graph = await engine("graph.open", { text });
-    times.engine = performance.now();
-  } catch (e) {
-    clearTimeout(soon);
-    // The pane as it was: closed, or with its drawing.
-    if (opened && !wasOpen) closeGraph();
-    else if (opened) status.textContent = before;
-    if (e.crash) throw e;
-    return errorLine(e.message);
-  }
-  clearTimeout(soon);
-  open();
-  // This drawing: a command its view asked for is not run on the next one.
-  const drawing = ++drawings;
-  let drawn;
-  try {
-    const module = await loadGraphModule();
-    // A new drawing: the last search's matches were of the old one.
-    search.clear();
-    drawn = await module.show($("graph-stage"), graph, { status, legend: $("graph-legend"), onError: graphFailed, onCommand: (command) => fromGraph(command, drawing), times, ...inspectorHooks });
-  } catch (e) {
-    // Closed (Esc) before it was drawn: nothing went wrong.
-    if (!graphOpen()) return true;
-    closeGraph();
-    return errorLine(`the graph view could not start: ${String(e?.message ?? e)}`);
-  }
-  const count = (n, one) => `${n.toLocaleString("en-US")} ${one}${n === 1 ? "" : "s"}`;
-  const skipped = graph.skipped ? `, skipping ${count(graph.skipped, "row")} with a NULL endpoint` : "";
-  const as = drawn.drawnAs ? ` as ${drawn.drawnAs}` : "";
-  const at = drawn.saved ? " at its saved positions" : "";
-  const replacing = wasOpen ? "replacing the last drawing; " : "";
-  if (drawn.grouped) {
-    // A grouped drawing (#499) says its groups, and how one opens.
-    const g = drawn.grouped;
-    await write(
-      `Drawing ${drawn.drawnAs}: ${count(g.groups, "group")} of ${count(g.total, "node")} by ${g.by}, with ${count(drawn.edges, "edge")} between groups${skipped} ` +
-        `(double-click a group, or .expand group:N, to open it; ${replacing}Esc closes)\r\n`,
-    );
-    return true;
-  }
-  await write(`Drawing ${count(drawn.edges, "edge")}, ${count(drawn.nodes, "node")}${as}${at}${skipped} (${replacing}Esc closes)\r\n`);
-  // A layout that will take a minute: how to run it once and draw from it (#502).
-  const hint = drawn.saved ? null : graphLoaded?.positionsHint(drawn.edges, drawn.graph);
-  if (hint)
-    await write(
-      `Its layout's fine level takes about a minute. To draw it at once, lay it out once and draw from that:\r\n` +
-        `  ${hint.copy}\r\n` +
-        `  ${hint.draw}\r\n` +
-        `The file stays in this session (.files lists it). As a table instead:\r\n` +
-        `  ${hint.here.join("\r\n  ")}\r\n` +
-        `The ursa CLI runs the same COPY on every core, and .files add brings its file here.\r\n`,
-    );
-  countNotShown();
-  return true;
+async function graphCommand(line) {
+  const r = await pane.exec(line);
+  if (!unechoed || r.err) await write(r.out + r.err);
+  if (r.replay) ran.push(r.replay);
+  return r.error ? errorLine(r.error) : r.ok;
 }
-
-/**
- * Ask the engine how many of each node's edges lead to something not shown,
- * and tell the view (its +N, in the tooltip and the header). Not waited for:
- * the answer is for whatever is drawn when it comes, or it is dropped.
- */
-function countNotShown() {
-  engine("graph.notShown").then(
-    ({ counts }) => graphOpen() && graphLoaded?.setNotShown(counts),
-    () => {},
-  );
-}
-
-// Bumped by each drawing: see fromGraph.
-let drawings = 0;
 
 // Whether a command the Graph view runs (a double-click's .expand) is shown
 // in the terminal, with its answer: `.graph echo off|on`.
@@ -1092,27 +995,6 @@ async function graphEcho(words) {
   return true;
 }
 
-/**
- * `.graph detail ?on|off?`: draw a large graph in full detail, or
- * aggregated again (#498); with no word, say which. The view's `a` does
- * the same.
- */
-async function graphDetail(words) {
-  const word = (words[0] ?? "").toLowerCase();
-  if (words.length > 1 || !["", "on", "off"].includes(word)) return errorLine("usage: .graph detail on|off");
-  const graph = await loadGraphModule();
-  const { detail, large } = graph.detail(word ? word === "on" : undefined);
-  const small = large === false ? " The graph drawn now is small enough to be drawn whole either way." : "";
-  await write(
-    (detail
-      ? "A large graph is drawn in full detail, every node and edge (.graph detail off aggregates it again)."
-      : "A large graph is drawn aggregated once it is laid out: a disc for each group of nodes, opened as the view zooms in (.graph detail on draws every node and edge).") +
-      small +
-      "\r\n",
-  );
-  return true;
-}
-
 // Set while a command the view asked for runs with the echo off: its answer
 // is not written, unless it is an error.
 let unechoed = false;
@@ -1123,13 +1005,13 @@ let unechoed = false;
  * after the prompt with a dimmed "from the graph" before it, its answer
  * under it, and kept in the history. With `.graph echo off` neither is
  * written (an error still is). Resolves to whether it ran without an error.
- * It is dropped if the drawing it was asked of (`drawing`) is closed or
- * replaced before its turn.
+ * It is dropped if the drawing it was asked of is closed or replaced before
+ * its turn (`current()` is false).
  */
-function fromGraph(command, drawing) {
+function fromGraph(command, current) {
   const session = generation;
   return enqueue(async () => {
-    if (session !== generation || drawing !== drawings || !graphOpen()) return false;
+    if (session !== generation || !current()) return false;
     setAside();
     // A statement left half typed would take this command as its next line.
     if (statement.length) await cancelPending();
@@ -1142,135 +1024,7 @@ function fromGraph(command, drawing) {
     }
   });
 }
-// What the Graph view's inspector (graph-inspector.js) asks of the page: a
-// command typed and run in the terminal, as its buttons do (.expand 33), and
-// a node's or an edge's row of the graph's tables, from the engine.
-const inspectorHooks = {
-  run: (command) => run(command),
-  inspect: (args) => engine("graph.inspect", args),
-};
 
-// The last explore command's answer, for tests: its `command`, how many
-// `nodes` and `edges` the engine shows after it, and `deltaBytes`, the size
-// of the change it sent (0 for none).
-let explored = null;
-
-/**
- * An explore command (.expand, .hide, .show, .undo, .redo, .graph history):
- * the engine changes its graph and prints what changed, and gives the change
- * as a UGR delta, which the pane applies to its drawing (graph.js's
- * applyDelta): new nodes appear beside their neighbours, hidden ones go, and
- * an undo puts every node back where it was. The shell itself (ursa-shell)
- * lists these commands in .help. A command that changed the graph is part
- * of the session a shared link replays.
- */
-async function explore(line) {
-  const at = performance.now();
-  const r = await engine("graph.explore", { command: line });
-  const command = line.trim().replace(/;\s*$/, "");
-  explored = { command: line, nodes: r.nodes, edges: r.edges, deltaBytes: r.delta?.byteLength ?? 0, drawn: null };
-  let lost = null;
-  if (r.delta && graphOpen()) {
-    const kind = /^\.(undo|redo)\b/i.exec(command)?.[1].toLowerCase() ?? "step";
-    try {
-      explored.drawn = (await loadGraphModule()).applyDelta(r.delta, { kind, command, at, engine: performance.now() - at });
-    } catch (e) {
-      lost = String(e?.message ?? e);
-    }
-  }
-  if (!unechoed || r.err) await write(r.out + r.err);
-  if (lost !== null) {
-    // The pane no longer draws what the engine holds: close both.
-    closeGraph();
-    return errorLine(`the graph view could not draw the change (${lost}); run .graph to draw it again`);
-  }
-  if (r.delta) {
-    ran.push(command);
-    countNotShown();
-  }
-  return !r.err;
-}
-
-// The last .find's answer, for tests: its `command`, the `ms` the engine
-// took to answer (the worker's round trip), how many nodes `matched` in the
-// view and how many of them were `selected`, and the matches `notShown`
-// ([{key, hidden}], the first of `notShownTotal`).
-let found = null;
-
-// The pane's search (graph-search.js): `/` opens its box, and Enter there
-// types .find into the shell.
-const search = setupSearch({
-  form: $("graph-search"),
-  input: $("graph-search-input"),
-  button: $("graph-find"),
-  list: $("graph-found"),
-  status: $("graph-status"),
-  run: (command) => run(command),
-  focusView: () => (graphPane.querySelector("canvas") ?? term).focus(),
-});
-
-/**
- * `.find TEXT` or `.find WHERE condition`: the engine says which nodes of the
- * graph drawn match (ursa-engine's graph::view::find), the view selects them
- * and fits them (graph.js's selectFound), and the pane lists the matches
- * that are not shown. A search that matches nothing in the view leaves the
- * selection as it was.
- */
-async function find(line) {
-  const start = performance.now();
-  const r = await engine("graph.find", { command: line });
-  found = { command: line, ms: performance.now() - start, matched: r.matches, selected: r.selected.length, notShown: r.notShown, notShownTotal: r.notShownTotal };
-  await write(r.out + r.err);
-  if (r.err) return false;
-  if (r.selected.length) graphLoaded?.selectFound(r.selected, r.matches);
-  search.show(r.notShown, r.notShownTotal);
-  return true;
-}
-
-/** Close the pane: the terminal takes the whole width again, and the focus. */
-function closeGraph() {
-  if (graphPane.hidden) return;
-  search.close(false);
-  search.clear();
-  // The engine's graph closes with the pane's: .expand then says none is open.
-  engine("graph.close").catch(() => {});
-  const hadFocus = graphPane.contains(document.activeElement);
-  graphPane.hidden = true;
-  graphModule?.then((m) => m.close(), () => {});
-  $("graph-stage").replaceChildren();
-  $("graph-status").textContent = "";
-  $("graph-legend").replaceChildren();
-  $("graph-legend").hidden = true;
-  if (hadFocus) term.focus();
-}
-
-/** The view failed while drawing (a lost GPU, a layout that stopped): say so. */
-function graphFailed(message) {
-  closeGraph();
-  enqueue(async () => {
-    setAside();
-    await errorLine(message);
-  });
-}
-
-$("graph-close").onclick = () => {
-  closeGraph();
-  term.focus();
-};
-graphPane.addEventListener("keydown", (e) => {
-  // `/` searches, from anywhere in the pane.
-  if (e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    e.preventDefault();
-    search.open();
-    return;
-  }
-  if (e.key !== "Escape") return;
-  e.preventDefault();
-  // A selection is cleared first; Esc again closes the pane.
-  if (graphLoaded?.clearSelection()) return;
-  closeGraph();
-  term.focus();
-});
 $("graph").onclick = (e) => {
   run(".graph");
   if (byPointer(e)) term.focus();
@@ -1369,7 +1123,7 @@ function fresh() {
   // A question waiting (a shared link's) is answered no.
   answer?.("");
   // What the pane drew belongs to the old session.
-  closeGraph();
+  pane.close();
   enqueue(async () => {
     if (session === generation) await restart();
   });
@@ -1483,7 +1237,7 @@ fileInput.onchange = () => {
       // prompt and what was typed are drawn again after it.
       setAside();
       const buffer = await file.arrayBuffer();
-      const { url } = await engine("addFile", { name: file.name }, [{ kind: "bytes", name: "file", bytes: buffer }]);
+      const { url } = await engine("addFile", { name: file.name }, [{ name: "file", kind: "bytes", bytes: buffer }]);
       uploads.push({ name: file.name, url, bytes: file.size });
       runAll([`CREATE OR REPLACE VIEW ${quoted} AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM ${quoted} LIMIT 10;`]);
     });
@@ -1611,14 +1365,14 @@ window.ursaShell = {
   // The Graph view: whether it is open, and (once graph.js is loaded) what it
   // draws, a frame's inked pixels, and the node at a canvas pixel.
   graphOpen,
-  graph: () => graphLoaded?.info() ?? null,
+  graph: () => pane.view()?.info() ?? null,
   // The last explore command (.expand, .hide, …): {command, nodes, edges,
   // deltaBytes, drawn}, the engine's counts of what is shown after it, and
   // what the pane drew of its delta ({nodes, edges, slots, bytesUploaded,
   // restored}; null with no delta).
-  explored: () => explored,
+  explored: () => pane.explored(),
   // The last .find: {command, ms, matched, selected, notShown, notShownTotal}.
-  found: () => found,
+  found: () => pane.found(),
   // The last .graph: when each step ended, in ms after Enter; and what the
   // view costs to use (#430, graph-timings.js): `frames` (how many, and the
   // p50, p95 and max of the time in render() and of the time between frames
@@ -1627,30 +1381,34 @@ window.ursaShell = {
   // from the input to the page being free of the frame that showed it) and
   // `longTasks` (the page's tasks over 50 ms: start, in ms after Enter, and
   // duration).
-  graphTimings: () =>
-    graphTimes && {
-      ...Object.fromEntries(Object.entries(graphTimes).filter(([, v]) => typeof v === "number").map(([k, v]) => [k, Math.round(v - graphTimes.enter)])),
-      ...graphLoaded?.readTimings(graphTimes.enter),
-    },
+  graphTimings: () => {
+    const times = pane.times();
+    return (
+      times && {
+        ...Object.fromEntries(Object.entries(times).filter(([, v]) => typeof v === "number").map(([k, v]) => [k, Math.round(v - times.enter)])),
+        ...pane.view()?.readTimings(times.enter),
+      }
+    );
+  },
   // For tests: forget the frames and picks timed so far.
-  graphTimingsReset: () => graphLoaded?.resetTimings(),
+  graphTimingsReset: () => pane.view()?.resetTimings(),
   // Memory: each wasm instance's (`wasm.engine`, `wasm.view`, `wasm.layout`,
   // in bytes) and, cross-origin isolated, what the browser measures for the
   // page and its workers (`userAgent`; see graph.js's memory()).
   graphMemory: async (options) => {
-    const [{ bytes }, rest] = await Promise.all([engine("memory"), graphLoaded?.memory(options)]);
+    const [{ bytes }, rest] = await Promise.all([engine("memory"), pane.view()?.memory(options)]);
     return { crossOriginIsolated, userAgent: null, ...rest, wasm: { engine: bytes, view: null, layout: null, ...rest?.wasm } };
   },
-  graphInked: async () => graphLoaded?.inked() ?? null,
-  graphNodeAt: (x, y) => graphLoaded?.nodeAt(x, y) ?? null,
+  graphInked: async () => pane.view()?.inked() ?? null,
+  graphNodeAt: (x, y) => pane.view()?.nodeAt(x, y) ?? null,
   // For tests: shown nodes with edges not shown, the most first, each with its place.
-  graphExpandable: (limit) => graphLoaded?.expandable(limit) ?? [],
+  graphExpandable: (limit) => pane.view()?.expandable(limit) ?? [],
   // For tests: the edge a click at a CSS pixel of the canvas picks, and what
   // the inspector shows.
-  graphEdgeAt: (x, y) => graphLoaded?.edgeAt(x, y) ?? null,
-  graphInspector: () => graphLoaded?.inspected() ?? null,
+  graphEdgeAt: (x, y) => pane.view()?.edgeAt(x, y) ?? null,
+  graphInspector: () => pane.view()?.inspected() ?? null,
   // For tests: where the node with a key is drawn, {index, x, y} in CSS pixels of the canvas.
-  graphNodePlace: (id) => graphLoaded?.nodePlace(id) ?? null,
+  graphNodePlace: (id) => pane.view()?.nodePlace(id) ?? null,
   // Where every node is, by its key: {ids, xy} (graph.js's placement).
-  graphPlacement: () => graphLoaded?.placement() ?? null,
+  graphPlacement: () => pane.view()?.placement() ?? null,
 };

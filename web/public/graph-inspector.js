@@ -12,8 +12,8 @@
 // It is self-contained, so it can move to ursa-viz/ui/ as it is: it has no
 // import, and knows nothing of the view, the engine or the terminal. Its host
 // (graph.js) describes what is selected as plain data (`show`) and gives it
-// callbacks: `fetchRow` and `fetchNeighbours` ask the engine, `run` types a
-// command in the terminal, `pin` and `select` change the view. Its styles are
+// callbacks: `fetchRow` and `fetchNeighbours` ask the engine, `run` runs a
+// command (the pane's commands sink: the shell's terminal), `pin` and `select` change the view. Its styles are
 // graph-inspector.css beside it, which it links on first use.
 //
 // Every value is set with textContent: nothing from the data is ever HTML.
@@ -79,7 +79,7 @@ export function pathCommand(graph, from, to) {
  *                            row of the graph's tables
  *   fetchNeighbours(subject) -> Promise of how many neighbours a node has in
  *                            the whole graph, or null
- *   run(command)          type a command in the terminal and run it
+ *   run(command)          run a command (the pane's commands sink)
  *   pin(index)            pin a node, or unpin it; returns whether it is pinned now
  *   select(index)         select a node alone (an edge's end)
  *   onLeave()             Esc was pressed in the panel: take the focus back

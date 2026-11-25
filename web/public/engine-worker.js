@@ -11,24 +11,23 @@
 //   reply    {id, ok: true, result, parts: [{kind, name, bytes: ArrayBuffer}]}
 //            {id, ok: false, error: {kind, message}}
 //
-// The parts' buffers are transferred, both ways. The operations are the
-// session's (Session::handle in ursa-shell/src/session.rs lists them), and
-// one of the worker's own: `memory`, the engine's WebAssembly memory in
-// bytes, for graphMemory. A WebAssembly trap (out of memory) fails its
+// The parts' buffers are transferred, both ways. The operations are all the
+// session's (ursa_shell::session::OPS lists them; docs/reference/protocol.md
+// is generated from it), `hello` first. A request of another protocol version
+// fails with kind `protocol`. A WebAssembly trap (out of memory) fails its
 // request with kind `crash`: the page then starts a fresh worker.
 //
 // Before any request, the worker says it loaded: {ready: true, version, ms},
 // or {ready: false, error}.
 import init, { WebShell, version } from "./engine/ursa_wasm.js";
 
+const PROTOCOL = 1;
 let shell = null;
-// The engine's wasm exports, once loaded.
-let wasm = null;
 
 const ready = (async () => {
   const t0 = performance.now();
   const engine = await (await fetch(new URL("./engine/engine.json", import.meta.url))).json();
-  wasm = await init({ module_or_path: new URL(engine.wasm, self.location.origin) });
+  await init({ module_or_path: new URL(engine.wasm, self.location.origin) });
   // Relative paths are the datasets' files.
   WebShell.setBaseUrl(new URL("/data/", self.location.origin).href);
   return { version: version(), ms: performance.now() - t0 };
@@ -45,13 +44,13 @@ onmessage = ({ data }) => {
   queue = queue.then(() => handle(data));
 };
 
-async function handle({ id, op, args = {}, parts = [] }) {
+async function handle({ v, id, op, args = {}, parts = [] }) {
+  if (v !== PROTOCOL) {
+    postMessage({ id, ok: false, error: { kind: "protocol", message: `this engine speaks protocol ${PROTOCOL}, not ${v}` } });
+    return;
+  }
   try {
     await ready;
-    if (op === "memory") {
-      postMessage({ id, ok: true, result: { bytes: wasm.memory.buffer.byteLength }, parts: [] });
-      return;
-    }
     shell ??= new WebShell();
     const answer = await shell.handle(op, JSON.stringify(args), parts.map((p) => new Uint8Array(p.bytes)));
     const reply = JSON.parse(answer.message);

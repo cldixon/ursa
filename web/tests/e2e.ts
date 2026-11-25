@@ -21,6 +21,7 @@
 // tour on a phone, and opens every "Try it live" link in the README, the SQL
 // docs and the website (a Share link is answered y).
 import { chromium, type Page } from "playwright";
+import { SECURITY_HEADERS } from "../src/headers";
 
 const base = (Bun.argv[2] ?? "http://localhost:8788").replace(/\/$/, "");
 const shots = Bun.argv[3];
@@ -3302,6 +3303,81 @@ for (const phone of [false, true]) {
     await p.close();
   }
   await lctx.close();
+}
+
+// URSA-8: the graph pane (graph-pane.js) is a pane any host can embed, not
+// the shell's. A second host, tests/pane-host/ (never built or deployed;
+// served here from the repository under the site's own headers), has no
+// terminal: it gives the pane the engine client, a commands sink (its History
+// list), a status line and a container. It draws a hop through the engine
+// client, and a double-click on a node sends `.expand 2` to its sink, which
+// runs it through the pane: the drawing grows, and no terminal is involved.
+{
+  const hctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
+  await hctx.route(/\/tests\/pane-host\/[a-z.-]*$/, async (route) => {
+    const name = new URL(route.request().url()).pathname.split("/").pop() || "index.html";
+    const body = await Bun.file(new URL(`./pane-host/${name}`, import.meta.url)).text().catch(() => null);
+    if (body === null) return route.fulfill({ status: 404, body: "not found" });
+    const type = name.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8";
+    await route.fulfill({ status: 200, body, headers: { ...SECURITY_HEADERS, "content-type": type } });
+  });
+  const h = await hctx.newPage();
+  await h.goto(`${base}/tests/pane-host/`);
+  await h.waitForFunction(() => (window as any).paneHost, null, { timeout: 30_000 });
+  await h.evaluate(() => (window as any).paneHost.ready());
+  const drew = await h.evaluate(() => (window as any).paneHost.exec(".graph SELECT * FROM hop(karate, seeds => [0], steps => 1, direction => 'both')"));
+  const settled = () =>
+    h
+      .waitForFunction(
+        () => {
+          const g = (window as any).paneHost.pane.view()?.info();
+          return g && g.frames > 0 && g.layoutDone;
+        },
+        null,
+        { timeout: 60_000, polling: 200 },
+      )
+      .then(() => true, () => false);
+  const drawnFirst = await settled();
+  const info = () => h.evaluate(() => (window as any).paneHost.pane.view()?.info() ?? null);
+  const base0 = await info();
+  const markup = await h.evaluate(() => ({
+    inHost: document.getElementById("graph-pane")?.parentElement?.id,
+    terminal: !!document.querySelector(".xterm"),
+    shell: "ursaShell" in window,
+    canvas: !!document.querySelector("#graph-stage canvas"),
+  }));
+  check(
+    drew === true && drawnFirst && base0?.nodes === 17 && markup.inHost === "host" && markup.canvas && !markup.terminal && !markup.shell,
+    "a second host (no terminal) opens a graph in the pane through the engine client; the pane makes its own markup",
+    `${JSON.stringify(markup)} | ${base0?.nodes} nodes`,
+  );
+  // Node 2 has four neighbours beyond 0's.
+  await h.waitForFunction(() => (window as any).paneHost.pane.view()?.info()?.notShownKnown === true, null, { timeout: 30_000 }).catch(() => {});
+  const box = (await h.locator("#graph-stage canvas").boundingBox())!;
+  const at: { x: number; y: number } | null = await h.evaluate(() => (window as any).paneHost.pane.view().nodePlace(2));
+  await h.mouse.dblclick(box.x + at!.x, box.y + at!.y);
+  const grew = await h
+    .waitForFunction(() => (window as any).paneHost.pane.view()?.info()?.nodes === 21, null, { timeout: 30_000 })
+    .then(() => true, () => false);
+  await settled();
+  const { received, logged }: { received: any[]; logged: any[] } = await h.evaluate(() => {
+    const { received, logged } = (window as any).paneHost;
+    return { received, logged };
+  });
+  check(
+    grew && received.some((r) => r.command === ".expand 2" && r.via === "view") && logged.some((l) => l.kind === "answer" && /^\+4 nodes, \+\d+ edges/.test(l.text)),
+    "a double-click in the second host's pane sends .expand 2 to its commands sink, which runs it: the drawing grows",
+    `${JSON.stringify(received)} | ${JSON.stringify(logged).slice(0, 200)} | ${(await info())?.nodes} nodes`,
+  );
+  // Esc clears the selection, then closes the pane; the engine's graph closes with it.
+  await h.locator("#graph-stage canvas").focus();
+  await h.keyboard.press("Escape");
+  await h.keyboard.press("Escape");
+  const closed = await h.evaluate(() => document.getElementById("graph-pane")!.hidden);
+  const after = await h.evaluate(() => (window as any).paneHost.client.call("graph.explore", { command: ".expand 2" }));
+  check(closed && /no graph is open/.test(after.err), "the second host's pane closes on Esc, and the engine's graph with it", `${closed} | ${after.err}`);
+  if (shots) await h.screenshot({ path: `${shots}/graph-pane-host.png` });
+  await hctx.close();
 }
 
 // The security headers, on every kind of response.

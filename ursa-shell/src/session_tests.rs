@@ -5,8 +5,12 @@
 use super::*;
 use ursa_engine::graph::view::GraphView;
 
+/// A session past its `hello`.
 fn session() -> Session {
-    Session::new(Options::default())
+    Session {
+        greeted: true,
+        ..Session::new(Options::default())
+    }
 }
 
 /// The graph `text` opens, as the engine made it: what
@@ -142,14 +146,6 @@ async fn start_is_a_fresh_session_with_the_hosts_commands() {
 #[tokio::test]
 async fn operations_fail_with_a_kind_and_a_message() {
     let mut shell = session();
-    let hello = op(
-        &mut shell,
-        "hello",
-        json!({"client": {"name": "test", "kind": "human"}}),
-    )
-    .await;
-    assert_eq!(hello["protocol"], 1);
-    assert_eq!(hello["transport"], "native");
     let unknown = shell
         .handle("nope", json!({}), Vec::new())
         .await
@@ -211,6 +207,7 @@ async fn export_and_files_go_as_parts() {
         uploads: false,
         ..Options::default()
     });
+    op(&mut bare, "hello", json!({"protocol": 1})).await;
     assert_eq!(op(&mut bare, "files", json!({})).await["files"], json!([]));
     let refused = bare
         .handle("addFile", json!({"name": "e.csv"}), vec![vec![]])
@@ -793,4 +790,338 @@ async fn the_last_result_is_kept_for_export() {
     run(&mut shell, "SELECT * FROM (VALUES (1), (2), (3)) AS t(x);").await;
     let (_, batches) = shell.shell.last_result().unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+}
+
+const TIES: &str = "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (3, 4), (4, 5)) AS t(src, dst);";
+const CLUB: &str =
+    "CREATE PROPERTY GRAPH club EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));";
+
+/// `hello` must come first, says what the host is, and refuses a protocol
+/// version other than 1.
+#[tokio::test]
+async fn hello_comes_first_and_speaks_protocol_1() {
+    let mut shell = Session::new(Options::default());
+    let early = shell
+        .handle("feed", json!({"line": "SELECT 1;"}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (early.kind, early.message.as_str()),
+        ("protocol", "the first request must be hello, not feed")
+    );
+    for (args, message) in [
+        (json!({}), "this session speaks protocol 1, not none"),
+        (
+            json!({"protocol": 2}),
+            "this session speaks protocol 1, not 2",
+        ),
+        (
+            json!({"protocol": "1"}),
+            "this session speaks protocol 1, not \"1\"",
+        ),
+        (
+            json!({"protocol": 1, "session": "mine"}),
+            "hello's session is \"new\" or \"shared\", not \"mine\"",
+        ),
+    ] {
+        let refused = shell.handle("hello", args, Vec::new()).await.unwrap_err();
+        assert_eq!(
+            (refused.kind, refused.message.as_str()),
+            ("protocol", message)
+        );
+    }
+    // A refused hello is no hello.
+    assert!(shell.handle("files", json!({}), Vec::new()).await.is_err());
+
+    let hello = op(
+        &mut shell,
+        "hello",
+        json!({"protocol": 1, "client": {"name": "test", "kind": "human"}, "session": "new"}),
+    )
+    .await;
+    assert_eq!(
+        hello,
+        json!({
+            "protocol": 1,
+            "version": env!("CARGO_PKG_VERSION"),
+            "transport": "native",
+            "capabilities": [],
+            "session": {"kind": "new"},
+        })
+    );
+    let shared = op(&mut shell, "hello", json!({"protocol": 1})).await;
+    assert_eq!(shared["session"], json!({"kind": "shared"}));
+    // `start` is a fresh shell, not a fresh conversation.
+    op(&mut shell, "start", json!({})).await;
+    op(&mut shell, "feed", json!({"line": "SELECT 1;"})).await;
+}
+
+/// The name the protocol does not have fails before `hello` is asked for.
+#[tokio::test]
+async fn an_unknown_op_is_a_protocol_error() {
+    let mut shell = Session::new(Options::default());
+    let unknown = shell
+        .handle("cancelled", json!({}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (unknown.kind, unknown.message.as_str()),
+        ("protocol", "unknown op cancelled")
+    );
+}
+
+/// `cancel` reaches the session only once nothing runs: there is nothing to
+/// stop. `cancelInput` drops what is typed.
+#[tokio::test]
+async fn cancel_stops_nothing_and_cancel_input_drops_the_statement() {
+    let mut shell = session();
+    assert_eq!(
+        op(&mut shell, "cancel", json!({"target": 3})).await,
+        json!({})
+    );
+    let typed = op(&mut shell, "feed", json!({"line": "SELECT 1"})).await;
+    assert_eq!(typed["pending"], true);
+    let dropped = op(&mut shell, "cancelInput", json!({})).await;
+    assert_eq!(dropped["prompt"], "memory U ");
+    let next = op(&mut shell, "feed", json!({"line": "SELECT 2 AS two;"})).await;
+    assert!(next["out"].as_str().unwrap().contains("two"), "{next}");
+    assert_eq!(next["err"], "");
+}
+
+/// `memory` says what it measured: natively, the resident set.
+#[tokio::test]
+async fn memory_says_what_it_measured() {
+    let mut shell = session();
+    let memory = op(&mut shell, "memory", json!({})).await;
+    assert_eq!(memory["kind"], "rss");
+    if cfg!(target_os = "linux") {
+        assert!(memory["bytes"].as_u64().unwrap() > 1 << 20, "{memory}");
+    }
+}
+
+/// The console's `query`: typed columns with their `ursa.*` metadata, the
+/// schema's own metadata, the first rows as Arrow IPC, and the result kept as
+/// the last one.
+#[tokio::test]
+async fn query_gives_typed_columns_metadata_and_arrow_rows() {
+    use arrow::ipc::reader::StreamReader;
+    let mut shell = session();
+    run(&mut shell, TIES).await;
+    run(&mut shell, CLUB).await;
+    let reply = shell
+        .handle(
+            "query",
+            json!({"sql": "SELECT * FROM pagerank(club) ORDER BY id", "rows": 3}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let r = &reply.result;
+    assert_eq!(
+        (r["rows"].as_u64(), r["more"].as_bool()),
+        (Some(5), Some(true))
+    );
+    assert_eq!(r["columns"][1]["name"], "pagerank");
+    assert_eq!(r["columns"][1]["type"], "Float64");
+    assert_eq!(r["columns"][0]["metadata"]["ursa.role"], "node", "{r}");
+    assert_eq!(r["notices"], json!([]));
+    assert_eq!(
+        (reply.parts.len(), reply.parts[0].name, reply.parts[0].kind),
+        (1, "arrow", PartKind::Arrow)
+    );
+    let reader = StreamReader::try_new(reply.parts[0].bytes.as_slice(), None).unwrap();
+    let schema = reader.schema();
+    assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 3);
+    let role = schema.field(0).metadata().get("ursa.role").cloned();
+    assert_eq!(role.as_deref(), Some("node"));
+    // Every row is the last result, for export.
+    let csv = shell.export("csv").unwrap();
+    assert_eq!(String::from_utf8(csv).unwrap().lines().count(), 6);
+
+    // GRAPH_TABLE's pattern is on the schema, not on a column.
+    let pattern = shell
+        .handle(
+            "query",
+            json!({"sql": "SELECT * FROM GRAPH_TABLE (club MATCH (a)-[e]->(b) COLUMNS (e.src AS a, e.dst AS b))"}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let metadata = &pattern.result["metadata"];
+    assert!(metadata["ursa.pattern"].is_string(), "{metadata}");
+    let reader = StreamReader::try_new(pattern.parts[0].bytes.as_slice(), None).unwrap();
+    assert!(reader.schema().metadata().contains_key("ursa.pattern"));
+
+    // A statement with no rows, and an error.
+    let created = op(
+        &mut shell,
+        "query",
+        json!({"sql": "CREATE VIEW v AS SELECT 1 AS x"}),
+    )
+    .await;
+    assert_eq!(
+        (created["columns"].clone(), created["notices"].clone()),
+        (json!([]), json!(["OK"]))
+    );
+    let wrong = shell
+        .handle("query", json!({"sql": "SELECT nope"}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.kind, "sql");
+}
+
+/// The graph operations through `handle`, with their parts named.
+#[tokio::test]
+async fn graph_ops_reply_with_named_parts() {
+    use ursa_viz::model::{GraphDelta, GraphResult};
+    let mut shell = session();
+    run(&mut shell, TIES).await;
+    run(&mut shell, CLUB).await;
+    let opened = shell
+        .handle(
+            "graph.open",
+            json!({"text": "SELECT * FROM hop(club, seeds => [1], direction => 'both')"}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened.result, json!({"skipped": 0}));
+    // No `positions`: they are only there with POSITIONS.
+    let names: Vec<_> = opened.parts.iter().map(|p| (p.name, p.kind)).collect();
+    assert_eq!(names, [("ugr", PartKind::Ugr)]);
+    let mut view = GraphResult::from_bytes(&opened.parts[0].bytes).unwrap();
+    assert_eq!((view.n_nodes(), view.n_edges()), (3, 3));
+
+    let expanded = shell
+        .handle("graph.explore", json!({"command": ".expand 3"}), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        expanded.result,
+        json!({"out": "+1 node, +1 edge\n", "err": "", "nodes": 4, "edges": 4, "delta": null})
+    );
+    assert_eq!(
+        (expanded.parts[0].name, expanded.parts[0].kind),
+        ("delta", PartKind::Ugr)
+    );
+    view.apply(&GraphDelta::from_bytes(&expanded.parts[0].bytes).unwrap())
+        .unwrap();
+    assert_eq!(view.n_nodes(), 4);
+    // A command that changes nothing has no `delta`.
+    let missing = shell
+        .handle("graph.explore", json!({"command": ".hide 9"}), Vec::new())
+        .await
+        .unwrap();
+    assert!(missing.parts.is_empty());
+    assert!(missing.result["err"]
+        .as_str()
+        .unwrap()
+        .contains("no node '9'"));
+
+    let found = shell
+        .handle("graph.find", json!({"command": ".find 4"}), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(found.result["matches"], 1);
+    assert_eq!(
+        (found.parts[0].name, found.parts[0].kind),
+        ("selected", PartKind::U32)
+    );
+    assert_eq!(found.parts[0].bytes, 3u32.to_le_bytes());
+
+    let counts = shell
+        .handle("graph.notShown", json!({}), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.parts[0].name, counts.parts[0].kind),
+        ("counts", PartKind::U32)
+    );
+    // 4 nodes shown, a u32 each; node 4's edge to 5 is not shown.
+    let counts: Vec<u32> = counts.parts[0]
+        .bytes
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, [0, 0, 0, 1]);
+
+    let inspected = op(
+        &mut shell,
+        "graph.inspect",
+        json!({"node": 3, "key": "4", "neighbours": true}),
+    )
+    .await;
+    assert_eq!(inspected["neighbours"], 2);
+    assert!(inspected["ms"].is_number());
+    let edge = op(
+        &mut shell,
+        "graph.inspect",
+        json!({"edge": 0, "src": "1", "dst": "2"}),
+    )
+    .await;
+    assert_eq!(edge["table"], "ties");
+    let neither = shell
+        .handle("graph.inspect", json!({}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(neither.kind, "protocol");
+
+    assert_eq!(op(&mut shell, "graph.close", json!({})).await, json!({}));
+    let closed = op(&mut shell, "graph.explore", json!({"command": ".undo"})).await;
+    assert!(closed["err"].as_str().unwrap().contains("no graph is open"));
+
+    // POSITIONS gives the second, optional part.
+    let placed = shell
+        .handle(
+            "graph.open",
+            json!({"text": "SELECT * FROM ties POSITIONS (SELECT src AS id, src * 1.0 AS x, 0.0 AS y FROM ties)"}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let names: Vec<_> = placed.parts.iter().map(|p| (p.name, p.kind)).collect();
+    assert_eq!(
+        names,
+        [("ugr", PartKind::Ugr), ("positions", PartKind::F32)]
+    );
+}
+
+/// Every operation of [`OPS`] reaches `handle`'s own code: none is unknown.
+#[tokio::test]
+async fn every_listed_op_is_handled() {
+    for o in OPS {
+        let mut shell = session();
+        if let Err(e) = shell.handle(o.name, json!({}), Vec::new()).await {
+            assert!(!e.message.starts_with("unknown op"), "{}: {e:?}", o.name);
+        }
+    }
+}
+
+/// The protocol's document is [`OPS`] as a table: `UPDATE_PROTOCOL_DOC=1
+/// cargo test -p ursa-shell protocol_doc` writes it.
+#[test]
+fn protocol_doc_lists_the_ops() {
+    const BEGIN: &str = "<!-- ops: generated from ursa_shell::session::OPS -->\n";
+    const END: &str = "<!-- /ops -->";
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/reference/protocol.md");
+    let doc = std::fs::read_to_string(path).unwrap();
+    let mut table =
+        String::from("| op | args | result; parts (kind) | what it does |\n|---|---|---|---|\n");
+    for o in OPS {
+        table += &format!(
+            "| `{}` | {} | {} | {}. |\n",
+            o.name, o.args, o.result, o.about
+        );
+    }
+    let start = doc.find(BEGIN).expect("the document marks the table") + BEGIN.len();
+    let end = doc[start..].find(END).expect("the table's end is marked") + start;
+    if std::env::var_os("UPDATE_PROTOCOL_DOC").is_some() {
+        std::fs::write(path, format!("{}{table}{}", &doc[..start], &doc[end..])).unwrap();
+    } else {
+        assert_eq!(
+            doc[start..end],
+            table,
+            "docs/reference/protocol.md is not OPS: run UPDATE_PROTOCOL_DOC=1 cargo test -p ursa-shell protocol_doc"
+        );
+    }
 }
