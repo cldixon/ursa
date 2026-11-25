@@ -880,23 +880,35 @@ the link it prints, and runs the suite with `URSA_SERVE_TOKEN` set: every
 browser context gets the token's cookie, and the suite skips (printing `skip`)
 the 6 checks of what only the browser demo has: the engine's crash (a
 WebAssembly trap) and recovery, the wasm instances' memory, the cross-origin
-isolation headers of the wasm engine's files, and its worker. At the end it
+isolation headers of the wasm engine's files, and its worker. Those 6 are
+listed in the suite (`SOCKET_SKIPS`), and its last check fails a socket run
+that skipped any other, or a worker run that skipped any at all. At the end it
 stops the server with Ctrl+C (SIGINT) and fails if it does not stop
 gracefully.
 
-CI runs it: the "Ursa Shell (browser e2e)" job (`.github/workflows/shell-e2e.yml`)
-runs on pull requests and pushes to `main` that touch `web/`, the crates built
-into the page (`ursa-wasm`, `ursa-shell`, `ursa-viz` and the engine crates
-under them), the Cargo files, or the datasets' inputs; it can also be started
-by hand (Run workflow). It does what is above, with no Cloudflare credentials:
+CI runs it over both transports, so the browser demo and `ursa serve` stay one
+product: `.github/workflows/shell-e2e.yml` has a leg per transport, the
+"Ursa Shell (browser e2e)" job (the worker, as deployed) and "Ursa Shell
+(browser e2e over ursa serve)" (the socket). They run on pull requests and
+pushes to `main` that touch `web/`, the crates built into the page
+(`ursa-wasm`, `ursa-shell`, `ursa-viz` and the engine crates under them),
+`ursa-server` or `ursa-cli/src/serve.rs`, the Cargo files, or the datasets'
+inputs; they can also be started by hand (Run workflow). The worker leg does
+what is above, with no Cloudflare credentials:
 `bun run engine`, `bun run build`, `bun run upload:data -- --dry` (which only
 stages `.data/`), then `bun scripts/preview.ts` and the suite against it, with
 Playwright pinned in the workflow (`PLAYWRIGHT_VERSION`) and its own Chromium.
 Cargo's dependencies are cached; so are `.engine/`, keyed by the engine's
 sources, and `.data/`, keyed by the bundled CSVs, `gen.py` and
 `upload-data.ts` (a miss builds the native `ursa` in release, several
-minutes). A failed run uploads the screenshots and the server's and suite's
-logs as the `shell-e2e` artifact.
+minutes). The socket leg restores the same `.engine/` and `.data/`, builds
+the page the same way, builds `ursa-cli --features serve` (a debug build: with
+the dependencies cached it takes a couple of minutes, where a release build
+takes about 25, for a suite about a minute slower), and runs
+`bun scripts/e2e-serve.ts` with it. Each leg keeps its own
+cargo cache. A failed run uploads the screenshots and the server's and suite's
+logs as the `shell-e2e` artifact (the worker) or `shell-e2e-serve` (the
+socket).
 
 ## Datasets
 
