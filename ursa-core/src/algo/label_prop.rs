@@ -58,13 +58,15 @@ pub fn label_propagation(
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
+    // Built (or read) here, so a relabelled topology's is renumbered below
+    // rather than transposed again.
+    topo.incoming();
     // Relabelled nodes (#172): vote in the original numbering, whose visit
     // order and ties give the labels an unrelabelled index gives.
     if let Some(original) = topo.in_original_order() {
         let labels = label_propagation(&original, mask, max_iter, seed, parallel);
         return in_node_order(topo, &labels);
     }
-    topo.incoming();
     let linked = Linked::of(topo, mask);
     let linked = linked.worth_it().then_some(&linked);
     if parallel {

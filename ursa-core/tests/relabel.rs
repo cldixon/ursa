@@ -94,6 +94,13 @@ fn the_relabel_is_a_permutation_by_in_degree() {
     assert_eq!(again.out().targets, plain.out().targets);
     assert_eq!(again.out().edge_ids, plain.out().edge_ids);
     assert!(plain.in_original_order().is_none());
+    // With its in-adjacency built, that is renumbered too: the transpose.
+    relabelled.incoming();
+    let again = relabelled.in_original_order().unwrap();
+    let inc = again.incoming_if_built().expect("renumbered, not rebuilt");
+    assert_eq!(inc.offsets, plain.incoming().offsets);
+    assert_eq!(inc.targets, plain.incoming().targets);
+    assert_eq!(inc.edge_ids, plain.incoming().edge_ids);
     // The edge rows are the same edges.
     let out = relabelled.out();
     for u in 0..n as u32 {

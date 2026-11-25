@@ -852,6 +852,49 @@ impl Relabel {
     }
 }
 
+/// `adj` renumbered by its original ids (see [`Topology::in_original_order`]):
+/// original node `o`'s segment is the segment of node `relabel.nodes()[o]`,
+/// its targets renamed to their original ids, its edge ids as they are.
+fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
+    use crate::parallel::*;
+    let node = relabel.nodes();
+    let n = node.len();
+    let mut offsets = vec![0u64; n + 1];
+    for (o, &v) in node.iter().enumerate() {
+        offsets[o + 1] = offsets[o] + u64::from(adj.degree(v));
+    }
+    let m = adj.targets.len();
+    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
+    let (t_addr, e_addr) = (
+        targets.as_mut_ptr() as usize,
+        edge_ids.as_mut_ptr() as usize,
+    );
+    let offsets_ref = &offsets;
+    let copy = |o: usize| {
+        let v = node[o];
+        let (lo, hi) = (adj.offsets[v as usize] as usize, adj.offsets[v as usize + 1] as usize);
+        let at = offsets_ref[o] as usize;
+        for (i, k) in (lo..hi).enumerate() {
+            // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
+            // across nodes and inside both buffers, which outlive the pass.
+            unsafe {
+                *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
+                *(e_addr as *mut u32).add(at + i) = adj.edge_ids[k];
+            }
+        }
+    };
+    if in_worker() || m < (1 << 16) {
+        (0..n).for_each(copy);
+    } else {
+        (0..n).into_par_iter().for_each(copy);
+    }
+    Adjacency {
+        offsets: offsets.into(),
+        targets: targets.into(),
+        edge_ids: edge_ids.into(),
+    }
+}
+
 /// Whether `ids` is a permutation of `0..ids.len()`.
 fn is_permutation(ids: &[u32]) -> bool {
     let mut seen = vec![false; ids.len()];
@@ -1093,36 +1136,32 @@ impl Topology {
     }
 
     /// This topology numbered by its original ids, as [`Self::build`] gives
-    /// it from the same rows: `None` when it was not relabelled. The rows'
-    /// endpoints are read back from the out-CSR (`edge_ids`), so this costs a
-    /// build. The seeded community kernels run over it, so that their result
+    /// it from the same rows: `None` when it was not relabelled. The seeded
+    /// community kernels and the layouts run over it, so that their result
     /// is the one the original numbering gives.
+    ///
+    /// No sort is needed: node `o`'s segment, in either direction, is the
+    /// segment of the node whose original id is `o`, in the same row order,
+    /// its neighbours renamed. So this is one streaming pass per direction
+    /// (the in-adjacency too, when this topology has it built), parallel.
     pub fn in_original_order(&self) -> Option<Topology> {
-        use crate::parallel::*;
         let relabel = self.relabel.as_ref()?;
-        let (n, m) = (self.n_nodes, self.n_edges);
-        let (mut src, mut dst) = (vec![0u32; m], vec![0u32; m]);
-        let (s_addr, d_addr) = (src.as_mut_ptr() as usize, dst.as_mut_ptr() as usize);
-        let out = &self.out;
-        let write = |u: usize| {
-            let o = relabel.original[u];
-            let (lo, hi) = (out.offsets[u] as usize, out.offsets[u + 1] as usize);
-            for k in lo..hi {
-                let row = out.edge_ids[k] as usize;
-                // SAFETY: `edge_ids` is a permutation of the rows, so each row
-                // is written once, by one node; both arrays have `m` rows.
-                unsafe {
-                    *(s_addr as *mut u32).add(row) = o;
-                    *(d_addr as *mut u32).add(row) = relabel.original[out.targets[k] as usize];
-                }
-            }
-        };
-        if in_worker() {
-            (0..n).for_each(write);
-        } else {
-            (0..n).into_par_iter().for_each(write);
+        let out = in_original(&self.out, relabel);
+        let inc = OnceLock::new();
+        if let Some(incoming) = self.incoming_if_built() {
+            let _ = inc.set(in_original(incoming, relabel));
         }
-        Some(Self::build(n, src, dst))
+        Some(Topology {
+            n_nodes: self.n_nodes,
+            n_edges: self.n_edges,
+            out,
+            inc,
+            inc_loader: LazyIncoming::default(),
+            undirected: OnceLock::new(),
+            symmetric: OnceLock::new(),
+            self_transpose: false,
+            relabel: None,
+        })
     }
 
     /// A symmetric topology taken directly from an undirected CSR: node `u`'s
