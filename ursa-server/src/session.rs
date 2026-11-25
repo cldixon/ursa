@@ -36,8 +36,10 @@ pub(crate) fn options(config: &Config) -> Options {
         capabilities: vec!["cancel", "uploads"],
         // The shell's page keeps imports and `COPY … TO 'name'` in memory,
         // as the browser demo does, so the page behaves alike on both (the
-        // e2e suite runs both). URSA-6 gives sessions a root of their own.
+        // e2e suite runs both). A root of their own, with COPY to disk under
+        // it (URSA-6), is set by `ursa serve` in URSA-4.
         uploads: true,
+        ..Options::default()
     }
 }
 
