@@ -1,14 +1,15 @@
 // The Graph view's search (#445): the box `/` opens in the pane's header,
 // and the list under it of the matches that are not shown.
 //
-// The box runs `.find` as the terminal would: Enter types `.find TEXT` (or
-// `.find WHERE condition`, when the text starts with WHERE) into the shell,
-// so the search is in the terminal and its history, and the engine answers
-// it (ursa-engine's graph::view::find). app.js gives the answer to the view
+// The box runs `.find` as the terminal would: Enter sends `.find TEXT` (or
+// `.find WHERE condition`, when the text starts with WHERE) to the pane's
+// commands sink (the shell types it into the terminal, so the search is in
+// its history), and the engine answers it (ursa-engine's graph::view::find).
+// graph-pane.js gives the answer to the view
 // (graph.js's selectFound: select the matches, fit them) and to show() here.
 //
 // Plain DOM and no state but what is on screen, so the page loads it with
-// app.js and it costs nothing until `/`.
+// graph-pane.js and it costs nothing until `/`.
 
 /** `key` as an explore command takes an id: quoted when it has a space or a quote. */
 export function idWord(key) {
@@ -27,8 +28,8 @@ export function findCommand(typed) {
 /**
  * Wire the search: `form` and its `input` (the box), `button` (which opens
  * it, for a pointer), `list` (the matches not shown) and `status` (the
- * header's line, which the box covers while it is open). `run(command)` types
- * a command into the shell; `focusView()` puts the focus back on the graph.
+ * header's line, which the box covers while it is open). `run(command)` sends
+ * a command to the pane's commands sink; `focusView()` puts the focus back on the graph.
  * Gives {open, close, show, clear}.
  */
 export function setup({ form, input, button, list, status, run, focusView }) {

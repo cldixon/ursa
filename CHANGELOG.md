@@ -1041,7 +1041,7 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the worker answered itself before) and the console's `query` (typed
   columns, the schema's metadata such as `ursa.pattern`, and the first rows
   as an Arrow IPC part). `ursa_shell::session::OPS` lists the operations;
-  the new reference page, [Session protocol](docs/reference/protocol.md), is
+  the new reference page, `docs/reference/protocol.md`, is
   generated from it and tested against it.
 
 - **The session keeps results, by id** (URSA-9). `query` gives its result
@@ -1053,6 +1053,18 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   first rows. A result that has gone, or rows past those kept, fail with
   `not_found` and a message to run the query again. The shell's last result
   (`.graph`, `.export`) is unchanged.
+
+- **The graph pane is a module any page can embed** (URSA-8,
+  `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
+  engine, commands, status})` makes the Graph view's pane: its markup, the
+  `/` search and `.find`, the not-shown counts, Esc, the theme, and the graph
+  commands (`.graph`, `.find`, `.expand`, `.collapse`, `.hide`, `.show`,
+  `.undo`, `.redo`), run through the engine client. What the view asks to run
+  (a double-click's `.expand 33`, the inspector's and the search's buttons)
+  goes to the host's `commands` sink: the web shell's is its terminal, as
+  before, and the console's will be its History panel. `app.js` loses about
+  250 lines of graph glue; the graph view behaves as before. A second host,
+  `web/tests/pane-host/` (never deployed), proves it in the e2e test.
 
 - **Default (serial) Louvain is about a third faster, with the same
   communities** (#268). Local moving, the serial core of `louvain(g)`, took
