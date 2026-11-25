@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Graph pane host (test)</title>
+  <!-- A second host for graph-pane.js, beside the Web Shell: no terminal, a
+       History list for the pane's commands sink. tests/e2e.ts serves it at
+       /tests/pane-host/ from this directory; it is never built or deployed. -->
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/tests/pane-host/host.js"></script>
+</head>
+<body>
+  <div class="workspace" id="host">
+    <main class="terminal" aria-label="History">
+      <ol id="history"></ol>
+    </main>
+  </div>
+</body>
+</html>

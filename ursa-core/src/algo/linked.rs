@@ -205,17 +205,43 @@ impl Linked {
     /// order): its linked nodes as compact ids, in order, and for each the
     /// number of isolated nodes just before it since the previous linked one;
     /// then the number of isolated nodes after the last.
+    ///
+    /// Pieces of the order are read in parallel (#268): each piece's gaps are
+    /// counted from its start, and then the isolated nodes that end the
+    /// pieces before it, back to the last linked node, are added to its first
+    /// gap. The result is the one a single pass gives.
     pub(crate) fn compact_order(&self, order: &[u32]) -> (Vec<u32>, Vec<u32>, u32) {
+        const PIECE: usize = 1 << 16;
+        let pieces: Vec<(Vec<u32>, Vec<u32>, u32)> = order
+            .par_chunks(PIECE)
+            .map(|piece| {
+                let mut ids = Vec::new();
+                let mut gaps = Vec::new();
+                let mut gap = 0u32;
+                for &v in piece {
+                    if self.contains(v) {
+                        ids.push(self.compact(v));
+                        gaps.push(std::mem::take(&mut gap));
+                    } else {
+                        gap += 1;
+                    }
+                }
+                (ids, gaps, gap)
+            })
+            .collect();
         let mut ids = Vec::with_capacity(self.len());
         let mut gaps = Vec::with_capacity(self.len());
         let mut gap = 0u32;
-        for &v in order {
-            if self.contains(v) {
-                ids.push(self.compact(v));
-                gaps.push(std::mem::take(&mut gap));
-            } else {
-                gap += 1;
+        for (piece_ids, mut piece_gaps, tail) in pieces {
+            match piece_gaps.first_mut() {
+                Some(first) => {
+                    *first += gap;
+                    gap = tail;
+                }
+                None => gap += tail,
             }
+            ids.extend_from_slice(&piece_ids);
+            gaps.extend_from_slice(&piece_gaps);
         }
         (ids, gaps, gap)
     }
@@ -428,5 +454,39 @@ mod tests {
         assert_eq!((ids, gaps, tail), (vec![4, 0], vec![1, 2], 1));
         let s = Linked::from_sorted(10, vec![1, 4, 9]);
         assert_eq!((s.compact(4), s.compact(9), s.contains(5)), (1, 2, false));
+    }
+
+    /// The compact order, read in pieces, is the one a single pass gives:
+    /// sparse and dense sets, whole pieces with no linked node, and an order
+    /// ending in isolated nodes.
+    #[test]
+    fn compact_order_in_pieces_is_one_pass() {
+        let n = 300_000u32;
+        // In node order at first (so whole pieces are isolated), then mixed.
+        let order: Vec<u32> = (0..n)
+            .map(|i| {
+                if i < 260_000 {
+                    i
+                } else {
+                    i.wrapping_mul(2_654_435_761) % n
+                }
+            })
+            .collect();
+        for keep in [1u32, 3, 97, 70_001] {
+            let set: Vec<u32> = (0..n)
+                .filter(|v| v % keep == 0 && !(100_000..250_000).contains(v))
+                .collect();
+            let l = Linked::from_sorted(n as usize, set);
+            let (mut ids, mut gaps, mut gap) = (Vec::new(), Vec::new(), 0u32);
+            for &v in &order {
+                if l.contains(v) {
+                    ids.push(l.compact(v));
+                    gaps.push(std::mem::take(&mut gap));
+                } else {
+                    gap += 1;
+                }
+            }
+            assert_eq!(l.compact_order(&order), (ids, gaps, gap), "keep {keep}");
+        }
     }
 }

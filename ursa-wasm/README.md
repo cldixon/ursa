@@ -20,28 +20,31 @@ console.log(await session.sql("SELECT * FROM 'karate_edges.csv' LIMIT 3"));
 - `version()` is the engine's version.
 
 `WebShell` is the `ursa` shell itself (crate `ursa-shell`), for a terminal on
-the page such as xterm.js, as DuckDB's web shell is DuckDB's CLI:
+the page such as xterm.js, as DuckDB's web shell is DuckDB's CLI. It speaks
+the session protocol (`design/console.md` §4): every operation goes through
+`handle(op, args, parts)`, which runs `ursa_shell::session::Session`, the
+same code `ursa serve` runs natively over a WebSocket:
 
 ```js
 import init, { WebShell } from "./ursa_wasm.js";
 await init();
 WebShell.setBaseUrl(new URL("data/", location.href).href);
 const shell = new WebShell();
-shell.setWidth(term.cols); // tables fit the terminal
-const { out, err, flow } = JSON.parse(await shell.feed("SELECT 42 AS answer;"));
-term.write((out + err).replaceAll("\n", "\r\n")); // ANSI colour, as in a terminal
+const { message } = await shell.handle("feed", JSON.stringify({ line: "SELECT 42 AS answer;" }), []);
+const { result } = JSON.parse(message); // {ok, result} or {ok: false, error: {kind, message}}
+term.write((result.out + result.err).replaceAll("\n", "\r\n")); // ANSI colour, as in a terminal
 ```
 
-- `feed(line)` runs one typed line: a dot-command, or SQL that runs once the
-  statement ends with `;`. `flow` is `continue`, `exit` (`.quit`), or `host`
-  for a dot-command the page added with `addHostCommand(name, args, help)`
-  (`.help` lists those too); `command` is then the line.
-- `prompt()` (`memory U `), `continuation()` (spaces as wide), `isPending()`,
-  `cancelInput()`, `highlight(text)` (typed text in ANSI colour) and
-  `promptColor()` let the page draw the prompt and input as the CLI does.
-- `addFile(name, bytes)` puts a file at `memory://uploads/<name>`;
-  `exportLast(format)` writes the last result (`csv`, `json`, `arrow`,
-  `parquet`) with every row.
+- `args` is a JSON object as text, and `parts` an array of `Uint8Array`s (a
+  file for `addFile`). It resolves to `{message, parts}`: the reply as JSON
+  text, and its binary parts (UGR graphs and deltas, `f32` and `u32` arrays,
+  exported files), each with a buffer of its own to transfer.
+- The operations are `start` (a fresh session, with the page's own
+  dot-commands), `feed` (one typed line: `flow` is `continue`, `exit` or
+  `host`), `cancelInput`, `width`, `highlightAnsi`, `addFile`, `files`,
+  `export`, and the graph view's `graph.open`, `graph.explore`, `graph.find`,
+  `graph.notShown`, `graph.inspect` and `graph.close`: see `Session::handle`
+  in `ursa-shell/src/session.rs`, and `web/public/engine-worker.js`.
 
 Files are read over HTTP with range requests. A server must answer `HEAD` and
 single `Range: bytes=a-b` requests (206 with `Content-Range`).
@@ -60,7 +63,7 @@ drives the engine's futures. In the wasm32 build:
   spawn tasks (`ursa_engine::session_files`). A `WebShell` keeps files in
   memory at `memory://uploads/`: `COPY … TO 'name.parquet'` (or `.csv`,
   `.json`, `.arrow`) writes one, `FROM 'name.parquet'` reads it, and
-  `WebShell.files()` lists them with the ones `addFile` added. Any other
+  the `files` operation lists them with the ones `addFile` added. Any other
   target is refused, as is an `INSERT INTO` a table of files; a `Session`
   keeps no files, so its `COPY` is refused: export a result instead;
 - `s3://`, `gs://`, `az://` and local paths are not available, nor is the

@@ -20,9 +20,14 @@ ursa-sql = { path = "../ursa-sql", version = "0.13.0-dev" }
 # The graph model's delta, which an explore command gives the host's view. No
 # default features: no GPU.
 ursa-viz = { path = "../ursa-viz", version = "0.13.0-dev", default-features = false }
-arrow = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
 datafusion = { workspace = true }
 futures = "0.3"
+# The session's files (`session::Session`), in memory at memory://uploads/.
+object_store = { workspace = true }
+# The session protocol's messages (`session`).
+serde_json = "1"
+url = { workspace = true }
 unicode-width = "0.2"
 # A clock that works in the browser too (std's Instant panics there).
 web-time = "1.1"

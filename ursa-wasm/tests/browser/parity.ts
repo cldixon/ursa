@@ -82,12 +82,19 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     const csv = new TextDecoder().decode(other.export(last, "csv"));
     const shape = { statements: described.length, columns: described[last].columns.map((c) => c.name), shown: described[last].rows.length, total: described[last].totalRows };
     // The shell, a line at a time, with no width limit (as a pipe has none).
+    // Every operation goes through WebShell.handle, the session protocol's
+    // dispatch (design/console.md §4): the reply is {message, parts}.
     const shell = new mod.WebShell();
-    shell.setWidth(0);
+    const call = async (op, args) => {
+      const reply = JSON.parse((await shell.handle(op, JSON.stringify(args), [])).message);
+      if (!reply.ok) throw new Error(`${op}: ${reply.error.message}`);
+      return reply.result;
+    };
+    await call("width", { columns: 0 });
     let shellOut = "";
     let shellErr = "";
     for (const line of sql.split("\n")) {
-      const r = JSON.parse(await shell.feed(line));
+      const r = await call("feed", { line });
       shellOut += r.out;
       shellErr += r.err;
     }

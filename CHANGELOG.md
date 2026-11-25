@@ -1023,6 +1023,54 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **The web shell talks to its engine through the session protocol**
+  (#536, `design/console.md` §4). The per-operation glue of `ursa-wasm`'s
+  `WebShell` (output capture, UGR encoding, inspect's JSON, uploads,
+  export) is `ursa_shell::session::Session`, with every operation behind
+  `Session::handle(op, args, parts)`; `WebShell` is wasm-bindgen glue over
+  it, with one method, `handle`. The page calls the engine through
+  `web/public/engine-client.js` (`connect(WorkerTransport)`), and the
+  operations take their protocol names (`graph.open`, `graph.explore`,
+  `cancelInput`, `highlightAnsi`, …). Nothing a user sees changes.
+
+- **The graph pane is a module any page can embed** (URSA-8,
+  `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
+  engine, commands, status})` makes the Graph view's pane: its markup, the
+  `/` search and `.find`, the not-shown counts, Esc, the theme, and the graph
+  commands (`.graph`, `.find`, `.expand`, `.collapse`, `.hide`, `.show`,
+  `.undo`, `.redo`), run through the engine client. What the view asks to run
+  (a double-click's `.expand 33`, the inspector's and the search's buttons)
+  goes to the host's `commands` sink: the web shell's is its terminal, as
+  before, and the console's will be its History panel. `app.js` loses about
+  250 lines of graph glue; the graph view behaves as before. A second host,
+  `web/tests/pane-host/` (never deployed), proves it in the e2e test.
+
+- **Default (serial) Louvain is about a third faster, with the same
+  communities** (#268). Local moving, the serial core of `louvain(g)`, took
+  70% of a run. Each node visit sorted every neighbouring community by id
+  before scanning them for the best move; it now keeps only the communities
+  whose gain beats staying (usually none, or one or two) and sorts those.
+  The others could never be chosen, so the choice is the same. Local moving
+  also prefetches the next node's adjacency, each neighbour's community and
+  its accumulator entry a few slots ahead, and each community's total. The
+  visit order, the tie rule and the order of every floating-point sum are
+  unchanged: labels are the same bit for bit, for every seed, on any thread
+  count. A new test, `tests/louvain_pinned.rs`, pins them with golden hashes
+  recorded before the change (karate, R-MAT, isolated nodes, weighted and
+  masked graphs, serial and `parallel => true`) on 1, 2, 4 and 8 threads and
+  without `rayon`. R-MAT, `seed => 1`, 4 shared cores, best of 3
+  interleaved runs:
+
+  | edges | before | after | peak RSS |
+  |---|---|---|---|
+  | 16M (2^20 slots) | 6.44 s, 5.14 CPU-s | 4.72 s, 3.77 CPU-s | 480 → 476 MB |
+  | 64M (2^22 slots) | 43.1 s, 32.5 CPU-s | 27.4 s, 21.1 CPU-s | 1,909 → 1,897 MB |
+
+  At 64M edges, local moving went from 21.7 to 11.6 CPU-s (70% of the run
+  to 50%). It stays serial, as its result depends on the visit order; the
+  graph build (now a third of the run) and the aggregation (a sixth) were
+  already parallel. `examples/rmat_kernel.rs` gains
+  `--kernel louvain`.
 - **Benchmarks: memory is the process's footprint, with peak RSS beside it**
   (#533). `benchmarks/bluesky_cloud/run.py` recorded each step's peak
   memory as `ru_maxrss`, which since #382 counts the pages of the

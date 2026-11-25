@@ -18,6 +18,32 @@ static assets and an R2 bucket.
 
 - `public/`: the page (`index.html`, `app.js`, `style.css`), the Datasets
   menu (`datasets.js`) and the engine's Web Worker (`engine-worker.js`).
+  - **The graph pane** (`graph-pane.js`) is the Graph view for any host:
+    `createPane({container, engine, commands, status, focus?})` adds the
+    pane's markup to `container`, runs the graph commands (`pane.exec(line)`:
+    `.graph`, `.find`, `.expand`, `.collapse`, `.hide`, `.show`, `.undo`,
+    `.redo`) through the engine client, and owns the search box, the
+    not-shown counts, Esc and the theme. What the view asks to run (a
+    double-click's `.expand 33`, the inspector's buttons, the search's
+    `.find`) goes to the host's `commands(command, {via, current})` sink.
+    The shell's sink is its terminal (`app.js`: typed, echoed and kept in the
+    history, then run by `pane.exec`); `.graph echo` is the shell's own. The
+    e2e test also drives `tests/pane-host/`, a second host with no terminal
+    whose sink is a History list; it is served by the test, never built or
+    deployed.
+  - **The engine boundary** is the session protocol (`design/console.md`
+    §4): `app.js` calls the engine only through `engine-client.js`
+    (`connect(transport).call(op, args, parts)`), whose `WorkerTransport`
+    posts `{v, id, op, args, parts}` to `engine-worker.js` and reads back
+    `{id, ok, result, parts}`, binary parts (UGR graphs and deltas, `f32` and
+    `u32` arrays, files) transferred. The worker hands every operation to
+    `WebShell.handle`, which runs `ursa_shell::session::Session`: the
+    operations (`start`, `feed`, `cancelInput`, `width`, `highlightAnsi`,
+    `addFile`, `files`, `export`, `graph.open`, `graph.explore`,
+    `graph.find`, `graph.notShown`, `graph.inspect`, `graph.close`) are
+    listed at `Session::handle`, and `memory` is the worker's own. A
+    WebAssembly trap fails its request with kind `crash`, and the page
+    connects again to a fresh session.
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
     by the build), with a line editor in `app.js`: Enter sends the line to the
     shell, which runs a statement once it ends with `;` and shows the
