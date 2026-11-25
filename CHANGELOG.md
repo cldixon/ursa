@@ -1021,6 +1021,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   8 MB more for the parallel run. Without a mask, a vote no longer reads
   the edge ids.
 
+- **`ursa serve [DIR]`: the shell in a browser tab, over a local WebSocket
+  to the native engine** (URSA-3, `design/console.md` §5; ursa-cli's
+  non-default `serve` feature, over the new crate `ursa-server`). It prints
+  a link with a one-time token and serves the shell's page, which talks to a
+  native session (`web/public/socket-transport.js`) with the same protocol
+  the browser demo speaks to its wasm worker. Each tab gets a session of its
+  own (`hello {session: "new"}`), or attaches to the server's one shared
+  session (`"shared"`). `cancel {target}` stops a running request with
+  DataFusion's cancellation, and a closed tab cancels its own; Ctrl+C stops
+  the server gracefully. It listens on `127.0.0.1` and `::1` only; the token
+  becomes an `HttpOnly`, `SameSite=Strict` cookie, which the WebSocket and
+  the served directory's files (`/data/`, with byte ranges read from the
+  file) need; every request's `Host`, and every WebSocket's `Origin`, must
+  be the server's own; and every response has the deploy's security
+  headers. The page's files come from `--assets DIR` (a `web/dist`), or are
+  built in with `rust-embed` (`serve-embed`, from a checkout). `ursa-server`
+  is published with the other crates, before `ursa-cli`. Release binaries
+  do not have `serve` yet.
+
 ### Changed
 
 - **The web shell talks to its engine through the session protocol**
