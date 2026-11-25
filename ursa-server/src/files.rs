@@ -101,7 +101,7 @@ async fn page_file(assets: &Assets, path: &str) -> Option<Cow<'static, [u8]>> {
 fn embedded(path: &str) -> Option<Cow<'static, [u8]>> {
     /// `web/dist`, without the wasm engine's files.
     #[derive(rust_embed::RustEmbed)]
-    #[folder = "$CARGO_MANIFEST_DIR/../web/dist"]
+    #[folder = "../web/dist"]
     #[exclude = "engine/*"]
     struct Ui;
 

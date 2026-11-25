@@ -31,7 +31,7 @@ getrandom = "0.3"
 base64 = "0.22"
 # `debug-embed`: a debug build embeds the files too, so it serves what a
 # release build would.
-rust-embed = { version = "8", optional = true, features = ["debug-embed", "include-exclude", "interpolate-folder-path"] }
+rust-embed = { version = "8", optional = true, features = ["debug-embed", "include-exclude"] }
 
 [dev-dependencies]
 # Drives the server's WebSocket from the tests, as a browser would.
