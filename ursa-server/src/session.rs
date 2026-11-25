@@ -49,7 +49,6 @@ pub(crate) fn options(config: &Config) -> Options {
         copy_to_disk: false,
         database: config.database.clone(),
         read_only: config.read_only,
-        ..Options::default()
     }
 }
 
