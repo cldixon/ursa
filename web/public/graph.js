@@ -638,11 +638,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     } else if (split && split.xy.length === 2 * view.nodeCount) {
       view.setPositions(split.xy);
       state.pending = null;
-    } else if (state.pending) {
-      view.setPositions(state.pending);
-      // A grouped drawing's scene has a disc for each node, at its place.
-      if (graph.grouped) view.setLevelPositions(state.pending);
-      state.pending = null;
+    } else {
+      takePending(state);
     }
     try {
       const start = performance.now();
@@ -1390,10 +1387,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     if (!nodes.length || !state.positioned) return false;
     // Into what the panel leaves clear, as the panel is now.
     roomNow();
-    if (state.pending) {
-      view.setPositions(state.pending);
-      state.pending = null;
-    }
+    takePending(state);
     // The selection's box, in canvas pixels, and the nodes at its sides: a
     // pan or a zoom keeps them at its sides, so they say where the box is
     // as the camera moves (and as the layout moves the nodes).
@@ -1664,11 +1658,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   // has them, and each member is put in its group's disc; the layout is
   // not told, for it lays out the groups alone.
   const applyGrouped = (bytes, { command, began, engine, start }) => {
-    if (state.pending) {
-      view.setPositions(state.pending);
-      view.setLevelPositions(state.pending);
-      state.pending = null;
-    }
+    takePending(state);
     // The closed discs as they are drawn before the change: a group that
     // opens keeps its disc.
     const closed = closedRadii();
@@ -2064,6 +2054,9 @@ export function info() {
     level,
     levels,
     layoutDone,
+    // Whether the layout's newest positions wait for the next frame: what
+    // is drawn is not yet where the layout has the nodes (URSA-10).
+    pending: current.pending !== null,
     // Whether the nodes are where POSITIONS (query) put them (#502): no
     // layout ran.
     saved: current.saved,
@@ -2154,8 +2147,11 @@ export async function inked() {
   let read;
   state.reading = new Promise((resolve) => (read = resolve));
   try {
-    // The view as it is now, not as its last frame was: a level's or a
-    // cut's discs are given to the GPU by a frame.
+    // The view as it is now, not as its last frame was: the layout's
+    // newest positions, which wait for the next frame (a grouped drawing's
+    // last ones can come with its "done", URSA-10), and a level's or a
+    // cut's discs, which are given to the GPU by a frame.
+    takePending(state);
     state.view.refreshLevel();
     const px = await state.view.snapshot();
     const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
@@ -2251,10 +2247,24 @@ function atNewest(state) {
   // Nodes on their way out from their parents (#497): in place.
   const split = state.hierarchy.settle();
   if (split?.level === 0 && split.xy.length === 2 * state.view.nodeCount) state.pending = split.xy;
-  if (!state.pending) return;
-  state.view.setPositions(state.pending);
-  state.pending = null;
+  if (!takePending(state)) return;
   state.redraw?.(false);
+}
+
+/**
+ * The layout's newest positions (`state.pending`), given to the view now
+ * rather than by the next frame; true if there were any. A grouped
+ * drawing's discs (#499) are its scene's, which has a node for each node,
+ * and are moved with them: given only the graph's, the discs would stay
+ * where they were until the layout's next positions, and a grouped
+ * layout's last come with its "done".
+ */
+function takePending(state) {
+  if (!state.pending) return false;
+  state.view.setPositions(state.pending);
+  if (state.graph.grouped) state.view.setLevelPositions(state.pending);
+  state.pending = null;
+  return true;
 }
 
 /**
