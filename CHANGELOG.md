@@ -1023,6 +1023,55 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
+  (behaviour change for the last bits of floats and the order of unordered
+  rows, #172). Dense node ids were first-seen order, which for anonymised
+  ids sorted by source (the Bluesky export) carries no locality: every rank
+  a pull PageRank reads is close to a random access. The build now
+  renumbers the nodes by in-degree, highest first (ties in first-seen
+  order), in one more parallel pass over the endpoints before the counting
+  sort, and renumbers the id map with them (`ursa_core::NodeOrder`,
+  `Topology::build_ordered`). Each node keeps its first-seen id
+  (`Topology::original_ids`), and what must not depend on the numbering is
+  defined on it: component labels (below), the visit order, ties and
+  aggregation of `louvain` and `label_propagation` (they run over the graph
+  renumbered back, `Topology::in_original_order`, a streaming copy, so a
+  seed gives the same communities and labels as before), the sampled
+  sources of `betweenness`, `avg_path_length` and `diameter`, the ties of a
+  weighted shortest path, and the layouts. Per-node rows still come out in
+  first-seen order. What may change: the last bits of a float summed in node
+  order (PageRank, about 1e-16 relative on karate), and the order of `hop`'s
+  rows. Partitions, counts, distances, reached sets and user ids do not
+  change; `ursa-core/tests/relabel.rs` and `ursa-engine/tests/locality.rs`
+  check every kernel against a first-seen build. A smaller graph keeps its
+  first-seen numbering (its arrays fit in cache in any order), and the
+  Python library does not relabel.
+
+  Measured with `ursa-core/examples/locality_order.rs` on a 4-core Xeon
+  (504 MB L3) shared with other builds, best of 3, CPU seconds. On R-MAT
+  64M edges with anonymised ids sorted by source, one thread: PageRank
+  0.30 → 0.19 s per iteration (-37%), BFS 0.32 → 0.26 s, weak components
+  0.44 → 0.37 s. On plain R-MAT, whose first-seen order already puts the
+  hubs first, nothing measurable moves (16M and 64M edges: PageRank, weak
+  and strong components, `hop`, BFS, triangles and closeness within the
+  run-to-run noise). The relabel adds 0.1–0.6 s to a 64M-edge build (about
+  +30%; the endpoints are renamed in place, so peak memory is unchanged).
+  `label_propagation` pays its renumbering, 8 bytes an edge per direction
+  (+1.3–1.7 s and +1.0 GB at 64M edges), and `louvain` its out-adjacency's
+  (+0.5 GB at 64M edges; time from +0% to +14%, within the noise of a
+  30 s run). Breadth-first and reverse Cuthill–McKee orders were
+  measured too: no faster than in-degree, and 5 to 8 times its build cost.
+  An index stored by 0.12 (format version 4) is read with its numbering
+  kept; a relabelled one is stored as version 5, with its original ids.
+- **Component labels are canonical** (behaviour change, #150).
+  `connected_components` labelled a component by its union-find root (weak)
+  or Tarjan root (strong), which depend on the order the work is done in. A
+  component's label is now the first-seen id of its first node to appear
+  (its smallest dense id when nothing is relabelled): the same for the
+  serial and parallel kernels, and unchanged by the relabel above. The
+  partition is the same. Python's `ur.connected_components` gives the same
+  labels.
+
 - **Benchmarks: memory is the process's footprint, with peak RSS beside it**
   (#533). `benchmarks/bluesky_cloud/run.py` recorded each step's peak
   memory as `ru_maxrss`, which since #382 counts the pages of the

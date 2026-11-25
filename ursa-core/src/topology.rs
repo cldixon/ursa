@@ -872,7 +872,10 @@ fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
     let offsets_ref = &offsets;
     let copy = |o: usize| {
         let v = node[o];
-        let (lo, hi) = (adj.offsets[v as usize] as usize, adj.offsets[v as usize + 1] as usize);
+        let (lo, hi) = (
+            adj.offsets[v as usize] as usize,
+            adj.offsets[v as usize + 1] as usize,
+        );
         let at = offsets_ref[o] as usize;
         for (i, k) in (lo..hi).enumerate() {
             // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
@@ -1145,10 +1148,17 @@ impl Topology {
     /// its neighbours renamed. So this is one streaming pass per direction
     /// (the in-adjacency too, when this topology has it built), parallel.
     pub fn in_original_order(&self) -> Option<Topology> {
+        self.renumbered(true)
+    }
+
+    /// [`Self::in_original_order`]; without the in-adjacency unless
+    /// `incoming` (for a kernel that reads only the out-adjacency, which then
+    /// costs 8 bytes an edge rather than 16).
+    pub(crate) fn renumbered(&self, incoming: bool) -> Option<Topology> {
         let relabel = self.relabel.as_ref()?;
         let out = in_original(&self.out, relabel);
         let inc = OnceLock::new();
-        if let Some(incoming) = self.incoming_if_built() {
+        if let Some(incoming) = self.incoming_if_built().filter(|_| incoming) {
             let _ = inc.set(in_original(incoming, relabel));
         }
         Some(Topology {

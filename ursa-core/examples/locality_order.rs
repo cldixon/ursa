@@ -26,7 +26,8 @@
 //! **Kernels.** `none` (the build alone), `pagerank` (20 iterations, `tol = 0`,
 //! per iteration), `triangles`, `wcc`, `scc`, `louvain`, `label-propagation`
 //! (20 sweeps), `hop` (2 steps out from the hub), `bfs` (from 3 sources, both
-//! directions) and `closeness` (exact, out-edges). `--parallel` takes the
+//! directions), `closeness` (exact, out-edges) and `bytes`, the size of the
+//! targets encoded as #173 proposes (sorted per node, delta + varint). `--parallel` takes the
 //! parallel form of Louvain and label propagation. The transpose (and, for
 //! triangles, the undirected view) is built before the clock starts, as a
 //! stored index has it.
@@ -353,6 +354,36 @@ fn main() {
             "closeness" => {
                 let c = in_original(&t, &closeness_directed(&t, None, Direction::Out));
                 format!("hash {:016x}", fnv(c.iter().map(|&x| round9(x))))
+            }
+            "bytes" => {
+                // #173's estimate: each node's targets sorted, the first
+                // stored as is and the rest as gaps, each a byte-aligned
+                // varint (LEB128), per direction.
+                let varint = |x: u64| (64 - x.max(1).leading_zeros()).div_ceil(7) as u64;
+                let size = |adj: &ursa_core::Adjacency| -> u64 {
+                    let mut seg = Vec::new();
+                    (0..n as u32)
+                        .map(|u| {
+                            seg.clear();
+                            seg.extend_from_slice(adj.neighbors(u));
+                            seg.sort_unstable();
+                            let mut prev = None;
+                            seg.iter()
+                                .map(|&v| {
+                                    let b = varint(prev.map_or(u64::from(v), |p| u64::from(v - p)));
+                                    prev = Some(v);
+                                    b
+                                })
+                                .sum::<u64>()
+                        })
+                        .sum()
+                };
+                let m = t.n_edges() as f64;
+                format!(
+                    "delta+varint targets: out {:.3} B/edge, in {:.3} B/edge",
+                    size(t.out()) as f64 / m,
+                    size(t.incoming()) as f64 / m
+                )
             }
             other => panic!("unknown --kernel {other}"),
         };

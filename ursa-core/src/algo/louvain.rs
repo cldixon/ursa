@@ -98,7 +98,7 @@ fn louvain_impl(
     // Relabelled nodes (#172): run in the original numbering, which fixes
     // the visit order, the ties and the aggregation, so a seed gives the
     // communities an unrelabelled index gives.
-    if let Some(original) = topo.in_original_order() {
+    if let Some(original) = topo.renumbered(false) {
         let labels = louvain_impl(&original, weights, mask, resolution, seed, parallel);
         return super::label_prop::in_node_order(topo, &labels);
     }
