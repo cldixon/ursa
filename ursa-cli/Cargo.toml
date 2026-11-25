@@ -24,11 +24,16 @@ default = ["aws-profile"]
 # AWS_PROFILE) through aws-config. Without it, S3 credentials come only from the
 # environment and the machine's role.
 aws-profile = ["ursa-engine/aws-profile"]
+# `ursa serve`: the shell's page in a browser tab, over a WebSocket to this
+# process's engine (ursa-server; the spike of #536, design/console.md). Off by
+# default: release builds do not have it.
+serve = ["dep:ursa-server"]
 
 [dependencies]
 ursa-engine = { path = "../ursa-engine", version = "0.13.0-dev" }
 ursa-sql = { path = "../ursa-sql", version = "0.13.0-dev" }
 ursa-shell = { path = "../ursa-shell", version = "0.13.0-dev", features = ["clap"] }
+ursa-server = { path = "../ursa-server", version = "0.13.0-dev", optional = true }
 datafusion = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"

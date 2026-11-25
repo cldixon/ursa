@@ -7,8 +7,12 @@
 //
 // - WorkerTransport: the browser demo's engine, ursa-wasm in a Web Worker
 //   (engine-worker.js), over postMessage. Binary parts are transferred.
+// - SocketTransport: `ursa serve`'s native engine, over a WebSocket at
+//   /session. The JSON goes in a text frame, and each binary part follows in
+//   a binary frame of its own, after an 8-byte header: the request's id (u32),
+//   the part's index (u16) and two reserved bytes, little-endian.
 //
-// A transport carries these messages:
+// Both carry the same messages:
 //
 //   request  {v: 1, id, op, args, parts: [{kind, name, bytes}]}
 //   reply    {id, ok: true, result, parts: [{kind, name, bytes}]}
@@ -79,9 +83,10 @@ export function connect(transport, client = { name: "shell", kind: "human" }) {
   };
 }
 
-/** The transport this page was served for. */
+/** The transport this page was served for: `ursa serve` marks its pages. */
 export function defaultTransport() {
-  return new WorkerTransport();
+  const meta = document.querySelector('meta[name="ursa-transport"]');
+  return meta?.content === "socket" ? new SocketTransport() : new WorkerTransport();
 }
 
 /** The reply's result, with its parts in it by name. */
@@ -137,4 +142,68 @@ export class WorkerTransport {
   close() {
     this.worker?.terminate();
   }
+}
+
+/** `ursa serve`'s native engine, over a WebSocket. */
+export class SocketTransport {
+  constructor(url = sessionUrl()) {
+    this.url = url;
+  }
+
+  open({ reply, event, fail }) {
+    const socket = (this.socket = new WebSocket(this.url));
+    socket.binaryType = "arraybuffer";
+    // The reply being read: its JSON, and its parts as they arrive.
+    let pending = null;
+    const deliver = () => {
+      if (pending && pending.parts.every((p) => p.bytes instanceof ArrayBuffer)) {
+        const done = pending;
+        pending = null;
+        reply(done);
+      }
+    };
+    socket.onmessage = ({ data }) => {
+      if (typeof data === "string") {
+        const message = JSON.parse(data);
+        if ("event" in message) return event(message);
+        pending = { ...message, parts: message.parts ?? [] };
+        return deliver();
+      }
+      const head = new DataView(data, 0, 8);
+      const id = head.getUint32(0, true);
+      const index = head.getUint16(4, true);
+      if (!pending || pending.id !== id || !pending.parts[index]) return fail("the engine sent a part of no reply");
+      pending.parts[index] = { ...pending.parts[index], bytes: data.slice(8) };
+      deliver();
+    };
+    return new Promise((resolve, reject) => {
+      socket.onopen = () => resolve({ transport: "socket" });
+      socket.onerror = () => reject(new Error("cannot reach the engine (is ursa serve running, and was this page opened from the link it printed?)"));
+      socket.onclose = (e) => fail(`the connection to the engine closed${e.reason ? ` (${e.reason})` : ""}`);
+    });
+  }
+
+  send(message) {
+    const { parts } = message;
+    this.socket.send(JSON.stringify({ ...message, parts: parts.map(({ kind, name, bytes }) => ({ kind, name, bytes: bytes.byteLength })) }));
+    parts.forEach((part, index) => {
+      const frame = new Uint8Array(8 + part.bytes.byteLength);
+      const head = new DataView(frame.buffer);
+      head.setUint32(0, message.id, true);
+      head.setUint16(4, index, true);
+      frame.set(new Uint8Array(part.bytes), 8);
+      this.socket.send(frame);
+    });
+  }
+
+  close() {
+    this.socket?.close();
+  }
+}
+
+/** ws://this-host/session: the page's token travels in its cookie. */
+function sessionUrl() {
+  const url = new URL("/session", location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return url.href;
 }

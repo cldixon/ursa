@@ -2,7 +2,7 @@
 
 > **Status:** design, November 2026, for `ursa` 0.13 and after. Nothing here is built yet.
 > **Follows:** [`graph-explorer.md`](graph-explorer.md) (Phases 1–3, shipped in the web shell).
-> **Spike:** #536. It tests §4 and §5 before anything else is built.
+> **Spike:** #536. It tests §4 and §5 before anything else is built. Its report is [`console-spike.md`](console-spike.md); §4 and §5 below have its changes.
 
 `ursa serve` starts a local server, opens a browser tab, and gives you a console: an SQL editor, results as tables, a sources panel (local files, object storage, attached databases), and the graph view rendering results from live queries. It is DuckDB's `duckdb -ui` for a graph engine, and Neo4j's Bloom for Ursa.
 
@@ -131,9 +131,14 @@ A **request**, from a client:
 A **reply**, from the session, exactly one per request, with the same `id`:
 
 ```json
-{"id": 17, "ok": true, "result": {"result": "r4", "columns": [...], "rows": 5, "more": false, "ms": 12},
- "parts": [{"kind": "arrow", "bytes": 1832}]}
+{"id": 17, "ok": true, "result": {"result": "r4", "columns": [...], "metadata": {}, "rows": 5, "more": false, "ms": 12},
+ "parts": [{"name": "arrow", "kind": "arrow", "bytes": 1832}]}
 ```
+
+Each part has a `name`, the field of the result it fills in (the spike found a
+kind alone ambiguous: `graph.open` can send a `ugr` part and an optional `f32`
+`positions`). A request may carry parts too, listed and framed the same way
+(`addFile`'s file).
 
 An **error** reply:
 
@@ -160,7 +165,7 @@ An **event**, from the session, unprompted:
 
 Over `postMessage`, `parts` hold the `ArrayBuffer`s themselves, transferred, not copied, as `engine-worker.js` does today.
 
-Over the WebSocket, the JSON goes in a text frame, and each part follows in its own binary frame, in the order `parts` lists them. Each binary frame starts with 8 bytes:
+Over the WebSocket, the JSON goes in a text frame, and each part follows in its own binary frame, in the order `parts` lists them, for requests and replies alike. The server sets `TCP_NODELAY`: without it, every reply's second frame waited 40 ms for a delayed ACK. Each binary frame starts with 8 bytes:
 
 | offset | size | what |
 |---|---|---|
@@ -183,7 +188,7 @@ Part kinds:
 
 | op | args | result | notes |
 |---|---|---|---|
-| `hello` | `client: {name, kind}` | `{protocol: 1, version, transport: "native" \| "wasm", capabilities: [...], session: {id, database, cwd}}` | Must be first. `kind` is `"human"` or `"agent"` (§9). |
+| `hello` | `client: {name, kind}`, `session?: "new" \| "shared"` | `{protocol: 1, version, transport: "native" \| "wasm", capabilities: [...], session: {id, database, cwd}}` | Must be first. `kind` is `"human"` or `"agent"` (§9). The shell asks for a `new` session (its New and `start` replace it); the console and agents share one. |
 | `cancel` | `target: id` | `{}` | Stops the running request `target`: it replies `cancelled`. Capability `cancel`, native only. |
 | `settings` | `set?: {name: value}` | all settings | The same as `SET` and `RESET` statements. |
 
@@ -199,7 +204,7 @@ Part kinds:
 | `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
-- `columns` gives each column's `{name, type, nullable, metadata}`.
+- `columns` gives each column's `{name, type, nullable, metadata}`, and `metadata` the schema's own (`ursa.pattern`).
 - `result` is an id such as `"r4"`. The session keeps a client's last 16 results, and drops the oldest beyond 256 MB.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
@@ -232,7 +237,7 @@ These are today's `graph`, `explore`, `find`, `notShown`, `inspect` and `closeGr
 
 | op | as today |
 |---|---|
-| `feed`, `width`, `highlightAnsi`, `memory` | unchanged, so the terminal UI runs over either transport |
+| `start`, `feed`, `cancelInput`, `width`, `highlightAnsi`, `memory` | today's, so the terminal UI runs over either transport. `start` is a fresh session with the page's dot-commands; `cancelInput` drops a half-typed statement (today's `cancel`, renamed: §4.3's `cancel` stops a running request); `memory` answers `{bytes, kind: "wasm" \| "rss"}` |
 
 ### 4.4 Events
 
@@ -273,14 +278,14 @@ ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
 - **`--read-only`** refuses statements that write: `COPY TO`, `CREATE` in an attached database, `INSERT`, and the rest. It is meant for pairing with an agent (§9).
-- **One session per server process.** A second browser tab attaches to the same session.
+- **One shared session per server process,** which a second browser tab and an agent attach to (`hello {session: "shared"}`). The shell's page asks for a session of its own (`"new"`), since its New replaces it; the spike gave every connection its own.
 
 ### Security
 
 The native engine reads any file and any bucket the user's credentials reach, so the server must be reachable only by the user's own browser tab.
 
 - **Bind to `127.0.0.1` and `::1` only.** There is no flag to bind elsewhere in v1.
-- **A token:** 32 random bytes, base64url, made at startup. It is required on the page's URL (`/?token=…`, then kept in `sessionStorage`) and on the WebSocket (`/session?token=…`). Static assets need no token: they hold no data.
+- **A token:** 32 random bytes, base64url, made at startup. The link `ursa serve` prints carries it (`/?token=…`); the server answers with an `HttpOnly`, `SameSite=Strict` cookie named for its port (`ursa_token_PORT`: cookies are shared across a host's ports) and a redirect to the same page without it, so the token never sits in an address the page shares. The WebSocket and `/data/` (the served directory's files) need the cookie, or `?token=` from a client that is not a browser. Static assets need no token: they hold no data.
 - **`Origin` must be the server's own,** `http://127.0.0.1:PORT` or `http://localhost:PORT`, on every WebSocket upgrade. This stops other sites' pages from connecting, even ones that learned the token.
 - **`Host` must be `127.0.0.1:PORT` or `localhost:PORT`.** This stops DNS rebinding.
 - **The same security headers as the deploy:** `web/src/headers.ts` (a CSP with `connect-src 'self'`, COOP, COEP and CORP). The console works cross-origin isolated, as the shell does.
@@ -288,7 +293,7 @@ The native engine reads any file and any bucket the user's credentials reach, so
 
 ### Shipping the UI
 
-The UI's files (about 3–4 MB, most of it the graph view's wasm) are embedded in the binary with `rust-embed`, behind the `serve` feature, built by `bun run build` before `cargo build`. Release binaries and the Homebrew formula have the feature on. A `cargo install ursa-cli` from crates.io gets the CLI without it, unless the crate ships the built assets. The spike decides between shipping prebuilt assets in the published crate and leaving `serve` to the release binaries (§12).
+The UI's files (3.7 MB, 1.3 MB gzipped, most of it the graph view's wasm; the spike measured them) are embedded in the binary with `rust-embed`, behind the `serve` feature, built by `bun run build` before `cargo build`. Release binaries and the Homebrew formula have the feature on. A `cargo install ursa-cli` from crates.io gets the CLI without it, unless the crate ships the built assets. The spike decides between shipping prebuilt assets in the published crate and leaving `serve` to the release binaries (§12).
 
 ## 6. The console
 

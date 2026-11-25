@@ -1,0 +1,26 @@
+[package]
+name = "ursa-server"
+description = "ursa serve: Ursa's shell and console in a browser tab, over a local WebSocket to a native engine session (a spike, design/console.md)."
+version = "0.13.0-dev"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# The spike (#536): not published until C1 settles the protocol.
+publish = false
+
+[dependencies]
+ursa-shell = { path = "../ursa-shell", version = "0.13.0-dev" }
+# The HTTP server and its WebSocket (tokio-tungstenite, through `ws`).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "fs"] }
+futures = "0.3"
+serde_json = "1"
+# The per-run token: 32 bytes from the operating system, base64url.
+getrandom = "0.3"
+base64 = "0.22"
+
+[dev-dependencies]
+# Drives the server's WebSocket from the tests, as a browser would.
+tokio-tungstenite = "0.29"
+tempfile = "3"

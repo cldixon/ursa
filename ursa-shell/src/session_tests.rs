@@ -794,3 +794,92 @@ async fn the_last_result_is_kept_for_export() {
     let (_, batches) = shell.shell.last_result().unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 }
+
+/// The console's `query`: typed columns with their `ursa.*` metadata, the
+/// first rows as Arrow IPC, and a result a graph opens from by its id.
+#[tokio::test]
+async fn query_gives_typed_columns_and_arrow_rows() {
+    use arrow::ipc::reader::StreamReader;
+    let mut shell = session();
+    run(
+        &mut shell,
+        "CREATE VIEW ties AS SELECT * FROM (VALUES (1, 2), (2, 3), (3, 1), (3, 4)) AS t(src, dst);",
+    )
+    .await;
+    run(
+        &mut shell,
+        "CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));",
+    )
+    .await;
+    let reply = shell
+        .handle(
+            "query",
+            json!({"sql": "SELECT * FROM pagerank(g) ORDER BY id", "rows": 3}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let r = &reply.result;
+    assert_eq!(
+        (
+            r["result"].as_str(),
+            r["rows"].as_u64(),
+            r["more"].as_bool()
+        ),
+        (Some("r1"), Some(4), Some(true))
+    );
+    assert_eq!(r["columns"][1]["name"], "pagerank");
+    assert_eq!(r["columns"][1]["type"], "Float64");
+    assert_eq!(r["columns"][0]["metadata"]["ursa.role"], "node", "{r}");
+    assert_eq!(reply.parts[0].kind, PartKind::Arrow);
+    let reader = StreamReader::try_new(reply.parts[0].bytes.as_slice(), None).unwrap();
+    let schema = reader.schema();
+    let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+    assert_eq!(rows, 3);
+    assert_eq!(
+        schema
+            .field(0)
+            .metadata()
+            .get("ursa.role")
+            .map(String::as_str),
+        Some("node")
+    );
+
+    // A statement with no rows; an error; and a result by its id.
+    let created = op(
+        &mut shell,
+        "query",
+        json!({"sql": "CREATE VIEW v AS SELECT 1 AS x"}),
+    )
+    .await;
+    assert_eq!(
+        (created["columns"].clone(), created["notices"].clone()),
+        (json!([]), json!(["OK"]))
+    );
+    let wrong = shell
+        .handle("query", json!({"sql": "SELECT nope"}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.kind, "sql");
+    let edges = op(
+        &mut shell,
+        "query",
+        json!({"sql": "SELECT src, dst FROM ties"}),
+    )
+    .await;
+    let drawn = shell
+        .handle("graph.open", json!({"result": "r1"}), Vec::new())
+        .await;
+    assert!(drawn.is_ok(), "{drawn:?}");
+    let drawn = shell
+        .handle("graph.open", json!({"result": edges["result"]}), Vec::new())
+        .await
+        .unwrap();
+    let graph = ursa_viz::model::GraphResult::from_bytes(&drawn.parts[0].bytes).unwrap();
+    assert_eq!((graph.n_nodes(), graph.n_edges()), (4, 4));
+    let gone = shell
+        .handle("graph.open", json!({"result": "r99"}), Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(gone.kind, "not_found");
+}

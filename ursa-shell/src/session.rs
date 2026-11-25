@@ -31,6 +31,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -292,7 +293,14 @@ pub struct Session {
     /// The session's files, at `memory://uploads/`, if it has them.
     uploads: Option<Arc<InMemory>>,
     options: Options,
+    /// The console's results ([`Self::query`]), the oldest first.
+    results: VecDeque<(String, SchemaRef, Vec<RecordBatch>)>,
+    next_result: u64,
 }
+
+/// How many of the console's results a session keeps (design §12, question
+/// 3: a guess the spike keeps).
+const KEPT_RESULTS: usize = 16;
 
 impl Session {
     /// A session over a new engine session, drawing tables in colour for a
@@ -320,6 +328,8 @@ impl Session {
             width,
             uploads,
             options,
+            results: VecDeque::new(),
+            next_result: 0,
         }
     }
 
@@ -343,6 +353,10 @@ impl Session {
     /// | `graph.notShown` | — | `counts` (`u32`) |
     /// | `graph.inspect` | `node, key, neighbours?` or `edge, src, dst` | inspect's JSON, with `ms` |
     /// | `graph.close` | — | `{}` |
+    /// | `query` | `sql`, `rows?` (1,000) | `{result, columns, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
+    ///
+    /// `graph.open` takes `result` (an id `query` gave) in place of the last
+    /// result.
     ///
     /// SQL and command errors are what `feed`, `graph.explore` and
     /// `graph.find` print; the other operations fail with an [`Error`].
@@ -431,6 +445,10 @@ impl Session {
                 })
             }
             "graph.open" => {
+                if let Some(id) = a.str_opt("result") {
+                    let (schema, batches) = self.result(id)?;
+                    self.shell.set_last_result(schema, batches);
+                }
                 let graph = self.open_graph(a.str_opt("text").unwrap_or("")).await?;
                 let mut parts = vec![Part {
                     name: "ugr",
@@ -510,8 +528,101 @@ impl Session {
                 self.close_graph();
                 Ok(Reply::json(json!({})))
             }
+            "query" => {
+                let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(1_000);
+                let (result, arrow) = self.query(a.str("sql")?, rows as usize).await?;
+                Ok(Reply {
+                    result,
+                    parts: vec![Part {
+                        name: "arrow",
+                        kind: PartKind::Arrow,
+                        bytes: arrow,
+                    }],
+                })
+            }
             other => Err(Error::protocol(format!("unknown op {other}"))),
         }
+    }
+
+    /// Run `sql` (one or more statements) for the console: the last
+    /// statement's result is kept under a new id, and becomes the shell's
+    /// last result (`.graph`, `export`). Gives `{result, columns, metadata,
+    /// rows, more, ms, notices}`, where `columns` are `[{name, type, nullable,
+    /// metadata}]` and `rows` the whole result's count, and the first
+    /// `rows` rows as an Arrow IPC stream (with the schema's metadata).
+    pub async fn query(&mut self, sql: &str, rows: usize) -> Result<(Value, Vec<u8>)> {
+        let start = Instant::now();
+        let ctx = self.shell.context().clone();
+        let mut last = None;
+        for (statement, text) in ursa_sql::parse_sql_with_text_for(&ctx, sql)? {
+            let frame = ursa_sql::execute_with_text(&ctx, statement, &text).await?;
+            let schema: SchemaRef = Arc::clone(frame.schema().inner());
+            let batches = frame.collect().await?;
+            last = Some((schema, batches));
+        }
+        let (schema, batches) =
+            last.ok_or_else(|| DataFusionError::Plan("no statement to run".into()))?;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut first = Vec::new();
+        let mut left = rows;
+        for batch in &batches {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(batch.num_rows());
+            first.push(batch.slice(0, take));
+            left -= take;
+        }
+        let arrow = encode(&schema, &first, "arrow")?;
+        let columns: Vec<Value> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                json!({
+                    "name": f.name(),
+                    "type": f.data_type().to_string(),
+                    "nullable": f.is_nullable(),
+                    "metadata": f.metadata(),
+                })
+            })
+            .collect();
+        let notices: Vec<&str> = if columns.is_empty() {
+            vec!["OK"]
+        } else {
+            vec![]
+        };
+        self.next_result += 1;
+        let id = format!("r{}", self.next_result);
+        if !columns.is_empty() {
+            self.shell
+                .set_last_result(Arc::clone(&schema), batches.clone());
+        }
+        self.results
+            .push_back((id.clone(), Arc::clone(&schema), batches));
+        while self.results.len() > KEPT_RESULTS {
+            self.results.pop_front();
+        }
+        let result = json!({
+            "result": id,
+            "columns": columns,
+            // The schema's own metadata: `ursa.pattern`, for GRAPH_TABLE.
+            "metadata": schema.metadata(),
+            "rows": total,
+            "more": total > rows,
+            "ms": start.elapsed().as_secs_f64() * 1000.0,
+            "notices": notices,
+        });
+        Ok((result, arrow))
+    }
+
+    /// A result [`Self::query`] kept.
+    fn result(&self, id: &str) -> std::result::Result<(SchemaRef, Vec<RecordBatch>), Error> {
+        let kept = self.results.iter().find(|(kept, ..)| kept == id);
+        let (_, schema, batches) = kept.ok_or_else(|| Error {
+            kind: "not_found",
+            message: format!("no result {id}: the session keeps the last {KEPT_RESULTS}"),
+        })?;
+        Ok((Arc::clone(schema), batches.clone()))
     }
 
     /// The table width: tables are drawn no wider.

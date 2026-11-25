@@ -1021,6 +1021,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   8 MB more for the parallel run. Without a mask, a vote no longer reads
   the edge ids.
 
+- **`ursa serve`, a spike (#536, `design/console.md`)**, behind ursa-cli's
+  non-default `serve` feature: the shell's page in a browser tab over a
+  local WebSocket to a native session (crate `ursa-server`: axum, a session
+  actor per connection, the per-run token as a same-site cookie, `Origin`
+  and `Host` checks, loopback only, the deploy's security headers).
+  `engine-client.js` gains `SocketTransport`; the session a `query` op (the
+  first rows as Arrow IPC) and `graph.open` by result id; and
+  `web/console/` a bare console page (`bun run console`). `bun
+  scripts/e2e-serve.ts` runs the e2e suite against it. Release builds are
+  unchanged.
+
 ### Changed
 
 - **The web shell talks to its engine through the session protocol**

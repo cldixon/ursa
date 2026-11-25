@@ -85,6 +85,8 @@ const slow: string[] = [];
 const mb = (bytes: number | null | undefined) => (bytes == null ? "–" : `${(bytes / 2 ** 20).toFixed(1)} MiB`);
 for (let r = 0; r < runs; r++) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+  // Against `ursa serve`: the run's token, as the cookie its link gives.
+  if (process.env.URSA_SERVE_TOKEN) await ctx.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: process.env.URSA_SERVE_TOKEN, url: base }]);
   const p = await ctx.newPage();
   p.on("pageerror", (e) => console.error(`page error: ${e.message}`));
   await p.goto(`${base}/?dataset=${dataset}`);

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- The console spike (#536, design/console.md §11): a textarea, the
+       `query` op with its first rows as Arrow IPC, and the shell's graph
+       pane. Not the console's UI: no editor, catalog or sources. -->
+  <title>Ursa Console (spike)</title>
+  <script src="/theme.js"></script>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/console.css">
+  <script type="module" src="/console.js"></script>
+</head>
+<body>
+  <div class="workspace">
+    <main class="console" aria-label="Ursa console">
+      <label for="sql">SQL</label>
+      <textarea id="sql" spellcheck="false" rows="6">SELECT * FROM pagerank(karate) ORDER BY pagerank DESC</textarea>
+      <div class="console-bar">
+        <button id="run" type="button" title="Run (Ctrl+Enter)">Run</button>
+        <button id="draw" type="button" disabled title="Draw the result as a graph">Graph</button>
+        <span id="info" class="console-info" aria-live="polite">Connecting…</span>
+      </div>
+      <div id="result" class="console-result"></div>
+      <h2>History</h2>
+      <ol id="history" class="console-history"></ol>
+    </main>
+    <section id="graph-pane" class="graph-pane" aria-label="Graph view" hidden>
+      <div class="graph-head">
+        <span id="graph-status" class="graph-status" aria-live="polite"></span>
+      </div>
+      <div id="graph-legend" class="graph-legend" aria-label="Legend" hidden></div>
+      <div id="graph-stage" class="graph-stage"></div>
+    </section>
+  </div>
+</body>
+</html>
