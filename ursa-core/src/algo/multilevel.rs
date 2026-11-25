@@ -390,15 +390,25 @@ fn coarse_rows(
         let rows: Vec<(Vec<u32>, Vec<f32>, f32)> = (start..end)
             .into_par_iter()
             .map_init(
-                || (vec![0.0f32; nc], vec![false; nc], Vec::<u32>::new()),
-                |(sum, met, targets), c| {
+                || {
+                    let words = nc.div_ceil(64);
+                    (
+                        vec![0.0f32; nc],
+                        vec![0u64; words],
+                        vec![0u64; words.div_ceil(64)],
+                        Vec::<u32>::new(),
+                    )
+                },
+                |(sum, met, any, found), c| {
                     // Each target's weights are added in the order its
                     // edges are met (members in index order, each one's
                     // neighbours in theirs), into a slot of its own: the
                     // sums a stable sort by target and a merge would give,
-                    // without sorting the edges.
-                    targets.clear();
+                    // without sorting the edges. `met` has a bit for each
+                    // target met, `any` a bit for each of its words that has
+                    // one, and `found` the targets as they were met.
                     let mut m = 0.0f32;
+                    found.clear();
                     for &u in &members[member_offsets[c] as usize..member_offsets[c + 1] as usize] {
                         m += mass[u as usize];
                         let base = adj.offsets[u as usize] as usize;
@@ -408,22 +418,47 @@ fn coarse_rows(
                             let gv = group[v as usize] as usize;
                             if gv != c {
                                 let w = weights.map_or(1.0, |w| w[base + e]);
-                                if met[gv] {
+                                let (word, bit) = (gv / 64, 1u64 << (gv % 64));
+                                if met[word] & bit != 0 {
                                     sum[gv] += w;
                                 } else {
-                                    met[gv] = true;
+                                    met[word] |= bit;
+                                    any[word / 64] |= 1 << (word % 64);
                                     sum[gv] = w;
-                                    targets.push(gv as u32);
+                                    found.push(gv as u32);
                                 }
                             }
                         }
                     }
-                    targets.sort_unstable();
-                    let ws: Vec<f32> = targets.iter().map(|&t| sum[t as usize]).collect();
-                    for &t in targets.iter() {
-                        met[t as usize] = false;
+                    // The targets in ascending order. They are read off
+                    // the bits, which costs the words the row touched and
+                    // a scan of `any`; a row with too few targets for that
+                    // scan is sorted. The order is the same either way.
+                    let mut targets = Vec::with_capacity(found.len());
+                    if found.len() * 8 >= any.len() {
+                        for (top, words) in any.iter_mut().enumerate() {
+                            let mut words = std::mem::take(words);
+                            while words != 0 {
+                                let word = top * 64 + words.trailing_zeros() as usize;
+                                words &= words - 1;
+                                let mut bits = std::mem::take(&mut met[word]);
+                                while bits != 0 {
+                                    targets.push((word * 64) as u32 + bits.trailing_zeros());
+                                    bits &= bits - 1;
+                                }
+                            }
+                        }
+                    } else {
+                        targets.extend_from_slice(found);
+                        targets.sort_unstable();
+                        for &t in &targets {
+                            let word = t as usize / 64;
+                            met[word] = 0;
+                            any[word / 64] = 0;
+                        }
                     }
-                    (targets.clone(), ws, m)
+                    let ws: Vec<f32> = targets.iter().map(|&t: &u32| sum[t as usize]).collect();
+                    (targets, ws, m)
                 },
             )
             .collect();
@@ -2159,6 +2194,82 @@ mod tests {
         first.sort_unstable();
         assert_eq!(first, [2, 3, 4, 5, 6]);
         assert_eq!(order, edge_order_by_degree(topo.undirected(), &src, &dst));
+    }
+
+    /// A coarse level's rows, by sorting every edge: what [`coarse_rows`]
+    /// gives without sorting any (#525).
+    fn rows_by_sorting(
+        adj: &UndirectedCsr,
+        weights: Option<&[f32]>,
+        group: &[u32],
+        nc: usize,
+    ) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+        let mut edges: Vec<Vec<(u32, f32)>> = vec![Vec::new(); nc];
+        for u in 0..group.len() {
+            let base = adj.offsets[u] as usize;
+            for (e, &v) in adj.neighbors(u as u32).iter().enumerate() {
+                let (gu, gv) = (group[u], group[v as usize]);
+                if gu != NONE && gu != gv {
+                    edges[gu as usize].push((gv, weights.map_or(1.0, |w| w[base + e])));
+                }
+            }
+        }
+        let (mut offsets, mut targets, mut sums) = (vec![0u64], Vec::new(), Vec::new());
+        for row in &mut edges {
+            // Stable: a target's weights are added in the order they came.
+            row.sort_by_key(|&(t, _)| t);
+            for &(t, w) in row.iter() {
+                if targets.len() as u64 > *offsets.last().unwrap() && targets.last() == Some(&t) {
+                    *sums.last_mut().unwrap() += w;
+                } else {
+                    targets.push(t);
+                    sums.push(w);
+                }
+            }
+            offsets.push(targets.len() as u64);
+        }
+        (offsets, targets, sums)
+    }
+
+    #[test]
+    fn a_coarse_levels_rows_are_the_sorted_ones_whichever_way_they_are_ordered() {
+        // A dense graph, whose rows are read off the bitmap; and a ring of
+        // 600,000 nodes with chords, whose coarse nodes have a few targets
+        // each among 300,000: those rows are sorted (their targets are
+        // fewer than an eighth of the summary's 74 words).
+        let dense = random_edges(300, 9_000);
+        let mut ring: (Vec<u32>, Vec<u32>) =
+            (0..600_000u32).map(|i| (i, (i + 1) % 600_000)).unzip();
+        let chords = random_edges(600_000, 50_000);
+        ring.0.extend(chords.0);
+        ring.1.extend(chords.1);
+        for (n, (src, dst), sorted) in [(300usize, dense, false), (600_000, ring, true)] {
+            let adj = UndirectedCsr::from_edges(n, &src, &dst);
+            let mut levels = 0;
+            let (mut a, mut w, mut m) = (adj, None::<Vec<f32>>, None::<Vec<f32>>);
+            loop {
+                let mass = m.clone().unwrap_or_else(|| degree_mass(&a));
+                let (group, nc) = group_nodes(&a, w.as_deref(), &mass);
+                if nc < 2 {
+                    break;
+                }
+                if levels == 0 {
+                    let few = nc.div_ceil(64).div_ceil(64) > 8 * 3;
+                    assert_eq!(few, sorted, "{nc} coarse nodes");
+                }
+                let next = contract(&a, w.as_deref(), &mass, &group, nc);
+                let (offsets, targets, sums) = rows_by_sorting(&a, w.as_deref(), &group, nc);
+                assert_eq!(next.adj.offsets, offsets);
+                assert_eq!(next.adj.targets, targets);
+                assert_eq!(next.weights, sums);
+                levels += 1;
+                if levels == 4 {
+                    break;
+                }
+                (a, w, m) = (next.adj, Some(next.weights), Some(next.mass));
+            }
+            assert!(levels >= 2, "{levels} levels of {n} nodes");
+        }
     }
 
     #[test]

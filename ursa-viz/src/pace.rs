@@ -13,9 +13,6 @@ use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
-use wasm_bindgen::JsCast;
-
 /// How long a paced piece of work holds the thread before it gives the
 /// event loop a turn at the next [`Pace::breathe`], in milliseconds. The
 /// longest hold is this and the piece that follows: the largest pieces at a
@@ -64,7 +61,7 @@ impl Pace {
     /// time (a browser frees what was written to the GPU between tasks).
     pub async fn turn(&mut self) {
         if self.since.is_some() {
-            yield_now().await;
+            wait_a_turn().await;
             self.since = Some(now());
         }
     }
@@ -98,23 +95,129 @@ fn now() -> f64 {
 
 /// Give the event loop a turn: a macrotask in the browser (feature `web`),
 /// where GPU callbacks are delivered; elsewhere, nothing to wait for.
+///
+/// The task is a message on a channel of this thread's own, not a timer: a
+/// browser makes a timer set from a timer's task wait 4 ms, and a view of
+/// a million edges gives sixty turns or more as it is made, which was a
+/// quarter of a second of it spent waiting for nothing (#525). A message
+/// is the next task the loop takes, after whatever else is due.
 pub(crate) async fn yield_now() {
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
     {
         let promise = js_sys::Promise::new(&mut |resolve, _| {
-            let global = js_sys::global();
-            let set_timeout = js_sys::Reflect::get(&global, &"setTimeout".into())
-                .ok()
-                .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
-            match set_timeout {
-                Some(f) => {
-                    let _ = f.call2(&global, &resolve, &0.into());
-                }
-                None => {
-                    let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
-                }
+            if !turns::post(&resolve) {
+                turns::after_a_timer(&resolve);
             }
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
+/// Give the event loop a turn that lasts: a timer's task, which a browser
+/// runs no sooner than a millisecond on (and 4 ms on, from a timer's own
+/// task). For work that waits for something else to have happened by then
+/// (the GPU taking what was written to it), not only for a turn.
+pub(crate) async fn wait_a_turn() {
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    {
+        let promise = js_sys::Promise::new(&mut |resolve, _| turns::after_a_timer(&resolve));
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
+/// The turns of the browser's event loop.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod turns {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use js_sys::{Array, Function, Reflect};
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
+
+    /// Call `resolve` from a timer's task (or now, where there are no timers).
+    pub(super) fn after_a_timer(resolve: &Function) {
+        let global = js_sys::global();
+        let set_timeout = Reflect::get(&global, &"setTimeout".into())
+            .ok()
+            .and_then(|f| f.dyn_into::<Function>().ok());
+        match set_timeout {
+            Some(f) => {
+                let _ = f.call2(&global, resolve, &0.into());
+            }
+            None => {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            }
+        }
+    }
+
+    /// This thread's channel to itself: what posts to it, and what its
+    /// messages call, in order.
+    struct Channel {
+        port: JsValue,
+        post: Function,
+        waiting: VecDeque<Function>,
+    }
+
+    thread_local! {
+        /// `None` once it could not be made: there is no `MessageChannel`.
+        static CHANNEL: RefCell<Option<Option<Channel>>> = const { RefCell::new(None) };
+    }
+
+    fn open() -> Option<Channel> {
+        let make = Reflect::get(&js_sys::global(), &"MessageChannel".into())
+            .ok()?
+            .dyn_into::<Function>()
+            .ok()?;
+        let channel = Reflect::construct(&make, &Array::new()).ok()?;
+        let (to, from) = (
+            Reflect::get(&channel, &"port1".into()).ok()?,
+            Reflect::get(&channel, &"port2".into()).ok()?,
+        );
+        let post = Reflect::get(&to, &"postMessage".into())
+            .ok()?
+            .dyn_into::<Function>()
+            .ok()?;
+        // Each message is one turn asked for: the oldest.
+        let taken = Closure::<dyn FnMut()>::new(|| {
+            let next = CHANNEL.with(|c| {
+                c.borrow_mut()
+                    .as_mut()
+                    .and_then(Option::as_mut)
+                    .and_then(|c| c.waiting.pop_front())
+            });
+            if let Some(resolve) = next {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            }
+        });
+        Reflect::set(&from, &"onmessage".into(), taken.as_ref()).ok()?;
+        // The channel lasts as long as the thread does.
+        taken.forget();
+        Some(Channel {
+            port: to,
+            post,
+            waiting: VecDeque::new(),
+        })
+    }
+
+    /// Call `resolve` from the task of a message posted now; `false` if
+    /// there is no channel to post it on.
+    pub(super) fn post(resolve: &Function) -> bool {
+        CHANNEL.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(channel) = c.get_or_insert_with(open) else {
+                return false;
+            };
+            channel.waiting.push_back(resolve.clone());
+            if channel
+                .post
+                .call1(&channel.port, &JsValue::UNDEFINED)
+                .is_err()
+            {
+                channel.waiting.pop_back();
+                return false;
+            }
+            true
+        })
     }
 }

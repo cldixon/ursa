@@ -383,6 +383,13 @@ moving frame draws no more than the level has, nothing is picked, the frame
 after `clearLevel()` is the graph's own byte for byte, and the layout
 stepped a level at a time ends on the bits of one stepped whole.
 
+Since #525 the hierarchy is built without sorting its rows (a coarse
+node's targets are read off a bitmap, in `ursa-core`), the shell's engine
+draws a property graph from its index and not from its rows, and the first
+frame is shown 0.69 to 0.84 s after Enter where main took 1.0 to 1.3 s on
+the same busy machine ([`BENCH.md`](BENCH.md#the-first-frame), with what
+0.6 s would still need). Before it:
+
 Measured on `.graph rmat` (1M edges) in the shell, in headless Chromium's
 software WebGL2 ([`BENCH.md`](BENCH.md#the-first-paint)): the first frame
 is shown 0.94 s after Enter where it was 1.13 to 1.23 s, and it is 27
@@ -529,7 +536,11 @@ and 50 MB ([`BENCH.md`](BENCH.md#making-a-view)). A view made from a result
   (`createView`, `createViewFromResult`; `View::new_paced` and
   `View::from_result_paced`) the view gives the event loop a turn between
   pieces whenever it has held the thread for 4 ms (`pace`), so a click or a
-  frame waits for one piece, not all of them. The largest piece is the
+  frame waits for one piece, not all of them. A turn is a message on a
+  channel of the thread's own, not `setTimeout(0)`, which a browser makes
+  wait 4 ms once timers nest (#525: sixty turns of a view of a million
+  edges were a quarter of a second of waiting); the turns that wait for
+  the GPU to take what was written are timers still. The largest piece is the
   shader, about 30 ms. `View::new` and `View::from_result` make the same
   view in one go, for a caller with no event loop.
 - **The level pipelines, and the hand-back, are pieces too** (#520). A

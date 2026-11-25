@@ -25,7 +25,7 @@ use crate::interact::nearest_edge;
 use crate::live::{Changes, Drawn, Info, LiveResult, Parts};
 use crate::model::{GraphDelta, GraphResult, ModelError, Op, Room, Source, UgrError};
 use crate::order::{check_order_from, BadOrder, EdgeOrder, Ordered};
-use crate::pace::{ready, yield_now, Pace};
+use crate::pace::{ready, Pace};
 use crate::refine::{change, Change, Kind, SlicePace, SLICE_TIMEOUT_MS};
 use crate::render::{
     disc_area, radius_scale_for, starting_capacity, FrontNode, Renderer, Slice, Under,
@@ -1695,7 +1695,7 @@ impl View {
             let _ = device.poll(wgpu::PollType::Poll);
             match rx.try_recv() {
                 Ok(Some(r)) => break r,
-                Ok(None) => yield_now().await,
+                Ok(None) => crate::pace::wait_a_turn().await,
                 Err(_) => break Err(wgpu::BufferAsyncError),
             }
         };

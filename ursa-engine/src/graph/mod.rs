@@ -77,6 +77,7 @@ mod vertex_keys;
 pub mod view;
 
 pub use catalog_table::UrsaFunctions;
+pub(crate) use exec::index_under;
 pub use exec::{
     GraphAlgorithmExec, GraphPlanner, GraphTraversalExec, KeepEdgeOrder, UrsaQueryPlanner,
 };
