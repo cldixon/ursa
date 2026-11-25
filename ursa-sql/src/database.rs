@@ -649,7 +649,13 @@ pub(crate) async fn attach(ctx: &SessionContext, attach: Attach) -> Result<DataF
             attach.path, attach.path
         )));
     }
-    open_into(ctx, Path::new(&attach.path), &OpenOptions::default()).await?;
+    // In a session with a root, a relative path is the root's, as in a query.
+    let config = ctx.state().config().clone();
+    let path = match ursa_engine::paths::root(&config) {
+        Some(_) => ursa_engine::paths::resolve(&config, &attach.path)?,
+        None => attach.path.clone(),
+    };
+    open_into(ctx, Path::new(&path), &OpenOptions::default()).await?;
     graph_ddl::empty(ctx)
 }
 
@@ -772,9 +778,10 @@ fn stored_text(
     statement: &UrsaStatement,
     text: Option<&str>,
 ) -> Result<String> {
-    let cwd = std::env::current_dir().map_err(|e| {
+    // Relative paths are the session's root's, or the current directory's.
+    let cwd = ursa_engine::paths::base_dir(ctx.state().config()).ok_or_else(|| {
         DataFusionError::Execution(format!(
-            "cannot store this {} in {}: cannot read the current directory: {e}",
+            "cannot store this {} in {}: cannot read the current directory",
             leading_words(statement),
             database.name()
         ))

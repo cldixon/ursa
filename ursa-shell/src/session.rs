@@ -32,11 +32,12 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayData, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::writer::StreamWriter;
 use datafusion::error::{DataFusionError, Result};
@@ -47,12 +48,14 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::{json, Value};
 use url::Url;
-use ursa_engine::graph::view::inspect::Inspect;
+use ursa_engine::graph::view::{self, inspect::Inspect};
 use web_time::Instant;
 
 use crate::highlight;
 use crate::print::{json_array_writer, DelimitedWriter, OutputFormat};
 use crate::shell::{Flow, Shell};
+
+pub use ursa_engine::paths::Root;
 
 /// The protocol's version: what `hello` reports, and the only one it
 /// accepts.
@@ -138,12 +141,30 @@ pub const OPS: &[Op] = &[
     Op {
         name: "query",
         args: "`sql`, `rows?` (1,000)",
-        result: "`{columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`)",
-        about: "Runs `sql` for the console; the last statement's result becomes the \
-                last result (`graph.open`, `export`). `columns` are `[{name, type, \
-                nullable, metadata}]`, `metadata` is the schema's (`ursa.pattern`), \
-                `rows` the whole result's count; the part holds the first `rows` rows \
-                as an Arrow IPC stream",
+        result: "`{result, columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`)",
+        about: "Runs `sql` for the console. The last statement's result is kept as \
+                `result` (`\"r4\"`; `null` for a statement with no columns) for `fetch`, \
+                `export` and `graph.open`, and becomes the last result too. `columns` are \
+                `[{name, type, nullable, metadata}]`, `metadata` is the schema's \
+                (`ursa.pattern`), `rows` the whole result's count; the part holds the \
+                first `rows` rows as an Arrow IPC stream. The session keeps its last 16 \
+                results, within 256 MB, and drops the oldest first; a result over 256 MB \
+                on its own keeps only the rows the reply sent",
+    },
+    Op {
+        name: "fetch",
+        args: "`result`, `offset?` (0), `rows?` (1,000)",
+        result: "`{rows, more}`; `arrow` (`arrow`)",
+        about: "A page of a kept result: `rows` rows from `offset`, as an Arrow IPC \
+                stream, and whether more follow. `not_found` for a result closed or \
+                dropped, or for rows past those a result over the cap kept: run the \
+                query again",
+    },
+    Op {
+        name: "close",
+        args: "`result`",
+        result: "`{}`",
+        about: "Drops a kept result; `not_found` if it has gone already",
     },
     Op {
         name: "addFile",
@@ -159,16 +180,19 @@ pub const OPS: &[Op] = &[
     },
     Op {
         name: "export",
-        args: "`format`",
+        args: "`format`, `result?`",
         result: "`{}`; `bytes` (`bytes`)",
-        about: "The last result, every row, as `csv`, `json`, `arrow` or `parquet`",
+        about: "A kept result, or without `result` the last result, every row, as \
+                `csv`, `json`, `arrow` or `parquet`. `not_found` for a result that has \
+                gone, or that kept only its first rows",
     },
     Op {
         name: "graph.open",
-        args: "`text`",
+        args: "`text?`, `result?`",
         result: "`{skipped}`; `ugr` (`ugr`), `positions?` (`f32`)",
-        about: "Opens a graph to draw (`.graph TEXT`). `positions`, every `x` then \
-                every `y`, only with `POSITIONS`",
+        about: "Opens a graph to draw (`.graph TEXT`). A `text` that names no source \
+                draws the kept `result`, or without it the last result. `positions`, \
+                every `x` then every `y`, only with `POSITIONS`",
     },
     Op {
         name: "graph.explore",
@@ -214,9 +238,19 @@ pub struct Options {
     pub capabilities: Vec<&'static str>,
     /// Keep the session's files in memory, at `memory://uploads/`: `addFile`
     /// puts them there, and `COPY … TO 'name'` writes there
-    /// (`ursa_engine::session_files`). The browser has no disk, so the demo
-    /// always has them.
+    /// (`ursa_engine::session_files`), unless `copy_to_disk`. The browser
+    /// has no disk, so the demo always has them.
     pub uploads: bool,
+    /// Where relative paths resolve ([`Root`]): a directory natively (`ursa
+    /// serve DIR`), a URL in the browser. A session with a directory root
+    /// writes files only under it. `None`: natively, the process's working
+    /// directory, as the CLI; in the browser, nowhere.
+    pub root: Option<Root>,
+    /// Write `COPY … TO 'name'` to disk (under `root`, if it is a
+    /// directory), as DataFusion's `COPY` does, though the session has
+    /// `uploads`: these are then for the files a page adds only. Native only:
+    /// the browser always keeps a copy in memory.
+    pub copy_to_disk: bool,
 }
 
 impl Default for Options {
@@ -226,6 +260,8 @@ impl Default for Options {
             transport: "native",
             capabilities: Vec::new(),
             uploads: true,
+            root: None,
+            copy_to_disk: false,
         }
     }
 }
@@ -298,6 +334,14 @@ impl Part {
         }
     }
 
+    fn arrow(bytes: Vec<u8>) -> Part {
+        Part {
+            name: "arrow",
+            kind: PartKind::Arrow,
+            bytes,
+        }
+    }
+
     fn u32s(name: &'static str, values: &[u32]) -> Part {
         let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         Part {
@@ -338,6 +382,13 @@ impl Error {
     pub fn protocol(message: impl Into<String>) -> Error {
         Error {
             kind: "protocol",
+            message: message.into(),
+        }
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Error {
+        Error {
+            kind: "not_found",
             message: message.into(),
         }
     }
@@ -441,6 +492,8 @@ pub struct Session {
     options: Options,
     /// Whether `hello` came: every other operation waits for it.
     greeted: bool,
+    /// The results `query` kept, for `fetch`, `export`, `graph.open`.
+    results: Results,
 }
 
 impl Session {
@@ -453,6 +506,8 @@ impl Session {
             ctx.register_object_store(&uploads_url(), Arc::clone(&store) as Arc<dyn ObjectStore>);
             store
         });
+        ursa_engine::paths::set_root(&ctx, options.root.clone());
+        ursa_engine::session_files::set_copy_to_disk(&ctx, options.copy_to_disk);
         let (out, err) = (Buffer::default(), Buffer::default());
         let width = Rc::new(Cell::new(80));
         let mut shell = Shell::new(ctx, OutputFormat::Table, out.clone(), err.clone());
@@ -470,6 +525,7 @@ impl Session {
             uploads,
             options,
             greeted: false,
+            results: Results::default(),
         }
     }
 
@@ -534,12 +590,22 @@ impl Session {
                 let (result, arrow) = self.query(a.str("sql")?, rows as usize).await?;
                 Ok(Reply {
                     result,
-                    parts: vec![Part {
-                        name: "arrow",
-                        kind: PartKind::Arrow,
-                        bytes: arrow,
-                    }],
+                    parts: vec![Part::arrow(arrow)],
                 })
+            }
+            "fetch" => {
+                let id = a.str("result")?;
+                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(1_000);
+                let (result, arrow) = self.fetch(id, offset as usize, rows as usize)?;
+                Ok(Reply {
+                    result,
+                    parts: vec![Part::arrow(arrow)],
+                })
+            }
+            "close" => {
+                self.close_result(a.str("result")?)?;
+                Ok(Reply::json(json!({})))
             }
             "start" => {
                 *self = Session {
@@ -604,7 +670,11 @@ impl Session {
             }
             "files" => Ok(Reply::json(json!({"files": self.files().await?}))),
             "export" => {
-                let bytes = self.export(a.str("format")?)?;
+                let format = a.str("format")?;
+                let bytes = match a.id_opt("result")? {
+                    Some(id) => self.export_result(id, format)?,
+                    None => self.export(format)?,
+                };
                 Ok(Reply {
                     result: json!({}),
                     parts: vec![Part {
@@ -615,7 +685,11 @@ impl Session {
                 })
             }
             "graph.open" => {
-                let graph = self.open_graph(a.str_opt("text").unwrap_or("")).await?;
+                let text = a.str_opt("text").unwrap_or("");
+                let graph = match a.id_opt("result")? {
+                    Some(id) => self.open_graph_of(text, id).await?,
+                    None => self.open_graph(text).await?,
+                };
                 let mut parts = vec![Part {
                     name: "ugr",
                     kind: PartKind::Ugr,
@@ -699,12 +773,18 @@ impl Session {
     }
 
     /// Run `sql` (one or more statements) for the console: the last
-    /// statement's result becomes the shell's last result (`.graph`,
-    /// `export`). Gives `{columns, metadata, rows, more, ms, notices}`, where
-    /// `columns` are `[{name, type, nullable, metadata}]`, `metadata` is the
-    /// schema's own (`ursa.pattern` sits there for a `GRAPH_TABLE` result)
-    /// and `rows` the whole result's count; and the first `rows` rows as an
-    /// Arrow IPC stream, the metadata inside its schema.
+    /// statement's result is kept, by the id in `result`, for
+    /// [`Self::fetch`], [`Self::export_result`] and [`Self::open_graph_of`],
+    /// and becomes the shell's last result (`.graph`, `export`). Gives
+    /// `{result, columns, metadata, rows, more, ms, notices}`, where `columns`
+    /// are `[{name, type, nullable, metadata}]`, `metadata` is the schema's
+    /// own (`ursa.pattern` sits there for a `GRAPH_TABLE` result) and `rows`
+    /// the whole result's count; and the first `rows` rows as an Arrow IPC
+    /// stream, the metadata inside its schema. A statement with no columns
+    /// (`CREATE`, `SET`) keeps nothing: its `result` is `null`.
+    ///
+    /// Every row is collected before the first are sent: the reply gives the
+    /// whole result's count, and the shell's last result holds every row.
     pub async fn query(&mut self, sql: &str, rows: usize) -> Result<(Value, Vec<u8>)> {
         let start = Instant::now();
         let ctx = self.shell.context().clone();
@@ -718,16 +798,7 @@ impl Session {
         let (schema, batches) =
             last.ok_or_else(|| DataFusionError::Plan("no statement to run".into()))?;
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        let mut first = Vec::new();
-        let mut left = rows;
-        for batch in &batches {
-            if left == 0 {
-                break;
-            }
-            let take = left.min(batch.num_rows());
-            first.push(batch.slice(0, take));
-            left -= take;
-        }
+        let first = page(&batches, 0, rows);
         let arrow = encode(&schema, &first, "arrow")?;
         let columns: Vec<Value> = schema
             .fields()
@@ -747,10 +818,15 @@ impl Session {
         } else {
             vec![]
         };
-        if !columns.is_empty() {
-            self.shell.set_last_result(Arc::clone(&schema), batches);
-        }
+        let id = if columns.is_empty() {
+            None
+        } else {
+            self.shell
+                .set_last_result(Arc::clone(&schema), batches.clone());
+            Some(self.results.keep(Arc::clone(&schema), batches, rows)?)
+        };
         let result = json!({
+            "result": id,
             "columns": columns,
             "metadata": schema.metadata(),
             "rows": total,
@@ -759,6 +835,56 @@ impl Session {
             "notices": notices,
         });
         Ok((result, arrow))
+    }
+
+    /// `rows` rows of the kept result `id` from `offset`, as an Arrow IPC
+    /// stream, with `{rows, more}`: how many it holds, and whether rows
+    /// follow. Fails with `not_found` for a result that has gone, and for
+    /// rows past those a result over the cap kept.
+    pub fn fetch(
+        &self,
+        id: &str,
+        offset: usize,
+        rows: usize,
+    ) -> std::result::Result<(Value, Vec<u8>), Error> {
+        let kept = self.results.get(id)?;
+        let end = offset.saturating_add(rows).min(kept.rows);
+        if end > kept.kept {
+            return Err(kept.past_its_rows());
+        }
+        let slices = page(&kept.batches, offset, rows);
+        let sent: usize = slices.iter().map(RecordBatch::num_rows).sum();
+        let arrow = encode(&kept.schema, &slices, "arrow")?;
+        let more = offset.saturating_add(sent) < kept.rows;
+        Ok((json!({"rows": sent, "more": more}), arrow))
+    }
+
+    /// Drop the kept result `id`; `not_found` if it has gone already.
+    pub fn close_result(&mut self, id: &str) -> std::result::Result<(), Error> {
+        self.results.close(id)
+    }
+
+    /// The kept result `id`, every row, written as `format` (see
+    /// [`encode`]). Fails with `not_found` for a result that has gone, or
+    /// that kept only its first rows.
+    pub fn export_result(&self, id: &str, format: &str) -> std::result::Result<Vec<u8>, Error> {
+        let kept = self.results.get(id)?.whole()?;
+        Ok(encode(&kept.schema, &kept.batches, format)?)
+    }
+
+    /// [`Self::open_graph`], with the kept result `id` as what `text` draws
+    /// when it names no source. The last result stays. Fails with
+    /// `not_found` for a result that has gone, or that kept only its first
+    /// rows.
+    pub async fn open_graph_of(
+        &mut self,
+        text: &str,
+        id: &str,
+    ) -> std::result::Result<GraphData, Error> {
+        let kept = self.results.get(id)?.whole()?;
+        let rows = (Arc::clone(&kept.schema), kept.batches.clone());
+        let placed = self.shell.open_graph_of(text, Some(rows)).await?;
+        Ok(self.graph_data(placed))
     }
 
     /// The table width: tables are drawn no wider.
@@ -795,18 +921,23 @@ impl Session {
     /// Open a graph to draw (the host's `.graph TEXT`): the shell's open
     /// graph from now on. A rejection leaves the one that was open.
     pub async fn open_graph(&mut self, text: &str) -> Result<GraphData> {
-        let (skipped, positions) = self.shell.open_graph_placed(text).await?;
+        let placed = self.shell.open_graph_placed(text).await?;
+        Ok(self.graph_data(placed))
+    }
+
+    /// The graph the shell just opened, for the host's view.
+    fn graph_data(&self, (skipped, positions): (usize, Option<view::Positions>)) -> GraphData {
         // The bytes are written from the shell's own result: it is not
         // copied first (8 bytes an edge).
         let result = self.shell.explorer().expect("a graph was opened").result();
-        Ok(GraphData {
+        GraphData {
             ugr: result.to_bytes(),
             skipped,
             positions: positions.map(|mut p| {
                 p.x.append(&mut p.y);
                 p.x
             }),
-        })
+        }
     }
 
     /// Run an explore command on the open graph (`.expand`, `.hide`,
@@ -940,6 +1071,197 @@ fn memory() -> Value {
     }
 }
 
+/// How many results a session keeps.
+pub const RESULTS_KEPT: usize = 16;
+
+/// How many bytes of results a session keeps: 256 MB.
+pub const RESULTS_BYTES: usize = 256 << 20;
+
+/// A result `query` kept ([`Results`]).
+struct Kept {
+    id: u64,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    /// The whole result's rows.
+    rows: usize,
+    /// The rows kept: all of them, or for a result over the cap, the first
+    /// ones, which the reply sent.
+    kept: usize,
+    /// What its buffers hold ([`held_bytes`]).
+    bytes: usize,
+}
+
+impl Kept {
+    fn name(&self) -> String {
+        format!("r{}", self.id)
+    }
+
+    /// This result, if it kept every row.
+    fn whole(&self) -> std::result::Result<&Kept, Error> {
+        if self.kept < self.rows {
+            return Err(self.past_its_rows());
+        }
+        Ok(self)
+    }
+
+    /// Why rows past those a result over the cap kept cannot be had.
+    fn past_its_rows(&self) -> Error {
+        Error::not_found(format!(
+            "result {} kept only its first {} of {} rows, as it is over the {} MB \
+             the session keeps; run the query again",
+            self.name(),
+            self.kept,
+            self.rows,
+            RESULTS_BYTES >> 20,
+        ))
+    }
+}
+
+/// The results a session keeps for `fetch`, `export`, `graph.open` and
+/// `close`, by id (`"r4"`): the last [`RESULTS_KEPT`], within
+/// [`RESULTS_BYTES`], the oldest dropped first. A result over the bytes on
+/// its own keeps only its first rows.
+struct Results {
+    kept: VecDeque<Kept>,
+    /// The next result's id: ids are never reused within a session.
+    next: u64,
+    max_count: usize,
+    max_bytes: usize,
+}
+
+impl Default for Results {
+    fn default() -> Self {
+        Results {
+            kept: VecDeque::new(),
+            next: 1,
+            max_count: RESULTS_KEPT,
+            max_bytes: RESULTS_BYTES,
+        }
+    }
+}
+
+impl Results {
+    /// Keep a result, dropping the oldest to make room, and give its id.
+    /// Over the cap on its own, it keeps its first `sent` rows, copied so
+    /// they hold none of the rest; or none, if even those are over.
+    fn keep(
+        &mut self,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        sent: usize,
+    ) -> Result<String> {
+        let rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut bytes = held_bytes(&batches);
+        let (batches, kept) = if bytes <= self.max_bytes {
+            (batches, rows)
+        } else {
+            let first = page(&batches, 0, sent);
+            let first = arrow::compute::concat_batches(&schema, &first)?;
+            // Taken, not sliced: a slice, and concat of one batch, would
+            // hold the whole result's buffers.
+            let all = arrow::array::UInt32Array::from_iter_values(0..first.num_rows() as u32);
+            let first = vec![arrow::compute::take_record_batch(&first, &all)?];
+            bytes = held_bytes(&first);
+            if bytes <= self.max_bytes {
+                let kept = first[0].num_rows();
+                (first, kept)
+            } else {
+                bytes = 0;
+                (Vec::new(), 0)
+            }
+        };
+        while self.kept.len() >= self.max_count
+            || (!self.kept.is_empty() && self.bytes() + bytes > self.max_bytes)
+        {
+            self.kept.pop_front();
+        }
+        let id = self.next;
+        self.next += 1;
+        self.kept.push_back(Kept {
+            id,
+            schema,
+            batches,
+            rows,
+            kept,
+            bytes,
+        });
+        Ok(format!("r{id}"))
+    }
+
+    fn bytes(&self) -> usize {
+        self.kept.iter().map(|k| k.bytes).sum()
+    }
+
+    fn position(&self, id: &str) -> std::result::Result<usize, Error> {
+        let number = id.strip_prefix('r').and_then(|n| n.parse::<u64>().ok());
+        number
+            .and_then(|n| self.kept.iter().position(|k| k.id == n))
+            .ok_or_else(|| {
+                Error::not_found(format!(
+                    "no result {id}: it was closed, or dropped to keep the session's last \
+                     {RESULTS_KEPT} results within {} MB; run the query again",
+                    RESULTS_BYTES >> 20
+                ))
+            })
+    }
+
+    fn get(&self, id: &str) -> std::result::Result<&Kept, Error> {
+        Ok(&self.kept[self.position(id)?])
+    }
+
+    fn close(&mut self, id: &str) -> std::result::Result<(), Error> {
+        let at = self.position(id)?;
+        self.kept.remove(at);
+        Ok(())
+    }
+}
+
+/// Up to `rows` rows of `batches` from `offset`, as slices of them.
+fn page(batches: &[RecordBatch], mut offset: usize, rows: usize) -> Vec<RecordBatch> {
+    let mut slices = Vec::new();
+    let mut left = rows;
+    for batch in batches {
+        if left == 0 {
+            break;
+        }
+        let n = batch.num_rows();
+        if offset >= n {
+            offset -= n;
+            continue;
+        }
+        let take = left.min(n - offset);
+        slices.push(batch.slice(offset, take));
+        offset = 0;
+        left -= take;
+    }
+    slices
+}
+
+/// The bytes the buffers of `batches` hold, each buffer counted once: a
+/// batch sliced from another, or a column shared by two, holds the same
+/// memory. A buffer shared with a table still counts, so this is what the
+/// result would hold once the table has gone.
+fn held_bytes(batches: &[RecordBatch]) -> usize {
+    fn walk(data: &ArrayData, seen: &mut HashSet<usize>, bytes: &mut usize) {
+        let nulls = data.nulls().map(|n| n.buffer());
+        for buffer in data.buffers().iter().chain(nulls) {
+            if seen.insert(buffer.data_ptr().as_ptr() as usize) {
+                *bytes += buffer.capacity().max(buffer.len());
+            }
+        }
+        for child in data.child_data() {
+            walk(child, seen, bytes);
+        }
+    }
+    let (mut seen, mut bytes) = (HashSet::new(), 0);
+    for batch in batches {
+        for column in batch.columns() {
+            walk(&column.to_data(), &mut seen, &mut bytes);
+        }
+    }
+    bytes
+}
+
 /// An operation's arguments, read by name.
 struct Args<'a>(&'a Value);
 
@@ -951,6 +1273,18 @@ impl<'a> Args<'a> {
 
     fn str_opt(&self, name: &str) -> Option<&'a str> {
         self.0.get(name).and_then(Value::as_str)
+    }
+
+    /// An optional result id: absent or `null` is none, anything but a
+    /// string a protocol error.
+    fn id_opt(&self, name: &str) -> std::result::Result<Option<&'a str>, Error> {
+        match self.0.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(id)) => Ok(Some(id)),
+            Some(other) => Err(Error::protocol(format!(
+                "'{name}' is a result id such as \"r4\", not {other}"
+            ))),
+        }
     }
 }
 

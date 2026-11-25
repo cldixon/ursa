@@ -1138,6 +1138,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the new reference page, `docs/reference/protocol.md`, is
   generated from it and tested against it.
 
+- **The session keeps results, by id** (URSA-9). `query` gives its result
+  an id (`"r4"`) and keeps it: `fetch {result, offset, rows}` pages through
+  it as Arrow IPC, `export {result}` writes it, `graph.open {result}` draws
+  it, and `close {result}` drops it, so the console can keep several
+  results open. A session keeps its last 16 results within 256 MB, the
+  oldest dropped first; a result over 256 MB on its own keeps only its
+  first rows. A result that has gone, or rows past those kept, fail with
+  `not_found` and a message to run the query again. The shell's last result
+  (`.graph`, `.export`) is unchanged.
+
 - **The graph pane is a module any page can embed** (URSA-8,
   `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
   engine, commands, status})` makes the Graph view's pane: its markup, the
@@ -1149,6 +1159,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   before, and the console's will be its History panel. `app.js` loses about
   250 lines of graph glue; the graph view behaves as before. A second host,
   `web/tests/pane-host/` (never deployed), proves it in the e2e test.
+
+- **A root per session, and `COPY … TO` to disk under it** (URSA-6,
+  `design/console.md` §5). Relative paths resolve against the session's
+  root (`ursa_engine::paths::Root`), which travels with the session's
+  config, in place of a base URL global to the process: a directory
+  natively, a URL in the browser. Two sessions in one process each read
+  their own files. A session with no root is the CLI's: relative to the
+  working directory, as before. The root covers `FROM 'x.csv'`,
+  `read_*()`, `CREATE EXTERNAL TABLE … LOCATION`, `COPY … TO`, `ATTACH`
+  (and `.open`), `.read`, `.output` and `.once`. A session with a directory
+  root reads anything (an absolute path, `~/…` or a URL reads what it
+  names), but writes only under the root: a `COPY … TO`, `.output` or
+  `.once` target must be a relative path with no `..`, and no symbolic link
+  in it may lead out; an `INSERT INTO` a table of files must be into files
+  under the root. `ursa_shell::session::Options` gains `root` and
+  `copy_to_disk`: a native session can keep `memory://uploads` for the
+  files a page adds and write its copies to disk, as `ursa serve` will.
+  The browser demo is unchanged: `WebShell.setBaseUrl` sets the page's
+  root, which each session takes when it is made.
 
 - **Default (serial) Louvain is about a third faster, with the same
   communities** (#268). Local moving, the serial core of `louvain(g)`, took

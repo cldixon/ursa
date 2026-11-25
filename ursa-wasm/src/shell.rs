@@ -54,6 +54,8 @@ impl WebShell {
             transport: "wasm",
             capabilities: vec!["uploads"],
             uploads: true,
+            root: crate::page_root(),
+            copy_to_disk: false,
         };
         WebShell {
             session: Rc::new(RefCell::new(Session::new(options))),
@@ -61,8 +63,9 @@ impl WebShell {
     }
 
     /// Set the URL relative paths resolve against, such as
-    /// `https://example.com/data/` (end a directory with `/`), for every
-    /// shell and session on the page.
+    /// `https://example.com/data/` (end a directory with `/`): the page's
+    /// root, which every shell and session made after this takes (and keeps
+    /// through `start`). Call it before `new WebShell()`.
     #[wasm_bindgen(js_name = setBaseUrl)]
     pub fn set_base_url(base: &str) -> Result<(), JsError> {
         crate::set_base_url(base)
