@@ -63,9 +63,10 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         root: PathBuf::from("."),
         port: args.port,
         assets,
-        // The CLI's version, as `ursa --version` gives it: the page's banner
-        // shows it.
-        version: env!("URSA_VERSION").to_string(),
+        // The crate's version, as the browser demo reports its own (the
+        // page's banner shows it as one word: `ursa --version` adds the
+        // commit).
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
