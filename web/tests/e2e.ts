@@ -1033,24 +1033,33 @@ for (const scheme of ["light", "dark"] as const) {
     check(/^Selected node 33: (label \S+, )?degree 17 · 34 nodes · 78 edges$/.test(await statusText()) && live === "polite" && info.selection.length === 1 && info.picked?.index === n33.index && info.frames > drawnBefore, "a click on node 33 selects it, and the status names it", await statusText());
     const selectedInk = await g.evaluate(() => (window as any).ursaShell.graphInked());
 
-    // Shift+click adds node 0; Shift+click on it again takes it out.
+    // Shift+click adds node 0; Shift+click on it again takes it out. Each
+    // click where node 0 is once the camera has made room for the
+    // inspector's panel (#493), which a selection opens: under load the
+    // camera moved between a place and its click (URSA-11).
+    await roomSettled(g);
+    const n0Now = (await place(0))!;
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.mouse.click(box.x + n0Now.x, box.y + n0Now.y);
     await g.keyboard.up("Shift");
     info = await graphInfo(g);
     check(/^Selected 2 nodes: 33, 0 · 34 nodes · 78 edges$/.test(await statusText()) && info.selection.map((n: any) => n.index).join() === `${n33.index},${n0.index}`, "Shift+click selects two", await statusText());
+    await roomSettled(g);
+    const n0Then = (await place(0))!;
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + n0.x, box.y + n0.y);
+    await g.mouse.click(box.x + n0Then.x, box.y + n0Then.y);
     await g.keyboard.up("Shift");
     check(/^Selected node 33: /.test(await statusText()), "Shift+click on a selected node takes it out", await statusText());
 
     // A drag on empty space pans, and keeps the selection.
+    await roomSettled(g);
+    const from33 = (await place(33))!;
     await g.mouse.move(box.x + 4, box.y + 4);
     await g.mouse.down();
     await g.mouse.move(box.x + 24, box.y + 14, { steps: 4 });
     await g.mouse.up();
     const moved = (await place(33))!;
-    check(Math.abs(moved.x - n33.x - 20) <= 1.5 && Math.abs(moved.y - n33.y - 10) <= 1.5 && /^Selected node 33: /.test(await statusText()), "a drag on empty space pans, and keeps the selection", JSON.stringify(moved));
+    check(Math.abs(moved.x - from33.x - 20) <= 1.5 && Math.abs(moved.y - from33.y - 10) <= 1.5 && /^Selected node 33: /.test(await statusText()), "a drag on empty space pans, and keeps the selection", JSON.stringify(moved));
 
     // A click on empty space clears it, and the frame loses the selection's ink.
     await g.mouse.click(box.x + 4, box.y + 4);
@@ -1061,6 +1070,7 @@ for (const scheme of ["light", "dark"] as const) {
     check(selectedInk.inked > clearedInk.inked, "the selected node's ring and wide edges are drawn", `${selectedInk.inked} px inked selected, ${clearedInk.inked} cleared`);
 
     // Esc, with the focus in the pane, clears a selection and leaves the pane open.
+    await roomSettled(g);
     const again = (await place(33))!;
     await g.mouse.click(box.x + again.x, box.y + again.y);
     await g.focus("#graph-stage canvas");
@@ -1244,9 +1254,13 @@ for (const scheme of ["light", "dark"] as const) {
     const all = await Promise.all(Array.from({ length: 34 }, (_, id) => place(id).then((at) => ({ id, ...at! }))));
     const left = all.filter((n) => n.id !== 33).reduce((a, b) => (b.x < a.x ? b : a));
     await g.mouse.click(box.x + now33.x, box.y + now33.y);
-    const clear = await onCanvas(left.x, left.y);
+    // The left node where it is once the camera has made room for node
+    // 33's panel (under load it moved between the place and the click).
+    await roomSettled(g);
+    const leftNow = (await place(left.id))!;
+    const clear = await onCanvas(leftNow.x, leftNow.y);
     await g.keyboard.down("Shift");
-    await g.mouse.click(box.x + left.x, box.y + left.y);
+    await g.mouse.click(box.x + leftNow.x, box.y + leftNow.y);
     await g.keyboard.up("Shift");
     shown = await inspector();
     const where = `WHERE id IN (33, ${left.id})`;
@@ -1281,7 +1295,10 @@ for (const scheme of ["light", "dark"] as const) {
     check((await graphOpen(g)) && (await inspector()) === null && (await g.locator("#graph-stage .graph-inspector").isHidden()), "Esc clears the selection and closes the inspector, not the pane");
 
     // A button runs its command in the terminal: colour by redraws the graph.
-    await g.mouse.click(box.x + now33.x, box.y + now33.y);
+    // Node 33 where it is once the camera has given back the panel's room.
+    await roomSettled(g);
+    const back33 = (await place(33))!;
+    await g.mouse.click(box.x + back33.x, box.y + back33.y);
     await rowsRead();
     await g.locator("#graph-stage .graph-inspector dd", { hasText: "Officer" }).locator("button", { hasText: "colour by" }).click();
     await idle(g);
