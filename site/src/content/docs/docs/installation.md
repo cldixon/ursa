@@ -4,7 +4,7 @@ description: Install the ursa command-line tool on Linux, macOS or Windows, from
 ---
 
 :::note[Versions]
-The newest release is `ursa-cli` 0.12.0. Features marked **New in 0.7** or **New in 0.8** need that version or later (`ursa --version` says which you have). The SQL surface may still change between minor versions, and the [changelog](https://github.com/cldixon/ursa/blob/main/CHANGELOG.md) records every change.
+The newest release is `ursa-cli` 0.13.0. Features marked **New in 0.7** or **New in 0.8** need that version or later (`ursa --version` says which you have). The SQL surface may still change between minor versions, and the [changelog](https://github.com/cldixon/ursa/blob/main/CHANGELOG.md) records every change.
 :::
 
 Ursa is one binary, `ursa`, with no server and no dependencies. To try it without installing anything, use [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev), which runs the same engine in your browser.
@@ -20,7 +20,7 @@ curl -fsSL https://cldixon.github.io/ursa/install.sh | sh
 It downloads the newest `ursa` for your machine from the [releases page](https://github.com/cldixon/ursa/releases), checks it against its SHA-256 checksum, and puts it in `~/.local/bin`. It needs no `sudo`. If `~/.local/bin` is not on your `PATH`, it prints the line to add. To choose the version or the directory, set `URSA_VERSION` or `URSA_INSTALL_DIR` after the pipe:
 
 ```bash
-curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.12.0 URSA_INSTALL_DIR=/opt/bin sh
+curl -fsSL https://cldixon.github.io/ursa/install.sh | URSA_VERSION=0.13.0 URSA_INSTALL_DIR=/opt/bin sh
 ```
 
 On Windows, in PowerShell. This installs to `%LOCALAPPDATA%\ursa\bin` and adds it to your user `PATH`:
@@ -43,18 +43,18 @@ Or download a prebuilt binary yourself from the [releases page](https://github.c
 
 | Platform              | Archive                                             |
 | --------------------- | --------------------------------------------------- |
-| Linux x86_64          | `ursa-cli-v0.12.0-x86_64-unknown-linux-gnu.tar.gz`  |
-| Linux aarch64         | `ursa-cli-v0.12.0-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS (Intel)         | `ursa-cli-v0.12.0-x86_64-apple-darwin.tar.gz`       |
-| macOS (Apple silicon) | `ursa-cli-v0.12.0-aarch64-apple-darwin.tar.gz`      |
-| Windows x64           | `ursa-cli-v0.12.0-x86_64-pc-windows-msvc.zip`       |
+| Linux x86_64          | `ursa-cli-v0.13.0-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux aarch64         | `ursa-cli-v0.13.0-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel)         | `ursa-cli-v0.13.0-x86_64-apple-darwin.tar.gz`       |
+| macOS (Apple silicon) | `ursa-cli-v0.13.0-aarch64-apple-darwin.tar.gz`      |
+| Windows x64           | `ursa-cli-v0.13.0-x86_64-pc-windows-msvc.zip`       |
 
 Each archive has a `.sha256` file next to it. For example, on an Apple silicon Mac:
 
 ```bash
-curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.12.0/ursa-cli-v0.12.0-aarch64-apple-darwin.tar.gz
-tar xzf ursa-cli-v0.12.0-aarch64-apple-darwin.tar.gz
-sudo mv ursa-cli-v0.12.0-aarch64-apple-darwin/ursa /usr/local/bin/
+curl -LO https://github.com/cldixon/ursa/releases/download/ursa-cli-v0.13.0/ursa-cli-v0.13.0-aarch64-apple-darwin.tar.gz
+tar xzf ursa-cli-v0.13.0-aarch64-apple-darwin.tar.gz
+sudo mv ursa-cli-v0.13.0-aarch64-apple-darwin/ursa /usr/local/bin/
 ```
 
 ## Check it runs
@@ -66,7 +66,7 @@ ursa --version
 ```
 
 ```text
-ursa 0.12.0
+ursa 0.13.0
 ```
 
 ## Nightly builds

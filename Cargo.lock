@@ -4785,7 +4785,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "ursa-cli"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "clap",
@@ -4806,7 +4806,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-core"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "criterion",
@@ -4819,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-engine"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4846,7 +4846,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-io"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-server"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4915,7 +4915,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-shell"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "clap",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-sql"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -4950,7 +4950,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-viz"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "bytemuck",
  "console_error_panic_hook",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "ursa-wasm"
-version = "0.13.0-dev"
+version = "0.13.0"
 dependencies = [
  "arrow",
  "chrono",
