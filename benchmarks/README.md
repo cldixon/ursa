@@ -312,7 +312,7 @@ uv run --no-project --with numpy --with pyarrow \
     python benchmarks/sql_scale/gen.py --out DATA --sizes 1M,5M,20M --weighted
 
 # Every step as its own process: the release binary for SQL, a fresh
-# interpreter for Python. Wall time and peak RSS per step, the index builds
+# interpreter for Python. Wall time and peak memory per step, the index builds
 # and loads the CLI reports, and the stored index's size.
 cargo build --release -p ursa-cli
 uv sync --reinstall-package ursa-graph --group bench
@@ -322,6 +322,10 @@ uv run --group bench python benchmarks/sql_scale/run.py \
 
 Keep `DATA` and `WORK` outside the repository. Each step has a timeout
 (`--timeout`) and a memory ceiling (`--mem-limit-gb`); a step that passes
-either is killed and recorded as `timeout` or `memory`, not dropped. Raw rows
+either is killed and recorded as `timeout` or `memory`, not dropped. Memory is
+the process's own footprint (`peak_mem_mb`: on Linux the peak of `RssAnon +
+RssShmem`, on macOS `phys_footprint`), which leaves out the clean pages of a
+memory-mapped stored index; peak RSS (`peak_rss_mb`, from `wait4`) is recorded
+beside it. Raw rows
 are appended to the CSV, and a Markdown summary of medians is printed.
 `--engines sql` skips the Python steps (and the Python build).

@@ -380,6 +380,53 @@ async fn a_search_with_a_known_last_node_stops_at_it() {
     );
 }
 
+/// A variable alone is not a column: a path's error names its functions, a
+/// node's or an edge's its properties and element_id, never "'p' needs its
+/// variable, as a.p" (#388).
+#[tokio::test]
+async fn a_bare_variable_in_columns_says_what_to_write() {
+    let ctx = karate().await;
+    for columns in ["p AS p", "p"] {
+        let message = err(
+            &ctx,
+            &format!(
+                "FROM GRAPH_TABLE (karate MATCH p = (a WHERE a.id = 0)-[e]->(b) COLUMNS ({columns}))"
+            ),
+        )
+        .await;
+        assert_contains(
+            &message,
+            "'p' is a path variable, and a path cannot be a column; use path_length(p), vertices(p), edges(p) or element_id(p)",
+        );
+        assert!(!message.contains("needs its variable"), "{message}");
+    }
+    assert_contains(
+        &err(
+            &ctx,
+            "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[e]->(b) COLUMNS (b AS b))",
+        )
+        .await,
+        "'b' is a node variable, and a node cannot be a column; name one of its properties, as b.club, or use element_id(b) for its key",
+    );
+    assert_contains(
+        &err(
+            &ctx,
+            "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[e]->(b) COLUMNS (e AS e))",
+        )
+        .await,
+        "'e' is an edge variable, and an edge cannot be a column; name one of its properties, as e.dst, or use element_id(e) for its row in the edge table",
+    );
+    // A name that is no variable still asks for one.
+    assert_contains(
+        &err(
+            &ctx,
+            "FROM GRAPH_TABLE (karate MATCH (a WHERE a.id = 0)-[e]->(b) COLUMNS (zz))",
+        )
+        .await,
+        "'zz' needs its variable, as a.zz",
+    );
+}
+
 #[tokio::test]
 async fn a_missing_property_names_the_variables_properties() {
     let ctx = karate().await;

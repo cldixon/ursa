@@ -6,7 +6,7 @@ This runs each algorithm over one R-MAT edge list from ``gen.py`` twice: as
 an edge-only graph, and with a vertex table of ``--vertices`` keys (every
 node of the edges, then keys with no edges, in a seeded random order). Each
 query runs in its own process with no database, so it builds its index; wall
-time and peak RSS are the process's, measured as ``run.py`` measures them.
+time and peak memory are the process's, measured as ``run.py`` measures them.
 
 ``degree`` is the baseline: building the index and writing one row per node,
 with next to no kernel. The rest of an algorithm's time and memory is its
@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             for step in steps:
                 runs = []
                 for _ in range(args.repeat):
-                    status, wall, rss, out, err = measure(
+                    status, wall, mem, _rss, out, err = measure(
                         [binary, "-c", define(edges, vt) + QUERIES[step]],
                         cwd=args.work,
                         env=os.environ.copy(),
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                         tail = err.strip().splitlines()[-1:] or [""]
                         runs = f"{status.upper()} {tail[0][:80]}"
                         break
-                    runs.append((wall, rss, first_number(out)))
+                    runs.append((wall, mem or 0.0, first_number(out)))
                 if isinstance(runs, str):
                     results[label, graph, step] = runs
                 else:
@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     cols = [(label, graph) for label, _ in binaries for graph in graphs]
-    print(f"\n{edges.name}, wall time / peak RSS\n")
+    print(f"\n{edges.name}, wall time / peak memory\n")
     print("| step | " + " | ".join(f"{label}: {graph}" for label, graph in cols) + " |")
     print("|---|" + "---|" * len(cols))
     for step in steps:

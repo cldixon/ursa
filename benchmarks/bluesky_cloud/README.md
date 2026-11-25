@@ -17,7 +17,7 @@ So what works on EC2 runs unchanged on Fargate.
 
 | File | What it is |
 |---|---|
-| `run.py` | The benchmark. Every step is its own `ursa` process, with wall/user/sys time and peak RSS (`wait4`), notices, and correctness checks. Standard library only; `boto3` for `s3://` |
+| `run.py` | The benchmark. Every step is its own `ursa` process, with wall/user/sys time, peak memory (footprint, and RSS from `wait4`), notices, and correctness checks. Standard library only; `boto3` for `s3://` |
 | `smoke_data.py` | Writes a small synthetic stand-in for the two data files, for smoke tests |
 | `Dockerfile` | `debian:bookworm-slim`, a released `ursa` installed with the public install script, and `run.py` |
 | `stack.yml` | CloudFormation: S3 bucket, ECR, VPC, ECS cluster, Fargate task definition, IAM roles, GitHub OIDC role |
@@ -41,7 +41,7 @@ So what works on EC2 runs unchanged on Fargate.
 
 **Checks.** With `--before 2024-01-01`, the graphs are the 95,744,886-edge ones from the round 1–3 reports (`bsky23`, `bsky23e`). Each step's result is compared with the value those reports cross-checked against plain SQL, and a mismatch fails the run (exit status 1). For other cutoffs the values are recorded but not compared.
 
-**Output.** `results.json` (every number, plus notices and errors) and `summary.md` (a table, also used as the GitHub job summary), in `--out`, and in `--results s3://…` when given.
+**Output.** `results.json` (every number, plus notices and errors) and `summary.md` (a table, also used as the GitHub job summary), in `--out`, and in `--results s3://…` when given. Each step has two memory figures: `peak_footprint_bytes` (the **Memory** column), the process's own memory without the memory-mapped index pages, and `peak_rss_bytes` (**Peak RSS**). `meta.memory_measure` in `results.json` says how the footprint was taken on that host.
 
 **Run it anywhere:**
 
@@ -101,7 +101,8 @@ All 2,416,311,437 follows with all 39,650,447 users as nodes (`run.py` without `
 At this size the limits are time rather than memory: triangles grow with the hubs, Louvain and the components run near one core, and every query pays the 15 s index load.
 
 **Measurement notes:**
-- Peak memory is each `ursa` process's own `ru_maxrss`. On Linux that is close to the real peak. On macOS RSS overstates it; the round reports use `phys_footprint` there.
+- Peak memory is each `ursa` process's own footprint: on macOS the lifetime peak `phys_footprint` (`proc_pid_rusage`, `RUSAGE_INFO_V4`, read before the process is reaped), on Linux the peak of `RssAnon + RssShmem`, sampled from `/proc/<pid>/status` every 20 ms (so a spike shorter than that can be missed). Neither counts the clean file pages of the memory-mapped stored index, which the kernel can drop and read again (#533).
+- Peak RSS (`ru_maxrss` from `wait4`) is kept as a second column. Since #382 a query memory-maps the stored index and the pages it reads count in RSS, so for a step that reads the whole index (PageRank, components) RSS can be several times the footprint. Compare memory across releases by the footprint; the reports before round 5 give RSS (and `phys_footprint` on macOS where noted).
 - The first step on each graph builds its index and stores it in the run's database, so later steps load it the way a user's second query does.
 - Every run starts with a fresh database.
 

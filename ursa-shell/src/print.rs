@@ -8,6 +8,11 @@
 //! every row; table, Markdown and JSON (an array) are written once the result
 //! is complete.
 //!
+//! Nothing is written until the first row arrives, or until the result ends
+//! with none: a statement that fails before its first row writes nothing to
+//! stdout, not even its CSV header, and an empty result still writes its
+//! header (as DuckDB does).
+//!
 //! Markdown and line are DuckDB's `.mode markdown` and `.mode line`:
 //!
 //! ```text
@@ -129,8 +134,23 @@ pub struct TableStyle {
     pub headers: bool,
 }
 
+/// The first batch of `stream` that has rows, or `None` when it ends with
+/// none. Batches with no rows before it are dropped. An error before the
+/// first row is returned before anything is written.
+async fn first_rows(stream: &mut SendableRecordBatchStream) -> Result<Option<RecordBatch>> {
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            return Ok(Some(batch));
+        }
+    }
+    Ok(None)
+}
+
 /// Write every batch of `stream` to `out` as `format`, a table as `table`
-/// says; see the module's docs.
+/// says; see the module's docs. Nothing is written before the first row
+/// arrives or the stream ends, so a statement that fails before its first
+/// row writes nothing, not even a header.
 pub async fn write_stream<W: Write>(
     format: OutputFormat,
     mut stream: SendableRecordBatchStream,
@@ -139,6 +159,9 @@ pub async fn write_stream<W: Write>(
     table: TableStyle,
 ) -> Result<()> {
     let schema = stream.schema();
+    let first = first_rows(&mut stream).await?;
+    // The first batch, then the rest of the stream.
+    let mut stream = futures::stream::iter(first.map(Ok)).chain(stream);
     match format {
         OutputFormat::Table => {
             let mut rows = Rows::new(table.max_rows);

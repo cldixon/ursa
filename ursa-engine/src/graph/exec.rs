@@ -593,8 +593,14 @@ impl ExecutionPlan for PathSearchExec {
         let schema = Arc::clone(&shape.schema);
         let expanded = MetricBuilder::new(&self.metrics).counter("expanded", partition);
         let max_paths = crate::options::max_paths(context.session_config());
+        let notifier = crate::notices::Notifier::of(context.session_config());
         let run = async move {
             let index = unweighted_index(&shape.edges, input, &context).await?;
+            if let Some(notice) =
+                path_search::floor_notice(&shape.search, index.topology.n_nodes(), max_paths)
+            {
+                notifier.say(crate::notices::NoticeLevel::On, || notice);
+            }
             let starts = search_keys(&starts, "start nodes", &shape, &context).await?;
             let targets = match &targets {
                 Some(t) => Some(search_keys(t, "target nodes", &shape, &context).await?),

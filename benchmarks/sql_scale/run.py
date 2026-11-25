@@ -1,8 +1,13 @@
 """Scale test of the ``ursa`` SQL binary, with the Python library alongside.
 
-Every step runs as its own process, so each one's wall time and peak RSS are
+Every step runs as its own process, so each one's wall time and memory are
 its own: the release ``ursa`` binary for SQL, and a fresh interpreter for the
-Python library. Peak RSS is the child's ``ru_maxrss`` from ``wait4``.
+Python library. Memory is the child's own peak footprint, measured as
+``bluesky_cloud/run.py`` measures it (#533): on Linux the peak of ``RssAnon +
+RssShmem`` sampled from ``/proc``, on macOS the lifetime peak
+``phys_footprint``. Neither counts the clean file pages of a memory-mapped
+stored index. Peak RSS (the child's ``ru_maxrss`` from ``wait4``), which does
+count them, is recorded beside it.
 
 Per dataset (an ``rmat-<size>-<int|str>.parquet`` from ``gen.py``), in a fresh
 ``.ursa`` database:
@@ -29,7 +34,7 @@ disk is recorded. The Python steps scan the same Parquet with
 parameters; with no stored index, each builds its index afresh. Both report
 the number of result rows, so the two can be checked against each other.
 
-A step that runs past ``--timeout`` or whose RSS passes ``--mem-limit-gb`` is
+A step that runs past ``--timeout`` or whose memory passes ``--mem-limit-gb`` is
 killed and recorded as ``timeout`` or ``memory``; a failing step is recorded
 as ``error`` with the end of its stderr. Nothing is dropped.
 
@@ -46,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import platform
@@ -60,6 +66,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def _load_memory():
+    """The footprint sampler of ``bluesky_cloud/run.py`` (standard library only)."""
+    path = REPO / "benchmarks" / "bluesky_cloud" / "run.py"
+    spec = importlib.util.spec_from_file_location("bluesky_cloud_run", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # dataclasses look the module up
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_mem = _load_memory()
 SQL_STEPS = [
     "define",
     "first_query",
@@ -95,6 +114,7 @@ class Row:
     rep: int = 0
     status: str = "ok"
     wall_s: float = 0.0
+    peak_mem_mb: float | None = None
     peak_rss_mb: float = 0.0
     built: int | None = None
     loaded: int | None = None
@@ -104,39 +124,31 @@ class Row:
     note: str = ""
 
 
-def rss_mb(pid: int) -> float:
-    """Current resident set of ``pid``, in MB, or 0 if it is gone."""
-    try:
-        with open(f"/proc/{pid}/status") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024
-    except OSError:
-        pass
-    return 0.0
-
-
 def measure(
     argv: list[str], *, cwd: Path, env: dict, timeout: float, mem_limit_mb: float
-) -> tuple[str, float, float, str, str]:
-    """Run ``argv``; return (status, wall seconds, peak RSS MB, stdout, stderr)."""
+) -> tuple[str, float, float | None, float, str, str]:
+    """Run ``argv``; return (status, wall seconds, peak memory MB or None,
+    peak RSS MB, stdout, stderr)."""
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         start = time.perf_counter()
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err)
+        fp = _mem.Footprint(proc.pid)
         status, killed = "ok", None
         while True:
-            pid, code, usage = os.wait4(proc.pid, os.WNOHANG)
-            if pid:
+            fp.sample()
+            done = _mem._wait_done(proc.pid, fp)
+            if done:
+                _, code, usage = done
                 break
             if time.perf_counter() - start > timeout:
                 killed = "timeout"
-            elif rss_mb(proc.pid) > mem_limit_mb:
+            elif (fp.peak or 0) / 2**20 > mem_limit_mb:
                 killed = "memory"
             if killed:
                 os.kill(proc.pid, signal.SIGKILL)
-                pid, code, usage = os.wait4(proc.pid, 0)
+                _, code, usage = os.wait4(proc.pid, 0)
                 break
-            time.sleep(0.02)
+            time.sleep(_mem.SAMPLE_S)
         wall = time.perf_counter() - start
         proc.returncode = os.waitstatus_to_exitcode(code)
         if killed:
@@ -149,7 +161,9 @@ def measure(
         err.seek(0)
         stdout = out.read().decode(errors="replace")
         stderr = err.read().decode(errors="replace")
-    return status, wall, usage.ru_maxrss / 1024, stdout, stderr
+    rss = _mem._maxrss_bytes(usage.ru_maxrss) / 2**20
+    mem = fp.peak / 2**20 if fp.peak is not None else None
+    return status, wall, mem, rss, stdout, stderr
 
 
 def first_ids(path: Path, n: int = 3) -> list:
@@ -285,14 +299,14 @@ def run_dataset(
         for step, query in sql_steps(edges, weighted, seeds).items():
             if args.steps and step not in args.steps:
                 continue
-            status, wall, rss, out, err = measure(
+            status, wall, mem, rss, out, err = measure(
                 [str(args.ursa), str(db), "-c", query],
                 cwd=dbdir,
                 env=env,
                 timeout=args.timeout,
                 mem_limit_mb=limit,
             )
-            row = Row(run_id, name, edges_count, "sql", step, rep, status, wall, rss)
+            row = Row(run_id, name, edges_count, "sql", step, rep, status, wall, mem, rss)
             if m := STATS.search(err):
                 row.built, row.loaded = int(m[1]), int(m[2])
             row.rows = first_number(out)
@@ -309,7 +323,7 @@ def run_dataset(
                 continue
             if step == "weighted" and weighted is None:
                 continue
-            status, wall, rss, out, err = measure(
+            status, wall, mem, rss, out, err = measure(
                 [
                     str(args.python),
                     "-c",
@@ -324,7 +338,7 @@ def run_dataset(
                 timeout=args.timeout,
                 mem_limit_mb=limit,
             )
-            row = Row(run_id, name, edges_count, "python", step, rep, status, wall, rss)
+            row = Row(run_id, name, edges_count, "python", step, rep, status, wall, mem, rss)
             if status == "ok":
                 result = json.loads(out.strip().splitlines()[-1])
                 row.rows, row.inner_s = result["rows"], result["inner_s"]
@@ -340,23 +354,32 @@ def fmt_row(r: Row) -> str:
     size = f" index={r.index_bytes / 2**20:.0f}MiB" if r.index_bytes else ""
     return (
         f"  {r.dataset:<14} {r.engine:<6} {r.step:<15} {r.status:<7} "
-        f"{r.wall_s:8.2f}s {r.peak_rss_mb:8.0f}MB rows={r.rows}{stats}{size} {r.note}"
+        f"{r.wall_s:8.2f}s {mb(r.peak_mem_mb):>8}MB (RSS {r.peak_rss_mb:.0f}MB) "
+        f"rows={r.rows}{stats}{size} {r.note}"
     )
 
 
+def mb(v: float | None) -> str:
+    return "-" if v is None else f"{v:,.0f}"
+
+
 def cell(rs: list[Row]) -> str:
-    """The median wall time and peak RSS of the repetitions, or the first failure."""
+    """The median wall time, memory and peak RSS of the repetitions, or the
+    first failure."""
     if not rs:
         return "-"
     if bad := [r for r in rs if r.status != "ok"]:
         return f"{bad[0].status.upper()} ({bad[0].wall_s:.0f}s)"
     wall = statistics.median(r.wall_s for r in rs)
+    mems = [r.peak_mem_mb for r in rs if r.peak_mem_mb is not None]
+    mem = statistics.median(mems) if mems else None
     rss = statistics.median(r.peak_rss_mb for r in rs)
-    return f"{wall:.2f}s / {rss:,.0f} MB"
+    return f"{wall:.2f}s / {mb(mem)} MB ({rss:,.0f})"
 
 
 def summary(rows: list[Row]) -> str:
-    """One Markdown table per dataset: steps × engine, median wall / peak RSS."""
+    """One Markdown table per dataset: steps × engine, median wall / memory
+    (peak RSS)."""
     out = []
     for dataset in dict.fromkeys(r.dataset for r in rows):
         rs = [r for r in rows if r.dataset == dataset]
@@ -367,6 +390,7 @@ def summary(rows: list[Row]) -> str:
         out.append(f"\n### {dataset} ({rs[0].edges:,} edges)\n")
         if idx:
             out.append(f"Stored index: {idx / 2**20:.0f} MiB\n")
+        out.append("Each cell: wall time / memory MB (peak RSS MB), medians.\n")
         out.append("| step | SQL | Python | SQL built/loaded |")
         out.append("|---|---|---|---|")
         for step in SQL_STEPS:
@@ -403,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", default="", help="only these steps (comma-separated)")
     parser.add_argument("--timeout", type=float, default=900, help="seconds per step")
     parser.add_argument(
-        "--mem-limit-gb", type=float, default=11, help="kill a step whose RSS passes this"
+        "--mem-limit-gb", type=float, default=11, help="kill a step whose memory passes this"
     )
     parser.add_argument("--repeat", type=int, default=1, help="runs of every step (median)")
     parser.add_argument("--label", default="", help="free text stored with every row")

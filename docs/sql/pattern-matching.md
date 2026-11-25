@@ -204,7 +204,7 @@ FROM GRAPH_TABLE (karate
 └───────┴───────────────────────┴──────────────────────┘
 ```
 
-A path has four functions: `path_length(p)` is its number of edges, `vertices(p)` its nodes' keys from first to last, `edges(p)` its edges' rows in the edge table (counted from 0), and `element_id(p)` the two alternating, as DuckPGQ lists them (it needs integer keys).
+A path has four functions: `path_length(p)` is its number of edges, `vertices(p)` its nodes' keys from first to last, `edges(p)` its edges' rows in the edge table (counted from 0), and `element_id(p)` the two alternating, as DuckPGQ lists them (it needs integer keys). A path is not a value itself: `COLUMNS (p)` is an error that names these four. Nor is a node or an edge: name one of its properties (`a.id`), or use `element_id(a)`.
 
 How many members are each number of steps from member 0:
 
@@ -298,7 +298,7 @@ The bounds count edges, and a shortest path of at least one edge from a node bac
 A path search holds its paths in memory, and stops with an error once it holds more than `ursa.max_paths` (10,000,000 unless `SET`; `0` for no limit). The error names the setting and what to do:
 
 - Without a selector, a walk's paths grow fast with its length: give the quantified edge a lower upper bound, or keep fewer paths with `ANY SHORTEST`.
-- `ANY SHORTEST` keeps one path per first and last node, so its search holds at most one partial path per node. It counts the paths it keeps, and never refuses one start node's: from one node it may reach every node of the graph. From many start nodes it can still reach the limit; to count the nodes at each distance, [`hop`](reference/functions.md#hop) answers without listing paths, or `SET ursa.max_paths` higher.
+- `ANY SHORTEST` keeps one path per first and last node, so its search holds at most one partial path per node. It counts the paths it keeps, and never refuses one start node's: from one node it may reach every node of the graph. From many start nodes it can still reach the limit; to count the nodes at each distance, [`hop`](reference/functions.md#hop) answers without listing paths, or `SET ursa.max_paths` higher. Because of that floor, `ursa.max_paths` set below the graph's node count does not limit an `ANY SHORTEST` search (nor below `k` times it a `SHORTEST k` one): the search says so in a notice on stderr, `ursa.max_paths 1000 is below the node count; ANY SHORTEST keeps up to 39650447 paths`, and its results are the same.
 
 ### How it runs
 
