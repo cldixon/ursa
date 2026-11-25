@@ -51,7 +51,8 @@ async function serve() {
   const reader = server.stdout.getReader();
   let printed = "";
   let link: string | undefined;
-  while (!link) {
+  // Up to its last line, which says where the shell is.
+  while (!link || !/once the link has opened\.\n/.test(printed)) {
     const { value, done } = await reader.read();
     if (done) throw new Error(`ursa serve stopped:\n${printed}`);
     printed += new TextDecoder().decode(value);
@@ -169,8 +170,9 @@ check((await page.evaluate(() => document.documentElement.dataset.theme)) === "l
 
 // ---------------------------------------------------------------- keyboard
 
-await page.mouse.click(700, 5);
-await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+// A fresh load: the keyboard starts at the top of the page.
+await page.reload();
+await connected();
 await page.keyboard.press("Tab");
 const first = await page.evaluate(() => {
   const el = document.activeElement as HTMLElement;
@@ -343,8 +345,10 @@ const shell = await context.newPage();
 watch(shell);
 await shell.goto(`${base}/`);
 check((await shell.title()) === "Ursa Web Shell", "the shell is still at /", await shell.title());
-await shell.waitForFunction(() => document.querySelector(".xterm-rows")?.textContent?.includes("ursa"), null, { timeout: 30_000 }).catch(() => {});
-check(Boolean(await shell.evaluate(() => document.querySelector(".xterm-rows")?.textContent?.includes("ursa"))), "and starts its session over the socket");
+const started = await shell
+  .waitForFunction(() => (window as any).ursaShell?.screen().includes("memory U"), null, { timeout: 60_000 })
+  .then(() => true, () => false);
+check(started, "and starts its session over the socket");
 await shell.close();
 
 check(violations.length === 0, "no Content Security Policy violations", violations.join(" | "));

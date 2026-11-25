@@ -88,6 +88,8 @@ let announced = null;
 function showRequests() {
   const requests = session.requests;
   const running = requests[0];
+  // Cancel had the keyboard: it stays in the status bar.
+  if (!running && $("running").contains(document.activeElement)) $("status").focus();
   $("running").hidden = !running;
   clearInterval(ticking);
   ticking = null;

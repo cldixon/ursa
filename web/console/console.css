@@ -264,8 +264,9 @@ body.resizing-rows { cursor: row-resize; user-select: none; }
 .status-session .root, .status-session .engine { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .status-session .root[hidden], .status-session .engine[hidden] { display: none; }
 .status-session .root svg { flex: none; width: 14px; height: 14px; }
-/* A long root keeps its end, which names it: cut from the left. */
-.status-session .root bdi {
+/* A long root keeps its end, which names it: cut from the left (the path
+   itself, in its <bdi>, still reads left to right). */
+.status-session .root .root-clip {
   overflow: hidden;
   text-overflow: ellipsis;
   direction: rtl;
@@ -309,7 +310,7 @@ body.resizing-rows { cursor: row-resize; user-select: none; }
   .console-head .console-head-side { flex: none; }
   .statusbar { gap: 10px; padding: 0 10px; }
   .status-session .engine { display: none; }
-  .status-session .root bdi { max-width: 30vw; }
+  .status-session .root .root-clip { max-width: 30vw; }
   .placeholder { margin: 4px 10px 10px; }
 }
 @media (max-width: 420px) {

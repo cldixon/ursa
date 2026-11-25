@@ -147,7 +147,10 @@ async fn the_console_is_at_console_and_its_link_is_printed() {
     );
     let (status, response) = get(port, &format!("/console/?x=1&token={token}"), &h).await;
     assert_eq!(status, 303, "{response}");
-    assert!(response.contains("location: /console/?x=1\r\n"), "{response}");
+    assert!(
+        response.contains("location: /console/?x=1\r\n"),
+        "{response}"
+    );
     assert_eq!(get(port, "/console/?token=nope", &h).await.0, 403);
     // The page, marked for the socket; its address ends in a slash.
     for path in ["/console/", "/console/index.html"] {
@@ -162,7 +165,10 @@ async fn the_console_is_at_console_and_its_link_is_printed() {
     }
     let (status, response) = get(port, "/console?token=x", &h).await;
     assert_eq!(status, 308, "{response}");
-    assert!(response.contains("location: /console/?token=x\r\n"), "{response}");
+    assert!(
+        response.contains("location: /console/?token=x\r\n"),
+        "{response}"
+    );
     // Its own files, and the shell's beside it, from the other directory.
     let (status, js) = get(port, "/console/console.js", &h).await;
     assert_eq!(status, 200, "{js}");
