@@ -163,6 +163,15 @@ fn attach(
     session: &mut Option<SessionHandle>,
     args: &Value,
 ) -> Result<SessionHandle, Error> {
+    // The session checks it too; the shared session's later hellos are
+    // answered here.
+    if let Some(protocol) = args.get("protocol") {
+        if protocol.as_u64() != Some(1) {
+            return Err(Error::protocol(format!(
+                "this server speaks protocol 1, not {protocol}"
+            )));
+        }
+    }
     let wanted = match args.get("session") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s == "new" => Some(false),

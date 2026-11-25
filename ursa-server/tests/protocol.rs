@@ -63,9 +63,11 @@ async fn hello_comes_first_and_bad_requests_are_protocol_errors() {
     let mut socket = server.connect().await;
     let (early, _) = call(&mut socket, 1, "feed", json!({"line": "SELECT 1;"}), &[]).await;
     assert_eq!(early["error"]["kind"], "protocol", "{early}");
-    let (wrong, _) = call(&mut socket, 2, "hello", json!({"session": "mine"}), &[]).await;
+    let (wrong, _) = call(&mut socket, 2, "hello", json!({"protocol": 1, "session": "mine"}), &[]).await;
     assert_eq!(wrong["error"]["kind"], "protocol", "{wrong}");
-    let (hello, _) = call(&mut socket, 3, "hello", json!({}), &[]).await;
+    let (newer, _) = call(&mut socket, 3, "hello", json!({"protocol": 2}), &[]).await;
+    assert_eq!(newer["error"]["kind"], "protocol", "{newer}");
+    let (hello, _) = call(&mut socket, 3, "hello", json!({"protocol": 1}), &[]).await;
     assert_eq!(hello["ok"], true, "{hello}");
     // Another version, no op, args that are not an object, a part's length
     // that is not what was listed: each refused, and the connection goes on.
@@ -95,7 +97,7 @@ async fn hello_comes_first_and_bad_requests_are_protocol_errors() {
     let (refused, _) = receive(&mut socket).await;
     assert_eq!(refused["error"]["kind"], "protocol", "{refused}");
     // A second hello for the other kind of session is refused.
-    let (other, _) = call(&mut socket, 8, "hello", json!({"session": "shared"}), &[]).await;
+    let (other, _) = call(&mut socket, 8, "hello", json!({"protocol": 1, "session": "shared"}), &[]).await;
     assert_eq!(other["error"]["kind"], "protocol", "{other}");
     let (_, err) = feed(&mut socket, 9, "SELECT 41 + 1 AS answer;").await;
     assert_eq!(err, "");

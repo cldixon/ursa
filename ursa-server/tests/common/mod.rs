@@ -95,7 +95,7 @@ impl Server {
     /// A connection that has said `hello`, asking for `session`.
     pub async fn session(&self, session: Option<&str>) -> (Socket, Value) {
         let mut socket = self.connect().await;
-        let mut args = json!({"client": {"name": "test", "kind": "agent"}});
+        let mut args = json!({"protocol": 1, "client": {"name": "test", "kind": "agent"}});
         if let Some(session) = session {
             args["session"] = json!(session);
         }
