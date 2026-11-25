@@ -1152,6 +1152,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the new reference page, `docs/reference/protocol.md`, is
   generated from it and tested against it.
 
+- **The session keeps results, by id** (URSA-9). `query` gives its result
+  an id (`"r4"`) and keeps it: `fetch {result, offset, rows}` pages through
+  it as Arrow IPC, `export {result}` writes it, `graph.open {result}` draws
+  it, and `close {result}` drops it, so the console can keep several
+  results open. A session keeps its last 16 results within 256 MB, the
+  oldest dropped first; a result over 256 MB on its own keeps only its
+  first rows. A result that has gone, or rows past those kept, fail with
+  `not_found` and a message to run the query again. The shell's last result
+  (`.graph`, `.export`) is unchanged.
+
 - **The graph pane is a module any page can embed** (URSA-8,
   `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
   engine, commands, status})` makes the Graph view's pane: its markup, the
@@ -2020,6 +2030,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- **Web Shell: a `.graph` that fails downloads none of the graph view**
+  (URSA-11). The pane opens with "Loading graph view…" once the engine has
+  taken 150 ms, and it began downloading `graph.js` and `ursa-viz` then; so
+  an error that took longer to say, as on a busy machine, downloaded a few
+  MB for nothing. The view's code is now first downloaded once the engine
+  has the graph; the pane still opens at 150 ms, and once the code is here
+  it starts a layout worker then, as before. And the e2e checks of the
+  graph view no longer depend on the machine's speed: `.graph`'s errors
+  download no view (as above); `graphSettled` waits for the layout's last
+  positions to be drawn, not just its "done", for every check that uses it
+  (URSA-10 did so for GROUP BY alone); and the checks that click or probe
+  a node or an edge after a selection does so where it is once the camera
+  has made room for the inspector's panel, or given it back (#493), not
+  where it was 450 ms before: the edge pick within 4 px (under load the
+  room was made first, and both picks missed), Shift+click, the drag that
+  pans, several nodes' WHERE clause, the panel's side for the rightmost
+  node, and colour by.
 
 - **A graph with a vertex table builds its index as fast as in 0.10 again,
   and faster** (#532). Since 0.12 the edges read while the vertex keys are

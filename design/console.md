@@ -195,14 +195,15 @@ Part kinds:
 |---|---|---|
 | `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, metadata, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
 | `fetch` | `result`, `offset`, `rows` | `{rows, more}`; `arrow` |
-| `export` | `result`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes` |
+| `export` | `result?`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes`; without `result`, the last result |
 | `close` | `result` | `{}` |
 | `explain` | `sql` | `{plan}`: the plan as text |
 | `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
 - `columns` gives each column's `{name, type, nullable, metadata}`; `metadata` is the schema's own, where `ursa.pattern` sits for a `GRAPH_TABLE` result.
-- `result` is an id such as `"r4"`. The session keeps a client's last 16 results, and drops the oldest beyond 256 MB.
+- `result` is an id such as `"r4"` (`null` for a statement with no columns). The session keeps its last 16 results, within 256 MB, and drops the oldest first. A result over 256 MB on its own keeps only the rows `query` sent: `fetch` past them, `export` and `graph.open` of it fail with `not_found` and say to run the query again (the spike's measure: rmat's whole edge table is 16 MB, PageRank's result 0.7 MB). `close` of a result that has gone is `not_found` too.
+- `query` collects every row before it replies, as its reply gives the whole result's count and the shell's last result holds every row. Sending the first rows sooner needs `rows` to come later (an event, or `fetch`'s `more`): C2.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
 
