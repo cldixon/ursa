@@ -2693,18 +2693,25 @@ for (const scheme of ["light", "dark"] as const) {
   if (shots) await k.screenshot({ path: `${shots}/graph-group-open.png` });
 
   // .undo is the closed drawing again: the same frame, to the pixel count.
-  await k.click("#terminal");
-  await type(".undo", k);
-  await openIs([]);
-  // (Nothing selected, as when the closed frame was read: no ring.) No
-  // frame is drawn between the click and the read-back: a read-back is of
-  // the view as it is, not of its last frame, whose discs had the ring.
-  // (Under load the frame came after the read-back, and the ring with it.)
+  // First nothing selected, as when the closed frame was read. The
+  // double-click selected the group: its ring, and the inspector's panel,
+  // which the camera makes room for once the pointer has rested (#493),
+  // and gives back as long after the selection is cleared. So the room is
+  // given back before .undo (URSA-10: under load the camera had made room
+  // for the panel before the read-back, and not yet given it back).
+  await k.mouse.click(box.x + 6, box.y + 6);
+  await roomSettled(k);
+  const cleared = await graphInfo(k);
+  // No frame is drawn from .undo to the read-back: a read-back is of the
+  // view as it is, not of its last frame, which had the group open. (#521:
+  // under load the frame came after the read-back.)
   await k.evaluate(() => {
     (window as any).__raf = window.requestAnimationFrame;
     window.requestAnimationFrame = () => 0;
   });
-  await k.mouse.click(box.x + 6, box.y + 6);
+  await k.click("#terminal");
+  await type(".undo", k);
+  await openIs([]);
   g = await graphInfo(k);
   const undone = await ink();
   // Frames again, and one drawn (a read-back asks for one when it ends).
@@ -2713,9 +2720,10 @@ for (const scheme of ["light", "dark"] as const) {
     await (window as any).ursaShell.graphInked();
   });
   check(
-    g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
+    cleared.selection.length === 0 && cleared.room.inset.join() === "0,0,0,0" &&
+      g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
     "GROUP BY: .undo restores the closed drawing, read back",
-    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}`,
+    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}; ${JSON.stringify({ selected: cleared.selection.length, room: cleared.room, frames: [cleared.frames, g.frames] })}`,
   );
 
   // A read-back as the layout ends is of its last positions (URSA-10). A

@@ -1995,6 +1995,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   page gives the view those positions ahead of a frame (a test hook's
   lookup, a fit to the selection), a grouped drawing's discs move with
   them; they stayed where they were until the layout's next positions.
+  The check itself now clears the selection, and waits for the camera to
+  give back the room it made for the inspector's panel, before `.undo`:
+  under more load the panel's room was in the read-back.
 
 - **Shell: the DuckDB dot-commands people reach for first** (#418).
   - `.mode markdown` writes a Markdown table, as DuckDB does (names centred,
