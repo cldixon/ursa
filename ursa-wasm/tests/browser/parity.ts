@@ -101,6 +101,14 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     const memory = await call("memory", {});
     if (memory.kind !== "wasm" || !(memory.bytes > 0)) throw new Error(`memory: ${JSON.stringify(memory)}`);
     await call("width", { columns: 0 });
+    // Kept results: query gives an id, fetch pages it, close drops it.
+    const kept = await call("query", { sql: "SELECT i FROM range(0, 5) AS t(i)", rows: 2 });
+    if (kept.result !== "r1" || kept.rows !== 5 || !kept.more) throw new Error(`query: ${JSON.stringify(kept)}`);
+    const page = await call("fetch", { result: kept.result, offset: 2, rows: 3 });
+    if (page.rows !== 3 || page.more) throw new Error(`fetch: ${JSON.stringify(page)}`);
+    await call("close", { result: kept.result });
+    const gone = JSON.parse((await shell.handle("fetch", JSON.stringify({ result: kept.result }), [])).message);
+    if (gone.ok || gone.error.kind !== "not_found") throw new Error("a closed result was fetched");
     let shellOut = "";
     let shellErr = "";
     for (const line of sql.split("\n")) {

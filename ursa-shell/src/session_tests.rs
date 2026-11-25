@@ -970,6 +970,294 @@ async fn query_gives_typed_columns_metadata_and_arrow_rows() {
     assert_eq!(wrong.kind, "sql");
 }
 
+/// The rows of an Arrow IPC part, as their first column's `Int64`s.
+fn ints(part: &Part) -> Vec<i64> {
+    use arrow::array::{AsArray, Int64Array};
+    use arrow::ipc::reader::StreamReader;
+    let reader = StreamReader::try_new(part.bytes.as_slice(), None).unwrap();
+    reader
+        .flat_map(|b| {
+            let batch = b.unwrap();
+            let column: &Int64Array = batch.column(0).as_primitive();
+            column.values().to_vec()
+        })
+        .collect()
+}
+
+/// `op` with `args`, which must fail: its error.
+async fn fails(shell: &mut Session, op: &str, args: Value) -> Error {
+    shell.handle(op, args, Vec::new()).await.unwrap_err()
+}
+
+/// `n` rows, of `i` from 0, as one `Int64` column.
+fn series(n: usize) -> String {
+    format!("SELECT i FROM range(0, {n}) AS t(i) ORDER BY i")
+}
+
+/// `query` keeps its result by id; `fetch` pages through it, `export`
+/// writes it, `close` drops it.
+#[tokio::test]
+async fn query_keeps_a_result_to_fetch_export_and_close() {
+    let mut shell = session();
+    let first = shell
+        .handle("query", json!({"sql": series(5), "rows": 2}), Vec::new())
+        .await
+        .unwrap();
+    let r = &first.result;
+    assert_eq!(
+        (r["result"].as_str(), r["rows"].as_u64()),
+        (Some("r1"), Some(5))
+    );
+    assert_eq!(ints(&first.parts[0]), [0, 1]);
+
+    let page = shell
+        .handle(
+            "fetch",
+            json!({"result": "r1", "offset": 2, "rows": 2}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.result, json!({"rows": 2, "more": true}));
+    assert_eq!(
+        (page.parts[0].name, page.parts[0].kind),
+        ("arrow", PartKind::Arrow)
+    );
+    assert_eq!(ints(&page.parts[0]), [2, 3]);
+    let last = shell
+        .handle("fetch", json!({"result": "r1", "offset": 4}), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(last.result, json!({"rows": 1, "more": false}));
+    assert_eq!(ints(&last.parts[0]), [4]);
+    let past = op(&mut shell, "fetch", json!({"result": "r1", "offset": 9})).await;
+    assert_eq!(past, json!({"rows": 0, "more": false}));
+
+    // A second result: export names either, and without a name writes
+    // the last.
+    op(&mut shell, "query", json!({"sql": series(3)})).await;
+    let csv = |reply: Reply| String::from_utf8(reply.parts[0].bytes.clone()).unwrap();
+    let r1 = shell
+        .handle(
+            "export",
+            json!({"result": "r1", "format": "csv"}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csv(r1), "i\n0\n1\n2\n3\n4\n");
+    let r2 = shell
+        .handle("export", json!({"format": "csv"}), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(csv(r2), "i\n0\n1\n2\n");
+    let bad = fails(&mut shell, "export", json!({"result": 1, "format": "csv"})).await;
+    assert_eq!(bad.kind, "protocol");
+
+    // A statement with no columns keeps nothing.
+    let created = op(
+        &mut shell,
+        "query",
+        json!({"sql": "CREATE VIEW v AS SELECT 1 AS x"}),
+    )
+    .await;
+    assert_eq!(created["result"], Value::Null);
+    // Ids are not reused.
+    let next = op(&mut shell, "query", json!({"sql": "SELECT 1 AS x"})).await;
+    assert_eq!(next["result"], "r3");
+
+    assert_eq!(
+        op(&mut shell, "close", json!({"result": "r1"})).await,
+        json!({})
+    );
+    for (o, args) in [
+        ("fetch", json!({"result": "r1"})),
+        ("close", json!({"result": "r1"})),
+        ("export", json!({"result": "r1", "format": "csv"})),
+        ("graph.open", json!({"result": "r1"})),
+        ("fetch", json!({"result": "nope"})),
+    ] {
+        let gone = fails(&mut shell, o, args).await;
+        assert_eq!(gone.kind, "not_found", "{o}: {gone:?}");
+        assert!(
+            gone.message.contains("run the query again"),
+            "{o}: {gone:?}"
+        );
+    }
+    assert_eq!(fails(&mut shell, "fetch", json!({})).await.kind, "protocol");
+    // The others stay.
+    op(&mut shell, "fetch", json!({"result": "r2"})).await;
+}
+
+/// `graph.open {result}` draws a kept result, not the last one, which
+/// stays.
+#[tokio::test]
+async fn graph_open_draws_a_kept_result() {
+    use ursa_viz::model::GraphResult;
+    let mut shell = session();
+    run(&mut shell, TIES).await;
+    let edges = op(&mut shell, "query", json!({"sql": "SELECT * FROM ties"})).await;
+    let id = edges["result"].as_str().unwrap().to_string();
+    op(
+        &mut shell,
+        "query",
+        json!({"sql": "SELECT 1 AS src, 2 AS dst"}),
+    )
+    .await;
+    let opened = shell
+        .handle("graph.open", json!({"result": id}), Vec::new())
+        .await
+        .unwrap();
+    let view = GraphResult::from_bytes(&opened.parts[0].bytes).unwrap();
+    assert_eq!((view.n_nodes(), view.n_edges()), (5, 5));
+    // Without one, the last result.
+    let last = op(&mut shell, "graph.open", json!({})).await;
+    assert_eq!(last, json!({"skipped": 0}));
+    let view = GraphResult::from_bytes(
+        &shell
+            .handle("graph.open", json!({"text": ""}), Vec::new())
+            .await
+            .unwrap()
+            .parts[0]
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!((view.n_nodes(), view.n_edges()), (2, 1));
+    // A text that names a source draws it, result or not.
+    let hop = shell
+        .handle(
+            "graph.open",
+            json!({"result": id, "text": "SELECT 7 AS src, 8 AS dst"}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let view = GraphResult::from_bytes(&hop.parts[0].bytes).unwrap();
+    assert_eq!(view.n_edges(), 1);
+}
+
+/// The session keeps its last 16 results, the oldest dropped first.
+#[tokio::test]
+async fn sixteen_results_are_kept() {
+    let mut shell = session();
+    for i in 1..=RESULTS_KEPT + 1 {
+        let r = op(&mut shell, "query", json!({"sql": series(1)})).await;
+        assert_eq!(r["result"], format!("r{i}"));
+    }
+    let gone = fails(&mut shell, "fetch", json!({"result": "r1"})).await;
+    assert_eq!(gone.kind, "not_found");
+    assert!(gone.message.contains("dropped"), "{gone:?}");
+    for i in 2..=RESULTS_KEPT + 1 {
+        op(&mut shell, "fetch", json!({"result": format!("r{i}")})).await;
+    }
+    assert_eq!(shell.results.kept.len(), RESULTS_KEPT);
+}
+
+/// Results are kept within a number of bytes, the oldest dropped first;
+/// one over it on its own keeps only the rows its reply sent.
+#[tokio::test]
+async fn results_are_kept_within_the_cap() {
+    let mut shell = session();
+    op(&mut shell, "query", json!({"sql": series(1000)})).await;
+    let one = shell.results.kept[0].bytes;
+    // 8 bytes a row, in what the sort allocated.
+    assert!((8000..1 << 20).contains(&one), "{one}");
+    shell.results.max_bytes = one * 5 / 2;
+    op(&mut shell, "query", json!({"sql": series(1000)})).await;
+    op(&mut shell, "query", json!({"sql": series(1000)})).await;
+    // Three are over: the first went.
+    assert_eq!(
+        fails(&mut shell, "fetch", json!({"result": "r1"}))
+            .await
+            .kind,
+        "not_found"
+    );
+    op(&mut shell, "fetch", json!({"result": "r2"})).await;
+    op(&mut shell, "fetch", json!({"result": "r3"})).await;
+    assert!(shell.results.bytes() <= shell.results.max_bytes);
+
+    // Over the cap on its own: its first rows only, and the others stay.
+    shell.results.max_bytes = one / 2;
+    let big = shell
+        .handle(
+            "query",
+            json!({"sql": series(1000), "rows": 10}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            big.result["result"].as_str(),
+            big.result["rows"].as_u64(),
+            big.result["more"].as_bool()
+        ),
+        (Some("r4"), Some(1000), Some(true))
+    );
+    let kept = shell.results.kept.back().unwrap();
+    assert_eq!((kept.kept, kept.rows), (10, 1000));
+    assert!(
+        kept.bytes < one / 2,
+        "the first rows are copied out: {}",
+        kept.bytes
+    );
+    let first = shell
+        .handle(
+            "fetch",
+            json!({"result": "r4", "offset": 5, "rows": 5}),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.result, json!({"rows": 5, "more": true}));
+    assert_eq!(ints(&first.parts[0]), [5, 6, 7, 8, 9]);
+    for (o, args) in [
+        ("fetch", json!({"result": "r4", "offset": 5, "rows": 6})),
+        ("fetch", json!({"result": "r4", "offset": 10})),
+        ("export", json!({"result": "r4", "format": "csv"})),
+        ("graph.open", json!({"result": "r4"})),
+    ] {
+        let past = fails(&mut shell, o, args).await;
+        assert_eq!(past.kind, "not_found", "{o}");
+        assert!(
+            past.message.contains("kept only its first 10 of 1000 rows")
+                && past.message.contains("run the query again"),
+            "{o}: {past:?}"
+        );
+    }
+    // The shell's last result is every row, as it was.
+    let csv = shell.export("csv").unwrap();
+    assert_eq!(String::from_utf8(csv).unwrap().lines().count(), 1001);
+
+    // Even its first rows over: none kept.
+    shell.results.max_bytes = 16;
+    let none = op(
+        &mut shell,
+        "query",
+        json!({"sql": series(1000), "rows": 10}),
+    )
+    .await;
+    assert_eq!(none["result"], "r5");
+    let past = fails(&mut shell, "fetch", json!({"result": "r5"})).await;
+    assert!(past.message.contains("first 0 of 1000"), "{past:?}");
+}
+
+/// A result's bytes count each buffer once: slices of one batch hold its
+/// memory once, not once a slice.
+#[test]
+fn held_bytes_counts_a_shared_buffer_once() {
+    use arrow::array::Int64Array;
+    let column = Arc::new(Int64Array::from_iter_values(0..1000));
+    let batch = RecordBatch::try_from_iter([("i", column as _)]).unwrap();
+    let whole = held_bytes(std::slice::from_ref(&batch));
+    assert!(whole >= 8000, "{whole}");
+    let slices = page(&[batch], 0, 1000)
+        .into_iter()
+        .flat_map(|b| (0..10).map(move |i| b.slice(i * 100, 100)))
+        .collect::<Vec<_>>();
+    assert_eq!(held_bytes(&slices), whole);
+}
+
 /// The graph operations through `handle`, with their parts named.
 #[tokio::test]
 async fn graph_ops_reply_with_named_parts() {

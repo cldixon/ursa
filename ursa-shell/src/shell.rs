@@ -363,7 +363,19 @@ impl<O: Write, E: Write> Shell<O, E> {
         &mut self,
         text: &str,
     ) -> Result<(usize, Option<view::Positions>)> {
-        let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, self.last.clone()).await?;
+        let last = self.last.clone();
+        self.open_graph_of(text, last).await
+    }
+
+    /// [`Self::open_graph_placed`], with `rows` standing in for the last
+    /// result: what `text` draws when it names no source (a session's
+    /// `graph.open {result}`, of a result it kept). The last result stays.
+    pub async fn open_graph_of(
+        &mut self,
+        text: &str,
+        rows: Option<view::Rows>,
+    ) -> Result<(usize, Option<view::Positions>)> {
+        let drawn = view::of_command(&self.ctx, &ursa_sql::Sql, text, rows).await?;
         self.explorer = Some(match drawn.groups {
             Some(groups) => ExploreSession::grouped(drawn.result, groups),
             None => ExploreSession::new(drawn.result),
