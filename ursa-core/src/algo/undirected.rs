@@ -34,6 +34,7 @@ pub fn symmetric_view(topo: &Topology, mask: Option<&EdgeMask>) -> Topology {
         }
         UndirectedView::Masked(adj) => Topology::from_undirected(n, adj.offsets, adj.targets),
     }
+    .numbered_as(topo)
 }
 
 /// The weighted symmetric view: as [`symmetric_view`], plus the per-row weight of
@@ -116,7 +117,10 @@ pub fn symmetric_view_weighted(
     targets.shrink_to_fit();
     wts.truncate(write);
     wts.shrink_to_fit();
-    (Topology::from_undirected(n, offsets, targets), wts)
+    (
+        Topology::from_undirected(n, offsets, targets).numbered_as(topo),
+        wts,
+    )
 }
 
 #[cfg(test)]

@@ -2654,6 +2654,12 @@ for (const scheme of ["light", "dark"] as const) {
   const ink = () => k.evaluate(() => (window as any).ursaShell.graphInked());
   const openIs = (groups: number[]) =>
     k.waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g?.grouped && g.grouped.open.join() === want && !(window as any).ursaShell.busy(); }, groups.join(), { timeout: 30_000, polling: 50 }).catch(() => {});
+  // The layout done, and its last positions drawn: they can come with its
+  // "done", after the frame graphSettled saw (URSA-10).
+  const groupsSettled = async () => {
+    await graphSettled(k);
+    await k.waitForFunction(() => !(window as any).ursaShell.graph().pending, null, { timeout: 30_000, polling: 50 }).catch(() => {});
+  };
   // What SQL says of the clubs: their sizes, and the ties between them.
   await type("SELECT club, count(*) AS n FROM members GROUP BY club ORDER BY n DESC, club;", k);
   const clubs = lastTable(await screen(k)).rows;
@@ -2663,7 +2669,7 @@ for (const scheme of ["light", "dark"] as const) {
   const inside = Object.fromEntries(lastTable(await screen(k)).rows);
 
   await type(".graph karate GROUP BY club", k);
-  await graphSettled(k);
+  await groupsSettled();
   let g = await graphInfo(k);
   const said = (await after(".graph karate GROUP BY club", k)).replace(/\n/g, "");
   check(
@@ -2725,18 +2731,25 @@ for (const scheme of ["light", "dark"] as const) {
   if (shots) await k.screenshot({ path: `${shots}/graph-group-open.png` });
 
   // .undo is the closed drawing again: the same frame, to the pixel count.
-  await k.click("#terminal");
-  await type(".undo", k);
-  await openIs([]);
-  // (Nothing selected, as when the closed frame was read: no ring.) No
-  // frame is drawn between the click and the read-back: a read-back is of
-  // the view as it is, not of its last frame, whose discs had the ring.
-  // (Under load the frame came after the read-back, and the ring with it.)
+  // First nothing selected, as when the closed frame was read. The
+  // double-click selected the group: its ring, and the inspector's panel,
+  // which the camera makes room for once the pointer has rested (#493),
+  // and gives back as long after the selection is cleared. So the room is
+  // given back before .undo (URSA-10: under load the camera had made room
+  // for the panel before the read-back, and not yet given it back).
+  await k.mouse.click(box.x + 6, box.y + 6);
+  await roomSettled(k);
+  const cleared = await graphInfo(k);
+  // No frame is drawn from .undo to the read-back: a read-back is of the
+  // view as it is, not of its last frame, which had the group open. (#521:
+  // under load the frame came after the read-back.)
   await k.evaluate(() => {
     (window as any).__raf = window.requestAnimationFrame;
     window.requestAnimationFrame = () => 0;
   });
-  await k.mouse.click(box.x + 6, box.y + 6);
+  await k.click("#terminal");
+  await type(".undo", k);
+  await openIs([]);
   g = await graphInfo(k);
   const undone = await ink();
   // Frames again, and one drawn (a read-back asks for one when it ends).
@@ -2745,9 +2758,76 @@ for (const scheme of ["light", "dark"] as const) {
     await (window as any).ursaShell.graphInked();
   });
   check(
-    g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
+    cleared.selection.length === 0 && cleared.room.inset.join() === "0,0,0,0" &&
+      g.grouped.open.length === 0 && g.slots === 2 && g.nodes === 2 && g.edges === 1 && undone.inked === closed.inked && undone.palette.join() === closed.palette.join(),
     "GROUP BY: .undo restores the closed drawing, read back",
-    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}`,
+    `${undone.inked} px inked for ${closed.inked}; ${JSON.stringify(undone.palette.slice(0, 2))}; ${JSON.stringify({ selected: cleared.selection.length, room: cleared.room, frames: [cleared.frames, g.frames] })}`,
+  );
+
+  // A read-back as the layout ends is of its last positions (URSA-10). A
+  // small grouped layout's last positions and its "done" can come before
+  // the frame that would draw them; a read-back then drew the discs where
+  // the frame before had them. Made to happen every time: the layout's
+  // messages after its first positions are held until a frame has drawn
+  // those, then given in one task, with no frame after them.
+  await k.evaluate(() => {
+    const w = window as any;
+    const handler = Object.getOwnPropertyDescriptor(Worker.prototype, "onmessage")!;
+    const gate = { open: false, first: false, held: [] as [Worker, MessageEvent][] };
+    const given = new WeakMap<Worker, (e: MessageEvent) => void>();
+    Object.defineProperty(Worker.prototype, "onmessage", {
+      configurable: true,
+      get() {
+        return given.get(this) ?? null;
+      },
+      set(fn) {
+        given.set(this, fn);
+        handler.set!.call(
+          this,
+          fn &&
+            ((e: MessageEvent) => {
+              const type = e.data?.type;
+              if (!gate.open && (type === "positions" || type === "done")) {
+                if (type === "positions" && !gate.first) gate.first = true;
+                else return void gate.held.push([this, e]);
+              }
+              given.get(this)?.call(this, e);
+            }),
+        );
+      },
+    });
+    w.__gate = gate;
+    w.__release = () => {
+      Object.defineProperty(Worker.prototype, "onmessage", handler);
+      gate.open = true;
+      w.__raf = window.requestAnimationFrame;
+      window.requestAnimationFrame = () => 0;
+      for (const [worker, e] of gate.held) given.get(worker)?.call(worker, e);
+    };
+  });
+  await k.click("#terminal");
+  await type(".graph karate GROUP BY club", k);
+  await k.waitForFunction(
+    () => {
+      const w = window as any;
+      const g = w.ursaShell.graph();
+      return g?.frames > 0 && w.__gate.held.some(([, e]: [Worker, MessageEvent]) => e.data.type === "done");
+    },
+    null,
+    { timeout: 60_000, polling: 50 },
+  ).catch(() => {});
+  await k.evaluate(() => (window as any).__release());
+  const ending = await graphInfo(k);
+  const ended = await ink();
+  await k.evaluate(async () => {
+    window.requestAnimationFrame = (window as any).__raf;
+    await (window as any).ursaShell.graphInked();
+  });
+  await groupsSettled();
+  check(
+    ending.layoutDone && ending.pending && ending.frames > 0 && ended.inked === closed.inked && ended.palette.join() === closed.palette.join(),
+    "GROUP BY: a read-back as the layout ends, before a frame has drawn its last positions, is of those",
+    `${ended.inked} px inked for ${closed.inked}; ${JSON.stringify(ended.palette.slice(0, 2))}; ${JSON.stringify({ done: ending.layoutDone, pending: ending.pending, frames: ending.frames })}`,
   );
 
   // Both open: every tie is drawn. .collapse closes one, and opening it
