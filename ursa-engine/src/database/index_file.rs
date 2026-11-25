@@ -4,14 +4,14 @@
 //! full key it was built for (the edge plan's fingerprint and the identity of
 //! every source file), followed by optional **chunks**: parts of the index
 //! that are built later, or that only some queries need, such as the
-//! in-adjacency. Version 4, all integers little-endian.
+//! in-adjacency. Version 5, all integers little-endian.
 //!
 //! The **main part** comes first:
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic            "URSAIDX\0"
-//!      8     4  version          4
+//!      8     4  version          5
 //!     12     4  flags            bit 0: string ids
 //!     16     8  n_nodes
 //!     24     8  n_edges
@@ -50,6 +50,13 @@
 //! has just mapped the file finds a seed's node by reading a slot or two and
 //! comparing the id there, where before it hashed every id of the graph into
 //! a table of its own first (#421).
+//!
+//! An index whose nodes were relabelled for locality (#172,
+//! `ursa_core::NodeOrder`) has one more section, the nodes' **original ids**
+//! (kind 13, `u32`, `n_nodes`): the first-seen number of each node, which
+//! component labels and the seeded community kernels are defined on. The id
+//! column is in the relabelled order. Without the section the nodes are in
+//! their original order.
 //!
 //! A graph with a vertex table leaves out the edge rows whose source or
 //! destination is not one of its keys (#311). When it left some out, the
@@ -94,14 +101,18 @@
 //! chunk, so a reader in another process (`--readonly`) never sees them
 //! change.
 //!
+//! **Version 4** (0.12) is version 5 without the original ids: its nodes
+//! were never relabelled, and they keep their numbering when it is read. It is
+//! still read, and mapped as version 5 is.
+//!
 //! **Version 3** (0.11) is version 4 without the lookup table. It is still
-//! read, and mapped as version 4 is; the table is then built in memory, the
+//! read, and mapped as version 5 is; the table is then built in memory, the
 //! first time a query looks an id up (one that runs an algorithm over the
 //! whole graph and names no node never does). **Version 2** (0.10) is the
 //! same layout with 24-byte table entries (no section CRCs) and one CRC over
 //! every byte before the trailer. It is still read, whole and checked (see
 //! [`read_file`]), and its lookup table built in the same way. A writer
-//! stores either again as version 4 (`IndexStore`).
+//! stores any of them again as version 5 (`IndexStore`).
 //!
 //! **Why raw arrays, not Arrow IPC.** The arrays have different lengths and
 //! no schema: an IPC stream would need one record batch per array, or padding
@@ -134,7 +145,7 @@
 //!
 //! **Version 1** files (the in-adjacency, if any, inside the main part) are
 //! not read: they are a miss like any other unreadable file, so the index is
-//! built again once and stored as version 4 in their place.
+//! built again once and stored as version 5 in their place.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -158,8 +169,11 @@ pub const MAGIC: [u8; 8] = *b"URSAIDX\0";
 /// The last bytes of every index file.
 const END_MAGIC: [u8; 4] = *b"XDIU";
 /// The index file version this build writes. It reads this one and
-/// [`VERSION_2`].
-pub const VERSION: u32 = 4;
+/// [`VERSION_4`] to [`VERSION_2`].
+pub const VERSION: u32 = 5;
+/// The version 0.12 wrote: version 5 without the original node ids (its
+/// nodes are never relabelled, #172).
+pub const VERSION_4: u32 = 4;
 /// The version 0.11 wrote: version 4 without the ids' lookup table.
 pub const VERSION_3: u32 = 3;
 /// The version 0.10 wrote: no section CRCs, one CRC over the main part.
@@ -198,6 +212,7 @@ const IDS_STR_BYTES: u32 = 9;
 const WEIGHTS_F64: u32 = 10;
 const KEPT_ROWS: u32 = 11;
 const ID_TABLE: u32 = 12;
+const ORIGINAL_IDS: u32 = 13;
 
 /// The version of the key's form. Version 2 (#327) is the portable key:
 /// paths inside the database's directory relative to it, and only the file
@@ -357,8 +372,8 @@ fn align(n: u64, to: u64) -> u64 {
 /// An index laid out for writing: its header fields, key, sections and where
 /// each goes.
 pub struct Encoded<'a> {
-    /// [`VERSION`]; or [`VERSION_3`] or [`VERSION_2`], for a test of reading
-    /// what 0.11 or 0.10 wrote.
+    /// [`VERSION`]; or [`VERSION_4`], [`VERSION_3`] or [`VERSION_2`], for a
+    /// test of reading what 0.12, 0.11 or 0.10 wrote.
     version: u32,
     flags: u32,
     n_nodes: u64,
@@ -414,6 +429,10 @@ impl<'a> Encoded<'a> {
                 slots: OnceLock::new(),
             }),
         ));
+        // The original id of each node, if the build relabelled them (#172).
+        if let Some(original) = topology.original_ids() {
+            sections.push((ORIGINAL_IDS, Data::U32(original)));
+        }
         let n_dropped = match kept {
             Some(kept) if n_dropped > 0 => {
                 sections.push((KEPT_ROWS, Data::Bytes(kept.sliced())));
@@ -482,7 +501,16 @@ impl<'a> Encoded<'a> {
         self.in_version(VERSION_3)
     }
 
-    /// This index laid out as an older `version`, which has no lookup table.
+    /// This index laid out as version 4, as 0.12 wrote it (no original
+    /// node ids): for tests of reading such a file. Its nodes must not have
+    /// been relabelled, as 0.12 never relabelled them.
+    #[doc(hidden)]
+    pub fn as_version_4(self) -> Self {
+        self.in_version(VERSION_4)
+    }
+
+    /// This index laid out as an older `version`, which has no original node
+    /// ids and, before version 4, no lookup table.
     fn in_version(self, version: u32) -> Self {
         let Self {
             flags,
@@ -495,7 +523,8 @@ impl<'a> Encoded<'a> {
         } = self;
         let sections = sections
             .into_iter()
-            .filter(|(k, _, _)| *k != ID_TABLE)
+            .filter(|(k, _, _)| *k != ORIGINAL_IDS)
+            .filter(|(k, _, _)| version == VERSION_4 || *k != ID_TABLE)
             .map(|(k, d, _)| (k, d))
             .collect();
         Self::laid_out(version, flags, n_nodes, n_edges, n_dropped, key, sections)
@@ -831,8 +860,8 @@ pub struct Stored {
     pub main: MainPart,
     /// The chunks that check out, in file order.
     pub chunks: Vec<ChunkInfo>,
-    /// The file's version: [`VERSION`], or [`VERSION_3`] or [`VERSION_2`]
-    /// for a file 0.11 or 0.10 wrote.
+    /// The file's version: [`VERSION`], or [`VERSION_4`], [`VERSION_3`] or
+    /// [`VERSION_2`] for a file 0.12, 0.11 or 0.10 wrote.
     pub version: u32,
     /// The checksums of a mapped file that are checked only when something
     /// reads the arrays whole; `None` when every one was checked as it loaded.
@@ -1354,7 +1383,7 @@ fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<H
         return Err("not an Ursa index file".into());
     }
     let version = u32_at(&header, 8);
-    if ![VERSION, VERSION_3, VERSION_2].contains(&version) {
+    if ![VERSION, VERSION_4, VERSION_3, VERSION_2].contains(&version) {
         return Err(format!(
             "index format version {version}; this build reads {VERSION_2} to {VERSION}"
         ));
@@ -1547,6 +1576,16 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
         VERSION_2 => Topology::from_parts(n_nodes, out, None)?,
         _ => Topology::from_checksummed_parts(n_nodes, out)?,
     };
+    // The nodes' original ids, if the build relabelled them (#172): only a
+    // version 5 file has them, and only when it was relabelled.
+    let topology = match head.sections.iter().any(|e| e.kind == ORIGINAL_IDS) {
+        true if head.version == VERSION => {
+            let original = scalars::<u32>(data, &take(ORIGINAL_IDS, 4, Some(n_nodes))?);
+            topology.with_original_ids(original)?
+        }
+        true => return Err(format!("section {ORIGINAL_IDS} is not in this version")),
+        false => topology,
+    };
 
     let ids: Arc<dyn Array> = if head.flags & FLAG_STRING_IDS == 0 {
         let values = scalars::<i64>(data, &take(IDS_INT64, 8, Some(n_nodes))?);
@@ -1572,7 +1611,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
     // The ids' lookup table, as it lies in the file; an older file has none,
     // and the id map builds it if a query looks an id up.
     let table = match head.version {
-        VERSION => {
+        VERSION | VERSION_4 => {
             let slots = usize::try_from(lookup_table_len(n_nodes)).map_err(|e| e.to_string())?;
             Some(scalars::<u32>(data, &take(ID_TABLE, 4, Some(slots))?))
         }
@@ -2289,7 +2328,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(
             decode(&bytes, &key()).unwrap_err(),
-            "index format version 1; this build reads 2 to 4"
+            "index format version 1; this build reads 2 to 5"
         );
     }
 
@@ -2310,5 +2349,107 @@ mod tests {
         assert_eq!(IndexKey::from_json(&json), None);
         json.as_object_mut().unwrap().remove("version");
         assert_eq!(IndexKey::from_json(&json), None);
+    }
+
+    /// A relabelled index (#172), with string and with integer ids: a
+    /// topology built in in-degree order, with its id map renumbered to match.
+    fn relabelled() -> [(Topology, IdMap); 2] {
+        let n = 200i64;
+        // Every node points at a few low ids, so in-degrees fall with the id
+        // and the first-seen order is not the in-degree order.
+        let (src, dst): (Vec<i64>, Vec<i64>) = (0..4 * n)
+            .map(|i| ((i * 37) % n, ((i % n) * (i % n)) % (n / 3 + 1 + i % 7)))
+            .unzip();
+        let strings = |v: &[i64]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                v.iter().map(|i| format!("user-{i}")).collect::<Vec<_>>(),
+            ))
+        };
+        let ints = |v: &[i64]| -> ArrayRef { Arc::new(Int64Array::from(v.to_vec())) };
+        let build = |column: &dyn Fn(&[i64]) -> ArrayRef| {
+            let (map, s, d) =
+                IdMap::from_edge_arrays(column(&src).as_ref(), column(&dst).as_ref()).unwrap();
+            let topology = Topology::build_ordered(map.len(), s, d, ursa_core::NodeOrder::InDegree);
+            let original = topology.original_ids().expect("relabelled").to_vec();
+            let ids = map.reordered(&original);
+            (topology, ids)
+        };
+        [build(&strings), build(&ints)]
+    }
+
+    /// #172: a relabelled index stores its nodes' original ids, and reads
+    /// them back; its components keep their labels.
+    #[test]
+    fn a_relabelled_index_round_trips_with_its_original_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        for (topology, ids) in relabelled() {
+            let bytes = encode(&key(), &topology, &ids);
+            assert_eq!(u32_at(&bytes, 8), VERSION);
+            let (at, len) = section_of(&bytes, ORIGINAL_IDS);
+            let stored: Vec<u32> = read(&bytes[at..at + len], u32::from_le_bytes).collect();
+            assert_eq!(stored, topology.original_ids().unwrap());
+            std::fs::write(&path, &bytes).unwrap();
+            let back = read_file(&path, &key()).unwrap();
+            assert_eq!(back.version, VERSION);
+            same(&topology, &back.topology);
+            assert_eq!(back.topology.original_ids(), topology.original_ids());
+            finds_every_id(&back.ids, &ids);
+            assert_eq!(
+                ursa_core::algo::connected_components_weak(&back.topology, None),
+                ursa_core::algo::connected_components_weak(&topology, None)
+            );
+            // Stored again from the loaded index: the same file.
+            assert_eq!(encode(&key(), &back.topology, &back.ids), bytes);
+            // A damaged order is an error when the file loads.
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 1;
+            std::fs::write(&path, &flipped).unwrap();
+            assert!(read_file(&path, &key()).is_err());
+        }
+        // An index that was not relabelled has no such section.
+        for (topology, ids) in graphs() {
+            let bytes = encode(&key(), &topology, &ids);
+            let n_sections = u32_at(&bytes, 40) as usize;
+            let table = align(HEADER_LEN + u64_at(&bytes, 32), 8) as usize;
+            assert!((0..n_sections).all(|i| u32_at(&bytes, table + 32 * i) != ORIGINAL_IDS));
+        }
+    }
+
+    /// #172: a file 0.12 wrote (version 4: no original ids, its nodes in
+    /// first-seen order) still opens, keeps its numbering and finds its ids,
+    /// and is written again as version 5.
+    #[test]
+    fn a_version_4_file_from_0_12_is_read_with_its_numbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        for (topology, ids) in graphs() {
+            let v5 = encode(&key(), &topology, &ids);
+            let encoded = Encoded::new(&key(), &topology, &ids)
+                .unwrap()
+                .as_version_4();
+            let mut v4 = Vec::new();
+            encoded.write_to(&mut v4).unwrap();
+            assert_eq!(u32_at(&v4, 8), VERSION_4);
+            // Version 5 adds no section for an index that is not relabelled:
+            // the files differ in the version and the header's CRC only.
+            assert_eq!(v4.len(), v5.len());
+            let differ: Vec<usize> = (0..v4.len()).filter(|&i| v4[i] != v5[i]).collect();
+            assert!(
+                differ.iter().all(|&i| i < 12 || i >= v4.len() - 8),
+                "{differ:?}"
+            );
+            std::fs::write(&path, &v4).unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            assert_eq!(stored.version, VERSION_4);
+            same(&topology, &stored.topology);
+            assert!(stored.topology.original_ids().is_none());
+            finds_every_id(&stored.ids, &ids);
+            assert_eq!(
+                stored.ids.lookup_table().unwrap(),
+                ids.lookup_table().unwrap()
+            );
+            assert_eq!(encode(&key(), &stored.topology, &stored.ids), v5);
+        }
     }
 }

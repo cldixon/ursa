@@ -1,8 +1,10 @@
 //! The SQL engine against the Python library: the same graph functions with
 //! the same parameters must give the same columns (names and types), the same
-//! ids and the same values, floats bit for bit. The one exception is
+//! ids and the same values, floats bit for bit. The exceptions are
 //! `neighbors_agg`'s `count` and `n_unique`, integers in SQL and whole floats
-//! in Python ([`as_counts`]).
+//! in Python ([`as_counts`]), and component labels, canonical since #150,
+//! which the fixture recorded before: they are compared as partitions
+//! ([`same_values`]).
 //!
 //! The traversals return rows of their own; those are compared in order, as
 //! the Python library returns them. The traversals' parameters and defaults
@@ -152,6 +154,44 @@ fn keyed(rows: Vec<Vec<Cell>>, per_node: bool) -> BTreeMap<Cell, Vec<Cell>> {
         .collect();
     assert_eq!(map.len(), n, "a repeated id");
     map
+}
+
+/// `got` is `expected`, as the module docs say: `connected_components`
+/// labels as a partition, every other cell exactly.
+fn same_values(
+    function: &str,
+    got: &BTreeMap<Cell, Vec<Cell>>,
+    expected: &BTreeMap<Cell, Vec<Cell>>,
+    label: &str,
+) {
+    assert_eq!(
+        got.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "{label}: ids"
+    );
+    let width = expected.values().next().map_or(0, Vec::len);
+    for c in 0..width {
+        if function == "connected_components" && c > 0 {
+            // The same partition: each label maps to one label, both ways.
+            let (mut there, mut back) = (BTreeMap::new(), BTreeMap::new());
+            for (g, e) in got.values().zip(expected.values()) {
+                assert_eq!(
+                    there.entry(&g[c]).or_insert(&e[c]),
+                    &&e[c],
+                    "{label}: partition"
+                );
+                assert_eq!(
+                    back.entry(&e[c]).or_insert(&g[c]),
+                    &&g[c],
+                    "{label}: partition"
+                );
+            }
+            continue;
+        }
+        for (id, (g, e)) in got.keys().zip(got.values().zip(expected.values())) {
+            assert_eq!(g[c], e[c], "{label}: {id:?}");
+        }
+    }
 }
 
 /// A case of a layout SQL does not offer, run through the engine's internal
@@ -456,7 +496,12 @@ async fn sql_matches_the_python_library() {
         } else if traversal::lookup(function).is_some() {
             assert_eq!(got, expected, "{sql}");
         } else {
-            assert_eq!(keyed(got, per_node), keyed(expected, per_node), "{sql}");
+            same_values(
+                function,
+                &keyed(got, per_node),
+                &keyed(expected, per_node),
+                &sql,
+            );
         }
     }
     // Every function SQL offers is covered, with weights.

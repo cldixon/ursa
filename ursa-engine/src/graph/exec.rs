@@ -8,8 +8,11 @@
 //! batch.
 //!
 //! Row order matters to the index: dense node ids are given in first-seen
-//! order, and they decide component labels and the order floating-point sums
-//! run in. The child's partitions are read in order, the node asks for no
+//! order. The build of a graph of 65,536 edges or more then renumbers the
+//! nodes by in-degree for locality (#172, `ursa_core::NodeOrder::InDegree`),
+//! keeping each node's first-seen id: component labels, the seeded community kernels and sampled sources
+//! are defined on those, and the order floating-point sums run in follows
+//! both. The child's partitions are read in order, the node asks for no
 //! repartitioning of its input, and the session turns off file-scan work
 //! stealing, so a file's edges arrive in the file's own order on any thread
 //! count, as `ursa-io` reads them for the Python library.
@@ -93,7 +96,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use futures::{FutureExt, TryStreamExt};
-use ursa_core::{EdgeInterner, IdError, Topology};
+use ursa_core::{EdgeInterner, IdError, IdMap, NodeOrder, Topology};
 
 use super::in_order::{read_ahead, InOrder};
 use super::index::{
@@ -1869,8 +1872,28 @@ fn finish_index(mut interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
         let (topology, ids) = ursa_io::topology::empty_topology(id_type);
         return GraphIndex::new(topology, ids).with_dropped(n_dropped, kept);
     }
-    let topology = Topology::build(ids.len(), source, destination);
+    let (topology, ids) = relabelled(ids, source, destination);
     GraphIndex::new(Arc::new(topology), Arc::new(ids)).with_dropped(n_dropped, kept)
+}
+
+/// The fewest edges an index relabels its nodes for (#172): a smaller graph's
+/// arrays fit in cache in any order, so it keeps its first-seen numbering.
+const RELABEL_MIN_EDGES: usize = 1 << 16;
+
+/// The topology of the edges `source -> destination` (dense ids of `ids`),
+/// its nodes relabelled for locality (#172) when it has
+/// [`RELABEL_MIN_EDGES`] edges or more, and `ids` renumbered with them.
+fn relabelled(ids: IdMap, source: Vec<u32>, destination: Vec<u32>) -> (Topology, IdMap) {
+    let order = match source.len() >= RELABEL_MIN_EDGES {
+        true => NodeOrder::InDegree,
+        false => NodeOrder::AsGiven,
+    };
+    let topology = Topology::build_ordered(ids.len(), source, destination, order);
+    let ids = match topology.original_ids() {
+        Some(original) => ids.reordered(original),
+        None => ids,
+    };
+    (topology, ids)
 }
 
 /// The number of rows `plan` will produce, if its statistics say: sizes the
@@ -2554,8 +2577,9 @@ mod tests {
             .iter()
             .map(|c| (c[0].as_ref(), c[1].as_ref()))
             .collect();
-        let (topology, ids) = ursa_io::build_topology_batches(&rows).unwrap();
-        let collected = GraphIndex::new(topology, ids);
+        let (ids, s, d) = IdMap::from_edge_batches(&rows).unwrap();
+        let (topology, ids) = relabelled(ids, s, d);
+        let collected = GraphIndex::new(Arc::new(topology), Arc::new(ids));
         let expected = stored_bytes(&serial);
         assert_eq!(stored_bytes(&collected), expected);
         // In parallel, with room to read ahead and with none: the same node

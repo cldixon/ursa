@@ -29,9 +29,14 @@ use crate::topology::{Adjacency, EdgeMask, Topology};
 
 /// Community label per node. Communities are treated as undirected (a node votes
 /// over both its out- and in-neighbours). Iterates until a full sweep changes no
-/// label or `max_iter` sweeps have run. Labels are dense node indices (one
-/// representative per community), not necessarily a contiguous `0..k`. A subgraph
-/// `mask` restricts voting to kept edges.
+/// label or `max_iter` sweeps have run. Labels are original node ids (one
+/// representative per community; see [`Topology::original_ids`]), not
+/// necessarily a contiguous `0..k`. A subgraph `mask` restricts voting to kept
+/// edges.
+///
+/// The visit order and the ties follow the node numbering, so a topology
+/// relabelled for locality (#172) can give other communities for a seed than
+/// one in first-seen order, of the same quality.
 ///
 /// An isolated node never votes and is never voted for, so it keeps its own
 /// label; a graph with many runs over its linked nodes only (#326), visited in
@@ -55,11 +60,18 @@ pub fn label_propagation(
     topo.incoming();
     let linked = Linked::of(topo, mask);
     let linked = linked.worth_it().then_some(&linked);
-    if parallel {
+    let mut labels = if parallel {
         label_propagation_parallel(topo, mask, max_iter, seed, linked)
     } else {
         label_propagation_over(topo, mask, max_iter, seed, linked)
+    };
+    // A label names a node: name it by its original id (#172).
+    if topo.original_ids().is_some() {
+        for l in labels.iter_mut() {
+            *l = topo.original_id(*l);
+        }
     }
+    labels
 }
 
 /// [`label_propagation`], compact over `linked` when given.

@@ -809,3 +809,52 @@ fn catalog_layout_fa2_is_thread_count_independent() {
         }
     }
 }
+
+/// #172: the in-degree relabel, and the kernels over a relabelled topology,
+/// are the same on any thread count. A build inside a pool runs serially
+/// (`parallel::in_worker`), so the parallel build is the one made outside.
+#[test]
+fn the_relabelled_build_is_thread_count_independent() {
+    use ursa_core::NodeOrder;
+    let reference = seeded_graph(30_000, 200_000);
+    let edges = || {
+        let out = reference.out();
+        let m = reference.n_edges();
+        let (mut src, mut dst) = (vec![0; m], vec![0; m]);
+        for u in 0..reference.n_nodes() as u32 {
+            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                (src[e as usize], dst[e as usize]) = (u, v);
+            }
+        }
+        (src, dst)
+    };
+    let build = || {
+        let (src, dst) = edges();
+        Topology::build_ordered(30_000, src, dst, NodeOrder::InDegree)
+    };
+    let serial = on_pool(1, build);
+    let parallel = build();
+    assert_eq!(serial.original_ids(), parallel.original_ids());
+    assert_eq!(serial.out().offsets, parallel.out().offsets);
+    assert_eq!(serial.out().targets, parallel.out().targets);
+    assert_eq!(serial.out().edge_ids, parallel.out().edge_ids);
+    let kernels = |t: &Topology| {
+        (
+            pagerank(t, None, PageRankParams::default()),
+            connected_components_weak(t, None),
+            connected_components_strong(t, None),
+            louvain(t, None, 1.0, Some(2), true),
+            label_propagation(t, None, 10, Some(2), true),
+            // Seeded, and since #172 run on the relabelled numbering itself.
+            louvain(t, None, 1.0, Some(2), false),
+            label_propagation(t, None, 10, Some(2), false),
+        )
+    };
+    let reference = on_pool(1, || kernels(&parallel));
+    for &threads in &THREADS {
+        assert!(
+            on_pool(threads, || kernels(&parallel)) == reference,
+            "a kernel over the relabelled topology diverged at {threads} threads"
+        );
+    }
+}

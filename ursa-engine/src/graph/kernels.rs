@@ -70,6 +70,16 @@ pub fn batch(
         let ordered = values.and_then(|v| v.ordered.as_ref());
         columns.push(retype(column, to, ordered)?);
     }
+    // A relabelled index (#172) gives its nodes' rows in original (first-seen)
+    // order, as an index that was not relabelled gives them.
+    if let (true, Some(order)) = (per_node, index.topology.nodes_in_original_order()) {
+        let order = UInt32Array::from(order.to_vec());
+        columns = columns
+            .iter()
+            .map(|c| take(c.as_ref(), &order, None))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    }
     RecordBatch::try_new(schema, columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }

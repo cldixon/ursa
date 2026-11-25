@@ -45,7 +45,11 @@ macro_rules! by_weights {
     };
 }
 
-/// Community label per node (contiguous `0..k`). Deterministic given `seed`
+/// Community label per node (contiguous `0..k`, by first appearance in node
+/// order). The visit order, the ties and the aggregation follow the node
+/// numbering, so a topology relabelled for locality (#172) can give other
+/// communities for a seed than one in first-seen order, of the same quality.
+/// Deterministic given `seed`
 /// (defaulting to a fixed seed when `None`, so an unseeded run is reproducible).
 /// A subgraph `mask` restricts the working graph to kept edges only.
 ///

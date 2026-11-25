@@ -29,3 +29,6 @@ ursa-viz = { path = "../ursa-viz", version = "0.13.0-dev", default-features = fa
 # `statement error <regex>` in the conformance suite (tests/conformance.rs; already
 # in the tree via ursa-io).
 regex = "1"
+# The stored-index pins renumber an index back to first-seen order
+# (tests/stored_indexes.rs; already in the tree via ursa-engine).
+ursa-core = { path = "../ursa-core", version = "0.13.0-dev" }
