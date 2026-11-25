@@ -1,0 +1,39 @@
+[package]
+name = "ursa-server"
+description = "ursa serve: Ursa's shell in a browser tab, over a local WebSocket to a native engine session (the session protocol's native end)."
+version = "0.13.0-dev"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+homepage = "https://cldixon.github.io/ursa/"
+keywords = ["sql", "graph", "websocket", "server"]
+categories = ["database", "web-programming::websocket"]
+
+[features]
+# The page's files built into the binary with rust-embed: this checkout's
+# `web/dist` (run `cd web && bun run engine && bun run build` first), without
+# the wasm engine's files, which `ursa serve` does not use. The published crate
+# has no assets, so this builds only from a checkout; without it, the files
+# come from a directory (`Assets::Dirs`, `ursa serve --assets DIR`).
+embed = ["dep:rust-embed"]
+
+[dependencies]
+ursa-shell = { path = "../ursa-shell", version = "0.13.0-dev" }
+# The HTTP server and its WebSocket (tokio-tungstenite, through `ws`).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "fs", "io-util", "time"] }
+futures = "0.3"
+serde_json = "1"
+# The per-run token: 32 bytes from the operating system, base64url.
+getrandom = "0.3"
+base64 = "0.22"
+# `debug-embed`: a debug build embeds the files too, so it serves what a
+# release build would.
+rust-embed = { version = "8", optional = true, features = ["debug-embed", "include-exclude", "interpolate-folder-path"] }
+
+[dev-dependencies]
+# Drives the server's WebSocket from the tests, as a browser would.
+tokio-tungstenite = "0.29"
+tempfile = "3"

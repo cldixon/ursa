@@ -87,6 +87,10 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # `ursa serve` (ursa-cli's non-default `serve` feature, over ursa-server).
+      - name: clippy (ursa serve)
+        run: cargo clippy -p ursa-cli --features serve --all-targets --locked -- -D warnings
+
       # ursa-py is included here (not just core+plan): with `extension-module`
       # behind a feature, ursa-py's rlib now links a normal interpreter, so its
       # test binary builds. This guards the fix against regressing.
@@ -98,6 +102,15 @@ jobs:
       # python/ursa/datasets/data).
       - name: test engine + sql + shell + cli + wasm (natively)
         run: cargo test -p ursa-engine -p ursa-sql -p ursa-shell -p ursa-cli -p ursa-wasm --locked
+
+      # `ursa serve` (design/console.md §5): ursa-server's security tests (no
+      # token, a wrong token or cookie, a foreign Origin, a wrong Host,
+      # loopback only, /data/) and the session protocol over its WebSocket
+      # (sessions, cancel, stopping); and ursa-cli with the `serve` feature.
+      - name: test ursa-server, and ursa-cli with serve
+        run: |
+          cargo test -p ursa-server --locked
+          cargo test -p ursa-cli --features serve --locked --test serve
 
       # The graph view (#280): its scene, camera and styles, and its WGSL,
       # validated by naga.

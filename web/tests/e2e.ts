@@ -30,7 +30,35 @@ const check = (ok: boolean, label: string, detail = "") => {
   if (!ok) failures.push(`${label}${detail ? `: ${detail}` : ""}`);
 };
 
-const browser = await chromium.launch();
+const launched = await chromium.launch();
+// Against `ursa serve` (scripts/e2e-serve.ts sets URSA_SERVE_TOKEN): every
+// context carries the run's token as the cookie the page gets from the link
+// ursa serve prints, and the checks of browser-only features are skipped,
+// each with a "skip" line: the engine's crash (a WebAssembly trap), its
+// WebAssembly memory, and the wasm engine's files and worker.
+const serveToken = process.env.URSA_SERVE_TOKEN ?? "";
+const overSocket = serveToken !== "";
+const serveCookie = overSocket ? `ursa_token_${new URL(base).port}=${serveToken}` : "";
+const skip = (label: string) => console.log(`skip ${label}: browser-only (the wasm engine)`);
+const withToken = async <C extends { addCookies(c: { name: string; value: string; url: string }[]): Promise<void> }>(c: C) => {
+  if (overSocket) await c.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: serveToken, url: base }]);
+  return c;
+};
+const browser = new Proxy(launched, {
+  get(target, key) {
+    if (key === "newContext") return async (options?: any) => withToken(await target.newContext(options));
+    if (key === "newPage")
+      return async (options?: any) => {
+        const ctx = await withToken(await target.newContext(options));
+        return ctx.newPage();
+      };
+    const value = (target as any)[key];
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
+// Bun's own requests (the headers' checks) carry the cookie too.
+const fetch = (url: string, init: RequestInit = {}) =>
+  globalThis.fetch(url, overSocket ? { ...init, headers: { ...(init.headers as Record<string, string>), cookie: serveCookie } } : init);
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
 // Content Security Policy violations, from every page: the console's, and
 // the documents' securitypolicyviolation events.
@@ -737,11 +765,16 @@ check(!(await screen()).includes("Error: ") && (await tables()) === 0, "New duri
 }
 
 // The engine crashing (out of memory) leaves a working shell, in a fresh session.
-await type("SELECT length(repeat('x', 2000000000)) AS n;");
-await idle();
-check((await screen()).includes("the engine stopped"), "an engine crash is reported");
-await type("SELECT 41 + 1 AS answer;");
-check(lastTable(await after("SELECT 41 + 1 AS answer;")).rows[0]?.[0] === "42", "the shell works after an engine crash");
+if (overSocket) {
+  skip("an engine crash is reported");
+  skip("the shell works after an engine crash");
+} else {
+  await type("SELECT length(repeat('x', 2000000000)) AS n;");
+  await idle();
+  check((await screen()).includes("the engine stopped"), "an engine crash is reported");
+  await type("SELECT 41 + 1 AS answer;");
+  check(lastTable(await after("SELECT 41 + 1 AS answer;")).rows[0]?.[0] === "42", "the shell works after an engine crash");
+}
 
 // The theme toggle, remembered.
 const theme0 = await page.evaluate(() => document.documentElement.dataset.theme ?? "");
@@ -1122,7 +1155,8 @@ for (const scheme of ["light", "dark"] as const) {
   );
   const mem: any = await g.evaluate(() => (window as any).ursaShell.graphMemory({ timeoutMs: 2_000 }));
   const pages = (bytes: any) => Number.isInteger(bytes) && bytes > 0 && bytes % 65536 === 0;
-  check(
+  if (overSocket) skip("graphMemory: each wasm instance's memory, and the browser's measure of the page");
+  else check(
     mem.crossOriginIsolated === true && pages(mem.wasm.engine) && pages(mem.wasm.view) && pages(mem.wasm.layout) && (mem.userAgent ? mem.userAgent.bytes > mem.wasm.view : typeof mem.userAgentError === "string"),
     "graphMemory: each wasm instance's memory, and the browser's measure of the page",
     JSON.stringify({ ...mem, userAgent: mem.userAgent && { bytes: mem.userAgent.bytes, parts: mem.userAgent.breakdown.length } }),
@@ -3341,7 +3375,7 @@ for (const path of [
 // response (a range of a dataset and the engine's .wasm too), and the page
 // and both its workers, the engine's and the layout's, say they are isolated.
 {
-  const engine: { wasm: string } = await (await fetch(`${base}/engine/engine.json`)).json();
+  const engine: { wasm: string } = overSocket ? { wasm: "" } : await (await fetch(`${base}/engine/engine.json`)).json();
   const viz: { module: string } = await (await fetch(`${base}/viz/viz.json`)).json();
   const isolating = (r: Response) =>
     r.headers.get("cross-origin-opener-policy") === "same-origin" && r.headers.get("cross-origin-embedder-policy") === "require-corp" && r.headers.get("cross-origin-resource-policy") === "same-origin";
@@ -3366,6 +3400,10 @@ for (const path of [
     "/data/no_such_file.csv",
     "/no/such/page",
   ]) {
+    if (overSocket && /^\/engine\/|^$/.test(path)) {
+      skip(`cross-origin isolation headers on ${path || "the engine's .wasm"}`);
+      continue;
+    }
     const r = await fetch(`${base}${path}`);
     await r.body?.cancel();
     check(isolating(r), `cross-origin isolation headers on ${path} (${r.status})`, sent(r));
@@ -3413,7 +3451,8 @@ for (const path of [
   const workers = await Promise.all(
     p.workers().map(async (w) => ({ name: new URL(w.url()).pathname, isolated: await w.evaluate(() => self.crossOriginIsolated).catch((e) => String(e)) })),
   );
-  for (const name of ["/engine-worker.js", "/graph-worker.js"]) {
+  if (overSocket) skip("the worker /engine-worker.js is cross-origin isolated");
+  for (const name of overSocket ? ["/graph-worker.js"] : ["/engine-worker.js", "/graph-worker.js"]) {
     const found = workers.filter((w) => w.name === name);
     check(found.length > 0 && found.every((w) => w.isolated === true), `the worker ${name} is cross-origin isolated`, JSON.stringify(workers));
   }
