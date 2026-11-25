@@ -472,9 +472,9 @@ async fn path_features_not_supported_yet_say_what_to_write() {
              quantifier follows the edge: write -[k:knows]->{1,3}",
         ),
         (
-            "(a:Person|School) COLUMNS (a.id)".to_string(),
-            "in GRAPH_TABLE: label expressions (|, &, !, %) are not supported yet; use one label \
-             (#412)",
+            "(a:Person&School) COLUMNS (a.id)".to_string(),
+            "in GRAPH_TABLE: label expressions with &, ! or parentheses are not supported yet; \
+             use one label, or several joined with |, as (a:person|school) (#412)",
         ),
     ] {
         assert_contains(&err(&ctx, &pg(&rest)).await, expected);
