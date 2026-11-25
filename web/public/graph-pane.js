@@ -79,7 +79,7 @@ function markup(container, prefix) {
   const legend = el("div", { id: id("legend"), className: "graph-legend", hidden: true }, { "aria-label": "Legend" });
   const found = el("div", { id: id("found"), className: "graph-found", hidden: true });
   const stage = el("div", { id: id("stage"), className: "graph-stage" });
-  const pane = el("section", { id: id("pane"), className: "graph-pane", hidden: true }, { "aria-label": "Graph view" }, el("div", { className: "graph-head" }, status, form, find, close), legend, found, stage);
+  const pane = el("section", { id: id("pane"), className: "graph-pane", hidden: true }, { "aria-label": "Graph view" }, el("div", { className: "graph-head" }, {}, status, form, find, close), legend, found, stage);
   container.append(pane);
   return { pane, status, form, input, find, close, legend, found, stage };
 }
