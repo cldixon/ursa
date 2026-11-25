@@ -44,7 +44,22 @@ const launched = await chromium.launch(process.env.URSA_SERVE_TOKEN ? { args: ["
 const serveToken = process.env.URSA_SERVE_TOKEN ?? "";
 const overSocket = serveToken !== "";
 const serveCookie = overSocket ? `ursa_token_${new URL(base).port}=${serveToken}` : "";
-const skip = (label: string) => console.log(`skip ${label}: browser-only (the wasm engine)`);
+// The checks a socket run skips, and no others: the suite's end checks that
+// exactly these were skipped, so a check can't quietly drop out of the socket
+// run (CI runs both transports, .github/workflows/shell-e2e.yml).
+const SOCKET_SKIPS = [
+  "an engine crash is reported",
+  "the shell works after an engine crash",
+  "graphMemory: each wasm instance's memory, and the browser's measure of the page",
+  "cross-origin isolation headers on /engine/engine.json",
+  "cross-origin isolation headers on the engine's .wasm",
+  "the worker /engine-worker.js is cross-origin isolated",
+];
+const skipped: string[] = [];
+const skip = (label: string) => {
+  skipped.push(label);
+  console.log(`skip ${label}: browser-only (the wasm engine)`);
+};
 const withToken = async <C extends { addCookies(c: { name: string; value: string; url: string }[]): Promise<void> }>(c: C) => {
   if (overSocket) await c.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: serveToken, url: base }]);
   return c;
@@ -3634,6 +3649,11 @@ for (const path of [
   await ictx.close();
 }
 check(violations.length === 0, "no Content Security Policy violations", violations.slice(0, 3).join(" | "));
+check(
+  overSocket ? skipped.length === SOCKET_SKIPS.length && SOCKET_SKIPS.every((l) => skipped.includes(l)) : skipped.length === 0,
+  overSocket ? `the socket run skipped exactly the ${SOCKET_SKIPS.length} browser-only checks` : "the worker run skipped no check",
+  `skipped: ${JSON.stringify(skipped)}`,
+);
 
 await browser.close();
 console.log(failures.length ? `\n${failures.length} failures:\n- ${failures.join("\n- ")}` : "\nall passed");
