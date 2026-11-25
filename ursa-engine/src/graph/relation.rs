@@ -2664,8 +2664,10 @@ fn explain_field_error(
     };
     let mut nodes = BTreeSet::new();
     let mut edges = BTreeSet::new();
+    let mut path_vars = BTreeSet::new();
     let mut unnamed_edge = false;
     for path in &pattern.paths {
+        path_vars.extend(path.var.clone());
         for element in &path.elements {
             match element {
                 Element::Node(spec) => nodes.extend(spec.var.clone()),
@@ -2678,8 +2680,43 @@ fn explain_field_error(
             }
         }
     }
+    // The properties of `var` that the pattern can read, sorted.
+    let properties_of = |var: &str| -> Vec<&str> {
+        let mut properties: Vec<&str> = base
+            .schema()
+            .iter()
+            .filter(|(q, _)| q.is_some_and(|q| q.table() == var))
+            .map(|(_, f)| f.name().as_str())
+            .collect();
+        properties.sort();
+        properties.dedup();
+        properties
+    };
     let name = field.name();
     let Some(var) = field.relation.as_ref().map(|r| r.table().to_string()) else {
+        // A variable on its own, as `COLUMNS (p)`: it is not a value (#388).
+        if path_vars.contains(name) {
+            return plan(format!(
+                "in GRAPH_TABLE: '{name}' is a path variable, and a path cannot be a column; use path_length({name}), vertices({name}), edges({name}) or element_id({name})"
+            ));
+        }
+        let element = if nodes.contains(name) {
+            Some(("node", "its key"))
+        } else if edges.contains(name) {
+            Some(("edge", "its row in the edge table"))
+        } else {
+            None
+        };
+        if let Some((kind, id)) = element {
+            let example = properties_of(name)
+                .first()
+                .map_or(String::new(), |p| format!(", as {name}.{p}"));
+            return plan(format!(
+                "in GRAPH_TABLE: '{name}' is {} {kind} variable, and {} {kind} cannot be a column; name one of its properties{example}, or use element_id({name}) for {id}",
+                if kind == "edge" { "an" } else { "a" },
+                if kind == "edge" { "an" } else { "a" },
+            ));
+        }
         let mut vars: Vec<&String> = nodes.iter().chain(&edges).collect();
         vars.sort();
         return plan(format!(
@@ -2705,14 +2742,7 @@ fn explain_field_error(
                 .join(", ")
         ));
     };
-    let mut properties: Vec<&str> = base
-        .schema()
-        .iter()
-        .filter(|(q, _)| q.is_some_and(|q| q.table() == var))
-        .map(|(_, f)| f.name().as_str())
-        .collect();
-    properties.sort();
-    properties.dedup();
+    let properties = properties_of(&var);
     let mut message = format!(
         "in GRAPH_TABLE: {kind} '{var}' has no property '{name}'; its properties are {}",
         if properties.is_empty() {

@@ -2,7 +2,7 @@
 
 The same script runs on a laptop, on an EC2 instance and in a Fargate task (see
 README.md). Every step is its own ``ursa`` process, so each step's wall time,
-CPU time and peak RSS are its own. Steps never share a process, but they share
+CPU time and memory are its own. Steps never share a process, but they share
 one ``.ursa`` database, so a step after ``build_*`` loads the stored index the
 way a user's second query would.
 
@@ -20,6 +20,14 @@ With ``--before 2024-01-01`` the graphs are the ones in the round-1 to round-3
 reports (``bsky23`` and ``bsky23e``: 95,744,886 edges), and the ``check``
 steps compare the results with the values those reports cross-checked against
 plain SQL. For other cutoffs the values are recorded but not compared.
+
+Memory is measured two ways. The main figure is the process's own memory,
+without the pages of the memory-mapped stored index (clean file pages, which
+the kernel can drop and read again): on macOS the lifetime peak
+``phys_footprint`` from ``proc_pid_rusage``, on Linux the peak of ``RssAnon +
+RssShmem`` sampled from ``/proc/<pid>/status`` while the step runs. Peak RSS
+(``ru_maxrss`` from ``wait4``) is kept beside it; it also counts the mapped
+index pages a step read, so it overstates what an index-reading step uses.
 
 Output: ``results.json`` (one object per step, with the raw numbers) and
 ``summary.md`` (a table for people and GitHub's job summary) in ``--out``, and
@@ -40,6 +48,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import ctypes
+import ctypes.util
 import io
 import json
 import os
@@ -83,6 +93,8 @@ class Result:
     wall_s: float = 0.0
     user_s: float = 0.0
     sys_s: float = 0.0
+    # The process's own peak memory (see ``Footprint``); None if not measured.
+    peak_footprint_bytes: int | None = None
     peak_rss_bytes: int = 0
     rows: list[list[str]] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
@@ -293,11 +305,180 @@ CREATE PROPERTY GRAPH ge
 """
 
 
+# --- memory -----------------------------------------------------------------
+#
+# ``ru_maxrss`` counts every resident page, including the clean file-backed
+# pages of the memory-mapped stored index (since #382), so a step that reads
+# the whole index looks bigger than it is (#533). The footprint leaves those
+# pages out.
+
+# How often the footprint is sampled while a step runs, in seconds.
+SAMPLE_S = 0.02
+_RUSAGE_INFO_V4 = 4
+
+
+class _RusageInfoV4(ctypes.Structure):
+    """``struct rusage_info_v4`` from macOS ``<sys/resource.h>``.
+
+    Every field is a ``uint64_t`` after the 16-byte UUID, so
+    ``ri_lifetime_max_phys_footprint`` is at byte 240. The tail is padded well
+    past the struct's real size, so the kernel never writes past the buffer.
+    """
+
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        *(
+            (name, ctypes.c_uint64)
+            for name in (
+                "ri_user_time",
+                "ri_system_time",
+                "ri_pkg_idle_wkups",
+                "ri_interrupt_wkups",
+                "ri_pageins",
+                "ri_wired_size",
+                "ri_resident_size",
+                "ri_phys_footprint",
+                "ri_proc_start_abstime",
+                "ri_proc_exit_abstime",
+                "ri_child_user_time",
+                "ri_child_system_time",
+                "ri_child_pkg_idle_wkups",
+                "ri_child_interrupt_wkups",
+                "ri_child_pageins",
+                "ri_child_elapsed_abstime",
+                "ri_diskio_bytesread",
+                "ri_diskio_byteswritten",
+                "ri_cpu_time_qos_default",
+                "ri_cpu_time_qos_maintenance",
+                "ri_cpu_time_qos_background",
+                "ri_cpu_time_qos_utility",
+                "ri_cpu_time_qos_legacy",
+                "ri_cpu_time_qos_user_initiated",
+                "ri_cpu_time_qos_user_interactive",
+                "ri_billed_system_time",
+                "ri_serviced_system_time",
+                "ri_logical_writes",
+                "ri_lifetime_max_phys_footprint",
+                "ri_instructions",
+                "ri_cycles",
+                "ri_billed_energy",
+                "ri_serviced_energy",
+                "ri_interval_max_phys_footprint",
+                "ri_runnable_time",
+            )
+        ),
+        ("ri_reserved", ctypes.c_uint64 * 64),
+    ]
+
+
+assert _RusageInfoV4.ri_lifetime_max_phys_footprint.offset == 240
+
+_proc_pid_rusage = None  # loaded on first use, macOS only; False if unavailable
+
+
+def _macos_footprint(pid: int) -> int | None:
+    """The lifetime peak ``phys_footprint`` of ``pid`` (alive, or exited and not
+    yet reaped), or None if it can't be read."""
+    global _proc_pid_rusage
+    if _proc_pid_rusage is None:
+        _proc_pid_rusage = False
+        for lib in ("/usr/lib/libproc.dylib", ctypes.util.find_library("System"), None):
+            try:
+                fn = ctypes.CDLL(lib, use_errno=True).proc_pid_rusage
+            except (OSError, AttributeError):
+                continue
+            fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+            _proc_pid_rusage = fn
+            break
+    if not _proc_pid_rusage:
+        return None
+    info = _RusageInfoV4()
+    try:
+        if _proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0:
+            return None
+    except (OSError, ctypes.ArgumentError):
+        return None
+    return info.ri_lifetime_max_phys_footprint or None
+
+
+def _linux_footprint(pid: int) -> int | None:
+    """``RssAnon + RssShmem`` of ``pid`` now, in bytes: its resident memory
+    without file pages. (``VmHWM`` would count file pages.)"""
+    total, seen = 0, False
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith(("RssAnon:", "RssShmem:")):
+                    total += int(line.split()[1]) * 1024  # kB
+                    seen = True
+    except (OSError, ValueError, IndexError):
+        return None
+    return total if seen else None  # an exited process has no Rss lines
+
+
+class Footprint:
+    """The peak footprint of one child process, from repeated ``sample()`` calls.
+
+    macOS keeps the lifetime peak itself, so a sample after the step's work
+    (the last one is taken after exit, before reaping) gives it exactly. Linux
+    has no such counter for anonymous memory, so the peak is the largest sample
+    and can miss a spike shorter than ``SAMPLE_S``.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.peak: int | None = None
+        if sys.platform == "darwin":
+            self._read = _macos_footprint
+        elif sys.platform.startswith("linux"):
+            self._read = _linux_footprint
+        else:
+            self._read = lambda _pid: None
+
+    def sample(self) -> None:
+        try:
+            v = self._read(self.pid)
+        except Exception:  # a measurement never ends the run
+            v = None
+        if v is not None and (self.peak is None or v > self.peak):
+            self.peak = v
+
+
+def memory_measure() -> str:
+    """What ``peak_footprint_bytes`` means on this host, for ``results.json``."""
+    if sys.platform == "darwin":
+        return "phys_footprint: proc_pid_rusage RUSAGE_INFO_V4 ri_lifetime_max_phys_footprint"
+    if sys.platform.startswith("linux"):
+        return f"peak RssAnon+RssShmem from /proc/<pid>/status, sampled every {SAMPLE_S}s"
+    return "not measured on this platform"
+
+
+def _wait_done(pid: int, fp: Footprint):
+    """``os.wait4``'s result if the child has exited, else None.
+
+    Where ``waitid(WNOWAIT)`` is available, an exited child is sampled once more
+    before ``wait4`` reaps it (macOS answers ``proc_pid_rusage`` for a zombie).
+    """
+    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+        try:
+            done = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except OSError:
+            done = True  # let wait4 below say what happened
+        if done is None:
+            return None
+        fp.sample()
+        return os.wait4(pid, 0)
+    res = os.wait4(pid, os.WNOHANG)
+    return res if res[0] else None
+
+
 def run_ursa(ursa: str, db: Path, sql: str, timeout: float) -> tuple[Result, str]:
     """Run one ``ursa`` process; return its measurements and its stdout.
 
     The child is reaped here with ``os.wait4``, so its rusage (CPU time and
     peak RSS) is its own, not the running maximum ``RUSAGE_CHILDREN`` keeps.
+    Its footprint is sampled while it runs (see ``Footprint``).
     """
     cmd = [ursa, str(db), "--format", "csv", "--no-init", "-c", sql]
     t0 = time.monotonic()
@@ -317,16 +498,20 @@ def run_ursa(ursa: str, db: Path, sql: str, timeout: float) -> tuple[Result, str
     for t in readers:
         t.start()
     status = "ok"
+    fp = Footprint(proc.pid)
     while True:
-        pid, wstatus, ru = os.wait4(proc.pid, os.WNOHANG)
-        if pid:
+        fp.sample()
+        done = _wait_done(proc.pid, fp)
+        if done:
+            _, wstatus, ru = done
             break
         if time.monotonic() - t0 > timeout:
+            fp.sample()
             os.killpg(proc.pid, signal.SIGKILL)
-            pid, wstatus, ru = os.wait4(proc.pid, 0)
+            _, wstatus, ru = os.wait4(proc.pid, 0)
             status = "timeout"
             break
-        time.sleep(0.05)
+        time.sleep(SAMPLE_S)
     wall = time.monotonic() - t0
     proc.returncode = os.waitstatus_to_exitcode(wstatus)  # keep Popen from waiting again
     for t in readers:
@@ -341,6 +526,7 @@ def run_ursa(ursa: str, db: Path, sql: str, timeout: float) -> tuple[Result, str
         wall_s=round(wall, 3),
         user_s=round(ru.ru_utime, 3),
         sys_s=round(ru.ru_stime, 3),
+        peak_footprint_bytes=fp.peak,
         peak_rss_bytes=_maxrss_bytes(ru.ru_maxrss),
     )
     errtext = b"".join(chunks["err"]).decode("utf-8", "replace")
@@ -505,13 +691,22 @@ def _ec2_identity() -> dict:
 # --- report -----------------------------------------------------------------
 
 
-def gb(b: int) -> str:
+def gb(b: int | None) -> str:
     return f"{b / 1e9:.2f}" if b else ""
 
 
 def _host_name(host: dict) -> str:
     ec2 = (host.get("ec2") or {}).get("instance_type")
     return host.get("label") or (f"EC2 {ec2}" if ec2 else host["platform"])
+
+
+def memory_footnote() -> str:
+    if sys.platform == "darwin":
+        return "the lifetime peak `phys_footprint` (`proc_pid_rusage`)."
+    return (
+        "the peak of `RssAnon + RssShmem`, sampled from `/proc/<pid>/status` "
+        f"every {SAMPLE_S * 1000:.0f} ms."
+    )
 
 
 def summary_md(meta: dict, results: list[Result]) -> str:
@@ -524,8 +719,8 @@ def summary_md(meta: dict, results: list[Result]) -> str:
         f"{meta['host']['cpus']} CPUs, {gb(meta['host'].get('mem_bytes', 0))} GB",
         f"- Download: {meta['download_s']:.1f} s; total: {meta['total_s']:.1f} s",
         "",
-        "| Step | Status | Wall s | User s | Peak RSS GB* | Result | Check |",
-        "|---|---|---:|---:|---:|---|---|",
+        "| Step | Status | Wall s | User s | Memory GB* | Peak RSS GB* | Result | Check |",
+        "|---|---|---:|---:|---:|---:|---|---|",
     ]
     for r in results:
         res = " ".join(r.rows[0]) if r.rows else ""
@@ -536,7 +731,7 @@ def summary_md(meta: dict, results: list[Result]) -> str:
         )
         lines.append(
             f"| {r.name} | {r.status} | {r.wall_s:.2f} | {r.user_s:.2f} | "
-            f"{gb(r.peak_rss_bytes)} | {res} | {check} |"
+            f"{gb(r.peak_footprint_bytes)} | {gb(r.peak_rss_bytes)} | {res} | {check} |"
         )
     notices = [(r.name, n) for r in results for n in r.notices]
     if notices:
@@ -548,8 +743,12 @@ def summary_md(meta: dict, results: list[Result]) -> str:
         lines += ["", f"### {r.name}: {r.status}", "", "```", r.error, "```"]
     lines += [
         "",
-        "\\* Each step's own `ursa` process (`wait4`). On Linux this is close to the "
-        "process's real peak; on macOS RSS overstates it (use `phys_footprint` there).",
+        "\\* Each step's own `ursa` process. **Memory** is the process's own memory, "
+        "without the pages of the memory-mapped stored index (clean file pages the kernel "
+        "can drop and read again): " + memory_footnote() + " **Peak RSS** is `ru_maxrss` "
+        "from `wait4`; it also counts file pages (the binary, and the mapped index pages "
+        "a step read), so it overstates what an index-reading step uses. "
+        "Empty when not measured.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -635,7 +834,8 @@ def main() -> int:
         results.append(r)
         flag = {"pass": " check pass", "fail": " CHECK FAIL"}.get(r.check, "")
         print(
-            f"{r.name:22} {r.status:8} {r.wall_s:9.2f}s  {gb(r.peak_rss_bytes):>6} GB"
+            f"{r.name:22} {r.status:8} {r.wall_s:9.2f}s  {gb(r.peak_footprint_bytes):>6} GB"
+            f" (RSS {gb(r.peak_rss_bytes):>6} GB)"
             f"  {' '.join(r.rows[0]) if r.rows else ''}{flag}",
             flush=True,
         )
@@ -651,6 +851,7 @@ def main() -> int:
         "before": a.before or "",
         "vertex": a.vertex,
         "host": host_info(),
+        "memory_measure": memory_measure(),
         "download_s": round(download_s, 3),
         "total_s": round(time.monotonic() - t_start, 3),
         "stored_index_bytes": sum(f.stat().st_size for f in idx.glob("*.idx"))

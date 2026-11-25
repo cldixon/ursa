@@ -233,6 +233,56 @@ impl ConfigField for ByteSize {
     }
 }
 
+/// A limit `SET` as a whole number, 0 for no limit (`ursa.max_paths`,
+/// `ursa.graph_max_edges`): `name` is the setting, for the message when
+/// `text` is not one, in the style of the other settings' messages (rather
+/// than DataFusion's "Error parsing '-5' as usize").
+pub fn parse_limit(name: &str, text: &str) -> Result<usize> {
+    text.trim().parse::<usize>().map_err(|_| {
+        DataFusionError::Configuration(format!(
+            "{name} must be a non-negative integer (0 for no limit); got {text}"
+        ))
+    })
+}
+
+/// A setting that is a limit: a whole number, 0 for no limit, parsed with
+/// [`parse_limit`] so a bad value names the setting.
+macro_rules! limit_setting {
+    ($(#[$doc:meta])* $ty:ident, $name:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $ty(pub usize);
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl ConfigField for $ty {
+            fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+                v.some(key, self, description)
+            }
+
+            fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+                self.0 = parse_limit($name, value)?;
+                Ok(())
+            }
+        }
+    };
+}
+
+limit_setting!(
+    /// `ursa.max_paths`: the most paths one path search holds.
+    MaxPaths,
+    "ursa.max_paths"
+);
+limit_setting!(
+    /// `ursa.graph_max_edges`: the most edges the graph view draws.
+    GraphMaxEdges,
+    "ursa.graph_max_edges"
+);
+
 /// Which notices a session prints (`ursa.notices`): one line each, to the
 /// sink the host installed (`crate::notices`; the CLI's is stderr).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -301,7 +351,7 @@ extensions_options! {
         /// k) it counts the paths kept, never fewer than one (k) per node of
         /// the graph; otherwise the paths and prefixes held. Default
         /// 10000000.
-        pub max_paths: usize, default = crate::graph::path_search::MAX_PATHS
+        pub max_paths: MaxPaths, default = MaxPaths(crate::graph::path_search::MAX_PATHS)
         /// The most bytes of decoded rows an index build reads ahead of the
         /// rows it is interning, so the partitions of its edge and vertex
         /// tables decode in parallel.
@@ -313,7 +363,7 @@ extensions_options! {
         /// graph with more is refused, with a message that names this
         /// setting. 0 for no limit. Default 5000000, which a desktop
         /// browser draws; the web shell sets 500000 on a phone.
-        pub graph_max_edges: usize, default = crate::graph::view::MAX_EDGES
+        pub graph_max_edges: GraphMaxEdges, default = GraphMaxEdges(crate::graph::view::MAX_EDGES)
     }
 }
 
@@ -347,7 +397,7 @@ pub fn max_paths(config: &SessionConfig) -> Option<usize> {
         .options()
         .extensions
         .get::<UrsaOptions>()
-        .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths);
+        .map_or(crate::graph::path_search::MAX_PATHS, |o| o.max_paths.0);
     (n > 0).then_some(n)
 }
 
@@ -358,7 +408,7 @@ pub fn graph_max_edges(config: &SessionConfig) -> usize {
         .options()
         .extensions
         .get::<UrsaOptions>()
-        .map_or(crate::graph::view::MAX_EDGES, |o| o.graph_max_edges);
+        .map_or(crate::graph::view::MAX_EDGES, |o| o.graph_max_edges.0);
     if n == 0 {
         usize::MAX
     } else {
@@ -390,6 +440,21 @@ pub fn index_storage_limit_set(config: &SessionConfig) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_parse_or_name_their_setting() {
+        assert_eq!(parse_limit("ursa.max_paths", "1000").unwrap(), 1000);
+        assert_eq!(parse_limit("ursa.max_paths", " 0 ").unwrap(), 0);
+        for bad in ["-5", "lots", "1.5", ""] {
+            let e = parse_limit("ursa.max_paths", bad).unwrap_err().to_string();
+            assert!(
+                e.ends_with(&format!(
+                    "ursa.max_paths must be a non-negative integer (0 for no limit); got {bad}"
+                )),
+                "{e}"
+            );
+        }
+    }
 
     #[test]
     fn sizes_parse_and_print() {

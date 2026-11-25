@@ -155,6 +155,91 @@ fn empty_results_keep_their_header() {
     );
 }
 
+/// A statement that fails writes nothing to stdout, not even its header, in
+/// any format: the header waits for the first row, or for the end of a
+/// result with none (#388). A script sees the error and exit status 1, never
+/// a header with no rows.
+#[test]
+fn a_failing_query_prints_no_header() {
+    // Planned, then fails as it runs: a division by zero over a file's rows.
+    let sql = format!(
+        "SELECT count(*) AS n, sum(1 / (src - src)) AS s FROM '{}'",
+        karate_edges()
+    );
+    for format in [
+        "csv", "tsv", "json", "ndjson", "markdown", "line", "arrow", "table",
+    ] {
+        let out = ursa(&["--format", format, "-c", &sql]);
+        assert!(!out.status.success(), "{format}");
+        assert!(
+            out.stdout.is_empty(),
+            "{format}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let message = String::from_utf8(out.stderr).unwrap();
+        assert!(message.contains("Divide by zero"), "{format}: {message}");
+    }
+    // The statements before it keep their output, as they did.
+    let out = ursa(&["--format", "csv", "-c", "SELECT 1 AS a", "-c", &sql]);
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "a\n1\n");
+}
+
+/// An empty result that succeeds still writes its header, in every format
+/// that has one.
+#[test]
+fn an_empty_result_still_prints_its_header() {
+    let sql = format!("SELECT src, dst FROM '{}' WHERE src < 0", karate_edges());
+    for (format, expected) in [
+        ("csv", "src,dst\n"),
+        ("tsv", "src\tdst\n"),
+        ("json", "[]\n"),
+        ("ndjson", ""),
+        ("markdown", "| src | dst |\n|----:|----:|\n"),
+    ] {
+        assert_eq!(
+            ok(ursa(&["--format", format, "-c", &sql])),
+            expected,
+            "{format}"
+        );
+    }
+    let arrow = ursa(&["--format", "arrow", "-c", &sql]);
+    assert!(arrow.status.success());
+    assert_eq!(&arrow.stdout[..4], &[0xff, 0xff, 0xff, 0xff]);
+}
+
+/// `SET ursa.max_paths` with a bad value says what it takes; one below the
+/// node count of an ANY SHORTEST search is a notice on stderr, and the rows
+/// are the same (#388).
+#[test]
+fn max_paths_bad_values_and_the_floor_notice() {
+    let e = err(ursa(&["-c", "SET ursa.max_paths = -5"]));
+    assert_eq!(
+        e,
+        "Error: ursa.max_paths must be a non-negative integer (0 for no limit); got -5\n"
+    );
+    let e = err(ursa(&["-c", "SET ursa.max_paths = 'lots'"]));
+    assert!(e.contains("got lots"), "{e}");
+    let sql = format!(
+        "CREATE VIEW ties AS FROM '{}';
+         CREATE PROPERTY GRAPH g EDGE TABLES (ties SOURCE KEY (src) DESTINATION KEY (dst));
+         SET ursa.max_paths = 10;
+         SELECT count(*) AS n FROM GRAPH_TABLE (g
+           MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->*(b) COLUMNS (b.id AS b))",
+        karate_edges()
+    );
+    let out = ursa(&["--format", "csv", "-c", &sql]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "n\n24\n");
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "ursa: ursa.max_paths 10 is below the node count; ANY SHORTEST keeps up to 34 paths\n"
+    );
+    let quiet = ursa(&["--quiet", "--format", "csv", "-c", &sql]);
+    assert_eq!(String::from_utf8(quiet.stdout).unwrap(), "n\n24\n");
+    assert!(quiet.stderr.is_empty());
+}
+
 #[test]
 fn several_statements_print_each_result() {
     let sql = format!(

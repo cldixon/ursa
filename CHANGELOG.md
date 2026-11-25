@@ -1012,6 +1012,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Benchmarks: memory is the process's footprint, with peak RSS beside it**
+  (#533). `benchmarks/bluesky_cloud/run.py` recorded each step's peak
+  memory as `ru_maxrss`, which since #382 counts the pages of the
+  memory-mapped stored index a step reads, so round 5 (#388) flagged
+  PageRank and the components as memory regressions when they use less. The
+  main figure (`peak_footprint_bytes`, the **Memory** column of
+  `summary.md`) is now the process's own memory without those clean file
+  pages: on macOS the lifetime peak `phys_footprint` (`proc_pid_rusage`,
+  `RUSAGE_INFO_V4`, read before the child is reaped), on Linux the peak of
+  `RssAnon + RssShmem` sampled from `/proc/<pid>/status` every 20 ms.
+  `peak_rss_bytes` stays as a second column, and `meta.memory_measure`
+  says how the footprint was taken. `benchmarks/sql_scale` records both the
+  same way (`peak_mem_mb`, `peak_rss_mb`), and its `--mem-limit-gb` applies
+  to the footprint. Still standard library only.
+
 - **The graph view's inspector shows an edge's row in 20 to 40 ms on a
   million edges, not 90 to 160** (#489). An edge's rows were found by a
   scan of the edge table for its two ends. They are now found through the
@@ -1778,6 +1793,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- **SQL: a query that fails writes nothing to stdout, not even its header**
+  (#388). `ursa --format csv -c "SELECT count(*) …"` wrote the header
+  (`count(*)`), then the error, and exited 1, so a script read a header
+  with no rows. Every output format now waits for the first row, or for the
+  end of a result with none, before it writes anything; an empty result
+  that succeeds still writes its header, as before and as in DuckDB. (Rows
+  are written as they arrive, so a query that fails after its first rows
+  were written has written them.)
+- **SQL: `COLUMNS (p)` says a path cannot be a column** (#388). A path
+  variable alone in `COLUMNS` said `'p' needs its variable, as a.p`. It now
+  says `'p' is a path variable, and a path cannot be a column; use
+  path_length(p), vertices(p), edges(p) or element_id(p)`. A node or edge
+  variable alone says the same of a node or an edge, and names one of its
+  properties and `element_id`.
+- **SQL: `SET ursa.max_paths` with a bad value says what it takes** (#388).
+  `SET ursa.max_paths = -5` (or `'lots'`) printed `Error parsing '-5' as
+  usize: invalid digit found in string`; it now says `ursa.max_paths must
+  be a non-negative integer (0 for no limit); got -5`, as the other
+  settings name theirs. `ursa.graph_max_edges` too. And a `ursa.max_paths`
+  below the floor an `ANY SHORTEST` search keeps to (one path per node of
+  the graph; `k` per node for `SHORTEST k`) is said in a notice on stderr,
+  `ursa: ursa.max_paths 1000 is below the node count; ANY SHORTEST keeps up
+  to 39650447 paths`, where it was silent. Results are unchanged.
 
 - **Making the graph view of a large graph no longer holds the page for
   over 60 ms** (#520). On `.graph rmat` in the Web Shell

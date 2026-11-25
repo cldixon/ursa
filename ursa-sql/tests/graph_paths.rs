@@ -4,6 +4,7 @@
 //! the karate club, checked against `hop` and `shortest_path`.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -458,6 +459,89 @@ async fn max_paths_limits_a_search_with_the_right_remedy() {
         rows(&ctx, "SHOW ursa.max_paths").await,
         ["ursa.max_paths|10000000"]
     );
+}
+
+/// A bad `ursa.max_paths` names the setting and what it takes, in the style
+/// of the other settings, not DataFusion's "Error parsing '-5' as usize"
+/// (#388); `ursa.graph_max_edges` too.
+#[tokio::test]
+async fn a_bad_limit_names_its_setting() {
+    let ctx = ursa_engine::new_session();
+    for (setting, value, shown) in [
+        ("max_paths", "-5", "-5"),
+        ("max_paths", "'lots'", "lots"),
+        ("max_paths", "1.5", "1.5"),
+        ("graph_max_edges", "-1", "-1"),
+    ] {
+        let message = err(&ctx, &format!("SET ursa.{setting} = {value}")).await;
+        assert_contains(
+            &message,
+            &format!("ursa.{setting} must be a non-negative integer (0 for no limit); got {shown}"),
+        );
+        assert!(!message.contains("usize"), "{message}");
+    }
+    // Nothing changed, and good values still work.
+    assert_eq!(
+        rows(&ctx, "SHOW ursa.max_paths").await,
+        ["ursa.max_paths|10000000"]
+    );
+    ok(&ctx, "SET ursa.max_paths = '1000'").await;
+    assert_eq!(
+        rows(&ctx, "SHOW ursa.max_paths").await,
+        ["ursa.max_paths|1000"]
+    );
+}
+
+/// `ursa.max_paths` below the floor of an ANY SHORTEST (or SHORTEST k)
+/// search, one path (k) per node, says that the floor is used; the rows are
+/// the same (#388).
+#[tokio::test]
+async fn a_limit_below_the_floor_says_so() {
+    let ctx = complete().await;
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = {
+        let said = Arc::clone(&said);
+        Arc::new(move |line: &str| said.lock().unwrap().push(line.to_string()))
+    };
+    ursa_engine::notices::set_sink(&ctx.state(), Some(sink));
+    let taken = || std::mem::take(&mut *said.lock().unwrap());
+    const ANY: &str = "SELECT count(*) FROM GRAPH_TABLE (g
+        MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[e]->{1,2}(b) COLUMNS (b.id AS b))";
+    const TWO: &str = "SELECT count(*) FROM GRAPH_TABLE (g
+        MATCH p = SHORTEST 2 (a WHERE a.id = 0)-[e]->{1,2}(b) COLUMNS (b.id AS b))";
+    let (any, two) = (rows(&ctx, ANY).await, rows(&ctx, TWO).await);
+    assert_eq!(taken(), Vec::<String>::new());
+
+    ok(&ctx, "SET ursa.max_paths = 10").await;
+    assert_eq!(rows(&ctx, ANY).await, any);
+    assert_eq!(
+        taken(),
+        ["ursa.max_paths 10 is below the node count; ANY SHORTEST keeps up to 50 paths"]
+    );
+    assert_eq!(rows(&ctx, TWO).await, two);
+    assert_eq!(
+        taken(),
+        ["ursa.max_paths 10 is below 2 times the node count; SHORTEST 2 keeps up to 100 paths"]
+    );
+
+    // At or above the floor, or no limit, or a search with no floor: nothing.
+    for limit in ["100", "0"] {
+        ok(&ctx, &format!("SET ursa.max_paths = {limit}")).await;
+        rows(&ctx, ANY).await;
+        rows(&ctx, TWO).await;
+        assert_eq!(taken(), Vec::<String>::new(), "{limit}");
+    }
+    ok(&ctx, "SET ursa.max_paths = 10").await;
+    err(
+        &ctx,
+        "SELECT count(*) FROM GRAPH_TABLE (g MATCH (a)-[e]->{1,2}(b) COLUMNS (b.id AS b))",
+    )
+    .await;
+    assert_eq!(taken(), Vec::<String>::new());
+    // `ursa.notices = 'off'` silences it.
+    ok(&ctx, "SET ursa.notices = 'off'").await;
+    rows(&ctx, ANY).await;
+    assert_eq!(taken(), Vec::<String>::new());
 }
 
 /// N50's repro: ANY SHORTEST from one node reaches 12,004,000 nodes within

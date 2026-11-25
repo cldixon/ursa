@@ -83,7 +83,8 @@
 //!   by the graph's nodes. It counts the paths it keeps (for `ANY SHORTEST`,
 //!   one per pair of first and last node: the destinations), never fewer
 //!   than `k` per node of the graph, so one start is never refused what
-//!   `hop` would list.
+//!   `hop` would list. When that floor is above `ursa.max_paths`, the
+//!   search says so in a notice ([`floor_notice`]).
 //! - Every other search counts the prefixes it holds and the paths it keeps:
 //!   a walk's prefixes can grow exponentially with its length.
 
@@ -1339,6 +1340,44 @@ impl Tally {
     }
 }
 
+/// Whether `search` is pruned: it keeps a bounded number of prefixes per
+/// state (see the module docs).
+fn is_pruned(search: &Search) -> bool {
+    search.mode == Mode::Walk
+        || (matches!(
+            search.selector,
+            Selector::Shortest(1) | Selector::AllShortest
+        ) && search.quantifier.min <= 1
+            && !(search.mode == Mode::Trail && search.direction == Direction::Any))
+}
+
+/// The notice that `ursa.max_paths` (`max_paths`) is below the floor an
+/// `ANY SHORTEST` or `SHORTEST k` search keeps to, `k` paths per node of a
+/// graph of `n_nodes` (see the module docs), so the search uses the floor
+/// instead; `None` when the setting applies as it is. It changes no result.
+pub fn floor_notice(search: &Search, n_nodes: usize, max_paths: Option<usize>) -> Option<String> {
+    let (Some(cap), Selector::Shortest(k)) = (max_paths, search.selector) else {
+        return None;
+    };
+    let floor = n_nodes.saturating_mul(k as usize);
+    if !is_pruned(search) || cap >= floor {
+        return None;
+    }
+    let selector = if k == 1 {
+        "ANY SHORTEST".to_string()
+    } else {
+        format!("SHORTEST {k}")
+    };
+    let count = if k == 1 {
+        "the node count".to_string()
+    } else {
+        format!("{k} times the node count")
+    };
+    Some(format!(
+        "ursa.max_paths {cap} is below {count}; {selector} keeps up to {floor} paths"
+    ))
+}
+
 /// Run `search` from each of `starts` (keys of the graph's id type, each
 /// once) on the index `topology`/`ids`; the rows of [`schema`], and how many
 /// path prefixes the search extended. `edge_row` gives the edge table's row
@@ -1372,12 +1411,7 @@ pub fn run(
     let mut rows = Rows::new(ids, starts, columns, schema);
     let Quantifier { min, .. } = search.quantifier;
     let restricted = search.mode != Mode::Walk;
-    let pruned = !restricted
-        || (matches!(
-            search.selector,
-            Selector::Shortest(1) | Selector::AllShortest
-        ) && min <= 1
-            && !(search.mode == Mode::Trail && search.direction == Direction::Any));
+    let pruned = is_pruned(search);
     // At most `k` prefixes per state: memory bounded by the nodes, and at
     // most `k` paths per node from one start.
     let bounded = pruned && matches!(search.selector, Selector::Shortest(_));

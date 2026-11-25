@@ -41,7 +41,7 @@ The timer reports, as DuckDB's does, the wall-clock time (`real`) and the CPU ti
 
 `.read FILE` in a script runs another script. In a script, `.quit` and `.exit` end the run there, with status 0. An unknown dot-command is an error, as a failing statement is. With `--format arrow`, the output is one Arrow stream: text a dot-command prints, such as the timer's, goes to stderr instead.
 
-Statements that return rows always print a result, with its header even when there are no rows. Statements that return no columns, which are DDL (`CREATE`, `DROP`) and `SET`, print nothing, as in DuckDB. In `ndjson`, which has no header, a result with no rows prints nothing.
+Statements that return rows always print a result, with its header even when there are no rows. Statements that return no columns, which are DDL (`CREATE`, `DROP`) and `SET`, print nothing, as in DuckDB. In `ndjson`, which has no header, a result with no rows prints nothing. A statement that fails prints nothing to stdout, not even its header, so a script never reads a header with no rows for a query that failed; the error goes to stderr. (Rows are written as they arrive, so a query that fails after its first rows have been written has written them.)
 
 Add `--readonly` to open a database without changing it. See [the database file](/docs/database/database-file/#read-only-and-sharing).
 
