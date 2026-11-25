@@ -15,8 +15,11 @@
 //! writers DataFusion's sinks use (configured from the statement's options
 //! the same way) and puts the bytes in the store, all in the task that asked.
 //!
-//! A session without the store (every native one) is untouched: its `COPY`
-//! is DataFusion's.
+//! A native session can have the store for the files a page adds and still
+//! write `COPY … TO` to disk ([`set_copy_to_disk`]), as `ursa serve` does:
+//! its `COPY` is DataFusion's, under the session's root if it has one
+//! (`crate::paths::write_target`). A native session without the store (the
+//! CLI) is untouched: its `COPY` is DataFusion's.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,13 +42,14 @@ use datafusion::datasource::file_format::write::BatchSerializer;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::source_as_provider;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::CopyTo;
 use datafusion::logical_expr::{LogicalPlan, WriteOp};
 use datafusion::parquet::arrow::arrow_writer::ArrowWriterOptions;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::file::properties::WriterPropertiesBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -64,9 +68,31 @@ pub fn store(runtime: &RuntimeEnv) -> Option<Arc<dyn ObjectStore>> {
 }
 
 /// Whether `COPY … TO` in this session is [`copy_to`]'s: a session with
-/// files, and any session in the browser, where DataFusion's cannot run.
-pub fn takes_copy(runtime: &RuntimeEnv) -> bool {
-    cfg!(target_arch = "wasm32") || store(runtime).is_some()
+/// files that does not write its copies to disk ([`set_copy_to_disk`]), and
+/// any session in the browser, where DataFusion's cannot run.
+pub fn takes_copy(state: &SessionState) -> bool {
+    cfg!(target_arch = "wasm32")
+        || (store(state.runtime_env()).is_some() && !copies_to_disk(state.config()))
+}
+
+/// Whether a session's `COPY … TO` writes to disk though it has files.
+#[derive(Debug)]
+struct CopyToDisk(bool);
+
+/// Make `COPY … TO` in the session `ctx` write to disk (`true`), as
+/// DataFusion's does, though the session has files in memory for the ones a
+/// page adds; or keep its copies with those files (`false`, the default).
+/// The browser has no disk: there `COPY` always keeps the file in memory.
+pub fn set_copy_to_disk(ctx: &SessionContext, on: bool) {
+    let state = ctx.state_ref();
+    let mut state = state.write();
+    state.config_mut().set_extension(Arc::new(CopyToDisk(on)));
+}
+
+/// Whether the session with `config` writes `COPY … TO` to disk though it
+/// has files ([`set_copy_to_disk`]).
+pub fn copies_to_disk(config: &SessionConfig) -> bool {
+    config.get_extension::<CopyToDisk>().is_some_and(|on| on.0)
 }
 
 /// Whether `name` is one a session file is kept under: ASCII letters, digits,

@@ -195,14 +195,15 @@ Part kinds:
 |---|---|---|
 | `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, metadata, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
 | `fetch` | `result`, `offset`, `rows` | `{rows, more}`; `arrow` |
-| `export` | `result`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes` |
+| `export` | `result?`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes`; without `result`, the last result |
 | `close` | `result` | `{}` |
 | `explain` | `sql` | `{plan}`: the plan as text |
 | `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
 - `columns` gives each column's `{name, type, nullable, metadata}`; `metadata` is the schema's own, where `ursa.pattern` sits for a `GRAPH_TABLE` result.
-- `result` is an id such as `"r4"`. The session keeps a client's last 16 results, and drops the oldest beyond 256 MB.
+- `result` is an id such as `"r4"` (`null` for a statement with no columns). The session keeps its last 16 results, within 256 MB, and drops the oldest first. A result over 256 MB on its own keeps only the rows `query` sent: `fetch` past them, `export` and `graph.open` of it fail with `not_found` and say to run the query again (the spike's measure: rmat's whole edge table is 16 MB, PageRank's result 0.7 MB). `close` of a result that has gone is `not_found` too.
+- `query` collects every row before it replies, as its reply gives the whole result's count and the shell's last result holds every row. Sending the first rows sooner needs `rows` to come later (an event, or `fetch`'s `more`): C2.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
 
@@ -278,7 +279,7 @@ The `graph` and `activity` events matter once a second client is attached. With 
 ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 ```
 
-- **The argument** is a database file, opened as the CLI opens one, or a directory. Relative paths in queries resolve against it, and the sources panel starts there. With no argument, it is an in-memory session rooted at the current directory.
+- **The argument** is a database file, opened as the CLI opens one, or a directory. Relative paths in queries resolve against it, and the sources panel starts there. With no argument, it is an in-memory session rooted at the current directory. The session's root is the directory (a database file's own directory), set with `ursa_shell::session::Options::root`, not by changing the process's working directory. A rooted session reads any file, as the CLI does, but writes only under its root: `COPY … TO` (to disk, `Options::copy_to_disk`), `.output` and `.once` take a relative path with no `..` and no symbolic link out of the root, and `INSERT INTO` a table of files must be into files under it (`ursa_engine::paths`). `memory://uploads` holds only the files a page adds.
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
 - **The pages:** the console at `/console/`, which the printed link opens, and the web shell at `/`, where the demo's addresses and share links have it. *(Decided in URSA-12: the console as the index would have moved the shell, its share links and its e2e suite; a path of its own moves nothing.)*
@@ -348,7 +349,7 @@ Removing it sooner would lose the only place the graph view is deployed and test
 | source | browser demo | `ursa serve` |
 |---|---|---|
 | Sample datasets | R2 over HTTP | the same URLs, or local copies |
-| Local files | uploads into `memory://uploads` | the disk, by path |
+| Local files | uploads into `memory://uploads` | the disk, by path; `COPY … TO` writes under the root |
 | `s3://` (and R2), `gs://`, `az://` | no (no wasm backend, #278) | yes: `object_store` with the CLI's credential chain |
 | Ursa database files | uploads | open or `ATTACH` by path |
 | Postgres and other databases | no | later: a connector, credentials in a local config file |

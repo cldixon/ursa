@@ -143,9 +143,13 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
             // its store registered before DataFusion plans the write or read.
             // In a session that keeps its files in memory (the browser), a
             // COPY writes one of those (#517).
-            if ursa_engine::session_files::takes_copy(state.runtime_env()) {
+            let in_memory = ursa_engine::session_files::takes_copy(&state);
+            if in_memory {
                 session_copy_target(state.runtime_env(), &mut statement)?;
             }
+            // Relative paths in a COPY target or an external table's
+            // location, against the session's root.
+            rooted_locations(state.config(), &mut statement, !in_memory)?;
             match statement.as_ref() {
                 DFStatement::CopyTo(copy) => {
                     ursa_engine::ensure_object_store_for(state.runtime_env(), &copy.target).await?
@@ -221,13 +225,98 @@ async fn plan_and_run(ctx: &SessionContext, statement: DFStatement) -> Result<Da
     ursa_engine::graph::check_ddl(&state, &plan).await?;
     // A session that keeps its files in memory (the browser) writes them
     // itself, and cannot run DataFusion's file sinks (#517).
-    if ursa_engine::session_files::takes_copy(state.runtime_env()) {
+    if ursa_engine::session_files::takes_copy(&state) {
         if let datafusion::logical_expr::LogicalPlan::Copy(copy) = &plan {
             return ursa_engine::session_files::copy_to(ctx, copy).await;
         }
         ursa_engine::session_files::check_insert(&plan)?;
+    } else {
+        // A session with a root inserts only into files under it.
+        check_inserts(state.config(), &plan)?;
     }
     ctx.execute_logical_plan(plan).await
+}
+
+/// Resolve the relative paths DataFusion would read against the working
+/// directory: an external table's `LOCATION`s, against the session's root
+/// ([`ursa_engine::paths::resolve`]), and a `COPY … TO` target (or the one an
+/// `EXPLAIN` explains), which in a session with a directory root must be
+/// under it ([`ursa_engine::paths::write_target`]). A session without a root
+/// is left as it is. `copies_to_disk` is false in a session that keeps its
+/// copies in memory, whose target [`session_copy_target`] has already made a
+/// session file's URL.
+fn rooted_locations(
+    config: &datafusion::prelude::SessionConfig,
+    statement: &mut DFStatement,
+    copies_to_disk: bool,
+) -> Result<()> {
+    if ursa_engine::paths::root(config).is_none() {
+        return Ok(());
+    }
+    match statement {
+        DFStatement::CopyTo(copy) if copies_to_disk => {
+            if let Some(target) = ursa_engine::paths::write_target(config, &copy.target)
+                .map_err(|e| copy_refused(&copy.target, e))?
+            {
+                copy.target = target;
+            }
+        }
+        DFStatement::CreateExternalTable(table) => {
+            for location in &mut table.locations {
+                *location = ursa_engine::paths::resolve(config, location)?;
+            }
+        }
+        DFStatement::Explain(explain) => {
+            rooted_locations(config, &mut explain.statement, copies_to_disk)?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A refusal of `COPY … TO 'target'`, saying which statement it is.
+fn copy_refused(target: &str, e: DataFusionError) -> DataFusionError {
+    match e {
+        DataFusionError::Plan(why) => {
+            DataFusionError::Plan(format!("COPY … TO '{target}' cannot be written: {why}"))
+        }
+        e => e,
+    }
+}
+
+/// Refuse an `INSERT INTO` a table of files outside the session's root
+/// ([`ursa_engine::paths::check_write`]).
+fn check_inserts(
+    config: &datafusion::prelude::SessionConfig,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::listing::ListingTable;
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    if !matches!(
+        ursa_engine::paths::root(config),
+        Some(ursa_engine::paths::Root::Dir(_))
+    ) {
+        return Ok(());
+    }
+    let mut refused = Ok(());
+    plan.apply(|node| {
+        if let LogicalPlan::Dml(dml) = node {
+            if let Ok(table) = source_as_provider(&dml.target) {
+                if let Some(listing) = table.downcast_ref::<ListingTable>() {
+                    for path in listing.table_paths() {
+                        if let Err(e) = ursa_engine::paths::check_write(config, path.get_url()) {
+                            refused = Err(e);
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    refused
 }
 
 /// Point a `COPY … TO` (or the one an `EXPLAIN` explains) at the session
