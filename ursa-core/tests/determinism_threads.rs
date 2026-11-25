@@ -845,6 +845,9 @@ fn the_relabelled_build_is_thread_count_independent() {
             connected_components_strong(t, None),
             louvain(t, None, 1.0, Some(2), true),
             label_propagation(t, None, 10, Some(2), true),
+            // Seeded, and since #172 run on the relabelled numbering itself.
+            louvain(t, None, 1.0, Some(2), false),
+            label_propagation(t, None, 10, Some(2), false),
         )
     };
     let reference = on_pool(1, || kernels(&parallel));

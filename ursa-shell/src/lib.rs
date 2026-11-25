@@ -11,6 +11,7 @@
 pub mod highlight;
 pub mod input;
 pub mod print;
+pub mod session;
 pub mod shell;
 pub mod table;
 pub mod text;

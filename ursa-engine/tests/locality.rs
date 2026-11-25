@@ -2,8 +2,10 @@
 //! edges or more numbers its nodes by in-degree, and every result, read by
 //! user id, is the one an index in first-seen order gives (the Python
 //! library's build, `ursa_io::build_topology_batches`): the same component
-//! labels, communities, counts and reached sets, and PageRank to within its
-//! last bits. Per-node rows come out in first-seen order, as before.
+//! labels, counts and reached sets, and PageRank to within its last bits.
+//! Per-node rows come out in first-seen order, as before. The seeded
+//! community kernels follow the numbering, so their communities may differ:
+//! they are checked to be the same on every run and of the same modularity.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,27 +109,64 @@ async fn results_by_user_id_are_those_of_an_unrelabelled_index() {
             keyed(connected_components_strong(&plain, None)),
         ),
         (
-            "SELECT * FROM louvain(g, seed => 1)",
-            "louvain",
-            keyed(louvain(&plain, None, 1.0, Some(1), false)),
-        ),
-        (
-            "SELECT * FROM louvain(g, seed => 1, parallel => true)",
-            "louvain",
-            keyed(louvain(&plain, None, 1.0, Some(1), true)),
-        ),
-        (
-            "SELECT * FROM label_propagation(g, seed => 1)",
-            "label_propagation",
-            keyed(label_propagation(&plain, None, 20, Some(1), false)),
-        ),
-        (
             "SELECT * FROM triangle_count(g)",
             "triangle_count",
             keyed(triangle_count(&plain, None)),
         ),
     ] {
         assert_eq!(by_id(&ctx, sql, column, label).await, expected, "{sql}");
+    }
+    // Communities: the same on a second run, a row per node in first-seen
+    // order, and a modularity within 0.02 of the first-seen build's.
+    let modularity = |labels: &[u32]| {
+        let out = plain.out();
+        let (mut intra, mut sums) = (0.0f64, HashMap::new());
+        for u in 0..plain.n_nodes() as u32 {
+            for &v in out.neighbors(u) {
+                let (a, b) = (labels[u as usize], labels[v as usize]);
+                *sums.entry(a).or_insert(0.0f64) += 1.0;
+                *sums.entry(b).or_insert(0.0f64) += 1.0;
+                intra += if a == b { 2.0 } else { 0.0 };
+            }
+        }
+        let m2 = 2.0 * plain.n_edges() as f64;
+        intra / m2 - sums.values().map(|s| (s / m2) * (s / m2)).sum::<f64>()
+    };
+    for (sql, column, reference) in [
+        (
+            "SELECT * FROM louvain(g, seed => 1)",
+            "louvain",
+            louvain(&plain, None, 1.0, Some(1), false),
+        ),
+        (
+            "SELECT * FROM louvain(g, seed => 1, parallel => true)",
+            "louvain",
+            louvain(&plain, None, 1.0, Some(1), true),
+        ),
+        (
+            "SELECT * FROM label_propagation(g, seed => 1)",
+            "label_propagation",
+            label_propagation(&plain, None, 20, Some(1), false),
+        ),
+        (
+            "SELECT * FROM label_propagation(g, seed => 1, parallel => true)",
+            "label_propagation",
+            label_propagation(&plain, None, 20, Some(1), true),
+        ),
+    ] {
+        let got = by_id(&ctx, sql, column, label).await;
+        assert_eq!(got, by_id(&ctx, sql, column, label).await, "{sql}: twice");
+        let ids: Vec<i64> = got.iter().map(|r| r.0).collect();
+        assert_eq!(
+            ids,
+            (0..user.len()).map(|v| user.value(v)).collect::<Vec<_>>()
+        );
+        let labels: Vec<u32> = got.iter().map(|r| r.1).collect();
+        let (q, q_plain) = (modularity(&labels), modularity(&reference));
+        assert!(
+            (q - q_plain).abs() <= 0.02,
+            "{sql}: modularity {q} vs {q_plain}"
+        );
     }
     // The ranks, to within their last bits.
     let ranks = pagerank(&plain, None, PageRankParams::default());

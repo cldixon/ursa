@@ -910,57 +910,158 @@ fn is_permutation(ids: &[u32]) -> bool {
     })
 }
 
-/// The in-degree order of `n_nodes` nodes over the edge targets `dst`: the
-/// original id of each new node, highest in-degree first, ties by original id.
-fn in_degree_order(n_nodes: usize, dst: &[u32]) -> Vec<u32> {
+/// The out-adjacency of `src -> dst` (original ids) with its nodes numbered
+/// by in-degree, highest first, ties by original id (#172): the adjacency,
+/// the original id of each node, and the node of each original id.
+///
+/// The relabel is fused into the counting sort rather than run as passes of
+/// its own. The first pass counts, per chunk of rows, both endpoints' degrees
+/// over the original ids. The in-degrees give the order (a parallel sort of
+/// one key per node); the out-degrees, gathered into it, give the offsets,
+/// and each chunk's counts become its cursors, still indexed by original id.
+/// The scatter then places each row by its source's original id and renames
+/// only its target, so neither endpoint array is renamed in place. Each
+/// segment holds its rows in row order: the output is exactly
+/// [`Adjacency::build`] over the renamed endpoints, on any thread count.
+fn build_in_degree(n: usize, src: &[u32], dst: &[u32]) -> (Adjacency, Vec<u32>, Vec<u32>) {
     use crate::parallel::*;
-    let m = dst.len();
-    // Per-chunk histograms, summed: the chunking rule of `Adjacency::build`.
-    let n_chunks = current_num_threads().min((m / n_nodes.max(1)).max(4));
-    let degree: Vec<u32> = if m < (1 << 16) || n_chunks <= 1 || in_worker() {
-        let mut h = vec![0u32; n_nodes];
-        for &d in dst {
-            h[d as usize] += 1;
+    let m = src.len();
+    assert!(
+        m <= u32::MAX as usize,
+        "more than u32::MAX (~4.29B) edges is beyond the v0.1 edge-id cap"
+    );
+    // The chunking rule of `Adjacency::build`; one chunk when serial.
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    let threads = current_num_threads().min((m / n.max(1)).max(4));
+    let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || n == 0 || in_worker();
+    let n_chunks = if serial { 1 } else { threads };
+    let chunk = m.div_ceil(n_chunks).max(1);
+    // Disjoint blocks of nodes for the per-node passes.
+    const BLOCK: usize = 1 << 14;
+    let blocks = n.div_ceil(BLOCK);
+    let par_blocks = |f: &(dyn Fn(std::ops::Range<usize>) + Sync)| {
+        let run = |b: usize| f(b * BLOCK..((b + 1) * BLOCK).min(n));
+        if serial {
+            (0..blocks).for_each(run);
+        } else {
+            (0..blocks).into_par_iter().for_each(run);
         }
-        h
-    } else {
-        let hists: Vec<Vec<u32>> = dst
-            .par_chunks(m.div_ceil(n_chunks))
-            .map(|chunk| {
-                let mut h = vec![0u32; n_nodes];
-                for &d in chunk {
-                    h[d as usize] += 1;
-                }
-                h
-            })
-            .collect();
-        let mut degree = vec![0u32; n_nodes];
-        degree
-            .par_chunks_mut(4096)
-            .enumerate()
-            .for_each(|(i, out)| {
-                let base = i * 4096;
-                for h in &hists {
-                    for (k, d) in out.iter_mut().enumerate() {
-                        *d += h[base + k];
-                    }
-                }
-            });
-        degree
     };
-    // One key per node: the in-degree, complemented so the highest sorts
-    // first, above the original id (unique, so the order is total).
-    let mut keys: Vec<u64> = degree
-        .iter()
-        .enumerate()
-        .map(|(v, &d)| (u64::from(!d) << 32) | v as u64)
-        .collect();
-    drop(degree);
+
+    // Pass 1: per chunk, out- and in-degree over original ids.
+    let count = |c: usize| {
+        let (lo, hi) = (c * chunk, ((c + 1) * chunk).min(m));
+        let (mut out, mut inc) = (vec![0u32; n], vec![0u32; n]);
+        for r in lo..hi {
+            out[src[r] as usize] += 1;
+            inc[dst[r] as usize] += 1;
+        }
+        (out, inc)
+    };
+    let (mut outs, incs): (Vec<Vec<u32>>, Vec<Vec<u32>>) = if serial {
+        (0..n_chunks).map(count).unzip()
+    } else {
+        (0..n_chunks).into_par_iter().map(count).unzip()
+    };
+
+    // The order: one key per node, the in-degree complemented so the highest
+    // sorts first, above the original id (unique, so the order is total).
+    let mut keys = vec![0u64; n];
+    let k_addr = keys.as_mut_ptr() as usize;
+    par_blocks(&|range| {
+        for k in range {
+            let d: u32 = incs.iter().map(|h| h[k]).sum();
+            // SAFETY: blocks are disjoint and inside `keys`.
+            unsafe { *(k_addr as *mut u64).add(k) = (u64::from(!d) << 32) | k as u64 };
+        }
+    });
+    drop(incs);
     #[cfg(feature = "rayon")]
-    keys.par_sort_unstable();
+    if serial {
+        keys.sort_unstable();
+    } else {
+        keys.par_sort_unstable();
+    }
     #[cfg(not(feature = "rayon"))]
     keys.sort_unstable();
-    keys.iter().map(|&k| k as u32).collect()
+    let original: Vec<u32> = keys.iter().map(|&k| k as u32).collect();
+    drop(keys);
+    let mut node = vec![0u32; n];
+    let n_addr = node.as_mut_ptr() as usize;
+    let original_ref = &original;
+    par_blocks(&|range| {
+        for v in range {
+            // SAFETY: `original` is a permutation, so each slot is written
+            // once; it is inside `node`.
+            unsafe { *(n_addr as *mut u32).add(original_ref[v] as usize) = v as u32 };
+        }
+    });
+
+    // Offsets in the new order: each node's out-degree, prefix-summed.
+    let mut offsets = vec![0u64; n + 1];
+    let o_addr = offsets.as_mut_ptr() as usize;
+    par_blocks(&|range| {
+        for v in range {
+            let k = original_ref[v] as usize;
+            let d: u64 = outs.iter().map(|h| u64::from(h[k])).sum();
+            // SAFETY: blocks are disjoint; `v + 1 <= n`.
+            unsafe { *(o_addr as *mut u64).add(v + 1) = d };
+        }
+    });
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    // Each chunk's counts become its cursors into every segment, in place,
+    // still indexed by original id.
+    let addrs: Vec<usize> = outs.iter_mut().map(|h| h.as_mut_ptr() as usize).collect();
+    let (offsets_ref, node_ref) = (&offsets, &node);
+    par_blocks(&|range| {
+        for k in range {
+            let mut at = offsets_ref[node_ref[k] as usize] as u32;
+            for &a in &addrs {
+                // SAFETY: blocks of `k` are disjoint, inside every histogram.
+                unsafe {
+                    let slot = (a as *mut u32).add(k);
+                    let cnt = *slot;
+                    *slot = at;
+                    at += cnt;
+                }
+            }
+        }
+    });
+
+    // Pass 2: scatter each row by its source's original id, its target
+    // renamed. Positions are disjoint across chunks (the cursors partition
+    // each segment), as in `build_parallel`.
+    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
+    let (t_addr, e_addr) = (
+        targets.as_mut_ptr() as usize,
+        edge_ids.as_mut_ptr() as usize,
+    );
+    let scatter = |(c, mut base): (usize, Vec<u32>)| {
+        let (lo, hi) = (c * chunk, ((c + 1) * chunk).min(m));
+        for r in lo..hi {
+            let k = src[r] as usize;
+            let pos = base[k] as usize;
+            base[k] += 1;
+            // SAFETY: `pos < m` and is claimed by exactly one (chunk, row).
+            unsafe {
+                *(t_addr as *mut u32).add(pos) = node_ref[dst[r] as usize];
+                *(e_addr as *mut u32).add(pos) = r as u32;
+            }
+        }
+    };
+    if serial {
+        outs.into_iter().enumerate().for_each(scatter);
+    } else {
+        outs.into_par_iter().enumerate().for_each(scatter);
+    }
+    let adjacency = Adjacency {
+        offsets: offsets.into(),
+        targets: targets.into(),
+        edge_ids: edge_ids.into(),
+    };
+    (adjacency, original, node)
 }
 
 impl Topology {
@@ -1007,10 +1108,10 @@ impl Topology {
     /// [`Self::build`], with the nodes renumbered in `order` for locality
     /// (#172): the dense ids given are the *original* ids, and node `v` of
     /// the result is the node whose original id is
-    /// [`Self::original_id`]`(v)`. The relabel is one more pass over the
-    /// endpoints before the counting sort (an in-degree histogram, a sort of
-    /// the nodes, and each endpoint renamed in place), parallel where the
-    /// build is. Each node's out-segment keeps its edges in row order, and
+    /// [`Self::original_id`]`(v)`. The relabel is fused into the counting
+    /// sort (its first pass counts the in-degrees too; a parallel sort of
+    /// the nodes; its scatter renames each target), parallel where the build
+    /// is. Each node's out-segment keeps its edges in row order, and
     /// `edge_ids` still names the original rows, so weights and edge masks
     /// apply unchanged.
     ///
@@ -1027,8 +1128,25 @@ impl Topology {
         match order {
             NodeOrder::AsGiven => Self::build(n_nodes, src_dense, dst_dense),
             NodeOrder::InDegree => {
-                let original = in_degree_order(n_nodes, &dst_dense);
-                Self::build_relabelled(n_nodes, src_dense, dst_dense, original)
+                let (out, original, node) = build_in_degree(n_nodes, &src_dense, &dst_dense);
+                drop((src_dense, dst_dense));
+                let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
+                Topology {
+                    n_nodes,
+                    n_edges: out.targets.len(),
+                    out,
+                    inc: OnceLock::new(),
+                    inc_loader: LazyIncoming::default(),
+                    undirected: OnceLock::new(),
+                    symmetric: OnceLock::new(),
+                    self_transpose: false,
+                    relabel: (!identity).then(|| {
+                        Arc::new(Relabel {
+                            original: original.into(),
+                            node: OnceLock::from(node),
+                        })
+                    }),
+                }
             }
         }
     }
@@ -1139,26 +1257,19 @@ impl Topology {
     }
 
     /// This topology numbered by its original ids, as [`Self::build`] gives
-    /// it from the same rows: `None` when it was not relabelled. The seeded
-    /// community kernels and the layouts run over it, so that their result
-    /// is the one the original numbering gives.
+    /// it from the same rows: `None` when it was not relabelled. The layouts
+    /// run over it (their starting positions follow the node ids), and a test
+    /// can compare a relabelled build with a first-seen one through it.
     ///
     /// No sort is needed: node `o`'s segment, in either direction, is the
     /// segment of the node whose original id is `o`, in the same row order,
     /// its neighbours renamed. So this is one streaming pass per direction
     /// (the in-adjacency too, when this topology has it built), parallel.
     pub fn in_original_order(&self) -> Option<Topology> {
-        self.renumbered(true)
-    }
-
-    /// [`Self::in_original_order`]; without the in-adjacency unless
-    /// `incoming` (for a kernel that reads only the out-adjacency, which then
-    /// costs 8 bytes an edge rather than 16).
-    pub(crate) fn renumbered(&self, incoming: bool) -> Option<Topology> {
         let relabel = self.relabel.as_ref()?;
         let out = in_original(&self.out, relabel);
         let inc = OnceLock::new();
-        if let Some(incoming) = self.incoming_if_built().filter(|_| incoming) {
+        if let Some(incoming) = self.incoming_if_built() {
             let _ = inc.set(in_original(incoming, relabel));
         }
         Some(Topology {

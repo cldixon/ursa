@@ -1,11 +1,12 @@
 //! A locality relabel of the nodes round-trips (#172): every kernel's result,
 //! read through the original ids, is the one an unrelabelled build gives.
 //!
-//! What must not change: partitions (components, and the seeded community
-//! kernels, which run in the original numbering), counts (degrees, triangles,
+//! What must not change: component partitions, counts (degrees, triangles,
 //! distances, reached sets), sampled sources, and the user ids an [`IdMap`]
 //! gives each node. What may change: the bits of a float whose sum runs in
-//! node order (PageRank, betweenness), checked within a tolerance here.
+//! node order (PageRank, betweenness), checked within a tolerance here, and
+//! the communities of the seeded community kernels, whose visit order follows
+//! the numbering: checked to be deterministic and as good (modularity).
 
 use ursa_core::algo::{
     betweenness, bfs_distances, closeness_directed, connected_components_strong,
@@ -66,6 +67,78 @@ fn close(a: &[f64], b: &[f64], what: &str) {
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
         let tol = 1e-12 * x.abs().max(y.abs()).max(1e-300);
         assert!((x - y).abs() <= tol, "{what}: node {i}: {x} vs {y}");
+    }
+}
+
+/// Modularity (resolution 1) of `labels` over the kept edges of `t`, read
+/// as undirected (each row once, both ends).
+fn modularity(t: &Topology, mask: Option<&EdgeMask>, labels: &[u32]) -> f64 {
+    let out = t.out();
+    let mut sums = std::collections::HashMap::new();
+    let (mut intra, mut m2) = (0.0f64, 0.0f64);
+    for u in 0..t.n_nodes() as u32 {
+        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            if mask.is_some_and(|m| !m.keep(e)) {
+                continue;
+            }
+            let (a, b) = (labels[u as usize], labels[v as usize]);
+            *sums.entry(a).or_insert(0.0) += 1.0;
+            *sums.entry(b).or_insert(0.0) += 1.0;
+            if a == b {
+                intra += 2.0;
+            }
+            m2 += 2.0;
+        }
+    }
+    if m2 == 0.0 {
+        return 0.0;
+    }
+    intra / m2
+        - sums
+            .values()
+            .map(|s: &f64| (s / m2) * (s / m2))
+            .sum::<f64>()
+}
+
+/// A community kernel `run` on the relabelled topology: the same on a second
+/// run (it is seeded), a label per node, and (on 1,000 edges or more) a
+/// modularity within 0.05 of the first-seen build's (#172: the visit order
+/// follows the numbering, so the communities may differ, not their quality).
+fn comparable(
+    plain: &Topology,
+    relabelled: &Topology,
+    mask: Option<&EdgeMask>,
+    run: impl Fn(&Topology) -> Vec<u32>,
+    what: &str,
+) {
+    let (a, b) = (run(relabelled), run(relabelled));
+    assert_eq!(a, b, "{what}: deterministic");
+    assert_eq!(a.len(), relabelled.n_nodes(), "{what}");
+    let (q_plain, q) = (
+        modularity(plain, mask, &run(plain)),
+        modularity(relabelled, mask, &a),
+    );
+    // On a graph of a few dozen edges one move is a large share of the
+    // modularity; the tolerance is for graphs of some size.
+    if relabelled.n_edges() >= 1000 {
+        assert!(
+            (q - q_plain).abs() <= 0.05,
+            "{what}: modularity {q} vs {q_plain}"
+        );
+    }
+}
+
+/// The fused in-degree build is the counting sort over the renamed endpoints.
+#[test]
+fn the_fused_build_is_the_renamed_build() {
+    for (seed, n, m) in [(7, 500, 4000), (8, 20_000, 300_000)] {
+        let (n, src, dst) = graph(n, m, seed);
+        let fused = Topology::build_ordered(n, src.clone(), dst.clone(), NodeOrder::InDegree);
+        let original = fused.original_ids().unwrap().to_vec();
+        let reference = Topology::build_relabelled(n, src, dst, original);
+        assert_eq!(fused.out().offsets, reference.out().offsets);
+        assert_eq!(fused.out().targets, reference.out().targets);
+        assert_eq!(fused.out().edge_ids, reference.out().edge_ids);
     }
 }
 
@@ -139,33 +212,31 @@ fn counts_and_partitions_are_the_same() {
             back(&relabelled, &connected_components_strong(&relabelled, None)),
             "strong components"
         );
-        // The seeded community kernels run in the original numbering.
+        // The seeded community kernels follow the node numbering (#172):
+        // other communities, as good.
         for parallel in [false, true] {
-            assert_eq!(
-                louvain(&plain, None, 1.0, Some(3), parallel),
-                back(
-                    &relabelled,
-                    &louvain(&relabelled, None, 1.0, Some(3), parallel)
-                ),
-                "louvain (parallel: {parallel})"
+            comparable(
+                &plain,
+                &relabelled,
+                None,
+                |t| louvain(t, None, 1.0, Some(3), parallel),
+                &format!("louvain (parallel: {parallel})"),
             );
-            assert_eq!(
-                label_propagation(&plain, None, 20, Some(3), parallel),
-                back(
-                    &relabelled,
-                    &label_propagation(&relabelled, None, 20, Some(3), parallel)
-                ),
-                "label propagation (parallel: {parallel})"
+            comparable(
+                &plain,
+                &relabelled,
+                None,
+                |t| label_propagation(t, None, 20, Some(3), parallel),
+                &format!("label propagation (parallel: {parallel})"),
             );
         }
         let weights: Vec<f64> = (0..m).map(|i| 0.5 + (i % 7) as f64).collect();
-        assert_eq!(
-            louvain_weighted(&plain, &weights, None, 1.0, None, false),
-            back(
-                &relabelled,
-                &louvain_weighted(&relabelled, &weights, None, 1.0, None, false)
-            ),
-            "weighted louvain"
+        comparable(
+            &plain,
+            &relabelled,
+            None,
+            |t| louvain_weighted(t, &weights, None, 1.0, None, false),
+            "weighted louvain",
         );
         // Distances, reached sets and sampled statistics.
         let hub = 0u32;
@@ -242,19 +313,19 @@ fn a_subgraph_mask_applies_unchanged() {
             &connected_components_weak(&relabelled, Some(&mask))
         )
     );
-    assert_eq!(
-        louvain(&plain, Some(&mask), 1.0, Some(1), false),
-        back(
-            &relabelled,
-            &louvain(&relabelled, Some(&mask), 1.0, Some(1), false)
-        )
+    comparable(
+        &plain,
+        &relabelled,
+        Some(&mask),
+        |t| louvain(t, Some(&mask), 1.0, Some(1), false),
+        "masked louvain",
     );
-    assert_eq!(
-        label_propagation(&plain, Some(&mask), 10, Some(1), true),
-        back(
-            &relabelled,
-            &label_propagation(&relabelled, Some(&mask), 10, Some(1), true)
-        )
+    comparable(
+        &plain,
+        &relabelled,
+        Some(&mask),
+        |t| label_propagation(t, Some(&mask), 10, Some(1), true),
+        "masked label propagation",
     );
 }
 

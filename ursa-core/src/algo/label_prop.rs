@@ -34,10 +34,9 @@ use crate::topology::{Adjacency, EdgeMask, Topology};
 /// necessarily a contiguous `0..k`. A subgraph `mask` restricts voting to kept
 /// edges.
 ///
-/// The visit order and the ties are defined on the original ids: a topology
-/// whose nodes were relabelled for locality (#172) runs over
-/// [`Topology::in_original_order`], so a seed gives the same communities, and
-/// the same labels, as on an index that was not relabelled.
+/// The visit order and the ties follow the node numbering, so a topology
+/// relabelled for locality (#172) can give other communities for a seed than
+/// one in first-seen order, of the same quality.
 ///
 /// An isolated node never votes and is never voted for, so it keeps its own
 /// label; a graph with many runs over its linked nodes only (#326), visited in
@@ -58,31 +57,21 @@ pub fn label_propagation(
     if topo.n_nodes() == 0 {
         return Vec::new();
     }
-    // Built (or read) here, so a relabelled topology's is renumbered below
-    // rather than transposed again.
     topo.incoming();
-    // Relabelled nodes (#172): vote in the original numbering, whose visit
-    // order and ties give the labels an unrelabelled index gives.
-    if let Some(original) = topo.in_original_order() {
-        let labels = label_propagation(&original, mask, max_iter, seed, parallel);
-        return in_node_order(topo, &labels);
-    }
     let linked = Linked::of(topo, mask);
     let linked = linked.worth_it().then_some(&linked);
-    if parallel {
+    let mut labels = if parallel {
         label_propagation_parallel(topo, mask, max_iter, seed, linked)
     } else {
         label_propagation_over(topo, mask, max_iter, seed, linked)
+    };
+    // A label names a node: name it by its original id (#172).
+    if topo.original_ids().is_some() {
+        for l in labels.iter_mut() {
+            *l = topo.original_id(*l);
+        }
     }
-}
-
-/// Labels computed over [`Topology::in_original_order`], back in `topo`'s
-/// node order: node `v` takes the label of its original id. The label values
-/// are original ids, as an unrelabelled run gives them.
-pub(crate) fn in_node_order(topo: &Topology, labels: &[u32]) -> Vec<u32> {
-    (0..topo.n_nodes() as u32)
-        .map(|v| labels[topo.original_id(v) as usize])
-        .collect()
+    labels
 }
 
 /// [`label_propagation`], compact over `linked` when given.
