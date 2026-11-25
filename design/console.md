@@ -269,7 +269,7 @@ The `graph` and `activity` events matter once a second client is attached. With 
 ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 ```
 
-- **The argument** is a database file, opened as the CLI opens one, or a directory. Relative paths in queries resolve against it, and the sources panel starts there. With no argument, it is an in-memory session rooted at the current directory.
+- **The argument** is a database file, opened as the CLI opens one, or a directory. Relative paths in queries resolve against it, and the sources panel starts there. With no argument, it is an in-memory session rooted at the current directory. The session's root is the directory (a database file's own directory), set with `ursa_shell::session::Options::root`, not by changing the process's working directory. A rooted session reads any file, as the CLI does, but writes only under its root: `COPY … TO` (to disk, `Options::copy_to_disk`), `.output` and `.once` take a relative path with no `..` and no symbolic link out of the root, and `INSERT INTO` a table of files must be into files under it (`ursa_engine::paths`). `memory://uploads` holds only the files a page adds.
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
 - **`--read-only`** refuses statements that write: `COPY TO`, `CREATE` in an attached database, `INSERT`, and the rest. It is meant for pairing with an agent (§9).
@@ -331,7 +331,7 @@ Removing it sooner would lose the only place the graph view is deployed and test
 | source | browser demo | `ursa serve` |
 |---|---|---|
 | Sample datasets | R2 over HTTP | the same URLs, or local copies |
-| Local files | uploads into `memory://uploads` | the disk, by path |
+| Local files | uploads into `memory://uploads` | the disk, by path; `COPY … TO` writes under the root |
 | `s3://` (and R2), `gs://`, `az://` | no (no wasm backend, #278) | yes: `object_store` with the CLI's credential chain |
 | Ursa database files | uploads | open or `ATTACH` by path |
 | Postgres and other databases | no | later: a connector, credentials in a local config file |

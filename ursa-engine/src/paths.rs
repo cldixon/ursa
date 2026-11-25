@@ -10,6 +10,11 @@
 //! `file:///data/*.csv`): the URL is split at the path segment where the glob
 //! begins, the part before it becomes the listing prefix, and the rest filters
 //! the listing.
+//!
+//! A relative path resolves against the session's [`Root`]: a directory
+//! natively, a URL in the browser, or, natively with none, the working
+//! directory. A session with a directory root also writes only under it
+//! ([`write_target`], [`check_write`]).
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -302,15 +307,24 @@ pub fn check_write(config: &SessionConfig, url: &Url) -> Result<()> {
             dir.display()
         ))
     };
-    let path = match url.scheme() {
-        "file" => url.to_file_path().map_err(|()| refused())?,
-        _ => return Err(refused()),
-    };
+    let path = local_path(url).ok_or_else(refused)?;
     let root = std::fs::canonicalize(&dir).map_err(|_| refused())?;
     match resolve_links(&path) {
         Ok(real) if real.starts_with(&root) => Ok(()),
         _ => Err(refused()),
     }
+}
+
+/// The local path a `file://` URL names.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_path(url: &Url) -> Option<PathBuf> {
+    (url.scheme() == "file").then(|| url.to_file_path().ok())?
+}
+
+/// The browser has no local paths.
+#[cfg(target_arch = "wasm32")]
+fn local_path(_: &Url) -> Option<PathBuf> {
+    None
 }
 
 /// `path` (absolute, without `..`) with its symbolic links resolved as far as
