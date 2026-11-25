@@ -335,12 +335,21 @@ impl Adjacency {
             .collect();
 
         // Global degree -> offsets (each node's segment start), prefix-summed.
+        // The per-node passes over the histograms run in parallel over
+        // ranges of nodes: they cost `n_chunks * n_nodes`, which on a graph
+        // with many more nodes than edges per node is as much as the
+        // scatter (#532). Only the prefix sum is serial.
+        const NODES: usize = 1 << 16;
         let mut offsets = vec![0u64; n_nodes + 1];
-        for h in &hists {
-            for (k, &c) in h.iter().enumerate() {
-                offsets[k + 1] += c as u64;
-            }
-        }
+        offsets[1..]
+            .par_chunks_mut(NODES)
+            .enumerate()
+            .for_each(|(b, out)| {
+                for (j, o) in out.iter_mut().enumerate() {
+                    let k = b * NODES + j;
+                    *o = hists.iter().map(|h| h[k] as u64).sum();
+                }
+            });
         for i in 0..n_nodes {
             offsets[i + 1] += offsets[i];
         }
@@ -348,13 +357,17 @@ impl Adjacency {
         // Convert each chunk's histogram into its per-node **base cursor**, in place:
         // running[k] walks from the segment start, handing each chunk (in order) its
         // slice of node k's segment. Bases fit in u32 (<= m <= u32::MAX).
-        let mut running: Vec<u32> = (0..n_nodes).map(|k| offsets[k] as u32).collect();
+        let mut running: Vec<u32> = offsets[..n_nodes].par_iter().map(|&o| o as u32).collect();
         for h in hists.iter_mut() {
-            for (k, slot) in h.iter_mut().enumerate() {
-                let cnt = *slot;
-                *slot = running[k];
-                running[k] += cnt;
-            }
+            h.par_chunks_mut(NODES)
+                .zip(running.par_chunks_mut(NODES))
+                .for_each(|(h, running)| {
+                    for (slot, run) in h.iter_mut().zip(running) {
+                        let cnt = *slot;
+                        *slot = *run;
+                        *run += cnt;
+                    }
+                });
         }
 
         // Pass 2 (parallel scatter): each chunk owns disjoint output slots (its base

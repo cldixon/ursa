@@ -1835,6 +1835,38 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **A graph with a vertex table builds its index as fast as in 0.10 again,
+  and faster** (#532). Since 0.12 the edges read while the vertex keys are
+  still being numbered are interned provisionally, then renumbered (#385).
+  That provisional interner gave its direct table of integer ids a slot
+  per edge row, as the final one does, so with keys that are compact
+  integers (Bluesky's) the few distinct ids of the early edges, spread over
+  the keys' whole range, grew the table to about one slot per edge, and it
+  grew one full copy at a time, on the edges' thread. It now keeps a direct
+  table only while that is dense in its own ids (4 slots per id), else a
+  hash map, and the index is the same. Four more passes of the build no
+  longer run on one core: settling a chunk of edges (keeping the rows
+  between two nodes) checks in parallel and copies nothing when no row is
+  dropped; interning new ids visits only the 4,096-row blocks that have
+  one; the CSR's per-node passes over the chunk histograms run over ranges
+  of nodes in parallel; and the stored id lookup table (#421) is filled by
+  every thread at once, giving the same table as filling it in id order
+  (linear probing with priority to the lower id is history independent).
+  On a synthetic Bluesky-shaped graph (a Parquet vertex table of 40M
+  compact integer keys, 100M edges between 2.5M of them; 4 cores, `--readonly`
+  `describe(g, full => true)`, three interleaved runs, build time from the
+  notice): 0.10.0 7.8–8.6 s, `main` before this 9.9–10.5 s, now 7.9–8.8 s,
+  with system time back from 5.6–5.8 s to 3.7–3.9 s (page faults halved:
+  1.63M to 0.82M on one thread). With a `.csv.gz` vertex table: 0.10.0
+  10.3–10.6 s, before 10.4–10.6 s, now 8.7–8.8 s. Edges only: 7.6–7.8 s,
+  7.9–8.8 s, 7.6–7.8 s. With 40M sparse integer keys: 16.5–18.4 s,
+  11.9–14.0 s, 11.9–13.0 s. Stored (a writable database), the whole
+  process: 14.0–14.8 s, 17.9–18.0 s, 15.1–15.5 s; the rest is the 0.24 GB
+  larger v4 file. The stored index files are byte-identical before and
+  after (compact, sparse and string keys, and the `.csv.gz` table), and a
+  test pins a hash of the stored index of a graph with a vertex table, for
+  integer and string keys, recorded before the change.
+
 - **SQL: a query that fails writes nothing to stdout, not even its header**
   (#388). `ursa --format csv -c "SELECT count(*) …"` wrote the header
   (`count(*)`), then the error, and exited 1, so a script read a header
