@@ -148,10 +148,7 @@ fn table_aliases(tokens: &[Token]) -> BTreeMap<String, String> {
             continue;
         }
         // One or more `name [AS] [alias]`, separated by commas.
-        loop {
-            let Some(Token::Word(first)) = tokens.get(i) else {
-                break;
-            };
+        while let Some(Token::Word(first)) = tokens.get(i) {
             let mut name = first.clone();
             i += 1;
             while let (Some(Token::Punct('.')), Some(Token::Word(part))) =
@@ -311,8 +308,8 @@ pub(crate) async fn complete(
     let mut at = word_start;
     while sql[..at].ends_with('.') {
         let head = &sql[..at - 1];
-        let part_start = if head.ends_with('"') {
-            match head[..head.len() - 1].rfind('"') {
+        let part_start = if let Some(quoted) = head.strip_suffix('"') {
+            match quoted.rfind('"') {
                 Some(q) => q,
                 None => break,
             }

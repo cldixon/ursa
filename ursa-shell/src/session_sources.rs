@@ -10,6 +10,7 @@
 //! first time a bucket is named. A reply names objects by `scheme://bucket/
 //! key` only: never a credential, a query string or a signed URL.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -162,7 +163,7 @@ fn list_local(root: &Root, path: &str) -> Result<Vec<Value>, Error> {
         if dir {
             url.push('/');
         }
-        entries.push(entry_json(&name, url, dir, (!dir).then(|| meta.len())));
+        entries.push(entry_json(&name, url, dir, (!dir).then_some(meta.len())));
     }
     sort(&mut entries);
     Ok(entries)

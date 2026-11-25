@@ -1153,6 +1153,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   250 lines of graph glue; the graph view behaves as before. A second host,
   `web/tests/pane-host/` (never deployed), proves it in the e2e test.
 
+- **The session sends events, and the console's catalog, sources,
+  completion and highlight operations** (URSA-13, URSA-15, URSA-16, the
+  protocol's part; `design/console.md` §4). `catalog` lists the session's
+  databases, schemas, tables (`table`, `view` or `external`) with their
+  columns, and its property graphs with their vertex and edge tables. After
+  any request that changes it (`CREATE`, `DROP`, `ATTACH`, `CREATE PROPERTY
+  GRAPH`, `.open`, a dataset load), the session sends `{"event":
+  "catalog"}`, found by comparing a fingerprint of the catalog before and
+  after: `ursa serve` sends it to every connection on the session, the
+  browser demo's worker posts it, both before the request's reply, and
+  `engine-client.js`'s `on("catalog", fn)` hears it. `sources.list {url}`
+  lists a directory under the session's root (symbolic links resolved, a
+  path outside refused, hidden files left out) or a bucket prefix (`s3://`,
+  `gs://`, `az://`, through `object_store`'s `list_with_delimiter` and the
+  CLI's credential chain), with each entry's format and size, never a
+  credential; `sources.attach {url, as}` is `ATTACH`. Both need capability
+  `sources`, which a session with a directory root reports in `hello`.
+  `complete {sql, cursor}` offers tables, columns (qualified after `t.`, an
+  alias's too), functions, graphs, keywords and dot-commands, without
+  running a query; `highlight {sql}` gives the shell's colouring as spans.
+  Their offsets are UTF-16 code units, as JavaScript's. The protocol
+  document gains an Events section, generated from
+  `ursa_shell::session::EVENTS`.
+
 - **A root per session, and `COPY … TO` to disk under it** (URSA-6,
   `design/console.md` §5). Relative paths resolve against the session's
   root (`ursa_engine::paths::Root`), which travels with the session's
