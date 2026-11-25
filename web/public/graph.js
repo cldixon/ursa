@@ -1,19 +1,21 @@
 // The Graph view (`.graph`): a result's graph drawn by ursa-viz (wgpu, on
-// WebGPU or else WebGL2) on a canvas in the pane beside the terminal, its
+// WebGPU or else WebGL2) on a canvas in the graph pane (graph-pane.js), its
 // coarse-to-fine ForceAtlas2 layout converging live in a worker
 // (graph-worker.js).
 //
-// app.js imports this module on the first `.graph` only, and this module
+// graph-pane.js imports this module on the first drawing only, and this module
 // loads ursa-viz (a few MB, named in /viz/viz.json by its build's hash) on
 // the first drawing, so a session that never draws a graph downloads none of
-// it. app.js owns the pane (opening, closing, Esc); this module owns what is
+// it. graph-pane.js owns the pane (its markup, opening, closing, Esc, search
+// and the commands sink its host gives it); this module owns what is
 // in it: the status line, the legend, the canvas, the view, the layout and
 // the pointer and keys.
 //
 // Drag (or the arrow keys) pans, the wheel (or + and -) zooms and a
 // double-click on empty space (or 0) fits the graph in view. A double-click
-// on a node (a double tap, or Enter with nodes selected) expands it: the page
-// runs `.expand ID` in the terminal, as if typed, and the node carries a busy
+// on a node (a double tap, or Enter with nodes selected) expands it: the pane
+// sends `.expand ID` to its host's commands sink (the shell types it in the
+// terminal), and the node carries a busy
 // ring until the command has run (Shift: `LIMIT 5000`). A click on a node selects it,
 // Shift+click adds a node to the selection (or takes it out), and a click on
 // empty space (or Esc) clears it: the selected nodes carry a ring, their
@@ -27,7 +29,7 @@
 // shows a tooltip: its key, label, SIZE BY and COLOR BY values and degree.
 // On a touch screen one finger pans, two pinch to zoom (and pan), a tap
 // selects a node and a double tap expands it, or fits. `f` fits the selection,
-// and a search (app.js runs .find, for the terminal and for the pane's `/`)
+// and a search (graph-pane.js runs .find, for the host and for the pane's `/`)
 // selects what it found and fits it (selectFound). The selection itself is ursa-viz's
 // (its interact module): this module tells it what was clicked. Colours are
 // the page's --graph-* tokens (style.css), read again when the theme changes
@@ -297,10 +299,12 @@ export function positionsHint(edges, graph) {
  * the legend under it; `onError(message)` is called if the view fails once
  * drawing (a lost GPU device or WebGL context, a layout that stopped).
  * `onCommand(command)` runs a command the view asks for (`.expand 33`, for a
- * double-click on node 33) as the terminal runs a typed one, and resolves
+ * double-click on node 33) through the host's commands sink (the shell's
+ * terminal runs it as a typed one), and resolves
  * once it has run.
  *
- * `run(command)` types a command in the terminal and runs it, and
+ * `run(command)` runs a command the inspector's buttons ask for, through
+ * the same sink, and
  * `inspect(args)` asks the engine for a node's or an edge's row (the engine
  * worker's `inspect`): the inspector's buttons and rows.
  * `times` gets the moments each step ended (performance.now()), for
@@ -1465,7 +1469,8 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     fitSelection();
   };
   // Expanding (#443). A double-click, a double tap or Enter asks the page
-  // to run `.expand ID` as the terminal runs a typed line: it is echoed,
+  // to run `.expand ID` through its commands sink, as the terminal runs a
+  // typed line in the shell: it is echoed,
   // kept in the history and replayed by a shared link, and its answer comes
   // back here as a delta (state.apply). Commands run one at a time, so a
   // second double-click waits for the first; until its command has run, a
@@ -1737,7 +1742,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
  * The inspector of the drawing `state` (graph-inspector.js), its panel in
  * `stage`: it shows what is selected, each time the selection changes. This
  * says what is selected as the inspector's plain data, and does what its
- * buttons ask: `run` a command in the terminal, `inspect` a row in the
+ * buttons ask: `run` a command (the host's sink), `inspect` a row in the
  * engine, pin a node, select an edge's end. `moved` is called when the panel
  * has opened, changed sides or closed. Returns {selectionChanged(), inset(),
  * focus(), state(), remove()}.
@@ -1942,7 +1947,7 @@ export function retheme() {
 
 /**
  * Select nothing. Returns whether anything was selected: Esc clears a
- * selection before it closes the pane (app.js).
+ * selection before it closes the pane (graph-pane.js).
  */
 export function clearSelection() {
   return current?.clearSelection?.() ?? false;

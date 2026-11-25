@@ -112,7 +112,7 @@ The graph view (`graph.js`, `graph-worker.js` and the `ursa-viz` wasm) never tou
 ### The web side
 
 - **`engine-client.js`:** `connect(transport)` returns `{call(op, args), on(event, fn), close()}`. `WorkerTransport` wraps today's worker; `SocketTransport` opens `ws://127.0.0.1:PORT/session`. `app.js`'s `engine()` becomes a call to this client, with no other change.
-- **The console:** a second entry point beside the shell (`web/console.html`), sharing `engine-client.js` and the graph modules. The graph modules stop writing to the terminal directly: they call a `commands` sink the host provides (the terminal in the shell, the history panel in the console).
+- **The console:** a second entry point beside the shell (`web/console.html`), sharing `engine-client.js` and the graph modules. The graph modules stop writing to the terminal directly: they call a `commands` sink the host provides (the terminal in the shell, the history panel in the console). Done in C1 (URSA-8): `graph-pane.js`'s `createPane({container, engine, commands, status})` is the pane for any host. It owns its markup, search, Esc, the not-shown counts and the theme, and runs the graph commands itself (`pane.exec(line)`); the sink, `commands(command, {via, current})`, receives what the view, the inspector and the search ask to run, and the host hands each back to `pane.exec` once it has shown it.
 
 ## 4. The session protocol
 
