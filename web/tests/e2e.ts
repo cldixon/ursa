@@ -31,7 +31,11 @@ const check = (ok: boolean, label: string, detail = "") => {
   if (!ok) failures.push(`${label}${detail ? `: ${detail}` : ""}`);
 };
 
-const launched = await chromium.launch();
+// Under `ursa serve`, the pane host's page (tests/pane-host/, fulfilled by the
+// test, not the server) has no address, so Chromium's Local Network Access
+// checks would keep it from the server's WebSocket; a page the server sends
+// is not affected.
+const launched = await chromium.launch(process.env.URSA_SERVE_TOKEN ? { args: ["--disable-features=LocalNetworkAccessChecks"] } : {});
 // Against `ursa serve` (scripts/e2e-serve.ts sets URSA_SERVE_TOKEN): every
 // context carries the run's token as the cookie the page gets from the link
 // ursa serve prints, and the checks of browser-only features are skipped,
@@ -3350,8 +3354,10 @@ for (const phone of [false, true]) {
   const hctx = await watchedContext({ viewport: { width: 1280, height: 800 } });
   await hctx.route(/\/tests\/pane-host\/[a-z.-]*$/, async (route) => {
     const name = new URL(route.request().url()).pathname.split("/").pop() || "index.html";
-    const body = await Bun.file(new URL(`./pane-host/${name}`, import.meta.url)).text().catch(() => null);
+    let body = await Bun.file(new URL(`./pane-host/${name}`, import.meta.url)).text().catch(() => null);
     if (body === null) return route.fulfill({ status: 404, body: "not found" });
+    // Under `ursa serve`, the page talks to it, as ursa serve marks its own.
+    if (overSocket && name.endsWith(".html")) body = body.replace("<head>", '<head>\n  <meta name="ursa-transport" content="socket">');
     const type = name.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/html; charset=utf-8";
     await route.fulfill({ status: 200, body, headers: { ...SECURITY_HEADERS, "content-type": type } });
   });

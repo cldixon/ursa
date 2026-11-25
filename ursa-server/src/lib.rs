@@ -198,9 +198,12 @@ impl Bound {
         // Until asked to stop, or a listener fails.
         let mut stopping = shared.stopping.clone();
         let failed = tokio::select! {
+            biased;
             _ = stopping.wait_for(|s| *s) => None,
             (result, _, _) = futures::future::select_all(&mut servers) => Some(result),
         };
+        // Stopping, the listeners end too: that is no failure.
+        let failed = failed.filter(|_| !*shared.stopping.borrow());
         if let Some(result) = failed {
             // A listener stopped by itself: stop the rest, and say why.
             for server in &servers {
