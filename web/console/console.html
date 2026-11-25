@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- The Ursa Console (design/console.md §6): `ursa serve`'s page, at
+       /console/. The frame (URSA-12): the panels, the layout, the status bar
+       and the session; each panel's body is a mount point the issue named in
+       it fills. The build copies this file to dist-console/console/index.html
+       (scripts/console.ts). -->
+  <title>Ursa Console</title>
+  <meta name="description" content="Ursa's console: SQL and graphs over a live engine session on this machine.">
+  <script src="/theme.js"></script>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/graph-pane.css">
+  <link rel="stylesheet" href="/console/console.css">
+  <script type="module" src="/console/console.js"></script>
+</head>
+<body class="console-page">
+  <nav class="skip-links" aria-label="Skip links">
+    <a href="#editor">Skip to the editor</a>
+    <a href="#results">Skip to the results</a>
+    <a href="#sources">Skip to the sources</a>
+    <a href="#inspector">Skip to the inspector</a>
+    <a href="#status">Skip to the status bar</a>
+  </nav>
+
+  <header class="bar console-head">
+    <div class="console-head-side">
+      <button id="toggle-left" type="button" class="icon-button" aria-controls="left" aria-expanded="true"
+              aria-label="Sources and catalog" title="Show or hide the sources and catalog">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M9.5 5v14"/></g><path class="fill" d="M5 6.5h3.5v11H5z"/></svg>
+      </button>
+    </div>
+    <a class="brand" href="/console/" title="Ursa Console">
+      <svg class="logo" viewBox="1 2.2 20.4 8.6" aria-hidden="true">
+        <!-- The Big Dipper: Ursa Major's seven bright stars, sized by magnitude. -->
+        <path class="logo-line" d="M19.4 4.2 19.2 8.4 15.1 9.1 15.3 5.2 Z M15.3 5.2 11.2 6.0 7.6 4.9 3.2 6.7"/>
+        <g class="logo-star">
+          <circle cx="19.4" cy="4.2" r="1.5"/><circle cx="15.3" cy="5.2" r="1.0"/>
+          <circle cx="15.1" cy="9.1" r="1.15"/><circle cx="19.2" cy="8.4" r="1.2"/>
+          <circle cx="11.2" cy="6.0" r="1.85"/><circle cx="7.6" cy="4.9" r="1.3"/>
+          <circle cx="3.2" cy="6.7" r="1.7"/>
+        </g>
+      </svg>
+      <span class="label"><b>Ursa</b> Console</span>
+    </a>
+    <div class="console-head-side right">
+      <button id="toggle-right" type="button" class="icon-button" aria-controls="right" aria-expanded="true"
+              aria-label="Inspector and history" title="Show or hide the inspector and history">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M14.5 5v14"/></g><path class="fill" d="M15.5 6.5H19v11h-3.5z"/></svg>
+      </button>
+      <button id="theme" type="button" class="theme" title="Switch between light and dark" aria-label="Switch between light and dark">
+        <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Three columns (design/console.md §6): sources and catalog; the editor
+       over the results; the inspector over History. The splitters resize
+       them (drag, or focus one and use the arrow keys; Enter folds a side
+       column away). Under 1024px the side columns become drawers. Each
+       panel's body (data-mount) is where its issue mounts its UI. -->
+  <div id="console" class="console">
+    <aside id="left" class="column side left" aria-label="Sources and catalog">
+      <section id="sources" class="panel" aria-labelledby="sources-title" tabindex="-1" data-panel="sources">
+        <h2 class="panel-head"><button type="button" id="sources-title" class="panel-toggle" aria-expanded="true" aria-controls="sources-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Sources</button></h2>
+        <div id="sources-body" class="panel-body" data-mount="sources">
+          <div class="placeholder">
+            <span class="issue">URSA-16</span>
+            <p class="what">Files and buckets</p>
+            <p>The served directory, buckets and attached databases. Choosing a file starts a query of it.</p>
+          </div>
+        </div>
+      </section>
+      <div class="splitter rows" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="sources"
+           aria-label="Resize the sources and catalog" data-split="left"></div>
+      <section id="catalog" class="panel" aria-labelledby="catalog-title" tabindex="-1" data-panel="catalog">
+        <h2 class="panel-head"><button type="button" id="catalog-title" class="panel-toggle" aria-expanded="true" aria-controls="catalog-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Catalog</button></h2>
+        <div id="catalog-body" class="panel-body" data-mount="catalog">
+          <div class="placeholder">
+            <span class="issue">URSA-15</span>
+            <p class="what">Tables and graphs</p>
+            <p>The session's databases, schemas, tables with their columns, and property graphs.</p>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <div class="splitter columns" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="left"
+         aria-label="Resize the sources and catalog" data-split="left-width"></div>
+
+    <main id="main" class="column main" aria-label="Query">
+      <section id="editor" class="panel" aria-labelledby="editor-title" tabindex="-1" data-panel="editor">
+        <h2 class="panel-head"><button type="button" id="editor-title" class="panel-toggle" aria-expanded="true" aria-controls="editor-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Editor</button></h2>
+        <div id="editor-body" class="panel-body" data-mount="editor">
+          <div class="placeholder">
+            <span class="issue">URSA-13</span>
+            <p class="what">SQL editor</p>
+            <p>SQL and SQL/PGQ with highlighting and completion from the session, run with Ctrl+Enter.</p>
+          </div>
+        </div>
+      </section>
+      <div class="splitter rows" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="editor"
+           aria-label="Resize the editor and results" data-split="main"></div>
+      <section id="results" class="panel" aria-labelledby="results-title" tabindex="-1" data-panel="results">
+        <h2 class="panel-head"><button type="button" id="results-title" class="panel-toggle" aria-expanded="true" aria-controls="results-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Results</button></h2>
+        <div id="results-body" class="panel-body" data-mount="results">
+          <div class="placeholder">
+            <span class="issue">URSA-14</span>
+            <p class="what">Result tabs</p>
+            <p>Each result in a tab of its own, as a paged, typed table, a graph or a plan.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="splitter columns" role="separator" tabindex="0" aria-orientation="vertical" aria-controls="right"
+         aria-label="Resize the inspector and history" data-split="right-width"></div>
+
+    <aside id="right" class="column side right" aria-label="Inspector and history">
+      <section id="inspector" class="panel" aria-labelledby="inspector-title" tabindex="-1" data-panel="inspector">
+        <h2 class="panel-head"><button type="button" id="inspector-title" class="panel-toggle" aria-expanded="true" aria-controls="inspector-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Inspector</button></h2>
+        <div id="inspector-body" class="panel-body" data-mount="inspector">
+          <div class="placeholder">
+            <span class="issue">Not yet assigned</span>
+            <p class="what">The selection</p>
+            <p>The selected row, node or edge, with every property.</p>
+          </div>
+        </div>
+      </section>
+      <div class="splitter rows" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="inspector"
+           aria-label="Resize the inspector and history" data-split="right"></div>
+      <section id="history" class="panel" aria-labelledby="history-title" tabindex="-1" data-panel="history">
+        <h2 class="panel-head"><button type="button" id="history-title" class="panel-toggle" aria-expanded="true" aria-controls="history-body"><svg class="chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>History</button></h2>
+        <div id="history-body" class="panel-body" data-mount="history">
+          <div class="placeholder">
+            <span class="issue">URSA-17</span>
+            <p class="what">Queries and graph steps</p>
+            <p>What ran in this session, and who ran it, to rerun or replay.</p>
+          </div>
+        </div>
+      </section>
+    </aside>
+    <div class="scrim" hidden></div>
+  </div>
+
+  <footer id="status" class="statusbar" tabindex="-1" aria-label="Status">
+    <div class="status-connection">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="connection" role="status">Connecting…</span>
+      <span id="retry-in" class="retry-in"></span>
+      <button id="reconnect" type="button" class="status-button" hidden>Reconnect now</button>
+    </div>
+    <div id="running" class="status-running" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="running-text"></span>
+      <span id="running-time" class="time"></span>
+      <button id="cancel" type="button" class="status-button cancel">Cancel</button>
+    </div>
+    <span id="announce" class="visually-hidden" role="status"></span>
+    <div class="status-session">
+      <span id="root" class="root" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="visually-hidden">Session root: </span><bdi id="root-path"></bdi></span>
+      <span id="engine" class="engine" hidden></span>
+    </div>
+  </footer>
+</body>
+</html>

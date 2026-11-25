@@ -1,7 +1,8 @@
 // Serve the shell locally without Cloudflare, as the Worker would: dist/ for
 // the page, .data/ at /data/ (with HEAD and byte ranges, which the engine
 // reads Parquet with) and the engine from .engine/ at /engine/<hash>.wasm,
-// with the Worker's security headers (src/headers.ts) on every response.
+// with the Worker's security headers (src/headers.ts) on every response. And
+// the console, from dist-console/ at /console/, over the wasm engine.
 // Build first: `bun run engine`, `bun run upload:data -- --dry` (stages
 // .data/) and `bun run build`.
 //
@@ -10,6 +11,7 @@ import { file } from "bun";
 import { extname, join, normalize, sep } from "node:path";
 import { withSecurityHeaders } from "../src/headers";
 import { DATA_DIR, ENGINE_DIR, WEB } from "./common";
+import { CONSOLE_DIST } from "./console";
 
 const dist = join(WEB, "dist");
 const TYPES: Record<string, string> = {
@@ -77,6 +79,13 @@ async function route(req: Request): Promise<Response> {
     const hit = await within(ENGINE_DIR, `${wasm[1]}.wasm.br`);
     if (!hit) return new Response("not found", { status: 404 });
     return new Response(hit.f, { headers: { "content-type": "application/wasm", "content-encoding": "br" } });
+  }
+  // The console (dist-console/console/), over the wasm engine here: `ursa
+  // serve` is its home, where it talks to a native session.
+  if (path === "/console") return Response.redirect(`${new URL(req.url).origin}/console/`, 308);
+  if (path.startsWith("/console/")) {
+    const hit = await within(CONSOLE_DIST, path.endsWith("/") ? `${path}index.html` : path);
+    if (hit) return new Response(hit.f, { headers: { "content-type": TYPES[extname(hit.full)] ?? "application/octet-stream" } });
   }
   const hit = await within(dist, path === "/" ? "index.html" : path);
   if (!hit) return new Response("not found", { status: 404 });
