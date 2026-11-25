@@ -31,7 +31,7 @@ let engineStarted;
 
 function startEngine() {
   client?.close();
-  client = connect(defaultTransport(), { name: "shell", kind: "human" });
+  client = connect(defaultTransport(), { name: "shell", kind: "human" }, { session: "new" });
   engineStarted = client.ready;
   engineStarted.catch(() => {});
 }
@@ -1483,7 +1483,7 @@ fileInput.onchange = () => {
       // prompt and what was typed are drawn again after it.
       setAside();
       const buffer = await file.arrayBuffer();
-      const { url } = await engine("addFile", { name: file.name }, [{ kind: "bytes", name: "file", bytes: buffer }]);
+      const { url } = await engine("addFile", { name: file.name }, [{ name: "file", kind: "bytes", bytes: buffer }]);
       uploads.push({ name: file.name, url, bytes: file.size });
       runAll([`CREATE OR REPLACE VIEW ${quoted} AS SELECT * FROM '${url.replace(/'/g, "''")}';`, `FROM ${quoted} LIMIT 10;`]);
     });

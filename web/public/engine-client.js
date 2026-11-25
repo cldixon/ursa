@@ -1,19 +1,33 @@
 // The page's one way to the engine: the session protocol (design/console.md
 // §4), over one of two transports.
 //
-//   const client = connect(defaultTransport());
+//   const client = connect(defaultTransport(), { name: "shell", kind: "human" }, { session: "new" });
 //   await client.ready;                        // hello's result
 //   const { out, err } = await client.call("feed", { line: "SELECT 1;" });
 //
 // - WorkerTransport: the browser demo's engine, ursa-wasm in a Web Worker
 //   (engine-worker.js), over postMessage. Binary parts are transferred.
 //
-// A transport carries these messages:
+// A transport carries these messages (docs/reference/protocol.md):
 //
-//   request  {v: 1, id, op, args, parts: [{kind, name, bytes}]}
-//   reply    {id, ok: true, result, parts: [{kind, name, bytes}]}
+//   request  {v: 1, id, op, args, parts: [{name, kind, bytes}]}
+//   reply    {id, ok: true, result, parts: [{name, kind, bytes}]}
 //            {id, ok: false, error: {kind, message}}
 //   event    {event, ...}
+//
+// where a part's `bytes` is its ArrayBuffer. A transport is an object with:
+//
+//   open({reply, event, fail})  start; resolves once requests can be sent.
+//                               Calls reply(message) for each reply, in full
+//                               (every part arrived), event(message) for each
+//                               event, and fail(text) once if the engine stops.
+//   send(request)               send a request; its parts' buffers may be
+//                               transferred (they are the transport's).
+//   close()                     stop.
+//
+// The first request is `hello`, which connect() sends: {protocol: 1, client,
+// session: "new" | "shared"}. The shell asks for a session of its own; the
+// console and agents share one. A session refuses another version.
 //
 // `call(op, args, parts)` resolves to the reply's result with each part put
 // in it under its name: a UGR graph or a file as a Uint8Array, `f32` parts as
@@ -28,8 +42,12 @@ import { SocketTransport, servedOverSocket } from "./socket-transport.js";
 
 const PROTOCOL = 1;
 
-/** A client of the session on the other end of `transport`. */
-export function connect(transport, client = { name: "shell", kind: "human" }) {
+/**
+ * A client of the session on the other end of `transport`. `client` is
+ * {name, kind: "human" | "agent"}; `session` is "new" (a session of the
+ * client's own, as the shell wants) or "shared".
+ */
+export function connect(transport, client = { name: "shell", kind: "human" }, { session = "shared" } = {}) {
   let nextId = 0;
   const calls = new Map();
   const listeners = new Map();
@@ -63,11 +81,11 @@ export function connect(transport, client = { name: "shell", kind: "human" }) {
     });
   }
 
-  const ready = opened.then(() => send("hello", { client }));
+  const ready = opened.then(() => send("hello", { protocol: PROTOCOL, client, session }));
   ready.catch(() => {});
   return {
     ready,
-    /** Run `op`; `parts` are [{kind, name, bytes: ArrayBuffer}], transferred. */
+    /** Run `op`; `parts` are [{name, kind, bytes: ArrayBuffer}], transferred. */
     call: (op, args, parts) => ready.then(() => send(op, args, parts)),
     on(event, fn) {
       if (!listeners.has(event)) listeners.set(event, new Set());
