@@ -198,22 +198,51 @@ impl EdgeInterner {
             });
         }
         drop(renumber);
-        // Keep the edges between nodes, in order, compacting in place.
-        let len = src.len();
-        let mut kept = 0;
-        for i in 0..len {
-            let keep = src[i] != MISS && dst[i] != MISS;
-            if keep {
-                (src[kept], dst[kept]) = (src[i], dst[i]);
-                kept += 1;
-            }
-            self.count_row(i, len, keep);
-        }
-        src.truncate(kept);
-        dst.truncate(kept);
         (self.src_dense, self.dst_dense) = (src, dst);
-        self.rows = len;
+        // Keep the edges between nodes, in order.
+        self.settle(0);
         Ok(())
+    }
+
+    /// Settle the edge rows from `base` of the dense endpoints, pushed since
+    /// the node set was fixed and each marked [`MISS`] at an end that is no
+    /// node: those with a missing end are dropped, counted and marked in
+    /// [`Self::kept_rows`], and the rest are compacted in order. A chunk
+    /// with nothing to drop, the common case, is checked in parallel and
+    /// left as it is; only one with a row to drop takes the serial pass
+    /// (#532).
+    fn settle(&mut self, base: usize) {
+        let len = self.src_dense.len() - base;
+        let (src, dst) = (&self.src_dense[base..], &self.dst_dense[base..]);
+        let missing = |(s, d): (&[u32], &[u32])| s.contains(&MISS) || d.contains(&MISS);
+        let drops = if intern_in_parallel(len) {
+            use crate::parallel::*;
+            const CHUNK: usize = 1 << 16;
+            src.par_chunks(CHUNK)
+                .zip(dst.par_chunks(CHUNK))
+                .any(missing)
+        } else {
+            missing((src, dst))
+        };
+        if !drops {
+            if let Some(kept) = &mut self.kept {
+                kept.append_n(len, true);
+            }
+        } else {
+            let mut kept = base;
+            for i in 0..len {
+                let (s, d) = (self.src_dense[base + i], self.dst_dense[base + i]);
+                let keep = s != MISS && d != MISS;
+                if keep {
+                    (self.src_dense[kept], self.dst_dense[kept]) = (s, d);
+                    kept += 1;
+                }
+                self.count_row(i, len, keep);
+            }
+            self.src_dense.truncate(kept);
+            self.dst_dense.truncate(kept);
+        }
+        self.rows += len;
     }
 
     /// Count row `i` of a chunk of `len` rows, pushed since the node set was
@@ -358,7 +387,11 @@ impl EdgeInterner {
             _ => return Err(IdError::MixedTypes),
         }
         let len = src.len();
-        let (mut s, mut d) = (vec![MISS; len], vec![MISS; len]);
+        // Each row's dense ends go straight after the edges kept so far, and
+        // [`Self::settle`] drops the rows that are not between two nodes.
+        let base = self.src_dense.len();
+        self.src_dense.resize(base + len, MISS);
+        self.dst_dense.resize(base + len, MISS);
         {
             let map = &*map;
             // The dense id of each row from `start` of `arr`; MISS for a null or
@@ -384,7 +417,8 @@ impl EdgeInterner {
                 }
             };
             const CHUNK: usize = 4096;
-            for (out, arr) in [(&mut s[..], src), (&mut d[..], dst)] {
+            let (s, d) = (&mut self.src_dense[base..], &mut self.dst_dense[base..]);
+            for (out, arr) in [(s, src), (d, dst)] {
                 if intern_in_parallel(len) {
                     use crate::parallel::*;
                     out.par_chunks_mut(CHUNK)
@@ -395,15 +429,7 @@ impl EdgeInterner {
                 }
             }
         }
-        for i in 0..len {
-            let keep = s[i] != MISS && d[i] != MISS;
-            if keep {
-                self.src_dense.push(s[i]);
-                self.dst_dense.push(d[i]);
-            }
-            self.count_row(i, len, keep);
-        }
-        self.rows += len;
+        self.settle(base);
         Ok(())
     }
 
@@ -435,7 +461,12 @@ impl EdgeInterner {
         let provisional = self.provisional;
         let map = self.map.get_or_insert_with(|| kind.new_map());
         let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
-        if let IdMap::Int64 { to_dense, .. } = map {
+        // A provisional interner's ids are only those of the edges read
+        // before the node set is fixed, which may be few spread over the
+        // nodes' whole range: a direct table with a slot per edge row would
+        // span it, and grow to it serially, a copy at a time (#532). So it
+        // holds a direct table only while that is dense in its own ids.
+        if let (IdMap::Int64 { to_dense, .. }, false) = (&mut *map, provisional) {
             to_dense.budget_rows(self.rows_hint.max(sd.len() + src.len()));
         }
         match (kind, &*map) {
@@ -1188,13 +1219,14 @@ fn probe(slots: &[u32], hash: u64, is: impl Fn(u32) -> bool) -> Option<u32> {
 
 /// The stored lookup table of `n` distinct ids, of which `hash(i)` is the
 /// hash of id `i` and `same(a, b)` says whether ids `a` and `b` are equal
-/// ([`IdError::DuplicateId`] if two are). The ids go in dense order, so the
-/// table is the same whatever the thread count; their hashes are computed in
-/// parallel first.
+/// ([`IdError::DuplicateId`] if two are). The table is the one inserting the
+/// ids in dense order gives, so it is the same whatever the thread count;
+/// their hashes are computed in parallel first, and a long table is filled
+/// in parallel too ([`place_in_parallel`], #532).
 fn build_slots(
     n: usize,
     hash: impl Fn(usize) -> u64 + Sync,
-    same: impl Fn(u32, u32) -> bool,
+    same: impl Fn(u32, u32) -> bool + Sync,
 ) -> Result<Vec<u32>, IdError> {
     use crate::parallel::*;
     if n >= u32::MAX as usize {
@@ -1207,6 +1239,10 @@ fn build_slots(
     } else {
         (0..n).map(&hash).collect()
     };
+    #[cfg(feature = "rayon")]
+    if intern_in_parallel(n) {
+        return place_in_parallel(&hashes, len, &same);
+    }
     let mut slots = vec![MISS; len];
     for (i, &h) in hashes.iter().enumerate() {
         let mut at = first_slot(h, len);
@@ -1226,6 +1262,82 @@ fn build_slots(
         }
     }
     Ok(slots)
+}
+
+/// [`build_slots`]'s table, filled by every thread at once: the table of
+/// `len` slots that inserting ids `0..hashes.len()` in that order gives,
+/// where `hashes[i]` is id `i`'s hash and `same(a, b)` says whether ids `a`
+/// and `b` are equal.
+///
+/// Linear probing is history independent when a lower id has priority
+/// (Shun and Blelloch, "Phase-concurrent hash tables for determinism",
+/// SPAA 2014): an id walking from its first slot passes a slot holding a
+/// lower one, takes an empty slot, and takes the slot of a higher one,
+/// which then walks on from the next slot. A slot only ever holds a lower
+/// id than it held, so the slots an id has passed still hold lower ones,
+/// and the table ends as the serial insertion in id order leaves it,
+/// whatever order the threads ran in.
+///
+/// Two equal ids are a [`IdError::DuplicateId`], as in the serial
+/// insertion, where the later one walks past the earlier. Here they may
+/// never meet while walking, so the finished table is checked: an id is a
+/// duplicate exactly when an equal one lies between its first slot and its
+/// own, which is where the serial insertion would have met it.
+#[cfg(feature = "rayon")]
+fn place_in_parallel(
+    hashes: &[u64],
+    len: usize,
+    same: &(impl Fn(u32, u32) -> bool + Sync),
+) -> Result<Vec<u32>, IdError> {
+    use crate::parallel::*;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let next = |at: usize| if at + 1 == len { 0 } else { at + 1 };
+    let slots: Vec<AtomicU32> = (0..len)
+        .into_par_iter()
+        .map(|_| AtomicU32::new(MISS))
+        .collect();
+    (0..hashes.len()).into_par_iter().for_each(|i| {
+        let mut id = i as u32;
+        let mut at = first_slot(hashes[i], len);
+        loop {
+            let held = slots[at].load(Relaxed);
+            if held < id {
+                at = next(at);
+            } else if slots[at]
+                .compare_exchange(held, id, Relaxed, Relaxed)
+                .is_ok()
+            {
+                if held == MISS {
+                    return;
+                }
+                // `held` was displaced: it walks on.
+                id = held;
+                at = next(at);
+            }
+            // Otherwise the slot changed meanwhile: read it again.
+        }
+    });
+    let slots: Vec<u32> = slots.into_par_iter().map(AtomicU32::into_inner).collect();
+    let duplicate = (0..len).into_par_iter().any(|j| {
+        let id = slots[j];
+        if id == MISS {
+            return false;
+        }
+        let h = hashes[id as usize];
+        let mut at = first_slot(h, len);
+        while at != j {
+            let other = slots[at];
+            if other != MISS && hashes[other as usize] == h && same(other, id) {
+                return true;
+            }
+            at = next(at);
+        }
+        false
+    });
+    match duplicate {
+        true => Err(IdError::DuplicateId),
+        false => Ok(slots),
+    }
 }
 
 /// [`build_slots`] of integer ids.
@@ -1267,24 +1379,33 @@ fn intern_two_phase(
     let base = sd.len();
     sd.resize(base + len, MISS);
     dd.resize(base + len, MISS);
+    // Which chunks of rows have an id the map does not hold yet: the serial
+    // pass visits only those (#532).
+    let mut missed = vec![false; len.div_ceil(CHUNK)];
     {
         let map = &*map;
         for (out, is_dst) in [(&mut sd[base..], false), (&mut dd[base..], true)] {
-            out.par_chunks_mut(CHUNK).enumerate().for_each(|(c, out)| {
-                for (k, o) in out.iter_mut().enumerate() {
-                    if let Some(dense) = lookup(map, is_dst, c * CHUNK + k) {
-                        *o = dense;
+            out.par_chunks_mut(CHUNK)
+                .zip(missed.par_iter_mut())
+                .enumerate()
+                .for_each(|(c, (out, missed))| {
+                    for (k, o) in out.iter_mut().enumerate() {
+                        match lookup(map, is_dst, c * CHUNK + k) {
+                            Some(dense) => *o = dense,
+                            None => *missed = true,
+                        }
                     }
-                }
-            });
+                });
         }
     }
-    for i in 0..len {
-        if sd[base + i] == MISS {
-            sd[base + i] = intern(map, false, i)?;
-        }
-        if dd[base + i] == MISS {
-            dd[base + i] = intern(map, true, i)?;
+    for (c, _) in missed.iter().enumerate().filter(|(_, &m)| m) {
+        for i in c * CHUNK..((c + 1) * CHUNK).min(len) {
+            if sd[base + i] == MISS {
+                sd[base + i] = intern(map, false, i)?;
+            }
+            if dd[base + i] == MISS {
+                dd[base + i] = intern(map, true, i)?;
+            }
         }
     }
     Ok(())
@@ -2026,6 +2147,78 @@ mod tests {
         interner.adopt(early).unwrap();
         assert_eq!(interner.n_dropped(), 2);
         assert_eq!(interner.finish().1, Vec::<u32>::new());
+    }
+
+    /// Long chunks, which settle their rows in parallel when none is
+    /// dropped (#532), keep and drop exactly the rows the row-by-row rule
+    /// does, pushed after the nodes or adopted, with drops before, after
+    /// and between chunks that drop nothing.
+    #[test]
+    fn long_chunks_keep_the_rows_between_two_nodes() {
+        let n = 50_000i64;
+        let len = PARALLEL_MIN_ROWS + 7;
+        // Chunks 0 and 2 drop nothing; 1 and 3 drop a few rows.
+        let chunks: Vec<(Vec<i64>, Vec<i64>)> = (0..4)
+            .map(|c| {
+                (0..len as i64)
+                    .map(|i| {
+                        let s = (i * 7 + c) % n;
+                        let mut d = (i * 13 + 3 * c) % n;
+                        if c % 2 == 1 && i % 5001 == 17 {
+                            d = n + i; // no node
+                        }
+                        (s, d)
+                    })
+                    .unzip()
+            })
+            .collect();
+        // The nodes are `0..n` given in that order, so each id is its own
+        // dense index.
+        let mut expect = (Vec::new(), Vec::new(), Vec::new());
+        for (s, d) in &chunks {
+            for (&s, &d) in s.iter().zip(d) {
+                let keep = d < n;
+                expect.2.push(keep);
+                if keep {
+                    expect.0.push(s as u32);
+                    expect.1.push(d as u32);
+                }
+            }
+        }
+        let with_nodes = || {
+            let mut interner = EdgeInterner::with_capacity(len);
+            let nodes: Vec<i64> = (0..n).collect();
+            interner.push_nodes(&Int64Array::from(nodes)).unwrap();
+            interner.close_nodes();
+            interner
+        };
+        let arr = |v: &Vec<i64>| Int64Array::from(v.clone());
+        for split in 0..=chunks.len() {
+            let mut early = EdgeInterner::provisional(len);
+            for (s, d) in &chunks[..split] {
+                early.push(&arr(s), &arr(d)).unwrap();
+            }
+            let mut interner = with_nodes();
+            interner.adopt(early).unwrap();
+            for (s, d) in &chunks[split..] {
+                interner.push(&arr(s), &arr(d)).unwrap();
+            }
+            let (sd, dd, _, dropped, kept) = built(interner);
+            assert_eq!(sd, expect.0, "src, split {split}");
+            assert_eq!(dd, expect.1, "dst, split {split}");
+            let n_dropped = expect.2.iter().filter(|&&k| !k).count() as u64;
+            assert_eq!(dropped, n_dropped, "split {split}");
+            assert_eq!(kept.as_ref(), Some(&expect.2), "kept, split {split}");
+        }
+        // Nothing dropped: no kept rows at all.
+        let mut interner = with_nodes();
+        interner
+            .push(&arr(&chunks[0].0), &arr(&chunks[0].1))
+            .unwrap();
+        interner
+            .push(&arr(&chunks[2].0), &arr(&chunks[2].1))
+            .unwrap();
+        assert_eq!(built(interner).4, None);
     }
 
     #[test]
@@ -2791,6 +2984,43 @@ mod tests {
             .unwrap();
         // 0xb456… * 2 >> 64 = 1.
         assert_eq!(table.as_ref(), &[MISS, 0]);
+    }
+
+    /// A table filled in parallel is the one filled serially (#532), on
+    /// columns long enough to take the parallel path, and an id given twice
+    /// is an error there too, wherever it is.
+    #[test]
+    fn a_table_filled_in_parallel_is_the_serial_one() {
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let table = |ids: &ArrayRef| {
+            IdMap::from_stored_ids(Arc::clone(ids), None)
+                .unwrap()
+                .lookup_table()
+        };
+        for n in [PARALLEL_MIN_ROWS, 3 * PARALLEL_MIN_ROWS + 5] {
+            for ids in stored_columns(n) {
+                let serial = one.install(|| table(&ids)).unwrap();
+                for _ in 0..3 {
+                    assert_eq!(table(&ids).unwrap(), serial, "n = {n}");
+                }
+            }
+            // Ids `0..n` with one of them again: first, in the middle, last.
+            for (at, again) in [(0, 0), (n / 2, 7), (n, n as i64 - 1)] {
+                let mut ints: Vec<i64> = (0..n as i64).collect();
+                ints.insert(at, again);
+                let strings: Vec<String> = ints.iter().map(|i| format!("k{i}")).collect();
+                let ints: ArrayRef = Arc::new(Int64Array::from(ints));
+                let strings: ArrayRef = Arc::new(StringArray::from(strings));
+                for ids in [ints, strings] {
+                    assert_eq!(table(&ids).unwrap_err(), IdError::DuplicateId);
+                    let serial = one.install(|| table(&ids));
+                    assert_eq!(serial.unwrap_err(), IdError::DuplicateId);
+                }
+            }
+        }
     }
 
     #[test]
