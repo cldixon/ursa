@@ -466,9 +466,12 @@ static assets and an R2 bucket.
     dimmed, and a hop's seeds ringed), set with `view.setTheme(…)`; the
     theme toggle (or the system's) recolours an open view. No CSS filter.
   - **Progress** (#390): the pane opens with "Loading graph view…" as soon
-    as the engine takes more than 150 ms (not at all, for a quick error),
-    and starts loading `ursa-viz`, here and in the layout worker, then,
-    while the engine still runs the query. Until the graph comes the
+    as the engine takes more than 150 ms (not at all, for a quick error).
+    The view's code (`graph.js` and `ursa-viz`) is first downloaded once the
+    engine has the graph, so a `.graph` that fails downloads none of it,
+    however long the engine took to say so (URSA-11); after that, the pane
+    starts a layout worker with `ursa-viz` loaded as it opens, while the
+    engine still runs the query. Until the graph comes the
     worker lays out a small random graph a few times, so that the browser
     has compiled the layout's code well by then (#525; `graph-worker.js`,
     `warm`). The graph goes to the worker
