@@ -264,7 +264,12 @@ def steps(before: str | None) -> list[Step]:
             "SELECT count(DISTINCT louvain) FROM louvain(ge, seed => 1)",
             "check",
             "ge",
+            # Recorded before #172: since then the index numbers its nodes by
+            # in-degree, and Louvain's visit order follows the numbering, so
+            # the communities for a seed differ (of the same modularity).
+            # Accept 5% either way until the next round re-records it.
             exp(3624),
+            rel_tol=0.05,
         ),
         Step(
             "check_in_degree",

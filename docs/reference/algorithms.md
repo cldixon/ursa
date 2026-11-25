@@ -31,7 +31,7 @@ PageRank over the directed rows. The scores sum to 1. A node with no out-edges s
 ur.connected_components(edges, mode: str = "weak")
 ```
 
-One integer label per node. `mode="weak"` ignores direction: two nodes share a label if a path connects them. `mode="strong"` follows direction: two nodes share a label only if each can reach the other. Labels are stable but arbitrary. Group by the label to get the components.
+One integer label per node. `mode="weak"` ignores direction: two nodes share a label if a path connects them. `mode="strong"` follows direction: two nodes share a label only if each can reach the other. A component's label is the first-seen number of its first node: the position, among the node ids in the order they first appear in the edges (or in the vertex table), of the first of its nodes to appear. So a label depends only on the components and that order, never on how the index numbers its nodes internally or on the order the kernel works in. Group by the label to get the components.
 
 ### `ur.triangle_count`
 
