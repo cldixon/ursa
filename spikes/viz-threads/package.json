@@ -1,0 +1,9 @@
+{
+  "name": "ursa-viz-threads-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bun bench.ts check",
+    "bench": "bun bench.ts bench"
+  }
+}

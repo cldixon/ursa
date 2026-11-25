@@ -1,0 +1,44 @@
+# The threaded-layout spike (#503, design/threaded-layout-spike.md).
+#
+# A workspace of its own, with its own Cargo.lock, so that nothing here can
+# reach the release build: the root workspace does not list it, and no crate
+# of the root workspace depends on it. `build.sh` builds it.
+[package]
+name = "ursa-viz-threads"
+description = "Spike: ursa-viz's layout on a pool of Web Workers over one shared WebAssembly.Memory."
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The pool: ursa-core's kernels on rayon, and (in the browser) rayon's
+# workers as Web Workers over the module's shared memory. Without it this is
+# the layout as the shell ships it, one thread, for the comparison.
+threads = ["ursa-core/rayon", "dep:rayon", "dep:wasm-bindgen-rayon"]
+
+[dependencies]
+ursa-core = { path = "../../ursa-core", default-features = false }
+# The layout as the graph view steps it (`scene::LiveLayout`), without wgpu.
+ursa-viz = { path = "../../ursa-viz", default-features = false }
+rayon = { version = "1.10", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The CLI's version (`wasm-bindgen --version`): the two must match.
+wasm-bindgen = "=0.2.126"
+js-sys = "0.3"
+console_error_panic_hook = "0.1.7"
+# `no-bundler`: the pool's workers import the glue by URL, as the shell
+# serves it (no webpack, no vite).
+wasm-bindgen-rayon = { version = "1.3", features = ["no-bundler"], optional = true }
+
+# The shell's profile (the root Cargo.toml's `wasm-release`).
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

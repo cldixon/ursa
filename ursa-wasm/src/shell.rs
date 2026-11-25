@@ -41,6 +41,7 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::{encode, js_error, Stored};
 use ursa_engine::graph::view::inspect::Inspect;
+#[cfg(test)]
 use ursa_engine::graph::view::GraphView;
 
 /// Where the session's files live: `memory://uploads/`. The engine reads a
@@ -92,19 +93,6 @@ pub struct GraphData {
     skipped: u32,
     /// `POSITIONS (query)`'s place for each node: every `x`, then every `y`.
     positions: Option<Vec<f32>>,
-}
-
-impl From<GraphView> for GraphData {
-    fn from(view: GraphView) -> Self {
-        GraphData {
-            ugr: view.result.to_bytes(),
-            skipped: view.skipped as u32,
-            positions: view.positions.map(|mut p| {
-                p.x.append(&mut p.y);
-                p.x
-            }),
-        }
-    }
 }
 
 #[wasm_bindgen]
@@ -425,9 +413,9 @@ impl WebShell {
     pub fn graph(&self, text: String) -> Promise {
         let shell = Rc::clone(&self.shell);
         future_to_promise(async move {
-            graph_of(&shell, &text)
+            graph_data(&shell, &text)
                 .await
-                .map(|g| GraphData::from(g).into())
+                .map(JsValue::from)
                 .map_err(|e| JsValue::from_str(&ursa_engine::user_message(&e)))
         })
     }
@@ -627,6 +615,29 @@ fn busy() -> DataFusionError {
     clippy::await_holding_refcell_ref,
     reason = "as feed: one call at a time, and the others fail instead of panicking"
 )]
+async fn graph_data(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphData> {
+    let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
+    let (skipped, positions) = shell.open_graph_placed(text).await?;
+    // The bytes are written from the shell's own result: it is not copied
+    // first (8 bytes an edge).
+    let result = shell.explorer().expect("a graph was opened").result();
+    Ok(GraphData {
+        ugr: result.to_bytes(),
+        skipped: skipped as u32,
+        positions: positions.map(|mut p| {
+            p.x.append(&mut p.y);
+            p.x
+        }),
+    })
+}
+
+/// The graph `text` opens, as the engine made it: what [`graph_data`]
+/// writes the bytes of.
+#[cfg(test)]
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "as feed: one call at a time, and the others fail instead of panicking"
+)]
 async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<GraphView> {
     let mut shell = shell.try_borrow_mut().map_err(|_| busy())?;
     let (skipped, positions) = shell.open_graph_placed(text).await?;
@@ -637,6 +648,20 @@ async fn graph_of(shell: &RefCell<Shell<Buffer, Buffer>>, text: &str) -> Result<
         positions,
         groups: None,
     })
+}
+
+#[cfg(test)]
+impl From<GraphView> for GraphData {
+    fn from(view: GraphView) -> Self {
+        GraphData {
+            ugr: view.result.to_bytes(),
+            skipped: view.skipped as u32,
+            positions: view.positions.map(|mut p| {
+                p.x.append(&mut p.y);
+                p.x
+            }),
+        }
+    }
 }
 
 /// What [`WebShell::not_shown`] resolves to.

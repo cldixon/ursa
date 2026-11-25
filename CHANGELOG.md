@@ -245,6 +245,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   what sizes the nodes and each colour's category and count. The engine does
   it all (`WebShell.graph` returns `size`, `color` and the legend; with no
   clause, the graph as before).
+- **A spike: the graph view's layout on threads in the browser** (#503).
+  Nothing in the release changes. `spikes/viz-threads` builds `ursa-viz`'s
+  layout twice from one source, unthreaded on stable and threaded on a
+  pinned nightly (`+atomics`, a rebuilt `std`), and runs the threaded one on a
+  pool of Web Workers over one shared `WebAssembly.Memory`. On four cores in
+  Chromium the layout is 2.0 to 2.3 times faster, with the same bits as the
+  unthreaded build at every thread count, for 33 KB more gzipped and about
+  25 ms more start-up. The report and its recommendation (yes, as an
+  optional build) are `design/threaded-layout-spike.md`. A CI job of its
+  own, `Threaded layout spike`, runs the determinism check when the spike
+  changes.
 - **Ursa Web Shell: the page runs cross-origin isolated** (#429). Every
   response, from the Worker and the local preview alike, carries
   `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
@@ -1817,6 +1828,36 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   the graph; `k` per node for `SHORTEST k`) is said in a notice on stderr,
   `ursa: ursa.max_paths 1000 is below the node count; ANY SHORTEST keeps up
   to 39650447 paths`, where it was silent. Results are unchanged.
+- **A large graph's first frame comes sooner** (#525). On `.graph rmat`
+  (1M edges) in the Web Shell it is shown 0.69 to 0.84 s after Enter
+  where it was 1.0 to 1.3 s, on a machine busy with other builds
+  (`ursa-viz/BENCH.md`, "The first frame"; the 0.6 s the issue asks for
+  is not reached, and the section says what it would take). The final
+  layout is the same, bit for bit.
+  - `.graph NAME` of a property graph that is one edge table (no vertex
+    table, endpoint columns of one integer or string type) is drawn from
+    the session's index of the graph, the one its algorithms run over,
+    and not from its rows: with the index cached nothing is scanned. The
+    drawing is the one the rows give (the same nodes and edges in the
+    same order); a graph the index cannot answer for (a NULL endpoint, a
+    vertex table, more edges than `ursa.graph_max_edges`) is read from
+    its rows as before. The first `.graph` of such a graph builds the
+    index if no algorithm has, and a session with a database stores it,
+    as an algorithm would. In the browser the engine answers in 0.14 to
+    0.23 s where it took 0.36 to 0.54 s, and holds 6 to 14 MiB less: the
+    result is not copied before its bytes are written.
+  - `ursa-core`: a layout's hierarchy no longer sorts the rows of its
+    coarse levels (`Fa2Multilevel`: a row's targets are read off a
+    bitmap), nor `UndirectedCsr::from_edges` the long runs of an
+    adjacency: 140 to 150 ms where it was 200, and 28 ms where it was 39,
+    natively for a 1M-edge R-MAT graph on one core. Both are checked
+    against a sort of every edge.
+  - `ursa-viz`: a view made in pieces gives the event loop its turns as
+    messages, not timers, which a browser makes wait 4 ms each once they
+    nest (`pace`); the turns that wait for the GPU are timers still.
+  - The shell's layout worker lays out a small random graph a few times
+    before the graph comes, so that the browser has compiled the
+    layout's code well by then (`graph-worker.js`).
 
 - **Making the graph view of a large graph no longer holds the page for
   over 60 ms** (#520). On `.graph rmat` in the Web Shell

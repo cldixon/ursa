@@ -216,8 +216,87 @@ pub(crate) fn build_within(
     ))
 }
 
+/// Whether ids of `key_type` come back from a graph index as they went in
+/// ([`of_index`]): an index holds integers as `i64` and strings as UTF-8,
+/// and these are the types that is exact for.
+pub(crate) fn index_key(key_type: &DataType) -> bool {
+    matches!(
+        key_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
+}
+
+/// The drawing of a graph index: `topology`'s nodes and edges, the nodes'
+/// ids `ids` (in the index's order) read as `key_type`. What
+/// [`build_within`] gives for the edge rows the index was built from, when
+/// none was dropped: the index numbers nodes as they are first seen and
+/// edges by their rows, as it does. `None` if an id repeats once read as
+/// `key_type`, which the rows would have told apart.
+pub(crate) fn of_index(
+    topology: &ursa_core::Topology,
+    ids: &ArrayRef,
+    key_type: DataType,
+) -> Result<Option<(EdgeList, NodeIndex)>> {
+    let n = topology.n_nodes();
+    let keys = if ids.data_type() == &key_type {
+        Arc::clone(ids)
+    } else {
+        cast(ids, &key_type)?
+    };
+    if keys.len() != n || keys.null_count() > 0 {
+        return Ok(None);
+    }
+    let converter = RowConverter::new(vec![SortField::new(key_type.clone())])?;
+    let rows = converter.convert_columns(&[Arc::clone(&keys)])?;
+    let options = FormatOptions::default();
+    let shown = ArrayFormatter::try_new(keys.as_ref(), &options)?;
+    let mut nodes = Nodes {
+        index: HashMap::with_capacity(n),
+        ids: Vec::with_capacity(n),
+    };
+    for i in 0..n {
+        if nodes.intern(rows.row(i).as_ref(), || shown.value(i).to_string()) != i as u32 {
+            return Ok(None);
+        }
+    }
+    // Each edge back at its row: the adjacency says which row a slot is.
+    let m = topology.n_edges();
+    let (mut src, mut dst) = (vec![0u32; m], vec![0u32; m]);
+    let out = topology.out();
+    for u in 0..n as u32 {
+        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+            src[e as usize] = u;
+            dst[e as usize] = v;
+        }
+    }
+    Ok(Some((
+        EdgeList {
+            n: n as u32,
+            src,
+            dst,
+            ids: nodes.ids,
+            ..EdgeList::default()
+        },
+        NodeIndex {
+            key_type,
+            index: nodes.index,
+            labels: 0,
+        },
+    )))
+}
+
 /// Node indexes by id, as [`build`] numbered them: what node values are
 /// joined on.
+#[derive(Debug, PartialEq)]
 pub(crate) struct NodeIndex {
     /// The one type every id was read as.
     pub(crate) key_type: DataType,

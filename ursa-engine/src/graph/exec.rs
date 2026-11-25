@@ -1507,6 +1507,35 @@ async fn index_key(
     Ok(Some((fingerprint, files)))
 }
 
+/// The index of the graph the first algorithm in `plan` runs over, as the
+/// algorithm itself would find it: the session's cached one, or built (and
+/// cached) from the plan's edge input. `None` if `plan` runs no algorithm.
+///
+/// For a caller that reads the topology and not a kernel's answer: the
+/// graph view draws a property graph from it (`super::view`, #525).
+pub(crate) async fn index_under(
+    plan: &Arc<dyn ExecutionPlan>,
+    context: &Arc<TaskContext>,
+) -> Result<Option<Arc<GraphIndex>>> {
+    let mut found = None;
+    plan.apply(|node| {
+        Ok(match node.downcast_ref::<GraphAlgorithmExec>() {
+            Some(exec) => {
+                found = Some((exec.shape.edges.clone(), Arc::clone(&exec.input)));
+                TreeNodeRecursion::Stop
+            }
+            None => TreeNodeRecursion::Continue,
+        })
+    })?;
+    match found {
+        Some((edges, input)) => {
+            let (index, _) = verified_index(&edges, input, None, context).await?;
+            Ok(Some(index))
+        }
+        None => Ok(None),
+    }
+}
+
 /// The index, cached or built from the endpoint-only input.
 async fn unweighted_index(
     shape: &Edges,

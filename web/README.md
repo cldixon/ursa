@@ -442,7 +442,10 @@ static assets and an R2 bucket.
   - **Progress** (#390): the pane opens with "Loading graph view…" as soon
     as the engine takes more than 150 ms (not at all, for a quick error),
     and starts loading `ursa-viz`, here and in the layout worker, then,
-    while the engine still runs the query. The graph goes to the worker
+    while the engine still runs the query. Until the graph comes the
+    worker lays out a small random graph a few times, so that the browser
+    has compiled the layout's code well by then (#525; `graph-worker.js`,
+    `warm`). The graph goes to the worker
     before the page builds its view, and nothing is drawn before the
     layout's first positions. The header then reads `… · Laying out · level
     k of n` (and, while a coarse level is drawn, `· G groups`), then

@@ -1,0 +1,19 @@
+5m serial/1 start 12 ms (pool 0), build 5112 ms, layout 116107 ms, 399 MB, dc59c7a1f2605d1f, busy 2.5 (not clean)
+5m threads/2 start 29 ms (pool 20), build 4726 ms, layout 72750 ms, 403 MB, dc59c7a1f2605d1f, busy 3.4 (not clean)
+5m threads/4 start 35 ms (pool 25), build 4251 ms, layout 53197 ms, 407 MB, dc59c7a1f2605d1f, busy 3.3
+5m serial/1 start 9 ms (pool 0), build 4568 ms, layout 118986 ms, 399 MB, dc59c7a1f2605d1f, busy 2.6 (not clean)
+5m threads/2 start 28 ms (pool 18), build 4350 ms, layout 74762 ms, 403 MB, dc59c7a1f2605d1f, busy 3.3 (not clean)
+5m threads/4 start 37 ms (pool 27), build 3757 ms, layout 39785 ms, 407 MB, dc59c7a1f2605d1f, busy 3.0
+  5m chromium serial/1: layout median 118986 ms (min 116107; 0 of 2 runs clean), x1.00
+  5m chromium threads/2: layout median 74762 ms (min 72750; 0 of 2 runs clean), x1.59
+  5m chromium threads/4: layout median 53197 ms (min 39785; 2 of 2 runs clean), x2.24
+grid1m serial/1 start 6 ms (pool 0), build 240 ms, layout 32078 ms, 81 MB, 3295334cf0ab8ee7, busy 1.3
+grid1m threads/2 start 31 ms (pool 20), build 600 ms, layout 19637 ms, 80 MB, 3295334cf0ab8ee7, busy 2.9 (not clean)
+grid1m threads/4 start 48 ms (pool 35), build 1074 ms, layout 14926 ms, 85 MB, 3295334cf0ab8ee7, busy 3.6
+grid1m serial/1 start 11 ms (pool 0), build 311 ms, layout 33212 ms, 81 MB, 3295334cf0ab8ee7, busy 2.7 (not clean)
+grid1m threads/2 start 31 ms (pool 21), build 615 ms, layout 22743 ms, 81 MB, 3295334cf0ab8ee7, busy 3.4 (not clean)
+grid1m threads/4 start 39 ms (pool 28), build 912 ms, layout 17290 ms, 85 MB, 3295334cf0ab8ee7, busy 3.7
+  grid1m chromium serial/1: layout median 32078 ms (min 32078; 1 of 2 runs clean), x1.00
+  grid1m chromium threads/2: layout median 22743 ms (min 19637; 0 of 2 runs clean), x1.41
+  grid1m chromium threads/4: layout median 17290 ms (min 14926; 2 of 2 runs clean), x1.86
+wrote results/chromium-large.json

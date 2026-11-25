@@ -17,6 +17,9 @@
 //!    alone, on a result. `AS …` is rule 0 (#434): it names the shape and
 //!    its columns, and nothing is inferred. `ON graph` names the graph the
 //!    ids belong to, and `LAYOUT` the layout, whatever the rule chose.
+//!    A property graph that is one edge table is read from the session's
+//!    index of it, the one its algorithms run over, where that says what
+//!    its rows would ([`from_index`], #525): nothing is scanned.
 //! 4. Ids become dense node indexes `0..n`, in the order they are first
 //!    seen, so the same rows always give the same graph.
 //! 5. `SIZE BY` and `COLOR BY` each become a node column, which the result's
@@ -1152,6 +1155,19 @@ async fn property_graph_indexed(
     graph: &PropertyGraph,
     max_edges: usize,
 ) -> Result<(EdgeList, NodeIndex)> {
+    if let Some(drawn) = from_index(ctx, graph, max_edges).await {
+        return Ok(drawn);
+    }
+    from_rows(ctx, graph, max_edges).await
+}
+
+/// [`property_graph_indexed`] from the rows of `graph`'s tables: every
+/// vertex table's keys, then every edge table's endpoints.
+async fn from_rows(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    max_edges: usize,
+) -> Result<(EdgeList, NodeIndex)> {
     let state = ctx.state();
     let mut vertices = Vec::new();
     for v in &graph.vertex_tables {
@@ -1183,6 +1199,69 @@ async fn property_graph_indexed(
         ));
     }
     build_within(&vertices, &edges, max_edges)
+}
+
+/// [`property_graph_indexed`] from the session's index of `graph` (the
+/// topology and the id map its algorithms run over, `crate::graph::index`)
+/// and not from its rows (#525): with the index cached, as it is once any
+/// algorithm has run, nothing is scanned and no id is hashed. The drawing
+/// is the one the rows give, node for node and edge for edge.
+///
+/// For a graph that is one edge table and no vertex table, whose endpoint
+/// columns have one type: its index numbers the nodes as they are first
+/// seen in the rows, source before destination, and its edges by their
+/// rows, as [`build_within`] does. `None` for any other graph, and
+/// whenever the index cannot say what the rows would (it dropped a row, an
+/// endpoint is NULL, the graph is beyond `max_edges`, or it could not be
+/// planned or built): the rows are then read as ever, and say why.
+async fn from_index(
+    ctx: &SessionContext,
+    graph: &PropertyGraph,
+    max_edges: usize,
+) -> Option<(EdgeList, NodeIndex)> {
+    let [e] = &graph.edge_tables[..] else {
+        return None;
+    };
+    if !graph.vertex_tables.is_empty() {
+        return None;
+    }
+    let state = ctx.state();
+    let def = GraphDef {
+        name: graph.name.clone(),
+        edges: e.clone(),
+        vertices: None,
+    };
+    // The type the rows' ids are read as: the endpoint columns' own.
+    let plan = edges_plan(&state, &def).await.ok()?;
+    let schema = plan.schema();
+    let type_of = |column: &str| {
+        let i = schema.index_of_column_by_name(None, column)?;
+        Some(schema.field(i).data_type().clone())
+    };
+    let key_type = type_of(&e.source)?;
+    if type_of(&e.destination)? != key_type || !build::index_key(&key_type) {
+        return None;
+    }
+    // Any algorithm over the graph has its index under it.
+    let query = format!(
+        "SELECT id FROM degree(\"{}\")",
+        graph.name.replace('"', "\"\"")
+    );
+    let physical = ctx
+        .sql(&query)
+        .await
+        .ok()?
+        .create_physical_plan()
+        .await
+        .ok()?;
+    let index = crate::graph::index_under(&physical, &ctx.task_ctx())
+        .await
+        .ok()??;
+    let edges = index.topology.n_edges();
+    if index.n_dropped() > 0 || edges == 0 || edges > max_edges {
+        return None;
+    }
+    build::of_index(&index.topology, &index.ids.user_id_array(), key_type).ok()?
 }
 
 /// The columns `columns` of one of `graph`'s tables, every row.
