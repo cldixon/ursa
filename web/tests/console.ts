@@ -259,7 +259,7 @@ await connected();
 // ---------------------------------------------------------------- a phone
 
 await page.setViewportSize({ width: 390, height: 844 });
-await page.waitForTimeout(100);
+await page.waitForFunction(() => document.getElementById("console")!.dataset.narrow === "true" && document.getElementById("left")!.hidden, null, { timeout: 10_000 }).catch(() => {});
 const phone = await page.evaluate(() => ({
   left: document.getElementById("left")!.hidden,
   right: document.getElementById("right")!.hidden,
