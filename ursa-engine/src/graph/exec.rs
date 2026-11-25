@@ -96,7 +96,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use futures::{FutureExt, TryStreamExt};
-use ursa_core::{EdgeInterner, IdError, IdMap, NodeOrder, Topology};
+use ursa_core::{EdgeInterner, IdError, IdMap, NodeOrder, RowSource, Topology};
 
 use super::in_order::{read_ahead, InOrder};
 use super::index::{
@@ -1876,6 +1876,25 @@ fn finish_index(mut interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
     GraphIndex::new(Arc::new(topology), Arc::new(ids)).with_dropped(n_dropped, kept)
 }
 
+/// Where an index keeps its edges' rows (#170): an index of
+/// [`RELABEL_MIN_EDGES`] edges or more writes each row's source to an
+/// anonymous temporary file, and builds its edge ids from it only when a
+/// query reads them (a weight, a mask, an edge's row); a query that reads
+/// none never holds them, 4 B an edge in each direction. A smaller index, or
+/// one whose file cannot be written (or a platform without one), builds them
+/// with the index. Rows already in source order need neither: their ids are
+/// the identity.
+fn spill(sources: &[u32]) -> Option<Arc<dyn RowSource>> {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    if sources.len() >= RELABEL_MIN_EDGES {
+        return ursa_core::topology::SpilledRows::write(sources)
+            .ok()
+            .map(|rows| Arc::new(rows) as Arc<dyn RowSource>);
+    }
+    let _ = sources;
+    None
+}
+
 /// The fewest edges an index relabels its nodes for (#172): a smaller graph's
 /// arrays fit in cache in any order, so it keeps its first-seen numbering.
 const RELABEL_MIN_EDGES: usize = 1 << 16;
@@ -1888,7 +1907,7 @@ fn relabelled(ids: IdMap, source: Vec<u32>, destination: Vec<u32>) -> (Topology,
         true => NodeOrder::InDegree,
         false => NodeOrder::AsGiven,
     };
-    let topology = Topology::build_ordered(ids.len(), source, destination, order);
+    let topology = Topology::build_with_rows(ids.len(), source, destination, order, &mut spill);
     let ids = match topology.original_ids() {
         Some(original) => ids.reordered(original),
         None => ids,
