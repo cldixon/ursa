@@ -56,6 +56,8 @@ impl WebShell {
             uploads: true,
             root: crate::page_root(),
             copy_to_disk: false,
+            database: None,
+            read_only: false,
         };
         WebShell {
             session: Rc::new(RefCell::new(Session::new(options))),
