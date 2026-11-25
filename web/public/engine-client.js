@@ -38,6 +38,8 @@
 //
 // Requests run one at a time, in the order they were sent.
 
+import { SocketTransport, servedOverSocket } from "./socket-transport.js";
+
 const PROTOCOL = 1;
 
 /**
@@ -99,7 +101,7 @@ export function connect(transport, client = { name: "shell", kind: "human" }, { 
 
 /** The transport this page was served for. */
 export function defaultTransport() {
-  return new WorkerTransport();
+  return servedOverSocket() ? new SocketTransport() : new WorkerTransport();
 }
 
 /** The reply's result, with its parts in it by name. */

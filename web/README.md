@@ -44,6 +44,14 @@ static assets and an R2 bucket.
     `cancelInput`, `width`, `highlightAnsi` and `memory`). A
     WebAssembly trap fails its request with kind `crash`, and the page
     connects again to a fresh session.
+  - **`ursa serve`** (`ursa-server`) serves the same page with
+    `<meta name="ursa-transport" content="socket">` in its index, and
+    `engine-client.js` then picks `SocketTransport` (`socket-transport.js`):
+    the same messages over a WebSocket at `/session` to a native session,
+    the JSON in a text frame and each part in a binary frame after an 8-byte
+    header (`design/console.md` §4.2). The page's token travels in an
+    `HttpOnly` cookie, which the script never sees. `bun
+    scripts/e2e-serve.ts PORT` runs the e2e suite that way (see Test).
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
     by the build), with a line editor in `app.js`: Enter sends the line to the
     shell, which runs a statement once it ends with `;` and shows the
@@ -859,6 +867,22 @@ bun run test:e2e                              # in another; or: bun tests/e2e.ts
 ```
 
 It needs Playwright and Chromium (`bun add --no-save playwright && bunx playwright install chromium`).
+
+Over `ursa serve`'s socket in place of the worker:
+
+```sh
+cargo build --release -p ursa-cli --features serve
+bun scripts/e2e-serve.ts 8901                 # [port] [ursa binary]; URSA_BIN= also names it
+```
+
+It starts `ursa serve .data --port PORT --assets dist`, reads the token from
+the link it prints, and runs the suite with `URSA_SERVE_TOKEN` set: every
+browser context gets the token's cookie, and the suite skips (printing `skip`)
+the 6 checks of what only the browser demo has: the engine's crash (a
+WebAssembly trap) and recovery, the wasm instances' memory, the cross-origin
+isolation headers of the wasm engine's files, and its worker. At the end it
+stops the server with Ctrl+C (SIGINT) and fails if it does not stop
+gracefully.
 
 CI runs it: the "Ursa Shell (browser e2e)" job (`.github/workflows/shell-e2e.yml`)
 runs on pull requests and pushes to `main` that touch `web/`, the crates built
