@@ -116,7 +116,7 @@ The graph view (`graph.js`, `graph-worker.js` and the `ursa-viz` wasm) never tou
 
 ## 4. The session protocol
 
-Version 1. Everything below is a proposal for the spike to test; §11 says what the spike must confirm.
+Version 1, as the spike amended it (`console-spike.md`, "What didn't fit") and URSA-2 made it. The reference, generated from `ursa_shell::session::OPS` and tested against `Session::handle`, is `docs/reference/protocol.md`; what is built so far is there, and the tables below are the whole design.
 
 ### 4.1 Messages
 
@@ -131,8 +131,8 @@ A **request**, from a client:
 A **reply**, from the session, exactly one per request, with the same `id`:
 
 ```json
-{"id": 17, "ok": true, "result": {"result": "r4", "columns": [...], "rows": 5, "more": false, "ms": 12},
- "parts": [{"kind": "arrow", "bytes": 1832}]}
+{"id": 17, "ok": true, "result": {"result": "r4", "columns": [...], "metadata": {}, "rows": 5, "more": false, "ms": 12},
+ "parts": [{"name": "arrow", "kind": "arrow", "bytes": 1832}]}
 ```
 
 An **error** reply:
@@ -157,6 +157,8 @@ An **event**, from the session, unprompted:
 ```
 
 ### 4.2 Binary parts
+
+Each part is listed in the JSON as `{name, kind, bytes}`. The name says which is which: a reply can carry two parts of one kind, and some are optional (`graph.open`'s `positions`, `graph.explore`'s `delta`). A client reading a reply as one object puts each part under its name. Requests carry parts the same way (`addFile`'s file), with the same framing; the header's id is the request's.
 
 Over `postMessage`, `parts` hold the `ArrayBuffer`s themselves, transferred, not copied, as `engine-worker.js` does today.
 
@@ -183,15 +185,15 @@ Part kinds:
 
 | op | args | result | notes |
 |---|---|---|---|
-| `hello` | `client: {name, kind}` | `{protocol: 1, version, transport: "native" \| "wasm", capabilities: [...], session: {id, database, cwd}}` | Must be first. `kind` is `"human"` or `"agent"` (§9). |
-| `cancel` | `target: id` | `{}` | Stops the running request `target`: it replies `cancelled`. Capability `cancel`, native only. |
+| `hello` | `protocol: 1`, `client: {name, kind}`, `session: "new" \| "shared"` | `{protocol: 1, version, transport: "native" \| "wasm", capabilities: [...], session: {kind, id?, database?, cwd?}}` | Must be first: the session refuses any other request before it, and a `protocol` it doesn't speak. `kind` is `"human"` or `"agent"` (§9). The shell asks for a `new` session (its `start` replaces it); the console and agents for the `shared` one. |
+| `cancel` | `target: id` | `{}` | Stops the running request `target`: it replies `cancelled`. Capability `cancel`, native only. The shell's dropping of typed input is `cancelInput`. |
 | `settings` | `set?: {name: value}` | all settings | The same as `SET` and `RESET` statements. |
 
 **The console's own operations.**
 
 | op | args | result, parts |
 |---|---|---|
-| `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
+| `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, metadata, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
 | `fetch` | `result`, `offset`, `rows` | `{rows, more}`; `arrow` |
 | `export` | `result`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes` |
 | `close` | `result` | `{}` |
@@ -199,7 +201,7 @@ Part kinds:
 | `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
-- `columns` gives each column's `{name, type, nullable, metadata}`.
+- `columns` gives each column's `{name, type, nullable, metadata}`; `metadata` is the schema's own, where `ursa.pattern` sits for a `GRAPH_TABLE` result.
 - `result` is an id such as `"r4"`. The session keeps a client's last 16 results, and drops the oldest beyond 256 MB.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
@@ -230,9 +232,16 @@ These are today's `graph`, `explore`, `find`, `notShown`, `inspect` and `closeGr
 
 **The shell's compatibility operations.**
 
-| op | as today |
-|---|---|
-| `feed`, `width`, `highlightAnsi`, `memory` | unchanged, so the terminal UI runs over either transport |
+| op | args | result |
+|---|---|---|
+| `start` | `commands`, `shortcuts`, `graphMaxEdges` | a fresh session: `{version, prompt, promptColor}` |
+| `feed` | `line` | as today |
+| `cancelInput` | — | drops a half-typed statement: `{prompt}` |
+| `width` | `columns` | `{}` |
+| `highlightAnsi` | `text`, `alone` | `{text}` |
+| `memory` | — | `{bytes, kind: "wasm" \| "rss"}`: what it measured |
+
+The terminal UI runs on these over either transport.
 
 ### 4.4 Events
 
@@ -255,7 +264,7 @@ The `graph` and `activity` events matter once a second client is attached. With 
 
 ### 4.6 Versioning
 
-`hello` carries `protocol: 1` and a `capabilities` list, for example `cancel`, `sources`, `arrow`, `multi-client`. Additions are new ops, new optional fields or new events, all marked by a new capability. A change that breaks a client increments `protocol`, and the server refuses a client that asks for a version it doesn't speak. The browser demo's worker reports `transport: "wasm"` and has no `cancel` and no `sources`.
+`hello`'s reply carries `protocol: 1` and a `capabilities` list, for example `cancel`, `sources`, `arrow`, `multi-client`. Additions are new ops, new optional fields or new events, all marked by a new capability. A change that breaks a client increments `protocol`, and the server refuses a client that asks for a version it doesn't speak. The browser demo's worker reports `transport: "wasm"` and has no `cancel` and no `sources`.
 
 ### 4.7 Why not something else
 

@@ -33,15 +33,15 @@ static assets and an R2 bucket.
     deployed.
   - **The engine boundary** is the session protocol (`design/console.md`
     §4): `app.js` calls the engine only through `engine-client.js`
-    (`connect(transport).call(op, args, parts)`), whose `WorkerTransport`
+    (`connect(transport, client, {session}).call(op, args, parts)`, which
+    sends `hello` first and asks for a `new` session), whose `WorkerTransport`
     posts `{v, id, op, args, parts}` to `engine-worker.js` and reads back
     `{id, ok, result, parts}`, binary parts (UGR graphs and deltas, `f32` and
     `u32` arrays, files) transferred. The worker hands every operation to
     `WebShell.handle`, which runs `ursa_shell::session::Session`: the
-    operations (`start`, `feed`, `cancelInput`, `width`, `highlightAnsi`,
-    `addFile`, `files`, `export`, `graph.open`, `graph.explore`,
-    `graph.find`, `graph.notShown`, `graph.inspect`, `graph.close`) are
-    listed at `Session::handle`, and `memory` is the worker's own. A
+    operations are listed in `docs/reference/protocol.md`, generated from
+    `ursa_shell::session::OPS` (the shell's own are `start`, `feed`,
+    `cancelInput`, `width`, `highlightAnsi` and `memory`). A
     WebAssembly trap fails its request with kind `crash`, and the page
     connects again to a fresh session.
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
