@@ -2,7 +2,7 @@
 
 > **Status:** design, November 2026, for `ursa` 0.13 and after. Nothing here is built yet.
 > **Follows:** [`graph-explorer.md`](graph-explorer.md) (Phases 1–3, shipped in the web shell).
-> **Spike:** the issue linked from this document's PR. It tests §4 and §5 before anything else is built.
+> **Spike:** #536. It tests §4 and §5 before anything else is built.
 
 `ursa serve` starts a local server, opens a browser tab, and gives you a console: an SQL editor, results as tables, a sources panel (local files, object storage, attached databases), and the graph view rendering results from live queries. It is DuckDB's `duckdb -ui` for a graph engine, and Neo4j's Bloom for Ursa.
 
