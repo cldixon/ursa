@@ -10,7 +10,8 @@
 // pools of each size. `check` also serves the page without COOP/COEP, to see
 // that the pool is not used there.
 //
-// Environment: SIZES=100k,1m · THREADS=1,2,4 · REPEATS=3 · NATIVE=0 ·
+// Environment: SIZES=100k,1m · THREADS=1,2,4 · REPEATS=3 · NATIVE=0 · CHROMIUM=0 ·
+// QUIET_WAIT_MS=120000 ·
 // CHROME=/path/to/chrome (else Playwright's Chromium).
 import { chromium, type Page } from "playwright";
 import { file, spawnSync } from "bun";
@@ -177,7 +178,7 @@ if (mode === "check") {
   const repeats = Number(process.env.REPEATS ?? 3);
   const rows: object[] = [];
   const { page, close } = await open(true);
-  for (const graph of sizes) {
+  for (const graph of process.env.CHROMIUM === "0" ? [] : sizes) {
     // Each repeat is a fresh worker (start-up is measured each time), and
     // the builds are interleaved so that a burst of load from elsewhere on
     // the machine lands on all of them.

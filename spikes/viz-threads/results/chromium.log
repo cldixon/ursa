@@ -1,0 +1,73 @@
+100k serial/1 start 7 ms (pool 0), build 53 ms, layout 5371 ms, 6 MB, c4b1159a9ad2f93f, busy 1.2
+100k threads/1 start 23 ms (pool 13), build 71 ms, layout 5924 ms, 9 MB, c4b1159a9ad2f93f, busy 1.2
+100k threads/2 start 21 ms (pool 13), build 34 ms, layout 3520 ms, 11 MB, c4b1159a9ad2f93f, busy 2.0
+100k threads/4 start 34 ms (pool 25), build 38 ms, layout 2296 ms, 15 MB, c4b1159a9ad2f93f, busy 3.0
+100k threads/8 start 58 ms (pool 48), build 61 ms, layout 2697 ms, 23 MB, c4b1159a9ad2f93f, busy 3.1
+100k serial/1 start 6 ms (pool 0), build 64 ms, layout 5720 ms, 6 MB, c4b1159a9ad2f93f, busy 1.2
+100k threads/1 start 21 ms (pool 12), build 83 ms, layout 6661 ms, 9 MB, c4b1159a9ad2f93f, busy 2.1 (not clean)
+100k threads/2 start 37 ms (pool 23), build 84 ms, layout 5744 ms, 11 MB, c4b1159a9ad2f93f, busy 3.8 (not clean)
+100k threads/4 start 59 ms (pool 46), build 90 ms, layout 3871 ms, 15 MB, c4b1159a9ad2f93f, busy 3.8
+100k threads/8 start 78 ms (pool 59), build 103 ms, layout 3583 ms, 23 MB, c4b1159a9ad2f93f, busy 3.5
+100k serial/1 start 7 ms (pool 0), build 68 ms, layout 5726 ms, 6 MB, c4b1159a9ad2f93f, busy 1.9 (not clean)
+100k threads/1 start 23 ms (pool 14), build 66 ms, layout 6554 ms, 9 MB, c4b1159a9ad2f93f, busy 1.9 (not clean)
+100k threads/2 start 28 ms (pool 17), build 63 ms, layout 3637 ms, 11 MB, c4b1159a9ad2f93f, busy 2.0
+100k threads/4 start 31 ms (pool 23), build 42 ms, layout 2446 ms, 15 MB, c4b1159a9ad2f93f, busy 3.1
+100k threads/8 start 44 ms (pool 36), build 45 ms, layout 2727 ms, 23 MB, c4b1159a9ad2f93f, busy 3.1
+  100k chromium serial/1: layout median 5720 ms (min 5371; 2 of 3 runs clean), x1.00
+  100k chromium threads/1: layout median 5924 ms (min 5924; 1 of 3 runs clean), x0.97
+  100k chromium threads/2: layout median 3637 ms (min 3520; 2 of 3 runs clean), x1.57
+  100k chromium threads/4: layout median 2446 ms (min 2296; 3 of 3 runs clean), x2.34
+  100k chromium threads/8: layout median 2727 ms (min 2697; 3 of 3 runs clean), x2.10
+1m serial/1 start 11 ms (pool 0), build 591 ms, layout 7881 ms, 57 MB, 0bea4355c4f4999a, busy 1.1
+1m threads/1 start 31 ms (pool 18), build 596 ms, layout 8749 ms, 60 MB, 0bea4355c4f4999a, busy 4.0 (not clean)
+1m threads/2 start 25 ms (pool 16), build 522 ms, layout 5162 ms, 62 MB, 0bea4355c4f4999a, busy 1.9
+1m threads/4 start 29 ms (pool 21), build 492 ms, layout 3441 ms, 66 MB, 0bea4355c4f4999a, busy 2.7
+1m threads/8 start 45 ms (pool 37), build 510 ms, layout 4012 ms, 74 MB, 0bea4355c4f4999a, busy 2.9
+1m serial/1 start 14 ms (pool 0), build 685 ms, layout 8232 ms, 57 MB, 0bea4355c4f4999a, busy 3.0 (not clean)
+1m threads/1 start 22 ms (pool 12), build 600 ms, layout 8156 ms, 60 MB, 0bea4355c4f4999a, busy 1.4
+1m threads/2 start 32 ms (pool 22), build 577 ms, layout 6334 ms, 62 MB, 0bea4355c4f4999a, busy 3.9 (not clean)
+1m threads/4 start 62 ms (pool 49), build 664 ms, layout 5538 ms, 66 MB, 0bea4355c4f4999a, busy 3.7
+1m threads/8 start 53 ms (pool 44), build 562 ms, layout 3943 ms, 74 MB, 0bea4355c4f4999a, busy 2.9
+1m serial/1 start 7 ms (pool 0), build 601 ms, layout 7707 ms, 57 MB, 0bea4355c4f4999a, busy 1.1
+1m threads/1 start 19 ms (pool 11), build 598 ms, layout 8241 ms, 60 MB, 0bea4355c4f4999a, busy 1.1
+1m threads/2 start 25 ms (pool 16), build 446 ms, layout 5112 ms, 62 MB, 0bea4355c4f4999a, busy 2.2
+1m threads/4 start 30 ms (pool 21), build 461 ms, layout 4030 ms, 66 MB, 0bea4355c4f4999a, busy 2.9
+1m threads/8 start 53 ms (pool 43), build 460 ms, layout 4232 ms, 74 MB, 0bea4355c4f4999a, busy 3.1
+  1m chromium serial/1: layout median 7881 ms (min 7707; 2 of 3 runs clean), x1.00
+  1m chromium threads/1: layout median 8241 ms (min 8156; 2 of 3 runs clean), x0.96
+  1m chromium threads/2: layout median 5162 ms (min 5112; 2 of 3 runs clean), x1.53
+  1m chromium threads/4: layout median 4030 ms (min 3441; 3 of 3 runs clean), x1.96
+  1m chromium threads/8: layout median 4012 ms (min 3943; 3 of 3 runs clean), x1.96
+grid100k serial/1 start 7 ms (pool 0), build 52 ms, layout 15490 ms, 9 MB, cfa783cf33a0acca, busy 2.1 (not clean)
+grid100k threads/1 start 21 ms (pool 12), build 59 ms, layout 18491 ms, 11 MB, cfa783cf33a0acca, busy 2.3 (not clean)
+grid100k threads/2 start 29 ms (pool 18), build 80 ms, layout 10415 ms, 13 MB, cfa783cf33a0acca, busy 2.0
+grid100k threads/4 start 29 ms (pool 21), build 71 ms, layout 8067 ms, 16 MB, cfa783cf33a0acca, busy 3.4
+grid100k threads/8 start 45 ms (pool 37), build 64 ms, layout 6931 ms, 25 MB, cfa783cf33a0acca, busy 3.2
+grid100k serial/1 start 6 ms (pool 0), build 60 ms, layout 15743 ms, 9 MB, cfa783cf33a0acca, busy 1.1
+grid100k threads/1 start 31 ms (pool 14), build 48 ms, layout 17649 ms, 11 MB, cfa783cf33a0acca, busy 1.1
+grid100k threads/2 start 22 ms (pool 14), build 59 ms, layout 9605 ms, 13 MB, cfa783cf33a0acca, busy 1.8
+grid100k threads/4 start 29 ms (pool 21), build 72 ms, layout 5964 ms, 16 MB, cfa783cf33a0acca, busy 3.2
+grid100k threads/8 start 56 ms (pool 47), build 102 ms, layout 6478 ms, 25 MB, cfa783cf33a0acca, busy 3.2
+grid100k serial/1 start 7 ms (pool 0), build 41 ms, layout 15570 ms, 9 MB, cfa783cf33a0acca, busy 1.0
+grid100k threads/1 start 21 ms (pool 11), build 51 ms, layout 17176 ms, 11 MB, cfa783cf33a0acca, busy 3.2 (not clean)
+grid100k threads/2 start 36 ms (pool 22), build 75 ms, layout 12338 ms, 13 MB, cfa783cf33a0acca, busy 3.8 (not clean)
+grid100k threads/4 start 35 ms (pool 27), build 95 ms, layout 7586 ms, 16 MB, cfa783cf33a0acca, busy 3.5
+grid100k threads/8 start 50 ms (pool 41), build 174 ms, layout 6907 ms, 25 MB, cfa783cf33a0acca, busy 3.2
+  grid100k chromium serial/1: layout median 15743 ms (min 15570; 2 of 3 runs clean), x1.00
+  grid100k chromium threads/1: layout median 17649 ms (min 17649; 1 of 3 runs clean), x0.89
+  grid100k chromium threads/2: layout median 10415 ms (min 9605; 2 of 3 runs clean), x1.51
+  grid100k chromium threads/4: layout median 7586 ms (min 5964; 3 of 3 runs clean), x2.08
+  grid100k chromium threads/8: layout median 6907 ms (min 6478; 3 of 3 runs clean), x2.28
+grid1m serial/1 start 6 ms (pool 0), build 251 ms, layout 33345 ms, 81 MB, 3295334cf0ab8ee7, busy 2.0 (not clean)
+grid1m threads/1 start 23 ms (pool 12), build 310 ms, layout 40530 ms, 79 MB, 3295334cf0ab8ee7, busy 3.2 (not clean)
+grid1m threads/2 start 39 ms (pool 26), build 606 ms, layout 20358 ms, 81 MB, 3295334cf0ab8ee7, busy 3.9 (not clean)
+grid1m threads/4 start 38 ms (pool 28), build 1119 ms, layout 21698 ms, 85 MB, 3295334cf0ab8ee7, busy 3.7
+grid1m threads/8 start 106 ms (pool 94), build 2417 ms, layout 23820 ms, 92 MB, 3295334cf0ab8ee7, busy 3.9
+grid1m serial/1 start 8 ms (pool 0), build 275 ms, layout 35361 ms, 81 MB, 3295334cf0ab8ee7, busy 3.9 (not clean)
+grid1m threads/1 start 27 ms (pool 17), build 397 ms, layout 42798 ms, 79 MB, 3295334cf0ab8ee7, busy 3.5 (not clean)
+grid1m threads/2 start 43 ms (pool 31), build 696 ms, layout 22683 ms, 81 MB, 3295334cf0ab8ee7, busy 3.9 (not clean)
+grid1m threads/4 start 55 ms (pool 42), build 1072 ms, layout 22225 ms, 84 MB, 3295334cf0ab8ee7, busy 3.8
+grid1m threads/8 start 76 ms (pool 65), build 3947 ms, layout 32787 ms, 93 MB, 3295334cf0ab8ee7, busy 4.0
+grid1m serial/1 start 6 ms (pool 0), build 387 ms, layout 33220 ms, 81 MB, 3295334cf0ab8ee7, busy 2.5 (not clean)
+grid1m threads/1 start 28 ms (pool 15), build 423 ms, layout 41944 ms, 79 MB, 3295334cf0ab8ee7, busy 4.0 (not clean)
+grid1m threads/2 start 51 ms (pool 33), build 675 ms, layout 29547 ms, 81 MB, 3295334cf0ab8ee7, busy 4.0 (not clean)
