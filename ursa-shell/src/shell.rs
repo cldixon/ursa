@@ -485,6 +485,18 @@ impl<O: Write, E: Write> Shell<O, E> {
         self.last.as_ref()
     }
 
+    /// Make `(schema, batches)` the last result, as if a query had given it:
+    /// what `.graph` with no source draws and the host's export writes (the
+    /// session's `query`, whose results the shell does not print).
+    pub fn set_last_result(&mut self, schema: SchemaRef, batches: Vec<RecordBatch>) {
+        self.last = Some((schema, batches));
+    }
+
+    /// The engine session the shell runs its SQL in.
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
     /// Colour errors red: the error stream is a screen that shows colour.
     pub fn set_error_color(&mut self, color: bool) {
         self.error_color = color;
