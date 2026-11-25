@@ -304,12 +304,14 @@ async fn patterns_that_cannot_be_matched_are_refused() {
     let ctx = social().await;
     for (sql, expected) in [
         (
-            "SELECT * FROM GRAPH_TABLE (social MATCH (a)-[e]->(b) COLUMNS (a.id))",
-            "which edge table edge 'e' is cannot be told from the pattern; give it a label",
+            "SELECT * FROM GRAPH_TABLE (social MATCH (a)-[e]->(b) COLUMNS (b.full_name))",
+            "node 'b' can be a row of vertex tables person and posts, and posts has no property \
+             'full_name'; read a property they all have (they have none in common), or give 'b' \
+             a label (#412)",
         ),
         (
             "SELECT * FROM GRAPH_TABLE (social MATCH (a) COLUMNS (a.id))",
-            "which vertex table node 'a' is cannot be told from the pattern; give it a label",
+            "node 'a' can be a row of vertex tables person and posts, and posts has no property 'id'",
         ),
         (
             "SELECT * FROM GRAPH_TABLE (social MATCH (a:robot) COLUMNS (a.id))",

@@ -1,0 +1,101 @@
+# A pattern variable over several element tables (#412): an unlabelled
+# variable, a label several tables carry, and a disjunction of labels. Each
+# is a row of any of its tables; the match is the union over every
+# combination of tables that the edges' REFERENCES allow. On DuckPGQ's
+# canonical graph, as starter.slt.
+
+statement ok
+CREATE TABLE Student AS SELECT * FROM (VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter'),(4,'David')) t(id, name);
+
+statement ok
+CREATE TABLE know AS SELECT * FROM (VALUES (0,1,10),(0,2,11),(0,3,12),(3,0,13),(1,2,14),(1,3,15),(2,3,16),(4,3,17)) t(src, dst, createDate);
+
+statement ok
+CREATE TABLE School AS SELECT * FROM (VALUES ('VU',0,0),('UVA',1,0)) t(school_name, school_id, school_kind);
+
+statement ok
+CREATE TABLE StudyAt AS SELECT * FROM (VALUES (0,0),(1,0),(2,1),(3,1),(4,1)) t(personId, schoolId);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (Student PROPERTIES (id, name) LABEL Person, School LABEL School)
+EDGE TABLES (
+  know    SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id)
+          PROPERTIES (createDate) LABEL Knows,
+  studyAt SOURCE KEY (personId) REFERENCES Student (id) DESTINATION KEY (schoolId) REFERENCES School (school_id));
+
+# id: multi/1  an unlabelled node: every vertex table
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a) COLUMNS (element_id(a)));
+----
+7
+
+# id: multi/2  a disjunction of labels, and IS LABELED per table
+query IB rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person|School) COLUMNS (element_id(a) AS id, a IS LABELED School AS school));
+----
+0 false
+1 false
+2 false
+3 false
+4 false
+0 true
+1 true
+
+# id: multi/3  % is any label
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a IS %) COLUMNS (element_id(a)));
+----
+7
+
+# id: multi/4  an unlabelled edge and node: each edge table that starts at a Person
+query IIB rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id < 2)-[e]->(b) COLUMNS (a.id, element_id(b) AS b, b IS LABELED School AS school));
+----
+0 1 false
+0 2 false
+0 3 false
+0 0 true
+1 2 false
+1 3 false
+1 0 true
+
+# id: multi/5  nothing labelled, either direction: know both ways, and studyAt from each end
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a)-[e]-(b) COLUMNS (element_id(a)));
+----
+26
+
+# id: multi/6  an undirected edge between two tables follows its one orientation
+query II rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[s:studyAt]-(b:School) COLUMNS (a.id, b.school_id));
+----
+0 0
+1 0
+2 1
+3 1
+4 1
+
+# id: multi/7  IS LABELED with a disjunction
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a) WHERE a IS LABELED Person|School COLUMNS (element_id(a)));
+----
+7
+
+# id: multi/8  a label on two vertex tables
+statement ok
+CREATE PROPERTY GRAPH pg2
+VERTEX TABLES (Student LABEL Person, School KEY (school_id) LABEL Person)
+EDGE TABLES (know SOURCE KEY (src) REFERENCES Student (id) DESTINATION KEY (dst) REFERENCES Student (id));
+
+# id: multi/9
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg2 MATCH (a:Person) COLUMNS (element_id(a)));
+----
+7
+
+# id: multi/10  a quantified edge that can be a row of several edge tables
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.id = 4)-[e]->{1,2}(b) COLUMNS (element_id(b)));
+----
+4

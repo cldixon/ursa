@@ -19,17 +19,23 @@
 //! path       := [var =] [selector] [mode [PATH | PATHS]] node (edge node)*
 //! selector   := ANY SHORTEST | ALL SHORTEST | ANY [k] | SHORTEST k | ALL
 //! mode       := WALK | TRAIL | SIMPLE | ACYCLIC
-//! node       := ( [var] [:label | IS label] [WHERE condition] )
+//! node       := ( [var] [:labels | IS labels] [WHERE condition] )
 //! edge       := (-[ spec ]->  |  <-[ spec ]-  |  -[ spec ]-  |  ->  |  <-  |  -) [quantifier]
 //! quantifier := * | + | ? | {n} | {m,n} | {m,} | {,n}
-//! spec       := [var] [:label | IS label] [WHERE condition]
+//! spec       := [var] [:labels | IS labels] [WHERE condition]
+//! labels     := label [| label …] | %
 //! ```
 //!
 //! Conditions and `COLUMNS` are SQL expressions over the variables
-//! (`a.name`); each variable is a relation of that name. A label names an element table: by its name or one of
-//! its labels. A variable without one gets the only table it can be: from the
-//! edges next to it and their `REFERENCES`, or because the graph has one table
-//! of that kind; otherwise the pattern is refused, never guessed.
+//! (`a.name`); each variable is a relation of that name. A label names the
+//! element tables that carry it (a table's name is one of its labels); `a|b`
+//! either label's, `%` and no label every table of the variable's kind (#412).
+//! [`lower`] keeps the combinations of tables, one per variable, in which each
+//! edge's table connects its nodes' tables, as its `REFERENCES` say, and
+//! lowers each combination on its own: the planner joins them with `UNION
+//! ALL`. When every variable has one table, there is one combination, lowered
+//! as a pattern always was. A pattern of more than [`MAX_COMBINATIONS`] is
+//! refused; one with none is refused too, as it can match nothing.
 //!
 //! Each variable reads its element table's properties: every column, or what
 //! its labels' `PROPERTIES` clauses give, under their property names. An
@@ -41,8 +47,8 @@
 //! or a mode, is not joined: it is a [`Segment`], searched on the graph index
 //! (see [`super::path_search`]), and joined to the nodes at its ends. A path
 //! with a variable, a selector or a mode is one edge between two nodes for
-//! now. Label expressions (`|`, `&`, `!`) and parenthesized path patterns are
-//! refused with a message.
+//! now, and its edge has one edge table. Label expressions with `&`, `!` or
+//! parentheses, and parenthesized path patterns, are refused with a message.
 //!
 //! ## Through the index
 //!
@@ -151,11 +157,14 @@ pub enum Element {
     Edge(Spec, Direction, Option<Quantifier>),
 }
 
-/// A node or edge: `[var] [:label] [WHERE condition]`.
+/// A node or edge: `[var] [:label[|label…]] [WHERE condition]`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Spec {
     pub var: Option<String>,
-    pub label: Option<String>,
+    /// The labels as written, `:a|b`: the element is a row of any table with
+    /// one of them. Empty: no label, so any table of its kind. `%` is any
+    /// label (#412).
+    pub labels: Vec<String>,
     pub condition: Option<String>,
 }
 
@@ -373,23 +382,39 @@ fn graph_predicates(text: &str) -> Result<String> {
             j += 1;
         }
         let call = if word(j, "LABELED") {
-            let Some((label, _)) = name(j + 1) else {
-                return pattern_err(format!(
-                    "{var} IS LABELED needs a label, as {var} IS LABELED person"
+            // A label, or labels joined with `|`: labeled with any of them.
+            let mut calls = Vec::new();
+            j += 1;
+            loop {
+                let Some((label, _)) = name(j) else {
+                    return pattern_err(format!(
+                        "{var} IS LABELED needs a label, as {var} IS LABELED person"
+                    ));
+                };
+                let label = match label.quote_style {
+                    Some(_) => label.value.clone(),
+                    None => label.value.to_lowercase(),
+                };
+                calls.push(format!(
+                    "{IS_LABELED}({var}, '{}')",
+                    label.replace('\'', "''")
                 ));
-            };
+                j += 1;
+                if !matches!(tokens.get(j).map(|t| &t.0), Some(Token::Pipe)) {
+                    break;
+                }
+                j += 1;
+            }
             if matches!(
-                tokens.get(j + 2).map(|t| &t.0),
-                Some(Token::Pipe | Token::Ampersand | Token::ExclamationMark | Token::Mod)
+                tokens.get(j).map(|t| &t.0),
+                Some(Token::Ampersand | Token::ExclamationMark | Token::Mod)
             ) {
                 return pattern_err(LABEL_EXPRESSIONS);
             }
-            let label = match label.quote_style {
-                Some(_) => label.value.clone(),
-                None => label.value.to_lowercase(),
-            };
-            j += 2;
-            format!("{IS_LABELED}({var}, '{}')", label.replace('\'', "''"))
+            match calls.len() {
+                1 => calls.remove(0),
+                _ => format!("({})", calls.join(" OR ")),
+            }
         } else if (word(j, "SOURCE") || word(j, "DESTINATION")) && word(j + 1, "OF") {
             let function = match word(j, "SOURCE") {
                 true => IS_SOURCE,
@@ -418,9 +443,12 @@ fn graph_predicates(text: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The refusal of a label expression (#412).
+/// The refusal of a label expression Ursa does not read (#412).
 const LABEL_EXPRESSIONS: &str =
-    "label expressions (|, &, !, %) are not supported yet; use one label (#412)";
+    "label expressions with &, ! or parentheses are not supported yet; use one label, or several joined with |, as (a:person|school) (#412)";
+
+/// `%` in a label expression: any label, so any table of the element's kind.
+pub const ANY_LABEL: &str = "%";
 
 /// What a piece of a pattern's text is, as SQL.
 #[derive(Clone, Copy)]
@@ -796,10 +824,25 @@ fn parse_spec(t: &mut Tokens, edge: Option<&str>) -> Result<Spec> {
         spec.var = Some(t.identifier("a variable")?);
     }
     if t.eat(&Token::Colon) || (t.is_word(0, "IS") && t.next().is_some()) {
-        spec.label = Some(t.identifier("a label")?);
+        // A label, or a disjunction of labels, `a|b` (#412). `%` is any label.
+        loop {
+            match t.peek(0) {
+                Some(Token::Mod) => {
+                    t.next();
+                    spec.labels.push(ANY_LABEL.to_string());
+                }
+                Some(Token::ExclamationMark | Token::Ampersand | Token::LParen) => {
+                    return pattern_err(LABEL_EXPRESSIONS)
+                }
+                _ => spec.labels.push(t.identifier("a label")?),
+            }
+            if !t.eat(&Token::Pipe) {
+                break;
+            }
+        }
         if matches!(
             t.peek(0),
-            Some(Token::Pipe | Token::Ampersand | Token::ExclamationMark | Token::Mod)
+            Some(Token::Ampersand | Token::ExclamationMark | Token::Mod | Token::LParen)
         ) {
             return pattern_err(LABEL_EXPRESSIONS);
         }
@@ -1096,7 +1139,7 @@ fn parse_quantifier(t: &mut Tokens) -> Result<Option<Quantifier>> {
 }
 
 /// Where a vertex variable reads from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum VertexSource<'g> {
     Table(&'g VertexTable),
     /// The graph's `nodes` table: a graph without vertex tables.
@@ -1104,25 +1147,66 @@ enum VertexSource<'g> {
 }
 
 /// One variable of the pattern.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Binding<'g> {
     is_edge: bool,
-    label: Option<String>,
+    /// Its labels as written (a disjunction); empty: none.
+    labels: Vec<String>,
     vertex: Option<VertexSource<'g>>,
     edge: Option<&'g EdgeTable>,
     conditions: Vec<String>,
 }
 
+/// A table a variable can be a row of (#412).
+#[derive(Debug, Clone, Copy)]
+enum Table<'g> {
+    Vertex(VertexSource<'g>),
+    Edge(&'g EdgeTable),
+}
+
+impl<'g> Table<'g> {
+    fn vertex(self) -> Option<&'g VertexTable> {
+        match self {
+            Table::Vertex(VertexSource::Table(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn edge(self) -> Option<&'g EdgeTable> {
+        match self {
+            Table::Edge(e) => Some(e),
+            Table::Vertex(_) => None,
+        }
+    }
+
+    /// Its element name, as messages say it.
+    fn name(self) -> &'g str {
+        match self {
+            Table::Vertex(VertexSource::Table(v)) => v.name.as_str(),
+            Table::Vertex(VertexSource::Nodes) => super::schema::NODES,
+            Table::Edge(e) => e.name.as_str(),
+        }
+    }
+}
+
 /// One edge of the pattern, with its two ends.
+#[derive(Debug, Clone)]
 struct Step {
     left: String,
     edge: String,
     right: String,
     direction: Direction,
+    /// The direction as written: `direction` is narrowed when only one
+    /// orientation of an undirected edge fits its tables.
+    written: Direction,
     quantifier: Option<Quantifier>,
     /// The path it is in.
     path: usize,
 }
+
+/// The most combinations of element tables one pattern may expand into: one
+/// plan each, under a `UNION ALL` (#412).
+pub const MAX_COMBINATIONS: usize = 64;
 
 /// A column of a variable: (variable, column).
 pub type VarColumn = (String, String);
@@ -1256,6 +1340,11 @@ pub struct Lowered {
     /// The pattern's edges, in the order written, for the result's
     /// `ursa.pattern`.
     pub edges: Vec<PatternEdge>,
+    /// When the pattern expands into several combinations of tables (#412):
+    /// per named variable that is a row of several tables, the properties
+    /// every one of them has with one type, in the first table's order. What
+    /// `v.*` returns for it.
+    pub shared: BTreeMap<String, Vec<String>>,
 }
 
 /// A pattern variable, as a result's field metadata describes it.
@@ -1315,14 +1404,19 @@ impl Lowered {
     }
 }
 
-/// Resolve `pattern` against `graph`. `schema_of` gives a table's columns
-/// (for properties).
+/// Resolve `pattern` against `graph`: one [`Lowered`] match per combination
+/// of element tables its variables can be rows of (#412), which the planner
+/// joins with `UNION ALL`. A variable with a label is a row of the tables
+/// that carry it (`a|b`: either); one without, of every table of its kind.
+/// Combinations whose edge tables do not connect their nodes' tables are
+/// left out. When every variable has one table there is one combination,
+/// planned as before. `schema_of` gives a table's columns (for properties).
 pub fn lower(
     pattern: &Pattern,
     graph: &PropertyGraph,
     schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
     usage: &Usage,
-) -> Result<Lowered> {
+) -> Result<Vec<Lowered>> {
     // Collect the variables, naming anonymous ones.
     let mut bindings: BTreeMap<String, Binding> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -1354,7 +1448,7 @@ pub fn lower(
                 return pattern_err(format!("'{var}' is used for both a node and an edge"));
             }
             if is_edge
-                && (binding.label.is_some()
+                && (!binding.labels.is_empty()
                     || !binding.conditions.is_empty()
                     || steps.iter().any(|s: &Step| s.edge == var))
             {
@@ -1362,14 +1456,16 @@ pub fn lower(
                     "edge variable '{var}' appears twice; an edge variable binds one edge"
                 ));
             }
-            if let Some(label) = &spec.label {
-                if binding.label.as_ref().is_some_and(|l| l != label) {
+            if !spec.labels.is_empty() {
+                let set = |labels: &[String]| labels.iter().cloned().collect::<BTreeSet<String>>();
+                if !binding.labels.is_empty() && set(&binding.labels) != set(&spec.labels) {
                     return pattern_err(format!(
-                        "'{var}' has two labels, {} and {label}",
-                        binding.label.as_ref().unwrap()
+                        "'{var}' has two labels, {} and {}",
+                        binding.labels.join("|"),
+                        spec.labels.join("|")
                     ));
                 }
-                binding.label = Some(label.clone());
+                binding.labels = spec.labels.clone();
             }
             binding.conditions.extend(spec.condition.clone());
             match element {
@@ -1380,6 +1476,7 @@ pub fn lower(
                             edge,
                             right: var.clone(),
                             direction,
+                            written: direction,
                             quantifier,
                             path: path_index,
                         });
@@ -1394,139 +1491,457 @@ pub fn lower(
         }
     }
 
-    // Labels as written.
-    for (var, b) in bindings.iter_mut() {
-        let Some(label) = &b.label else { continue };
-        if b.is_edge {
-            let tables: Vec<&EdgeTable> = graph
+    // The tables each variable can be a row of: those its labels name, or
+    // every table of its kind when it has none (#412).
+    let mut candidates: BTreeMap<String, Vec<Table>> = BTreeMap::new();
+    for (var, b) in &bindings {
+        let any = b.labels.is_empty() || b.labels.iter().any(|l| l == ANY_LABEL);
+        let named = b.labels.iter().filter(|l| *l != ANY_LABEL);
+        let tables: Vec<Table> = if b.is_edge {
+            for label in named {
+                if !graph.edge_tables.iter().any(|e| e.answers_to(label)) {
+                    return pattern_err(format!(
+                        "graph '{}' has no edge table or edge label '{label}' (for '{}'); its edge tables are {}",
+                        graph.name, shown(var), names(graph.edge_tables.iter().map(|e| e.name.as_str()))
+                    ));
+                }
+            }
+            if graph.edge_tables.is_empty() {
+                return pattern_err(format!("graph '{}' has no edge tables", graph.name));
+            }
+            graph
                 .edge_tables
                 .iter()
-                .filter(|e| e.answers_to(label))
-                .collect();
-            match tables.as_slice() {
-                [only] => b.edge = Some(only),
-                [] => return pattern_err(format!(
-                    "graph '{}' has no edge table or edge label '{label}' (for '{}'); its edge tables are {}",
-                    graph.name, shown(var), names(graph.edge_tables.iter().map(|e| e.name.as_str()))
-                )),
-                _ => return pattern_err(format!(
-                    "label '{label}' is on several edge tables; a label shared by several tables is not supported yet"
-                )),
-            }
+                .filter(|e| any || b.labels.iter().any(|l| e.answers_to(l)))
+                .map(Table::Edge)
+                .collect()
         } else {
-            let tables: Vec<&VertexTable> = graph
+            for label in named {
+                if !graph.vertex_tables.iter().any(|v| v.answers_to(label)) {
+                    return pattern_err(format!(
+                        "graph '{}' has no vertex table or vertex label '{label}' (for '{}'); its vertex tables are {}",
+                        graph.name, shown(var), names(graph.vertex_tables.iter().map(|v| v.name.as_str()))
+                    ));
+                }
+            }
+            graph
                 .vertex_tables
                 .iter()
-                .filter(|v| v.answers_to(label))
-                .collect();
-            match tables.as_slice() {
-                [only] => b.vertex = Some(VertexSource::Table(only)),
-                [] => return pattern_err(format!(
-                    "graph '{}' has no vertex table or vertex label '{label}' (for '{}'); its vertex tables are {}",
-                    graph.name, shown(var), names(graph.vertex_tables.iter().map(|v| v.name.as_str()))
-                )),
-                _ => return pattern_err(format!(
-                    "label '{label}' is on several vertex tables; a label shared by several tables is not supported yet"
-                )),
-            }
-        }
+                .filter(|v| any || b.labels.iter().any(|l| v.answers_to(l)))
+                .map(|v| Table::Vertex(VertexSource::Table(v)))
+                .collect()
+        };
+        candidates.insert(var.clone(), tables);
     }
-
-    // Infer the rest from the edges' REFERENCES, until nothing changes.
-    loop {
-        let mut changed = false;
-        for step in &steps {
-            let left = vertex_table(&bindings[&step.left]);
-            let right = vertex_table(&bindings[&step.right]);
-            let edge = bindings[&step.edge].edge;
-            match edge {
-                None => {
-                    let candidates: Vec<&EdgeTable> = graph
-                        .edge_tables
-                        .iter()
-                        .filter(|e| fits(graph, e, left, right, step.direction))
-                        .collect();
-                    if let [only] = candidates.as_slice() {
-                        bindings.get_mut(&step.edge).unwrap().edge = Some(only);
-                        changed = true;
-                    }
-                }
-                Some(e) => {
-                    let (from, to) = (
-                        graph.endpoint_vertex(e, true),
-                        graph.endpoint_vertex(e, false),
-                    );
-                    let (l, r) = match step.direction {
-                        Direction::Right => (from, to),
-                        Direction::Left => (to, from),
-                        Direction::Any if from.map(|v| &v.name) == to.map(|v| &v.name) => {
-                            (from, to)
-                        }
-                        Direction::Any => (None, None),
-                    };
-                    for (var, table) in [(&step.left, l), (&step.right, r)] {
-                        let b = bindings.get_mut(var).unwrap();
-                        if b.vertex.is_none() {
-                            if let Some(table) = table {
-                                b.vertex = Some(VertexSource::Table(table));
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // What is still open: the graph's only table of its kind, or a refusal.
-    // Edges first: labelling an edge usually tells its nodes too.
-    for (var, b) in bindings.iter_mut() {
-        if b.is_edge && b.edge.is_none() {
-            match graph.edge_tables.as_slice() {
-                [only] => b.edge = Some(only),
-                [] => return pattern_err(format!("graph '{}' has no edge tables", graph.name)),
-                _ => return pattern_err(format!(
-                    "which edge table {} is cannot be told from the pattern; give it a label, as -[{}:{}]->",
-                    describe_var(var, true),
-                    if var.starts_with("__ursa_") { "" } else { var.as_str() },
-                    graph.edge_tables[0].labels()[0].name
-                )),
-            }
-        }
-    }
-    for (var, b) in bindings.iter_mut() {
-        if !b.is_edge && b.vertex.is_none() {
-            match graph.vertex_tables.as_slice() {
-                [only] => b.vertex = Some(VertexSource::Table(only)),
-                [] if graph.default_pair().is_some() => b.vertex = Some(VertexSource::Nodes),
-                [] => return pattern_err(format!(
+    // A graph without vertex tables: its nodes are the `nodes` table's.
+    for (var, b) in &bindings {
+        if !b.is_edge && graph.vertex_tables.is_empty() {
+            if graph.default_pair().is_none() {
+                return pattern_err(format!(
                     "graph '{}' has no vertex tables and several edge tables, so its nodes cannot be matched",
                     graph.name
-                )),
-                _ => return pattern_err(format!(
-                    "which vertex table {} is cannot be told from the pattern; give it a label, as ({}:{})",
-                    describe_var(var, false),
-                    if var.starts_with("__ursa_") { "" } else { var.as_str() },
-                    graph.vertex_tables[0].labels()[0].name
-                )),
+                ));
             }
+            candidates.insert(var.clone(), vec![Table::Vertex(VertexSource::Nodes)]);
         }
     }
 
-    // An edge binds only between the vertex tables its edge table REFERENCES
-    // (#410): a node of another table is refused, not joined on key values
-    // that happen to be equal.
+    // Every combination of tables, one per variable, that the edges'
+    // REFERENCES allow: an edge binds only between the vertex tables its
+    // edge table connects (#410).
+    let combinations = combinations(graph, &order, &steps, &candidates, MAX_COMBINATIONS);
+    if combinations.len() > MAX_COMBINATIONS {
+        let open: Vec<String> = order
+            .iter()
+            .filter(|v| candidates[*v].len() > 1)
+            .map(|v| format!("{} ({})", shown(v), candidates[v].len()))
+            .collect();
+        return pattern_err(format!(
+            "the pattern can match more than {MAX_COMBINATIONS} combinations of element tables, one plan each; give its variables labels so fewer tables fit, as (a:person) or -[e:knows]-> (variables over several tables: {}) (#412)",
+            open.join(", ")
+        ));
+    }
+    if combinations.is_empty() {
+        return pattern_err(no_combination(graph, &bindings, &steps, &candidates));
+    }
+    // A searched edge (quantified, or the edge of a path searched as a whole)
+    // runs on one edge table's index.
     for step in &steps {
-        let e = bindings[&step.edge].edge.expect("resolved");
-        let left = vertex_table(&bindings[&step.left]);
-        let right = vertex_table(&bindings[&step.right]);
-        if !fits(graph, e, left, right, step.direction) {
-            return pattern_err(contradiction(graph, e, step, &bindings));
+        let path = &pattern.paths[step.path];
+        let whole = path.var.is_some() || path.selector != Selector::All || path.mode != Mode::Walk;
+        if !whole && step.quantifier.is_none() {
+            continue;
+        }
+        let at = order
+            .iter()
+            .position(|v| v == &step.edge)
+            .expect("a variable");
+        let mut tables: Vec<&str> = combinations.iter().map(|c| c[at].name()).collect();
+        tables.sort();
+        tables.dedup();
+        if tables.len() > 1 {
+            return pattern_err(format!(
+                "{} is quantified or in a searched path, and it can be an edge of {}; a path search runs over one edge table for now, so give it a label, as -[{}:{}]->* (#412)",
+                describe_var(&step.edge, true),
+                tables.join(" or "),
+                if step.edge.starts_with("__ursa_") { "" } else { step.edge.as_str() },
+                tables[0]
+            ));
         }
     }
+
+    let mut lowered = Vec::new();
+    for combination in &combinations {
+        let mut bindings = bindings.clone();
+        for (var, table) in order.iter().zip(combination) {
+            let b = bindings.get_mut(var).expect("a variable");
+            match table {
+                Table::Vertex(source) => b.vertex = Some(*source),
+                Table::Edge(e) => b.edge = Some(e),
+            }
+        }
+        // An undirected edge between two tables follows the one orientation
+        // its edge table has.
+        let mut steps = steps.clone();
+        for step in &mut steps {
+            if step.direction != Direction::Any {
+                continue;
+            }
+            let e = bindings[&step.edge].edge.expect("resolved");
+            let (left, right) = (
+                vertex_table(&bindings[&step.left]),
+                vertex_table(&bindings[&step.right]),
+            );
+            let forward = fits(graph, e, left, right, Direction::Right);
+            let backward = fits(graph, e, left, right, Direction::Left);
+            step.direction = match (forward, backward) {
+                (true, false) => Direction::Right,
+                (false, true) => Direction::Left,
+                _ => Direction::Any,
+            };
+        }
+        lowered.push(lower_one(
+            pattern, graph, &bindings, &order, &steps, anonymous, schema_of, usage,
+        )?);
+    }
+    if lowered.len() > 1 {
+        let shared = shared_properties(&order, &combinations, schema_of, usage)?;
+        for l in &mut lowered {
+            l.shared = shared.clone();
+        }
+    }
+    Ok(lowered)
+}
+
+/// Every combination of tables, one per variable of `order`, in which each
+/// step's edge table connects its two nodes' tables; at most `limit + 1`.
+fn combinations<'g>(
+    graph: &PropertyGraph,
+    order: &[String],
+    steps: &[Step],
+    candidates: &BTreeMap<String, Vec<Table<'g>>>,
+    limit: usize,
+) -> Vec<Vec<Table<'g>>> {
+    let at = |var: &str| order.iter().position(|v| v == var).expect("a variable");
+    // (left, edge, right, direction), and the variable after which all three
+    // are chosen.
+    let checks: Vec<(usize, usize, usize, Direction, usize)> = steps
+        .iter()
+        .map(|s| {
+            let (l, e, r) = (at(&s.left), at(&s.edge), at(&s.right));
+            (l, e, r, s.direction, l.max(e).max(r))
+        })
+        .collect();
+    let choices: Vec<&Vec<Table>> = order.iter().map(|v| &candidates[v]).collect();
+    let mut out = Vec::new();
+    let mut chosen = Vec::new();
+    #[allow(clippy::too_many_arguments)]
+    fn walk<'g>(
+        graph: &PropertyGraph,
+        choices: &[&Vec<Table<'g>>],
+        checks: &[(usize, usize, usize, Direction, usize)],
+        limit: usize,
+        chosen: &mut Vec<Table<'g>>,
+        out: &mut Vec<Vec<Table<'g>>>,
+    ) {
+        let i = chosen.len();
+        if i == choices.len() {
+            out.push(chosen.clone());
+            return;
+        }
+        for table in choices[i].iter() {
+            if out.len() > limit {
+                return;
+            }
+            chosen.push(*table);
+            let ok = checks.iter().filter(|c| c.4 == i).all(|&(l, e, r, d, _)| {
+                let e = chosen[e].edge().expect("an edge");
+                fits(graph, e, chosen[l].vertex(), chosen[r].vertex(), d)
+            });
+            if ok {
+                walk(graph, choices, checks, limit, chosen, out);
+            }
+            chosen.pop();
+        }
+    }
+    walk(graph, &choices, &checks, limit, &mut chosen, &mut out);
+    out
+}
+
+/// Why no combination of tables fits the pattern's edges.
+fn no_combination(
+    graph: &PropertyGraph,
+    bindings: &BTreeMap<String, Binding>,
+    steps: &[Step],
+    candidates: &BTreeMap<String, Vec<Table>>,
+) -> String {
+    // Every variable has one table: the edge that does not connect its nodes.
+    if candidates.values().all(|c| c.len() == 1) {
+        let mut bindings = bindings.clone();
+        for (var, tables) in candidates {
+            let b = bindings.get_mut(var).expect("a variable");
+            match tables[0] {
+                Table::Vertex(source) => b.vertex = Some(source),
+                Table::Edge(e) => b.edge = Some(e),
+            }
+        }
+        for step in steps {
+            let e = bindings[&step.edge].edge.expect("resolved");
+            let left = vertex_table(&bindings[&step.left]);
+            let right = vertex_table(&bindings[&step.right]);
+            if !fits(graph, e, left, right, step.direction) {
+                return contradiction(graph, e, step, &bindings);
+            }
+        }
+    }
+    let list = |var: &str| {
+        names(candidates[var].iter().map(|t| t.name()))
+            .replace(", ", " or ")
+            .to_string()
+    };
+    // An edge that fits none of the tables its nodes can be.
+    for step in steps {
+        let fitting = candidates[&step.edge].iter().any(|e| {
+            candidates[&step.left].iter().any(|l| {
+                candidates[&step.right].iter().any(|r| {
+                    fits(
+                        graph,
+                        e.edge().expect("an edge"),
+                        l.vertex(),
+                        r.vertex(),
+                        step.direction,
+                    )
+                })
+            })
+        });
+        if fitting {
+            continue;
+        }
+        let arrow = match step.direction {
+            Direction::Right => "->",
+            Direction::Left => "<-",
+            Direction::Any => "-",
+        };
+        let (left, right) = (
+            written(&step.left, &bindings[&step.left]),
+            written(&step.right, &bindings[&step.right]),
+        );
+        return format!(
+            "no edge table of graph '{}' fits {} as written, {left}{arrow}{right}: the edge can be a row of {}, {left} of {} and {right} of {}, and none of those edge tables connects them that way, so the pattern can match nothing; check the labels and the direction",
+            graph.name,
+            describe_var(&step.edge, true),
+            list(&step.edge),
+            list(&step.left),
+            list(&step.right),
+        );
+    }
+    "no combination of the tables its variables can be fits every edge of the pattern, so it can match nothing; check the labels and the directions".to_string()
+}
+
+/// The properties a variable over several tables can read: per such named
+/// variable, those every one of its tables has with one type (see
+/// [`Lowered::shared`]). Refuses a property the query reads that some of
+/// them lack, or that they have with types that do not mix.
+fn shared_properties(
+    order: &[String],
+    combinations: &[Vec<Table>],
+    schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
+    usage: &Usage,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    use datafusion::arrow::datatypes::DataType;
+    let mut shared = BTreeMap::new();
+    for (i, var) in order.iter().enumerate() {
+        if var.starts_with("__ursa_") {
+            continue;
+        }
+        let mut tables: Vec<Table> = Vec::new();
+        for c in combinations {
+            if !tables.iter().any(|t| t.name() == c[i].name()) {
+                tables.push(c[i]);
+            }
+        }
+        if tables.len() < 2 {
+            continue;
+        }
+        // Each table's properties and their types, in its order.
+        let mut typed: Vec<(&str, Vec<(String, DataType)>)> = Vec::new();
+        for table in &tables {
+            let (reference, columns) = match table {
+                Table::Vertex(VertexSource::Table(v)) => (
+                    &v.table,
+                    properties(&v.table, &v.labels(), &[v.key.as_str()], schema_of)?,
+                ),
+                Table::Edge(e) => (
+                    &e.table,
+                    properties(
+                        &e.table,
+                        &e.labels(),
+                        &[e.source.as_str(), e.destination.as_str()],
+                        schema_of,
+                    )?,
+                ),
+                Table::Vertex(VertexSource::Nodes) => continue,
+            };
+            let schema = schema_of(reference)?;
+            let of = |column: &str| {
+                schema
+                    .field_with_name(column)
+                    .map(|f| f.data_type().clone())
+                    .ok()
+            };
+            let list: Vec<(String, DataType)> = match columns {
+                None => schema
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name().clone(), f.data_type().clone()))
+                    .collect(),
+                Some(columns) => columns
+                    .iter()
+                    .filter_map(|(column, name)| Some((name.clone(), of(column)?)))
+                    .collect(),
+            };
+            typed.push((table.name(), list));
+        }
+        let type_in = |table: &[(String, DataType)], name: &str| {
+            table
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone())
+        };
+        // A property's type in every table, if they all have it and the
+        // types mix; else why not.
+        let common = |name: &str| -> std::result::Result<DataType, String> {
+            let lacking: Vec<&str> = typed
+                .iter()
+                .filter(|(_, list)| type_in(list, name).is_none())
+                .map(|(t, _)| *t)
+                .collect();
+            if !lacking.is_empty() {
+                return Err(format!(
+                    "{} has no property '{name}'",
+                    lacking.join(" and ")
+                ));
+            }
+            let mut result: Option<DataType> = None;
+            for (table, list) in &typed {
+                let t = type_in(list, name).expect("checked");
+                result = match result {
+                    None => Some(t),
+                    Some(r) => match common_type(&r, &t) {
+                        Some(c) => Some(c),
+                        None => {
+                            let first = typed[0].0;
+                            let first_type = type_in(&typed[0].1, name).expect("checked");
+                            return Err(format!(
+                                "property '{name}' is {first_type} in {first} but {t} in {table}, which do not mix"
+                            ));
+                        }
+                    },
+                };
+            }
+            Ok(result.expect("two tables or more"))
+        };
+        let visible: Vec<String> = typed[0]
+            .1
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| common(n).is_ok())
+            .collect();
+        let what = describe_var(var, bindings_is_edge(&tables));
+        if let Some(Some(read)) = usage.reads.get(var) {
+            for property in read {
+                // A property no table has is reported as any unknown one.
+                if typed
+                    .iter()
+                    .all(|(_, list)| type_in(list, property).is_none())
+                {
+                    continue;
+                }
+                if let Err(why) = common(property) {
+                    let kind = if bindings_is_edge(&tables) {
+                        "edge"
+                    } else {
+                        "vertex"
+                    };
+                    return pattern_err(format!(
+                        "{what} can be a row of {kind} tables {}, and {why}; read a property they all have ({}), or give '{var}' a label (#412)",
+                        names(typed.iter().map(|(t, _)| *t)).replace(", ", " and "),
+                        match visible.is_empty() {
+                            true => "they have none in common".to_string(),
+                            false => visible.join(", "),
+                        },
+                    ));
+                }
+            }
+        }
+        shared.insert(var.clone(), visible);
+    }
+    Ok(shared)
+}
+
+/// Whether the tables are edge tables.
+fn bindings_is_edge(tables: &[Table]) -> bool {
+    matches!(tables.first(), Some(Table::Edge(_)))
+}
+
+/// The type two columns of these types are read as together, under a
+/// `UNION ALL` of a variable's tables: the same type, two numbers, or two
+/// strings; `None` when they do not mix (#412).
+pub fn common_type(
+    a: &datafusion::arrow::datatypes::DataType,
+    b: &datafusion::arrow::datatypes::DataType,
+) -> Option<datafusion::arrow::datatypes::DataType> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
+    let string =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (DataType::Null, other) | (other, DataType::Null) => Some(other.clone()),
+        _ if (a.is_numeric() && b.is_numeric()) || (string(a) && string(b)) => {
+            comparison_coercion(a, b)
+        }
+        _ => None,
+    }
+}
+
+/// [`lower`] for one combination of tables: every variable of `bindings`
+/// has its table.
+#[allow(clippy::too_many_arguments)]
+fn lower_one(
+    pattern: &Pattern,
+    graph: &PropertyGraph,
+    bindings: &BTreeMap<String, Binding>,
+    order: &[String],
+    steps: &[Step],
+    mut anonymous: usize,
+    schema_of: &dyn Fn(&TableReference) -> Result<SchemaRef>,
+    usage: &Usage,
+) -> Result<Lowered> {
+    let order = order.to_vec();
+    let steps = steps.to_vec();
 
     // The edges searched on the index: quantified edges, and the edge of a
     // path with a variable, a selector or a mode.
@@ -1990,14 +2405,15 @@ pub fn lower(
     let edges = steps
         .iter()
         .map(|step| {
-            let (from, to) = match step.direction {
+            // As written: the same in every combination of tables (#412).
+            let (from, to) = match step.written {
                 Direction::Left => (&step.right, &step.left),
                 Direction::Right | Direction::Any => (&step.left, &step.right),
             };
             PatternEdge {
                 from: named(from),
                 to: named(to),
-                directed: step.direction != Direction::Any,
+                directed: step.written != Direction::Any,
                 edge: named(&step.edge),
                 label: bindings[&step.edge].edge.expect("resolved").name.clone(),
                 quantifier: step.quantifier.map(|q| (q.min, q.max)),
@@ -2015,6 +2431,7 @@ pub fn lower(
         columns: pattern.columns.clone(),
         variables,
         edges,
+        shared: BTreeMap::new(),
     })
 }
 
@@ -2052,6 +2469,17 @@ fn fits(
 
 /// The refusal of `step`, whose edge table `e` does not connect the vertex
 /// tables its nodes are bound to.
+/// A node as written: `(a:person)`, `(:person|school)`, `(a)` or `()`.
+fn written(var: &str, b: &Binding) -> String {
+    let label = b.labels.join("|");
+    match (var.starts_with("__ursa_"), label.is_empty()) {
+        (true, false) => format!("(:{label})"),
+        (true, true) => "()".to_string(),
+        (false, false) => format!("({var}:{label})"),
+        (false, true) => format!("({var})"),
+    }
+}
+
 fn contradiction(
     graph: &PropertyGraph,
     e: &EdgeTable,
@@ -2064,13 +2492,7 @@ fn contradiction(
     let node = |var: &str| {
         let b = &bindings[var];
         let table = vertex_table(b).map(|v| v.name.as_str()).unwrap_or("?");
-        let written = match (var.starts_with("__ursa_"), &b.label) {
-            (true, Some(label)) => format!("(:{label})"),
-            (true, None) => "()".to_string(),
-            (false, Some(label)) => format!("({var}:{label})"),
-            (false, None) => format!("({var})"),
-        };
-        (written, table)
+        (written(var, b), table)
     };
     let (left, left_table) = node(&step.left);
     let (right, right_table) = node(&step.right);
@@ -2169,7 +2591,7 @@ mod tests {
     fn spec(var: Option<&str>, label: Option<&str>, condition: Option<&str>) -> Spec {
         Spec {
             var: var.map(str::to_string),
-            label: label.map(str::to_string),
+            labels: label.map(|l| vec![l.to_string()]).unwrap_or_default(),
             condition: condition.map(str::to_string),
         }
     }
@@ -2322,7 +2744,9 @@ mod tests {
                 "g MATCH ((a)-[e]->(b))* COLUMNS (a.id)",
                 "parenthesized path patterns",
             ),
-            ("g MATCH (a:x|y) COLUMNS (a.id)", "label expressions"),
+            ("g MATCH (a:x&y) COLUMNS (a.id)", "label expressions"),
+            ("g MATCH (a:!x) COLUMNS (a.id)", "label expressions"),
+            ("g MATCH (a IS x|(y)) COLUMNS (a.id)", "label expressions"),
             (
                 "g MATCH ()-[]->()",
                 "a GRAPH_TABLE without COLUMNS returns the properties of the pattern's named nodes and edges",
@@ -2499,10 +2923,37 @@ mod tests {
             )
         );
         assert_eq!(p.columns, "__ursa_is_labeled(a, 'x') AS l");
-        let message = parse("g MATCH (a) WHERE a IS LABELED x|y COLUMNS (a.id)")
+        // A disjunction is labeled with any of them (#412).
+        let p = parse("g MATCH (a) WHERE a IS NOT LABELED x|\"Y\" AND a.id > 0 COLUMNS (a.id)")
+            .unwrap();
+        assert_eq!(
+            p.condition.as_deref(),
+            Some("(NOT (__ursa_is_labeled(a, 'x') OR __ursa_is_labeled(a, 'Y'))) AND a.id > 0")
+        );
+        let message = parse("g MATCH (a) WHERE a IS LABELED x&y COLUMNS (a.id)")
             .unwrap_err()
             .to_string();
         assert!(message.contains("(#412)"), "{message}");
+    }
+
+    #[test]
+    fn label_disjunctions_and_any_label() {
+        let p = parse("g MATCH (a:x|\"Y\")-[e IS %]->(b IS z|x) COLUMNS (a.id)").unwrap();
+        let labels: Vec<Vec<String>> = p.paths[0]
+            .elements
+            .iter()
+            .map(|e| match e {
+                Element::Node(spec) | Element::Edge(spec, ..) => spec.labels.clone(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                vec!["x".to_string(), "Y".to_string()],
+                vec![ANY_LABEL.to_string()],
+                vec!["z".to_string(), "x".to_string()],
+            ]
+        );
     }
 
     #[test]
