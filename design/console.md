@@ -282,7 +282,7 @@ ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
 - **`--read-only`** refuses statements that write: `COPY TO`, `CREATE` in an attached database, `INSERT`, and the rest. It is meant for pairing with an agent (§9).
-- **Sessions:** `hello {session: "new"}` (the default, the shell's choice) gives a tab a session of its own; `hello {session: "shared"}` attaches it to the server's one shared session, which every tab and agent that asks for it sees (§9). A shared session's requests from every connection run in one queue. *(Changed by the spike, #536, and URSA-3: one session per process did not fit the shell, whose `start` replaces its session.)*
+- **Sessions:** `hello {session: "new"}` (the shell's choice) gives a tab a session of its own; `hello {session: "shared"}` (the default) attaches it to the server's one shared session, which every tab and agent that asks for it sees (§9). A shared session's requests from every connection run in one queue. *(Changed by the spike, #536, and URSA-3: one session per process did not fit the shell, whose `start` replaces its session.)*
 - **Ctrl+C stops it gracefully:** no new connections, every running request cancelled, every WebSocket closed (code 1001, "the server stopped"), and the sessions ended.
 
 ### Security

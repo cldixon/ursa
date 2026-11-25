@@ -33,7 +33,7 @@ pub(crate) fn options(config: &Config) -> Options {
     Options {
         version: config.version.clone(),
         transport: "native",
-        capabilities: vec!["cancel", "shared-session", "uploads"],
+        capabilities: vec!["cancel", "uploads"],
         // The shell's page keeps imports and `COPY … TO 'name'` in memory,
         // as the browser demo does, so the page behaves alike on both (the
         // e2e suite runs both). URSA-6 gives sessions a root of their own.

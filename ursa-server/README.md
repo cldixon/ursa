@@ -34,17 +34,20 @@ bound.serve_with_shutdown(async { tokio::signal::ctrl_c().await.ok(); }).await?;
   per part it lists, each after an 8-byte header (request id `u32`, part
   index `u16`, two reserved zero bytes, little-endian). Requests and replies
   are framed alike. `web/public/socket-transport.js` is the other end.
-- **Sessions:** the first request is `hello`. `hello {session: "new"}` (the
-  default) gives the connection a session of its own, as the shell wants a
-  session per tab; `hello {session: "shared"}` attaches it to the server's
-  one shared session, which every such connection sees. `hello`'s result
-  names it: `session: {id, shared}`.
+- **Sessions:** the first request is `hello {protocol: 1}`. `hello {session:
+  "new"}` gives the connection a session of its own, as the shell wants a
+  session per tab; `hello {session: "shared"}`, the default, attaches it to
+  the server's one shared session, which every such connection sees, as the
+  console and agents want. `hello`'s result names it: `session: {kind, id,
+  cwd}`. The shared session's later `hello`s are answered at once, not
+  behind its running request.
 - **The session actor:** each session is a thread of its own that owns an
   `ursa_shell::session::Session` (`Handle::block_on` of the server's
   multi-threaded runtime, inside a `LocalSet`, so DataFusion's partitions
   still run on every core). Requests reach it over a channel and run one at
   a time, in the order they came, from every connection attached to it.
-- **`cancel {target}`** (native only) and `memory` bypass the queue.
+- **`cancel {target}`** (native only) and `memory` bypass the queue: the
+  server answers them itself.
   `cancel` stops one of the connection's own requests, queued or running,
   which then replies `cancelled`: its future is dropped, which is
   DataFusion's cancellation. A graph kernel that does not yield runs to its

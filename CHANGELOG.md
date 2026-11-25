@@ -1027,8 +1027,8 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   a link with a one-time token and serves the shell's page, which talks to a
   native session (`web/public/socket-transport.js`) with the same protocol
   the browser demo speaks to its wasm worker. Each tab gets a session of its
-  own (`hello {session: "new"}`), or attaches to the server's one shared
-  session (`"shared"`). `cancel {target}` stops a running request with
+  own (`hello {session: "new"}`, as the shell asks), or attaches to the
+  server's one shared session (`"shared"`, the default). `cancel {target}` stops a running request with
   DataFusion's cancellation, and a closed tab cancels its own; Ctrl+C stops
   the server gracefully. It listens on `127.0.0.1` and `::1` only; the token
   becomes an `HttpOnly`, `SameSite=Strict` cookie, which the WebSocket and

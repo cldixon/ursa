@@ -132,8 +132,9 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
             ("cancel", _) => {
                 let _ = answer(cancel(&request.args, &running));
             }
-            // The process's memory, not the session's: it needs no turn.
-            ("memory", _) => {
+            // The process's memory, as the session would say: it needs no
+            // turn.
+            ("memory", Some(_)) => {
                 let _ = answer(Ok(memory()));
             }
             (_, None) => {
@@ -156,7 +157,7 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
 }
 
 /// Attach the connection to the session `hello` asks for: `session: "new"`
-/// (the default) or `"shared"`. A second `hello` keeps the session the first
+/// or `"shared"` (the default). A second `hello` keeps the session the first
 /// chose.
 fn attach(
     shared: &Shared,
@@ -190,10 +191,12 @@ fn attach(
             _ => Ok(handle.clone()),
         };
     }
-    let handle = if wanted == Some(true) {
-        shared.sessions.shared()
-    } else {
+    // The protocol's default is the shared session; the shell asks for a
+    // new one.
+    let handle = if wanted == Some(false) {
         shared.sessions.new_session()
+    } else {
+        shared.sessions.shared()
     }
     .map_err(|e| Error {
         kind: "crash",
@@ -265,8 +268,8 @@ async fn reply(
     }
 }
 
-/// Put the session's id, and whether it is the shared one, in `hello`'s
-/// result: `session: {id, shared}`, beside what the session says of itself.
+/// Put the session's id and directory in `hello`'s result: `session: {kind,
+/// id, cwd}`, beside what the session says of itself.
 fn name_session(result: &mut Value, handle: &SessionHandle) {
     let Some(result) = result.as_object_mut() else {
         return;
@@ -275,8 +278,13 @@ fn name_session(result: &mut Value, handle: &SessionHandle) {
     if !session.is_object() {
         *session = json!({});
     }
+    session["kind"] = json!(if handle.shared { "shared" } else { "new" });
     session["id"] = json!(handle.id);
-    session["shared"] = json!(handle.shared);
+    // Relative paths resolve against the process's directory, which `ursa
+    // serve` sets to the one it serves (one root per process for now).
+    if let Ok(cwd) = std::env::current_dir() {
+        session["cwd"] = json!(cwd.display().to_string());
+    }
 }
 
 /// Write each reply, its JSON then its parts, until a close or the end.

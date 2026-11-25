@@ -17,11 +17,12 @@ const FOREVER: &str = "SELECT sum(value) AS s FROM range(0, 100000000000);";
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shell_runs_over_the_socket() {
     let server = Server::start().await;
-    let (mut socket, hello) = server.session(None).await;
+    let (mut socket, hello) = server.session(Some("new")).await;
     assert_eq!(hello["result"]["transport"], "native", "{hello}");
     assert_eq!(hello["result"]["protocol"], 1);
     assert_eq!(hello["result"]["version"], "test");
-    assert_eq!(hello["result"]["session"]["shared"], false);
+    assert_eq!(hello["result"]["session"]["kind"], "new");
+    assert!(hello["result"]["session"]["cwd"].is_string(), "{hello}");
     let capabilities = hello["result"]["capabilities"].as_array().unwrap();
     assert!(capabilities.contains(&json!("cancel")), "{hello}");
     call(&mut socket, 1, "start", json!({}), &[]).await;
@@ -63,7 +64,16 @@ async fn hello_comes_first_and_bad_requests_are_protocol_errors() {
     let mut socket = server.connect().await;
     let (early, _) = call(&mut socket, 1, "feed", json!({"line": "SELECT 1;"}), &[]).await;
     assert_eq!(early["error"]["kind"], "protocol", "{early}");
-    let (wrong, _) = call(&mut socket, 2, "hello", json!({"protocol": 1, "session": "mine"}), &[]).await;
+    let (early, _) = call(&mut socket, 1, "memory", json!({}), &[]).await;
+    assert_eq!(early["error"]["kind"], "protocol", "{early}");
+    let (wrong, _) = call(
+        &mut socket,
+        2,
+        "hello",
+        json!({"protocol": 1, "session": "mine"}),
+        &[],
+    )
+    .await;
     assert_eq!(wrong["error"]["kind"], "protocol", "{wrong}");
     let (newer, _) = call(&mut socket, 3, "hello", json!({"protocol": 2}), &[]).await;
     assert_eq!(newer["error"]["kind"], "protocol", "{newer}");
@@ -97,7 +107,14 @@ async fn hello_comes_first_and_bad_requests_are_protocol_errors() {
     let (refused, _) = receive(&mut socket).await;
     assert_eq!(refused["error"]["kind"], "protocol", "{refused}");
     // A second hello for the other kind of session is refused.
-    let (other, _) = call(&mut socket, 8, "hello", json!({"protocol": 1, "session": "shared"}), &[]).await;
+    let (other, _) = call(
+        &mut socket,
+        8,
+        "hello",
+        json!({"protocol": 1, "session": "new"}),
+        &[],
+    )
+    .await;
     assert_eq!(other["error"]["kind"], "protocol", "{other}");
     let (_, err) = feed(&mut socket, 9, "SELECT 41 + 1 AS answer;").await;
     assert_eq!(err, "");
@@ -124,8 +141,8 @@ async fn hello_comes_first_and_bad_requests_are_protocol_errors() {
 async fn each_tab_has_a_session_or_shares_one() {
     let server = Server::start().await;
     let (mut a, hello_a) = server.session(Some("new")).await;
-    let (mut b, hello_b) = server.session(None).await;
-    let (mut c, hello_c) = server.session(Some("shared")).await;
+    let (mut b, hello_b) = server.session(Some("new")).await;
+    let (mut c, hello_c) = server.session(None).await;
     let (mut d, hello_d) = server.session(Some("shared")).await;
     let id = |hello: &Value| {
         hello["result"]["session"]["id"]
@@ -136,7 +153,7 @@ async fn each_tab_has_a_session_or_shares_one() {
     assert_ne!(id(&hello_a), id(&hello_b));
     assert_eq!(id(&hello_c), id(&hello_d));
     assert_ne!(id(&hello_a), id(&hello_c));
-    assert_eq!(hello_c["result"]["session"]["shared"], true);
+    assert_eq!(hello_c["result"]["session"]["kind"], "shared");
     // A view made in one new session is not in another; in the shared one,
     // every connection sees it.
     feed(&mut a, 1, "CREATE VIEW mine AS SELECT 1 AS x;").await;
@@ -158,7 +175,7 @@ async fn each_tab_has_a_session_or_shares_one() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_stops_a_running_request() {
     let server = Server::start().await;
-    let (mut socket, _) = server.session(None).await;
+    let (mut socket, _) = server.session(Some("new")).await;
     send(&mut socket, 1, "feed", json!({"line": FOREVER}), &[]).await;
     // Queued behind it: cancelled before it runs.
     send(&mut socket, 2, "feed", json!({"line": "SELECT 1;"}), &[]).await;
@@ -216,7 +233,7 @@ async fn a_closed_tab_stops_its_request() {
 #[tokio::test(flavor = "multi_thread")]
 async fn it_stops_gracefully() {
     let mut server = Server::start().await;
-    let (mut socket, _) = server.session(None).await;
+    let (mut socket, _) = server.session(Some("new")).await;
     send(&mut socket, 1, "feed", json!({"line": FOREVER}), &[]).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let started = Instant::now();

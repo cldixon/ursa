@@ -9,7 +9,9 @@
 // replies are framed alike; the server never interleaves two replies' frames.
 //
 // The page's token travels in the cookie the link ursa serve printed set
-// (HttpOnly: this script never sees it).
+// (HttpOnly: this script never sees it). It is a transport as
+// engine-client.js's header defines one: open({reply, event, fail}), send,
+// close.
 
 /** Whether this page was served by `ursa serve`. */
 export function servedOverSocket() {
@@ -23,8 +25,16 @@ export class SocketTransport {
   }
 
   /** Open the socket; resolves once it is open. */
-  open({ reply, event, fail }) {
+  open({ reply, event, fail: failed }) {
     const socket = (this.socket = new WebSocket(this.url));
+    // Once: the engine is gone, or what it sent cannot be read.
+    let stopped = false;
+    const fail = (text) => {
+      if (stopped) return;
+      stopped = true;
+      failed(text);
+      socket.close();
+    };
     socket.binaryType = "arraybuffer";
     // The reply being read: its JSON, and its parts as they arrive.
     let pending = null;

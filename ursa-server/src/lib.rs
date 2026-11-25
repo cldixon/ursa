@@ -3,8 +3,8 @@
 //!
 //! The server is the session protocol's native end. A page opens `/session`,
 //! says `hello`, and gets a session: a new one of its own (`hello {session:
-//! "new"}`, the shell's choice, and the default), or the server's one shared
-//! session (`"shared"`, for the console and agents). A session is an actor: a
+//! "new"}`, the shell's choice), or the server's one shared
+//! session (`"shared"`, the default, for the console and agents). A session is an actor: a
 //! thread of its own that owns an [`ursa_shell::session::Session`], the same
 //! code the browser demo runs in its Web Worker, and runs its requests one at
 //! a time, in the order they came.
