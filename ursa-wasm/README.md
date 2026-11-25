@@ -32,6 +32,7 @@ await init();
 // The page's root: a shell made after this resolves relative paths against it.
 WebShell.setBaseUrl(new URL("data/", location.href).href);
 const shell = new WebShell();
+await shell.handle("hello", JSON.stringify({ protocol: 1, session: "new" }), []); // first, always
 const { message } = await shell.handle("feed", JSON.stringify({ line: "SELECT 42 AS answer;" }), []);
 const { result } = JSON.parse(message); // {ok, result} or {ok: false, error: {kind, message}}
 term.write((result.out + result.err).replaceAll("\n", "\r\n")); // ANSI colour, as in a terminal
@@ -41,12 +42,16 @@ term.write((result.out + result.err).replaceAll("\n", "\r\n")); // ANSI colour, 
   file for `addFile`). It resolves to `{message, parts}`: the reply as JSON
   text, and its binary parts (UGR graphs and deltas, `f32` and `u32` arrays,
   exported files), each with a buffer of its own to transfer.
-- The operations are `start` (a fresh session, with the page's own
-  dot-commands), `feed` (one typed line: `flow` is `continue`, `exit` or
-  `host`), `cancelInput`, `width`, `highlightAnsi`, `addFile`, `files`,
-  `export`, and the graph view's `graph.open`, `graph.explore`, `graph.find`,
-  `graph.notShown`, `graph.inspect` and `graph.close`: see `Session::handle`
-  in `ursa-shell/src/session.rs`, and `web/public/engine-worker.js`.
+- The first operation is `hello` with `protocol: 1`; any other before it,
+  and a `hello` of another version, fail with kind `protocol`.
+- The operations are `hello`, `cancel`, `start` (a fresh session, with the
+  page's own dot-commands), `feed` (one typed line: `flow` is `continue`,
+  `exit` or `host`), `cancelInput`, `width`, `highlightAnsi`, `memory`
+  (`{bytes, kind: "wasm"}`, the WebAssembly memory), `query` (rows as Arrow
+  IPC), `addFile`, `files`, `export`, and the graph view's `graph.open`,
+  `graph.explore`, `graph.find`, `graph.notShown`, `graph.inspect` and
+  `graph.close`: [the protocol's reference](../docs/reference/protocol.md),
+  generated from `ursa_shell::session::OPS`.
 
 Files are read over HTTP with range requests. A server must answer `HEAD` and
 single `Range: bytes=a-b` requests (206 with `Content-Range`).

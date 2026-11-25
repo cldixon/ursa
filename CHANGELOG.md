@@ -1033,6 +1033,29 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   operations take their protocol names (`graph.open`, `graph.explore`,
   `cancelInput`, `highlightAnsi`, …). Nothing a user sees changes.
 
+- **The session protocol is version 1** (URSA-2), with the spike's changes
+  to `design/console.md` §4. The first request must be `hello`, with
+  `protocol: 1` and `session: "new" | "shared"`; the session refuses any
+  other request before it and any other version, with kind `protocol`. The
+  session gains `cancel`, `memory` (`{bytes, kind: "wasm" | "rss"}`, which
+  the worker answered itself before) and the console's `query` (typed
+  columns, the schema's metadata such as `ursa.pattern`, and the first rows
+  as an Arrow IPC part). `ursa_shell::session::OPS` lists the operations;
+  the new reference page, `docs/reference/protocol.md`, is
+  generated from it and tested against it.
+
+- **The graph pane is a module any page can embed** (URSA-8,
+  `design/console.md` §3). `web/public/graph-pane.js`'s `createPane({container,
+  engine, commands, status})` makes the Graph view's pane: its markup, the
+  `/` search and `.find`, the not-shown counts, Esc, the theme, and the graph
+  commands (`.graph`, `.find`, `.expand`, `.collapse`, `.hide`, `.show`,
+  `.undo`, `.redo`), run through the engine client. What the view asks to run
+  (a double-click's `.expand 33`, the inspector's and the search's buttons)
+  goes to the host's `commands` sink: the web shell's is its terminal, as
+  before, and the console's will be its History panel. `app.js` loses about
+  250 lines of graph glue; the graph view behaves as before. A second host,
+  `web/tests/pane-host/` (never deployed), proves it in the e2e test.
+
 - **A root per session, and `COPY … TO` to disk under it** (URSA-6,
   `design/console.md` §5). Relative paths resolve against the session's
   root (`ursa_engine::paths::Root`), which travels with the session's

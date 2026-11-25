@@ -6,14 +6,25 @@ use std::path::Path;
 use serde_json::{json, Value};
 use ursa_shell::session::{Options, Root, Session};
 
+/// A session with `options`, past its `hello`.
+async fn session(options: Options) -> Session {
+    let mut session = Session::new(options);
+    session
+        .handle("hello", json!({ "protocol": 1 }), Vec::new())
+        .await
+        .unwrap();
+    session
+}
+
 /// A session rooted at `dir` that writes its copies to disk, as `ursa serve`
 /// makes one.
-fn rooted(dir: &Path) -> Session {
-    Session::new(Options {
+async fn rooted(dir: &Path) -> Session {
+    session(Options {
         root: Some(Root::Dir(dir.to_path_buf())),
         copy_to_disk: true,
         ..Options::default()
     })
+    .await
 }
 
 /// Feed `line`; its output and errors.
@@ -54,7 +65,7 @@ async fn two_sessions_read_their_own_roots() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     edges(a.path(), 3);
     edges(b.path(), 5);
-    let (mut sa, mut sb) = (rooted(a.path()), rooted(b.path()));
+    let (mut sa, mut sb) = (rooted(a.path()).await, rooted(b.path()).await);
     for (session, n) in [(&mut sa, "3"), (&mut sb, "5")] {
         ok(session, ".mode csv").await;
         let lines = [
@@ -96,7 +107,7 @@ async fn two_sessions_read_their_own_roots() {
 #[tokio::test]
 async fn copy_writes_under_the_root() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let (mut sa, mut sb) = (rooted(a.path()), rooted(b.path()));
+    let (mut sa, mut sb) = (rooted(a.path()).await, rooted(b.path()).await);
     ok(
         &mut sa,
         "COPY (SELECT 1 AS x UNION ALL SELECT 2) TO 'out.csv';",
@@ -135,7 +146,7 @@ async fn copy_never_leaves_the_root() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
-    let mut session = rooted(&root);
+    let mut session = rooted(&root).await;
     let outside = dir.path().join("outside.csv");
     let file_url = url::Url::from_file_path(&outside).unwrap();
     let targets = [
@@ -213,7 +224,7 @@ async fn copy_never_leaves_the_root() {
 async fn output_and_read_use_the_root() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("script.sql"), "SELECT 41 + 1 AS answer;\n").unwrap();
-    let mut session = rooted(dir.path());
+    let mut session = rooted(dir.path()).await;
     ok(&mut session, ".mode csv").await;
     ok(&mut session, ".once answer.csv").await;
     ok(&mut session, ".read script.sql").await;
@@ -226,10 +237,11 @@ async fn output_and_read_use_the_root() {
 #[tokio::test]
 async fn a_rooted_session_can_keep_its_copies_in_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let mut session = Session::new(Options {
+    let mut session = session(Options {
         root: Some(Root::Dir(dir.path().to_path_buf())),
         ..Options::default()
-    });
+    })
+    .await;
     ok(&mut session, "COPY (SELECT 1 AS x) TO 'kept.csv';").await;
     assert!(!dir.path().join("kept.csv").exists());
     let files: Value = session

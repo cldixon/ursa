@@ -6,6 +6,7 @@
 //! ```js
 //! WebShell.setBaseUrl(new URL("data/", location.href).href);
 //! const shell = new WebShell();
+//! await shell.handle("hello", JSON.stringify({ protocol: 1, session: "new" }), []);
 //! const { message, parts } = await shell.handle("feed", JSON.stringify({ line: "SELECT 42 AS answer;" }), []);
 //! const { ok, result } = JSON.parse(message);
 //! term.write(result.out.replaceAll("\n", "\r\n"));
