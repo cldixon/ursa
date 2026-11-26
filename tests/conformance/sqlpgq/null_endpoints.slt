@@ -1,0 +1,61 @@
+# An edge whose source or destination key is NULL references no vertex, so
+# it is no edge of the graph (#336): SQL/PGQ binds an edge to the vertices
+# its keys equal, and NULL equals nothing; DuckPGQ builds its CSR with an
+# inner join, which drops it. Every way of matching agrees: a fixed edge, a
+# bound node, an undirected edge, a quantified edge and a shortest path.
+
+statement ok
+CREATE TABLE Person AS SELECT * FROM (VALUES (0,'Daniel'),(1,'Tavneet'),(2,'Gabor'),(3,'Peter')) t(id, name);
+
+statement ok
+CREATE TABLE knows AS SELECT * FROM (VALUES (0,1),(1,2),(CAST(NULL AS INT),3),(2,CAST(NULL AS INT)),(CAST(NULL AS INT),CAST(NULL AS INT)),(2,0)) t(src, dst);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id));
+
+# id: nulls/1  a fixed edge: the three NULL-ended rows match nothing
+query II rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a)-[k]->(b) COLUMNS (a.id AS a, b.id AS b));
+----
+0 1
+1 2
+2 0
+
+# id: nulls/2  a bound node
+query I
+SELECT * FROM GRAPH_TABLE (pg MATCH (a WHERE a.id = 2)-[k]->(b) COLUMNS (b.id AS b));
+----
+0
+
+# id: nulls/3  into a vertex whose only edge has a NULL source
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a)-[k]->(b WHERE b.id = 3) COLUMNS (a.id));
+----
+0
+
+# id: nulls/4  an undirected edge: each kept edge both ways
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a)-[k]-(b) COLUMNS (a.id));
+----
+6
+
+# id: nulls/5  a quantified edge
+query II rowsort
+SELECT * FROM GRAPH_TABLE (pg MATCH (a WHERE a.id = 0)-[k]->{1,2}(b) COLUMNS (a.id AS a, b.id AS b));
+----
+0 1
+0 2
+
+# id: nulls/6  a shortest path never reaches 3
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH p = ANY SHORTEST (a WHERE a.id = 0)-[k]->{1,3}(b WHERE b.id = 3) COLUMNS (b.id));
+----
+0
+
+# id: nulls/7  every vertex is a vertex, 3 included
+query I
+SELECT count(*) FROM GRAPH_TABLE (pg MATCH (a) COLUMNS (a.id));
+----
+4

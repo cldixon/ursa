@@ -193,8 +193,9 @@ pub fn duckpgq_path_function(name: &str) -> Option<String> {
 }
 
 /// `describe`'s count of the edges left out of the graph because an endpoint
-/// is not a key of its vertex table (#311). SQL's own column: a Python graph
-/// has no vertex table, so it would always be 0 there.
+/// is NULL (#336) or not a key of its vertex table (#311). SQL's own column:
+/// the Python library refuses a NULL endpoint, or drops it before the graph
+/// (`on_null="drop"`), and has no vertex table, so it would always be 0 there.
 pub const N_DROPPED_EDGES: OutputSpec = OutputSpec {
     name: "n_dropped_edges",
     ty: ColumnType::Int64,

@@ -53,6 +53,15 @@ use std::hash::BuildHasher;
 /// it. The result is exactly that of pushing the same edges after
 /// [`EdgeInterner::close_nodes`]: the same dense endpoints, the same dropped
 /// edges and the same [`EdgeInterner::kept_rows`].
+///
+/// **Null endpoints.** With a fixed node set, an edge with a null source or
+/// destination is dropped, as above. Without one, [`EdgeInterner::push`]
+/// refuses it ([`IdError::Null`]: the Python library's `on_null="error"`)
+/// unless the interner was made with [`EdgeInterner::dropping_nulls`], the
+/// SQL engine's rule (#336): such an edge is then dropped, counted in
+/// [`EdgeInterner::n_dropped`] and marked in [`EdgeInterner::kept_rows`],
+/// exactly as with a node set, and neither of its endpoints becomes a node
+/// by it. So an edge with a null endpoint is never part of the graph.
 #[derive(Debug)]
 pub struct EdgeInterner {
     map: Option<IdMap>,
@@ -72,6 +81,9 @@ pub struct EdgeInterner {
     /// endpoint is kept as `(MISS, MISS)` rather than refused, for
     /// [`Self::adopt`] to drop (see the type's docs).
     provisional: bool,
+    /// Without a fixed node set, drop an edge with a null endpoint rather
+    /// than refuse it ([`Self::dropping_nulls`]).
+    drop_nulls: bool,
     /// Nodes given to [`Self::push_nodes`] so far, each id once.
     nodes: u32,
     /// The rows given to [`Self::push_nodes`] that were not a node of their own.
@@ -121,6 +133,7 @@ impl EdgeInterner {
             kept: None,
             dropped: 0,
             provisional: false,
+            drop_nulls: false,
             nodes: 0,
             key_rows: KeyRows::default(),
         }
@@ -136,6 +149,16 @@ impl EdgeInterner {
             provisional: true,
             ..Self::with_capacity(n_edges)
         }
+    }
+
+    /// This interner, dropping an edge with a null source or destination
+    /// rather than refusing it when there is no fixed node set: the edge is
+    /// counted in [`Self::n_dropped`] and marked in [`Self::kept_rows`], as an
+    /// edge to no node is with one (see the type's docs). With a node set, such
+    /// an edge is dropped either way.
+    pub fn dropping_nulls(mut self) -> Self {
+        self.drop_nulls = true;
+        self
     }
 
     /// Take in the edges `provisional` ([`Self::provisional`]) interned while
@@ -361,13 +384,15 @@ impl EdgeInterner {
         self.closed = true;
     }
 
-    /// Edges dropped because an endpoint is not a node (see the type's docs).
+    /// Edges dropped because an endpoint is null or not a node (see the type's
+    /// docs).
     pub fn n_dropped(&self) -> u64 {
         self.dropped
     }
 
-    /// Which of the edge rows pushed since [`Self::close_nodes`] were kept, one
-    /// bit per row in order; `None` if every row was.
+    /// Which of the edge rows pushed since [`Self::close_nodes`] (or, for an
+    /// interner [`Self::dropping_nulls`] with no node set, since the first)
+    /// were kept, one bit per row in order; `None` if every row was.
     pub fn kept_rows(&mut self) -> Option<BooleanBuffer> {
         self.kept.as_mut().map(|k| k.finish())
     }
@@ -444,8 +469,10 @@ impl EdgeInterner {
     }
 
     /// Intern one chunk of endpoints, appending its edges in row order. Errors on
-    /// a null endpoint, unequal lengths, mixed src/dst types, a type that differs
-    /// from earlier chunks, or an unsupported id type.
+    /// a null endpoint (unless the node set is fixed, or the interner is
+    /// [`Self::dropping_nulls`]: the edge is then dropped), unequal lengths,
+    /// mixed src/dst types, a type that differs from earlier chunks, or an
+    /// unsupported id type.
     pub fn push(&mut self, src: &dyn Array, dst: &dyn Array) -> Result<(), IdError> {
         if src.len() != dst.len() {
             return Err(IdError::LengthMismatch);
@@ -458,6 +485,26 @@ impl EdgeInterner {
         if self.closed {
             return self.push_closed(src, dst, kind);
         }
+        if self.drop_nulls && !self.provisional {
+            // Each row with a null end is interned as (MISS, MISS), and
+            // [`Self::settle`] drops and counts it, as a closed interner does.
+            let base = self.src_dense.len();
+            self.push_open(src, dst, kind, true)?;
+            self.settle(base);
+            return Ok(());
+        }
+        self.push_open(src, dst, kind, self.provisional)
+    }
+
+    /// [`Self::push`] without a fixed node set: an edge with a null end is
+    /// interned as `(MISS, MISS)` when `hold_nulls`, and refused otherwise.
+    fn push_open(
+        &mut self,
+        src: &dyn Array,
+        dst: &dyn Array,
+        kind: IdKind,
+        hold_nulls: bool,
+    ) -> Result<(), IdError> {
         let provisional = self.provisional;
         let map = self.map.get_or_insert_with(|| kind.new_map());
         let (sd, dd) = (&mut self.src_dense, &mut self.dst_dense);
@@ -501,7 +548,7 @@ impl EdgeInterner {
                 } else {
                     for i in 0..s.len() {
                         if s.is_null(i) || d.is_null(i) {
-                            if provisional {
+                            if hold_nulls {
                                 sd.push(MISS);
                                 dd.push(MISS);
                                 continue;
@@ -531,7 +578,7 @@ impl EdgeInterner {
                 }
                 for i in 0..s.len() {
                     if s.is_null(i) || d.is_null(i) {
-                        if provisional {
+                        if hold_nulls {
                             sd.push(MISS);
                             dd.push(MISS);
                             continue;
@@ -2025,6 +2072,67 @@ mod tests {
             interner.push(&Int64Array::from(vec![1]), &Int64Array::from(vec![1])),
             Err(IdError::MixedTypes)
         );
+    }
+
+    #[test]
+    fn dropping_nulls_drops_and_counts_edges_with_a_null_end() {
+        // Without the opt-in, a null endpoint is refused (on_null="error").
+        let mut interner = EdgeInterner::with_capacity(2);
+        assert_eq!(
+            interner.push(
+                &Int64Array::from(vec![Some(1), None]),
+                &Int64Array::from(vec![Some(2), Some(3)])
+            ),
+            Err(IdError::Null)
+        );
+        // With it: a null source, a null destination and both null are each
+        // dropped, and neither end of a dropped edge becomes a node by it (3
+        // and 4 are no nodes). A later chunk with no null is counted on.
+        let mut interner = EdgeInterner::with_capacity(4).dropping_nulls();
+        interner
+            .push(
+                &Int64Array::from(vec![Some(1), None, Some(2), None]),
+                &Int64Array::from(vec![Some(2), Some(3), None, None]),
+            )
+            .unwrap();
+        interner
+            .push(&Int64Array::from(vec![2]), &Int64Array::from(vec![1]))
+            .unwrap();
+        assert_eq!(interner.n_dropped(), 3);
+        let kept = interner.kept_rows().unwrap();
+        assert_eq!(
+            kept.iter().collect::<Vec<_>>(),
+            vec![true, false, false, false, true]
+        );
+        let (map, sd, dd) = interner.finish();
+        let ids = map.user_id_array();
+        let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ids.values(), &[1, 2]);
+        assert_eq!((sd, dd), (vec![0, 1], vec![1, 0]));
+
+        // Strings, and a long chunk (the parallel path) with no null: nothing
+        // dropped, no kept bitmap; then one null.
+        let n = 70_000;
+        let words: Vec<String> = (0..n).map(|i| format!("w{i}")).collect();
+        let mut interner = EdgeInterner::with_capacity(n).dropping_nulls();
+        let src = StringArray::from(words.clone());
+        let dst = StringArray::from(words.iter().rev().cloned().collect::<Vec<_>>());
+        interner.push(&src, &dst).unwrap();
+        assert_eq!(interner.n_dropped(), 0);
+        assert!(interner.kept_rows().is_none());
+        interner
+            .push(
+                &StringArray::from(vec![Some("w0"), None]),
+                &StringArray::from(vec![Some("w1"), Some("x")]),
+            )
+            .unwrap();
+        assert_eq!(interner.n_dropped(), 1);
+        let kept = interner.kept_rows().unwrap();
+        assert_eq!(kept.len(), n + 2);
+        assert_eq!(kept.count_set_bits(), n + 1);
+        assert!(!kept.value(n + 1));
+        let (map, sd, _) = interner.finish();
+        assert_eq!((map.len(), sd.len()), (n, n + 1));
     }
 
     #[test]

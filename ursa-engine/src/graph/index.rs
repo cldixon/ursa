@@ -84,12 +84,14 @@ use crate::notices::{self, NoticeLevel, Notifier};
 /// A graph with a vertex table has the vertex table's keys as its nodes, in
 /// the table's order, and only the edges whose endpoints are both keys (see
 /// `ursa_core::EdgeInterner`): its edge ids number the edges kept, and
-/// [`Self::edge_row`] maps them back to rows of the edge table.
+/// [`Self::edge_row`] maps them back to rows of the edge table. An edge with
+/// a NULL endpoint is dropped the same way, with or without a vertex table
+/// (#336).
 #[derive(Debug)]
 pub struct GraphIndex {
     pub topology: Arc<Topology>,
     pub ids: Arc<IdMap>,
-    /// Edge rows dropped because an endpoint is not a node.
+    /// Edge rows dropped because an endpoint is NULL or not a node.
     n_dropped: u64,
     /// Which edge rows were kept, one bit per row of the edge plan, when any
     /// was dropped.

@@ -11,8 +11,9 @@
 //!
 //! - `edges` is the edge table: every row and column, unchanged.
 //! - `nodes` is one row per node, the node id in a column named `id`:
-//!   - without a vertex table, the distinct non-null endpoints (`source` and
-//!     `destination` values) of the edges;
+//!   - without a vertex table, the distinct endpoints (`source` and
+//!     `destination` values) of the edges whose source and destination are
+//!     both non-null: an edge with a NULL end is not part of the graph (#336);
 //!   - with one, every row of the vertex table (its key renamed to `id`,
 //!     followed by its other columns), and nothing else: the vertex table
 //!     defines the node set, as in SQL/PGQ and DuckPGQ, and an edge whose
@@ -47,7 +48,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr_fn::cast;
 use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
-use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
 use parking_lot::RwLock;
 
@@ -326,10 +327,18 @@ pub fn nodes_plan_from(
         .build()
 }
 
-/// The distinct non-null endpoints of the edges, as one column `id`.
+/// The distinct endpoints of the edges whose source and destination are both
+/// non-null, as one column `id`: an edge with a NULL end is not part of the
+/// graph, so neither of its ends is a node by it (#336), as the index build
+/// drops it (`exec::edge_interner`).
 fn endpoints(def: &GraphDef, edges: &Arc<dyn TableSource>) -> Result<LogicalPlanBuilder> {
+    let end = |column: &str| Expr::Column(Column::new(Some(def.edges.table.clone()), column));
+    let both = end(&def.edges.source)
+        .is_not_null()
+        .and(end(&def.edges.destination).is_not_null());
     let side = |column: &str| -> Result<LogicalPlan> {
         LogicalPlanBuilder::scan(def.edges.table.clone(), Arc::clone(edges), None)?
+            .filter(both.clone())?
             .project(vec![Expr::Column(Column::new(
                 Some(def.edges.table.clone()),
                 column,
@@ -337,9 +346,7 @@ fn endpoints(def: &GraphDef, edges: &Arc<dyn TableSource>) -> Result<LogicalPlan
             .alias(ID)])?
             .build()
     };
-    LogicalPlanBuilder::from(side(&def.edges.source)?)
-        .union_distinct(side(&def.edges.destination)?)?
-        .filter(col(ID).is_not_null())
+    LogicalPlanBuilder::from(side(&def.edges.source)?).union_distinct(side(&def.edges.destination)?)
 }
 
 fn cast_to(expr: Expr, from: &DataType, to: &DataType) -> Expr {
