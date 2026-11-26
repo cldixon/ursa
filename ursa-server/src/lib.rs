@@ -203,7 +203,13 @@ impl Bound {
             stop,
         } = self;
         let app = router(Arc::clone(&shared));
-        let mut servers = Vec::new();
+        // A JoinSet, not a Vec of JoinHandles raced with `select_all`: a
+        // listener can end (stopping) between the two branches' polls
+        // below, and awaiting its handle again then panicked ("JoinHandle
+        // polled after completion", URSA-22). A JoinSet hands each result
+        // over once. Dropped, it aborts the listeners still running (once
+        // the grace below is up).
+        let mut servers = tokio::task::JoinSet::new();
         for listener in listeners {
             // A reply is a text frame and then its parts: without
             // TCP_NODELAY, Nagle's algorithm holds the second write until
@@ -215,7 +221,7 @@ impl Bound {
             let served = axum::serve(listener, app.clone()).with_graceful_shutdown(async move {
                 let _ = stopping.wait_for(|s| *s).await;
             });
-            servers.push(tokio::spawn(served.into_future()));
+            servers.spawn(served.into_future());
         }
         tokio::spawn(async move {
             signal.await;
@@ -226,15 +232,13 @@ impl Bound {
         let failed = tokio::select! {
             biased;
             _ = stopping.wait_for(|s| *s) => None,
-            (result, _, _) = futures::future::select_all(&mut servers) => Some(result),
+            Some(result) = servers.join_next() => Some(result),
         };
         // Stopping, the listeners end too: that is no failure.
         let failed = failed.filter(|_| !*shared.stopping.borrow());
         if let Some(result) = failed {
             // A listener stopped by itself: stop the rest, and say why.
-            for server in &servers {
-                server.abort();
-            }
+            servers.abort_all();
             shared.sessions.close();
             result.map_err(io::Error::other)??;
             return Err(io::Error::other("the server stopped listening"));
@@ -242,9 +246,7 @@ impl Bound {
         // The shared session ends once its connections have.
         shared.sessions.close();
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
-            for server in servers {
-                let _ = server.await;
-            }
+            while servers.join_next().await.is_some() {}
             shared.live.idle().await;
         })
         .await;

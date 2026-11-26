@@ -2290,6 +2290,20 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   first. `ursaConsole.editor.insert(".graph karate", {statement: true})`
   gave `.graph karate;`; a dot-command now gets no `;` (the Catalog panel's
   graphs).
+- **`ursa serve` no longer panics on Ctrl+C** (URSA-22). It sometimes
+  exited 101 (a panic: `JoinHandle polled after completion`) instead of
+  stopping with "Stopping.": when a listener ended between the two polls of
+  the shutdown's `select!`, which raced "asked to stop" against "a
+  listener ended", the listener's task was then awaited a second time.
+  `ursa-server` now keeps its listeners in a `JoinSet`, which hands each
+  result over once. `ursa serve` also installs its Ctrl+C handler first, so
+  a Ctrl+C while it starts stops it as soon as it listens rather than
+  ending it by SIGINT's default, and its own messages no longer panic on a
+  closed stdout (which left the server running after Ctrl+C). The test of
+  Ctrl+C now shows the server's stderr when it fails, and new tests stop
+  the server 50 times each right after its link and during a running
+  request, and 100 times in process (`ursa-server/tests/protocol.rs`).
+
 - **Web Shell: the aggregated view's e2e checks wait for the cut's frame**
   (URSA-19). A cut through the layout's hierarchy (#498) is drawn, and its
   largest groups labelled, by the frame after the layout worker's answer;

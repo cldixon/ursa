@@ -260,6 +260,32 @@ async fn it_stops_gracefully() {
         .is_err());
 }
 
+/// Asked to stop at varied moments, idle or while a request runs, again
+/// and again, it returns `Ok` every time (URSA-22: a listener that ended
+/// between the two polls of the shutdown's `select!` was awaited again, and
+/// panicked; `ursa-cli/tests/serve.rs` stops the real process so too).
+#[tokio::test(flavor = "multi_thread")]
+async fn it_stops_cleanly_whenever_it_is_asked() {
+    for i in 0..100u64 {
+        let mut server = Server::start().await;
+        let mut socket = None;
+        if i % 2 == 1 {
+            let (mut s, _) = server.session(Some("new")).await;
+            send(&mut s, 1, "feed", json!({"line": FOREVER}), &[]).await;
+            socket = Some(s);
+        }
+        // At once, or a moment later.
+        tokio::time::sleep(Duration::from_micros(i % 10 * 300)).await;
+        server.stop();
+        let served = server.served.take().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), served).await;
+        let result = result.expect("still serving");
+        assert!(result.is_ok(), "panicked: {result:?}");
+        assert!(result.unwrap().is_ok());
+        drop(socket);
+    }
+}
+
 /// The `catalog` event goes to every connection on the session, before the
 /// reply to the request that caused it (§4.4, §4.5).
 #[tokio::test(flavor = "multi_thread")]
