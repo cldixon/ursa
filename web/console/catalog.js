@@ -31,7 +31,6 @@ const ICONS = {
   table: '<svg viewBox="0 0 16 16"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M2.5 9.75h11M6.5 6.5V13"/></svg>',
   view: '<svg viewBox="0 0 16 16"><path d="M1.75 8S4 3.75 8 3.75 14.25 8 14.25 8 12 12.25 8 12.25 1.75 8 1.75 8Z"/><circle cx="8" cy="8" r="2"/></svg>',
   external: '<svg viewBox="0 0 16 16"><path d="M4 2.5h5.5L12.5 5.5v8H4Z"/><path d="M9.5 2.5v3h3M6 8.5h4.5M6 11h4.5"/></svg>',
-  column: '<svg viewBox="0 0 16 16"><path d="M5.5 3v10M10.5 3v10" opacity=".55"/><rect x="5.5" y="3" width="5" height="10" rx=".5"/></svg>',
   graph: '<svg viewBox="0 0 16 16"><path d="M4 4.5 11.5 4M4 4.5l2 7.5M11.5 4 6 12M11.5 4l1 6.5"/><circle cx="4" cy="4.5" r="1.75"/><circle cx="11.5" cy="4" r="1.75"/><circle cx="6" cy="12" r="1.75"/><circle cx="12.5" cy="10.5" r="1.5"/></svg>',
   vertex: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="4.25"/></svg>',
   edge: '<svg viewBox="0 0 16 16"><path d="M2.5 8h10M9.5 5l3 3-3 3"/></svg>',
@@ -207,8 +206,12 @@ export function mountCatalog(mount) {
     for (let n = byKey.get(active)?.parent; !target && n; n = n.parent) target = rowFor(n.key);
     target ??= mount.querySelector('[role="treeitem"]');
     for (const el of mount.querySelectorAll('[role="treeitem"]')) el.tabIndex = -1;
+    // One Tab stop in each tree: the active row in its own, the first in the other.
+    for (const tree of Object.values(trees)) {
+      const stop = target && tree.contains(target) ? target : tree.querySelector('[role="treeitem"]');
+      if (stop) stop.tabIndex = 0;
+    }
     if (target) {
-      target.tabIndex = 0;
       active = target.dataset.key;
       if (hadFocus) target.focus({ preventScroll: true });
     }
@@ -236,7 +239,8 @@ export function mountCatalog(mount) {
     const icon = document.createElement("span");
     icon.className = "icon";
     icon.setAttribute("aria-hidden", "true");
-    icon.innerHTML = ICONS[n.type] ?? "";
+    if (n.type === "column") icon.textContent = glyph(n.title);
+    else icon.innerHTML = ICONS[n.type] ?? "";
     const name = document.createElement("span");
     name.className = "name";
     name.append(...highlight(n.name));
@@ -328,7 +332,7 @@ export function mountCatalog(mount) {
   });
 
   function focusRow(el) {
-    for (const r of mount.querySelectorAll('[role="treeitem"][tabindex="0"]')) r.tabIndex = -1;
+    for (const r of el.closest('[role="tree"]').querySelectorAll('[role="treeitem"][tabindex="0"]')) r.tabIndex = -1;
     el.tabIndex = 0;
     active = el.dataset.key;
     el.focus();
@@ -338,7 +342,8 @@ export function mountCatalog(mount) {
     const el = e.target.closest?.('[role="treeitem"]');
     if (!el || e.altKey || e.ctrlKey || e.metaKey) return;
     const n = byKey.get(el.dataset.key);
-    const rows = [...mount.querySelectorAll('[role="treeitem"]')];
+    // Each tree (tables, graphs) is a Tab stop of its own: the keys move within it.
+    const rows = [...el.closest('[role="tree"]').querySelectorAll('[role="treeitem"]')];
     const i = rows.indexOf(el);
     const go = (r) => r && focusRow(r);
     let handled = true;
@@ -439,6 +444,17 @@ const selectFrom = (name) => `SELECT * FROM ${name} LIMIT 100`;
 function columnsLabel(columns) {
   const n = columns?.length ?? 0;
   return n ? `${n} col${n === 1 ? "" : "s"}` : "";
+}
+
+/** A column's mark, by its type's family: # numbers, Aa text, and so on. */
+function glyph(type = "") {
+  if (/^(U?Int|Float|Decimal)/.test(type)) return "#";
+  if (/Utf8/.test(type)) return "Aa";
+  if (/^Boolean/.test(type)) return "✓";
+  if (/^(Date|Time|Timestamp|Interval|Duration)/.test(type)) return "◷";
+  if (/List|Struct|Map/.test(type)) return "{}";
+  if (/Binary/.test(type)) return "01";
+  return "·";
 }
 
 /** Arrow's type names, shorter: Utf8 → varchar, Int64 → bigint, … */

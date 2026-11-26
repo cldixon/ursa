@@ -218,9 +218,9 @@ export function mountSources(mount) {
     title.textContent = place === "root" ? "Cannot list this folder" : `Cannot list ${url}`;
     const detail = document.createElement("p");
     detail.className = "error-detail";
-    detail.textContent = e.message;
+    detail.textContent = readable(e.message);
     box.append(title, detail);
-    if (place !== "root" && /credential|permission|denied|forbidden|403|401|auth|signature|token/i.test(e.message))
+    if (place !== "root" && /credential|permission|denied|forbidden|403|401|auth|signature|token|access ?key/i.test(e.message))
       box.append(Object.assign(document.createElement("p"), { className: "error-hint", textContent: "Check the credentials in ursa serve's environment (for S3, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a profile)." }));
     const actions = document.createElement("div");
     actions.className = "error-actions";
@@ -458,4 +458,14 @@ export function mountSources(mount) {
 
 function baseName(path) {
   return path.replace(/\/$/, "").split("/").pop() ?? "";
+}
+
+/** An error as people read it: a store's XML error body as its code and message. */
+function readable(message = "") {
+  return message.replace(/<\?xml[^>]*>\s*/g, "").replace(/<Error>[\s\S]*?<\/Error>/g, (xml) => {
+    const tag = (t) => xml.match(new RegExp(`<${t}>([\\s\\S]*?)</${t}>`))?.[1];
+    const code = tag("Code");
+    const text = tag("Message");
+    return code || text ? [code, text].filter(Boolean).join(": ") : xml;
+  });
 }

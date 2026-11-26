@@ -164,14 +164,14 @@ const aria = await page.evaluate(() => {
     expanded: el.getAttribute("aria-expanded"),
     level: el.getAttribute("aria-level"),
     set: `${el.getAttribute("aria-posinset")}/${el.getAttribute("aria-setsize")}`,
-    stops: document.querySelectorAll('#catalog [role="treeitem"][tabindex="0"]').length,
+    stops: document.querySelectorAll('#catalog [data-tree="tables"] [role="treeitem"][tabindex="0"]').length,
     label: document.querySelector('#catalog [data-tree="tables"]')!.getAttribute("aria-labelledby"),
   };
 });
-check(aria.expanded === "true" && aria.level === "3" && aria.set === "3/3" && aria.stops === 1 && aria.label === "catalog-tables-head", "treeitems carry aria-expanded, -level, -posinset and -setsize, with one Tab stop", JSON.stringify(aria));
+check(aria.expanded === "true" && aria.level === "3" && aria.set === "3/3" && aria.stops === 1 && aria.label === "catalog-tables-head", "treeitems carry aria-expanded, -level, -posinset and -setsize, with one Tab stop in the tree", JSON.stringify(aria));
 
 // Keys: Home, Down, Right (go in), Left (out, close), End, a letter.
-await page.locator('#catalog [role="treeitem"][tabindex="0"]').focus();
+await page.locator('#catalog [data-tree="tables"] [role="treeitem"][tabindex="0"]').focus();
 const focusedKey = () => page.evaluate(() => (document.activeElement as HTMLElement)?.dataset.key);
 await page.keyboard.press("Home");
 const k1 = await focusedKey();
@@ -180,21 +180,24 @@ await page.keyboard.press("ArrowDown");
 const k2 = await focusedKey();
 await page.keyboard.press("k");
 const k3 = await focusedKey();
-await page.keyboard.press("ArrowLeft");
-const closedEdges = await row(page, "t/datafusion/public/karate_edges").getAttribute("aria-expanded");
 await page.keyboard.press("ArrowRight");
-await page.keyboard.press("ArrowRight");
+const opened = await row(page, "t/datafusion/public/karate_edges").getAttribute("aria-expanded");
 const k4 = await focusedKey();
-await page.keyboard.press("ArrowLeft");
+await page.keyboard.press("ArrowRight");
 const k5 = await focusedKey();
 await page.keyboard.press("ArrowLeft");
 const k6 = await focusedKey();
+await page.keyboard.press("ArrowLeft");
+const closed = await row(page, "t/datafusion/public/karate_edges").getAttribute("aria-expanded");
+await page.keyboard.press("ArrowLeft");
+const k7 = await focusedKey();
+await page.keyboard.press("End");
+const k8 = await focusedKey();
 check(
-  k1 === "d/datafusion" && k2 === "t/datafusion/public/hubs" && k3 === "t/datafusion/public/karate_edges" && closedEdges === "false" && k4 === "c/datafusion/public/karate_edges/src" && k5 === "t/datafusion/public/karate_edges" && k6 === "t/datafusion/public/karate_edges",
-  "the tree's keys: Home, Down, a letter, Right opens and goes in, Left goes out and closes",
-  [k1, k2, k3, closedEdges, k4, k5, k6].join(" "),
+  k1 === "d/datafusion" && k2 === "t/datafusion/public/hubs" && k3 === "t/datafusion/public/karate_edges" && opened === "true" && k4 === k3 && k5 === "c/datafusion/public/karate_edges/src" && k6 === k3 && closed === "false" && k7 === "s/datafusion/public" && k8 === "c/datafusion/public/karate_nodes/club",
+  "the tree's keys: Home, Down, a letter, Right opens then goes in, Left goes out, closes, then up; End",
+  [k1, k2, k3, opened, k4, k5, k6, closed, k7, k8].join(" "),
 );
-check((await row(page, "t/datafusion/public/karate_edges").getAttribute("aria-expanded")) === "false", "Left closed it");
 
 // The filter.
 await page.fill("#catalog .filter-input", "club");
@@ -237,7 +240,7 @@ await page.waitForSelector('#sources .entry[data-name="karate"]');
 await page.locator('#sources .entry[data-name="karate"] .entry-main').click();
 await page.waitForSelector('#sources .entry[data-name="karate_nodes.parquet"]');
 const inKarate = await entries(page);
-check(inKarate[0] === "up .." && inKarate.some((e) => /^file karate_nodes\.parquet parquet \d+(\.\d)? KB$/.test(e)) && inKarate.some((e) => e.startsWith("file karate_edges.csv csv")), "browsing into folders: Parquet and CSV, sized", inKarate.join("|"));
+check(inKarate[0] === "up .." && inKarate.some((e) => /^file karate_nodes\.parquet parquet \d+(\.\d)? K?B$/.test(e)) && inKarate.some((e) => e.startsWith("file karate_edges.csv csv")), "browsing into folders: Parquet and CSV, sized", inKarate.join("|"));
 const crumbs = await page.$$eval("#sources .crumbs li", (els) => els.map((e) => e.textContent));
 check(crumbs.join("/") === `${root.split("/").pop()}/data/karate`, "the path above the list", crumbs.join("/"));
 check((await page.evaluate(() => document.activeElement?.closest(".entry")?.getAttribute("data-name"))) === "..", "the keyboard is in the new folder's list");
@@ -257,7 +260,14 @@ await page.keyboard.press("Backspace");
 await page.waitForSelector('#sources .entry[data-name="club.ursa"]');
 check(await page.locator("#sources .crumbs").isHidden(), "Backspace goes up a folder, to the root");
 
-// Attach a database file: its views and graph show in the Catalog.
+// Attach a database file: ATTACH comes before anything is defined, so
+// first in a fresh session (`start`), which empties the Catalog; then its
+// views and graph show in it.
+await page.locator('#sources .entry[data-name="club.ursa"] .attach').click();
+check(/Cannot attach club\.ursa: ATTACH must come before/.test(await noteSays(page, "sources", /Cannot|Attached/)), "an ATTACH the engine refuses says why in the panel");
+await page.evaluate(() => (window as any).ursaConsole.session.run("start", {}));
+await page.waitForFunction(() => !document.querySelector('#catalog [data-key="g/karate"]'), null, { timeout: 10_000 }).catch(() => {});
+check((await treeRows(page, "graphs")).length === 0, "a fresh session (start) empties the Catalog", (await treeRows(page, "graphs")).join("|"));
 await page.locator('#sources .entry[data-name="club.ursa"] .attach').click();
 const attached = await page
   .waitForSelector('#catalog [data-key="g/club"]', { timeout: 15_000 })
@@ -306,13 +316,24 @@ check(/No files to browse/.test(off.text) && off.controls === 0, "with no source
 
 if (shots) {
   mkdirSync(shots, { recursive: true });
-  // The data folder, the karate tables open, nothing filtered.
+  // The karate club's tables and graph again (the attach began a fresh
+  // session), the data folder, a table open, nothing filtered.
+  for (const statement of [
+    "CREATE TABLE karate_nodes AS SELECT * FROM 'data/karate/karate_nodes.parquet'",
+    "CREATE TABLE karate_edges AS SELECT * FROM 'data/karate/karate_edges.parquet'",
+    "CREATE VIEW hubs AS SELECT * FROM karate_nodes WHERE id < 5",
+    "CREATE PROPERTY GRAPH karate VERTEX TABLES (karate_nodes AS person KEY (id)) EDGE TABLES (karate_edges AS knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id))",
+  ]) {
+    const done = await sql(page, statement);
+    if (done !== "ok") console.log(`(screenshots) ${statement}: ${done}`);
+  }
+  await page.waitForSelector('#catalog [data-key="g/karate"]', { timeout: 10_000 }).catch(() => {});
   await page.waitForSelector('#sources .entry[data-name="data"]');
   await page.locator('#sources .entry[data-name="data"] .entry-main').click();
   await page.waitForSelector('#sources .entry[data-name="karate"]');
   await page.locator('#sources .entry[data-name="karate"] .entry-main').click();
   await page.waitForSelector('#sources .entry[data-name="karate_nodes.parquet"]');
-  await page.evaluate(() => (window as any).ursaConsole.catalog.expand(["t/datafusion/public/karate_nodes", "t/datafusion/public/karate_edges"]));
+  await page.evaluate(() => (window as any).ursaConsole.catalog.expand(["t/datafusion/public/karate_nodes"]));
   for (const theme of ["light", "dark"]) {
     await page.evaluate((t) => (document.documentElement.dataset.theme = t), theme);
     await page.mouse.move(700, 600);
