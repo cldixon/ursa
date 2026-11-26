@@ -804,8 +804,19 @@ static assets and an R2 bucket.
   the session's root, and the running request with Cancel), styled by
   `console.css` over the shell's `style.css` and `graph-pane.css`. Each
   panel's body is a mount point for the issue named in its placeholder
-  (`window.ursaConsole.panels`). `bun run build` (or `bun run console`
-  alone) copies it, with apache-arrow bundled as `vendor/arrow.mjs`, into
+  (`window.ursaConsole.panels`). The Editor panel is `editor.js` (URSA-13):
+  CodeMirror 6 coloured by the session's `highlight` (the shell's colours,
+  `editor.css`) and completed by its `complete`; Ctrl/Cmd+Enter runs the
+  statement at the cursor or the selection (`statements.js` splits them),
+  Shift with it every statement until one fails; SQL goes to
+  `ursaConsole.run(sql)` (the Results panel's) or else `query`, dot-commands
+  to `feed`; errors show at their statement; the text is kept per server
+  port. Other panels put SQL in it with
+  `ursaConsole.editor.insert(text, {statement, run})`. `bun run build` (or
+  `bun run console` alone) copies it, with apache-arrow bundled as
+  `vendor/arrow.mjs` and CodeMirror (MIT, pinned in `package.json`, from
+  `scripts/codemirror.ts`) as `vendor/codemirror.mjs`, their licences
+  beside them, into
   `dist-console/console/`: never into `dist/`, which is deployed. `bun run
   preview` serves it too, over the wasm engine (no Cancel there).
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
@@ -954,7 +965,16 @@ drawers with no sideways scroll; Cancel stopping a long query, with the
 session going on; the page saying the server stopped, then that it was
 restarted with a new link, and reconnecting once the link is opened; the
 shell still at `/`; and no page error or Content Security Policy violation.
-CI does not run it yet.
+
+`tests/console-editor.ts` (`bun run test:console-editor -- 8982`, the same
+arguments) tests the SQL editor the same way: its colour spans are
+`highlight`'s and each kind looks as the shell's terminal draws it, in both
+themes; completing a table's name, Tab, and Ctrl+Enter running it; the
+statement at the cursor, the selection, and Shift+Ctrl+Enter stopping at the
+first error; errors at their statement with the engine's hint; a
+dot-command through `feed`; the running mark and Cancel; Esc then Tab
+leaving the editor; `insert()`; and the text kept across a reload. With a
+screenshot dir it saves `editor-*.png`. CI does not run these yet.
 
 ## Datasets
 
