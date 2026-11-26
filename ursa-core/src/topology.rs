@@ -8,8 +8,9 @@
 //!    but attributes stay in the original Arrow columns. `edge_ids[k]` maps CSR
 //!    slot `k` back to its original row, so a weighted kernel can gather
 //!    `weight[edge_ids[k]]` on the fly. It is also the hook for future subgraph
-//!    views (a bitmask over the parent CSR instead of a rebuild after `filter`),
-//!    so it is materialized from day one even for unweighted use.
+//!    views (a bitmask over the parent CSR instead of a rebuild after `filter`).
+//!    It is built only when something reads it (#170, see [`EdgeIds`]): an
+//!    unweighted, unmasked pipeline never does.
 //! 3. **Directional laziness** — CSR gives out-neighbours; in-neighbours need the
 //!    transpose (CSC). The transpose is built on first demand and cached, so a
 //!    pull-based-PageRank-only pipeline never pays for the direction it never uses.
@@ -28,6 +29,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, BooleanArray};
 use arrow::buffer::ScalarBuffer;
+
+use crate::edge_ids::Rebuild;
+#[cfg(unix)]
+pub use crate::edge_ids::SpilledRows;
+pub use crate::edge_ids::{EdgeIds, KeepRows, RowSource};
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
@@ -190,7 +196,9 @@ pub struct Adjacency {
     /// Dense target node per CSR slot; length `n_edges`.
     pub targets: ScalarBuffer<u32>,
     /// Original edge row per CSR slot; length `n_edges`. The attribute-gather hook.
-    pub edge_ids: ScalarBuffer<u32>,
+    /// Built only when something reads it (#170, see [`EdgeIds`]): reading it
+    /// as a slice (`&adj.edge_ids[..]`, [`Adjacency::edge_ids`]) builds it.
+    pub edge_ids: EdgeIds,
 }
 
 impl Adjacency {
@@ -202,6 +210,11 @@ impl Adjacency {
         let bad = |why: &str| Err(format!("the {which}-adjacency {why}"));
         if self.targets.iter().any(|&t| t as usize >= n_nodes) {
             return bad("has a target out of range");
+        }
+        // Ids not built yet are built from the index itself, correct by
+        // construction: only ids handed in are checked.
+        if !self.edge_ids.is_built() {
+            return Ok(());
         }
         let mut seen = vec![false; m];
         for &e in self.edge_ids.iter() {
@@ -249,7 +262,23 @@ impl Adjacency {
     /// the paired `other` endpoint and the original row index per slot. Dispatches
     /// to a parallel build above a size threshold; the parallel and serial builds
     /// produce **byte-identical** output (same within-segment row order).
+    #[cfg(test)]
     fn build(n_nodes: usize, keys: &[u32], other: &[u32]) -> Adjacency {
+        let (offsets, targets, edge_ids) = Self::build_parts(n_nodes, keys, other, true);
+        Adjacency {
+            offsets: offsets.into(),
+            targets: targets.into(),
+            edge_ids: edge_ids.unwrap_or_default().into(),
+        }
+    }
+
+    /// [`Self::build`]'s offsets, targets and, if `with_ids`, edge ids.
+    fn build_parts(
+        n_nodes: usize,
+        keys: &[u32],
+        other: &[u32],
+        with_ids: bool,
+    ) -> (Vec<u64>, Vec<u32>, Option<Vec<u32>>) {
         debug_assert_eq!(keys.len(), other.len());
         let m = keys.len();
         // `edge_ids` stores the original row index as u32, so more than u32::MAX
@@ -273,15 +302,20 @@ impl Adjacency {
         let n_chunks = crate::parallel::current_num_threads().min((m / n_nodes.max(1)).max(4));
         // Also serial on a rayon worker: see `parallel::in_worker`.
         if m < PARALLEL_MIN_EDGES || n_chunks <= 1 || n_nodes == 0 || crate::parallel::in_worker() {
-            Self::build_serial(n_nodes, keys, other)
+            Self::build_serial(n_nodes, keys, other, with_ids)
         } else {
-            Self::build_parallel(n_nodes, keys, other, n_chunks)
+            Self::build_parallel(n_nodes, keys, other, n_chunks, with_ids)
         }
     }
 
     /// The serial two-pass counting sort: a degree histogram (prefix-summed into
     /// `offsets`) then a scatter into each node's segment, in original row order.
-    fn build_serial(n_nodes: usize, keys: &[u32], other: &[u32]) -> Adjacency {
+    fn build_serial(
+        n_nodes: usize,
+        keys: &[u32],
+        other: &[u32],
+        with_ids: bool,
+    ) -> (Vec<u64>, Vec<u32>, Option<Vec<u32>>) {
         let m = keys.len();
         // Pass 1: degree histogram, written into offsets[k + 1].
         let mut offsets = vec![0u64; n_nodes + 1];
@@ -295,20 +329,17 @@ impl Adjacency {
 
         // Pass 2: scatter each edge into its node's segment.
         let mut targets = vec![0u32; m];
-        let mut edge_ids = vec![0u32; m];
+        let mut edge_ids = vec![0u32; if with_ids { m } else { 0 }];
         let mut cursor: Vec<u64> = offsets[..n_nodes].to_vec();
         for (row, (&k, &o)) in keys.iter().zip(other).enumerate() {
             let pos = cursor[k as usize] as usize;
             targets[pos] = o;
-            edge_ids[pos] = row as u32;
+            if with_ids {
+                edge_ids[pos] = row as u32;
+            }
             cursor[k as usize] += 1;
         }
-
-        Adjacency {
-            offsets: offsets.into(),
-            targets: targets.into(),
-            edge_ids: edge_ids.into(),
-        }
+        (offsets, targets, with_ids.then_some(edge_ids))
     }
 
     /// The parallel counting sort: per-chunk degree histograms, a global prefix sum,
@@ -317,7 +348,13 @@ impl Adjacency {
     /// after every earlier chunk's node-`k` edges — so within each node's segment the
     /// edges remain in original row order, byte-identical to [`Self::build_serial`].
     /// The scatter writes are provably non-overlapping, so it runs lock-free.
-    fn build_parallel(n_nodes: usize, keys: &[u32], other: &[u32], n_chunks: usize) -> Adjacency {
+    fn build_parallel(
+        n_nodes: usize,
+        keys: &[u32],
+        other: &[u32],
+        n_chunks: usize,
+        with_ids: bool,
+    ) -> (Vec<u64>, Vec<u32>, Option<Vec<u32>>) {
         use crate::parallel::*;
         let m = keys.len();
         let chunk_size = m.div_ceil(n_chunks);
@@ -375,7 +412,7 @@ impl Adjacency {
         // thread boundary as plain `usize` addresses (trivially `Send`), cast back
         // inside — the Vecs outlive the scatter and are untouched until it returns.
         let mut targets = vec![0u32; m];
-        let mut edge_ids = vec![0u32; m];
+        let mut edge_ids = vec![0u32; if with_ids { m } else { 0 }];
         let targets_addr = targets.as_mut_ptr() as usize;
         let edge_ids_addr = edge_ids.as_mut_ptr() as usize;
         hists.into_par_iter().enumerate().for_each(|(c, mut base)| {
@@ -392,152 +429,75 @@ impl Adjacency {
                 // and `pos < m` is within both allocations.
                 unsafe {
                     *targets_ptr.add(pos) = other[row];
-                    *edge_ids_ptr.add(pos) = row as u32;
+                    if with_ids {
+                        *edge_ids_ptr.add(pos) = row as u32;
+                    }
                 }
             }
         });
-
-        Adjacency {
-            offsets: offsets.into(),
-            targets: targets.into(),
-            edge_ids: edge_ids.into(),
-        }
+        (offsets, targets, with_ids.then_some(edge_ids))
     }
 
     /// The transpose of `out` (grouped by target instead of source), with each
     /// node's segment in original row order, exactly as [`Self::build`] would
     /// produce it from the per-row endpoints, but without materializing them.
     ///
-    /// A counting sort moves each out-slot into its target's segment, carrying
-    /// the slot's owner (the source) and original row (`edge_ids`). Slots arrive
-    /// in source order, so each segment is then sorted by row; for an edge list
-    /// already sorted by source it is already in order, and the sort only checks.
-    /// Peak memory is the two CSRs (the former path also held two per-row endpoint
-    /// arrays, 8 B/edge, at the same time).
+    /// Its edge ids are kept when `out`'s are held (a pipeline that reads
+    /// them reads them in both directions). Otherwise none are built (#170):
+    /// for identity out-ids the slot order is the row order; for out-ids
+    /// that would be rebuilt from the rows' sources, those sources are
+    /// streamed once to place each row ([`transpose_rows`]); and the
+    /// transpose's own ids are built from the same when first read.
+    ///
+    /// [`transpose_rows`]: crate::edge_ids::transpose_rows
     fn transpose(out: &Adjacency, n_nodes: usize) -> Adjacency {
-        use crate::parallel::*;
-        let m = out.targets.len();
-        if m == 0 || n_nodes == 0 {
-            return Adjacency {
-                offsets: vec![0; n_nodes + 1].into(),
-                targets: Vec::new().into(),
-                edge_ids: Vec::new().into(),
-            };
-        }
-        // Same chunking rule as `build` (serial on a rayon worker; see
-        // `parallel::in_worker`).
-        const PARALLEL_MIN_EDGES: usize = 1 << 16;
-        let threads = current_num_threads();
-        let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || in_worker();
-        let n_chunks = if serial {
-            1
+        let ids = &out.edge_ids;
+        let lazy = |m: usize| {
+            EdgeIds::lazy(
+                m,
+                Rebuild::Transpose {
+                    out_offsets: out.offsets.clone(),
+                    out_targets: out.targets.clone(),
+                    out_ids: ids.clone(),
+                    n_nodes,
+                },
+            )
+        };
+        let (offsets, targets, edge_ids) = if ids.is_built() {
+            let (o, t, e) = transpose_parts(
+                &out.offsets,
+                &out.targets,
+                TransposeIds::Rows(ids.get()),
+                n_nodes,
+            );
+            (o, t, EdgeIds::from(e.unwrap_or_default()))
+        } else if ids.is_identity() {
+            let (o, t, _) =
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::None, n_nodes);
+            let m = t.len();
+            (o, t, lazy(m))
+        } else if let Some((source, node)) = ids.rows_source() {
+            let (o, t) = crate::edge_ids::transpose_rows(
+                &out.offsets,
+                &out.targets,
+                source,
+                node,
+                crate::edge_ids::InSlot::Source,
+            );
+            let m = t.len();
+            (o, t, lazy(m))
         } else {
-            threads.min((m / n_nodes).max(4))
+            // Ids of another kind (a reversed topology's): built for the pass.
+            let (o, t, _) = ids.with(|ids| {
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::Rows(ids), n_nodes)
+            });
+            let m = t.len();
+            (o, t, lazy(m))
         };
-        let chunk_size = m.div_ceil(n_chunks);
-
-        // Pass 1: a target histogram per contiguous chunk of out-slots.
-        let hist = |keys: &[u32]| {
-            let mut h = vec![0u32; n_nodes];
-            for &k in keys {
-                h[k as usize] += 1;
-            }
-            h
-        };
-        let mut hists: Vec<Vec<u32>> = if serial {
-            vec![hist(&out.targets)]
-        } else {
-            out.targets.par_chunks(chunk_size).map(hist).collect()
-        };
-        let mut offsets = vec![0u64; n_nodes + 1];
-        for h in &hists {
-            for (k, &c) in h.iter().enumerate() {
-                offsets[k + 1] += c as u64;
-            }
-        }
-        for i in 0..n_nodes {
-            offsets[i + 1] += offsets[i];
-        }
-        // Each chunk's histogram becomes its base cursor into every segment.
-        let mut running: Vec<u32> = (0..n_nodes).map(|k| offsets[k] as u32).collect();
-        for h in hists.iter_mut() {
-            for (k, slot) in h.iter_mut().enumerate() {
-                let cnt = *slot;
-                *slot = running[k];
-                running[k] += cnt;
-            }
-        }
-        drop(running);
-
-        // Pass 2: scatter (source, row) into each target's segment. Positions are
-        // disjoint across chunks (the base cursors partition each segment), so the
-        // writes never overlap; pointers cross threads as plain addresses, as in
-        // `build_parallel`.
-        let mut targets = vec![0u32; m];
-        let mut edge_ids = vec![0u32; m];
-        let (t_addr, e_addr) = (
-            targets.as_mut_ptr() as usize,
-            edge_ids.as_mut_ptr() as usize,
-        );
-        let scatter = |(c, mut base): (usize, Vec<u32>)| {
-            let (start, end) = (c * chunk_size, ((c + 1) * chunk_size).min(m));
-            // The source owning slot `start`: the last node whose segment starts
-            // at or before it.
-            let mut owner = out.offsets.partition_point(|&o| o as usize <= start) - 1;
-            for k in start..end {
-                while out.offsets[owner + 1] as usize <= k {
-                    owner += 1;
-                }
-                let key = out.targets[k] as usize;
-                let pos = base[key] as usize;
-                base[key] += 1;
-                // SAFETY: `pos < m` and is claimed by exactly one (chunk, slot).
-                unsafe {
-                    *(t_addr as *mut u32).add(pos) = owner as u32;
-                    *(e_addr as *mut u32).add(pos) = out.edge_ids[k];
-                }
-            }
-        };
-        if serial {
-            hists.into_iter().enumerate().for_each(scatter);
-        } else {
-            hists.into_par_iter().enumerate().for_each(scatter);
-        }
-
-        // Pass 3: restore original row order inside each segment.
-        let sort_segment = |scratch: &mut Vec<(u32, u32)>, v: usize| {
-            let (s, e) = (offsets[v] as usize, offsets[v + 1] as usize);
-            // SAFETY: segments are disjoint across nodes and inside both buffers.
-            let (ts, es) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut((t_addr as *mut u32).add(s), e - s),
-                    std::slice::from_raw_parts_mut((e_addr as *mut u32).add(s), e - s),
-                )
-            };
-            if es.windows(2).all(|w| w[0] < w[1]) {
-                return;
-            }
-            scratch.clear();
-            scratch.extend(es.iter().copied().zip(ts.iter().copied()));
-            scratch.sort_unstable_by_key(|&(row, _)| row); // rows are unique
-            for (k, &(row, src)) in scratch.iter().enumerate() {
-                es[k] = row;
-                ts[k] = src;
-            }
-        };
-        if serial {
-            let mut scratch = Vec::new();
-            (0..n_nodes).for_each(|v| sort_segment(&mut scratch, v));
-        } else {
-            (0..n_nodes)
-                .into_par_iter()
-                .for_each_init(Vec::new, sort_segment);
-        }
-
         Adjacency {
             offsets: offsets.into(),
             targets: targets.into(),
-            edge_ids: edge_ids.into(),
+            edge_ids,
         }
     }
 
@@ -552,10 +512,14 @@ impl Adjacency {
     /// Original edge rows of dense node `u`'s incident edges — same order as
     /// [`Adjacency::neighbors`], so a weight column can be gathered per neighbour.
     #[inline]
+    ///
+    /// Builds the adjacency's edge ids on first call (see [`EdgeIds`]): a
+    /// kernel that has no mask, weight or row to read uses
+    /// [`Adjacency::neighbors`] alone and never builds them.
     pub fn edge_ids(&self, u: u32) -> &[u32] {
         let s = self.offsets[u as usize] as usize;
         let e = self.offsets[u as usize + 1] as usize;
-        &self.edge_ids[s..e]
+        &self.edge_ids.get()[s..e]
     }
 
     /// Out-degree (or in-degree, depending which direction this is) of node `u`.
@@ -563,6 +527,166 @@ impl Adjacency {
     pub fn degree(&self, u: u32) -> u32 {
         (self.offsets[u as usize + 1] - self.offsets[u as usize]) as u32
     }
+}
+
+/// The transpose of the adjacency `out_offsets`/`out_targets` whose edge ids
+/// are `out_ids`: its offsets, targets and edge ids, each node's segment in
+/// original row order, exactly as [`Adjacency::build`] would produce it from
+/// the per-row endpoints, but without materializing them.
+///
+/// A counting sort moves each out-slot into its target's segment, carrying
+/// the slot's owner (the source) and original row (`edge_ids`). Slots arrive
+/// in source order, so each segment is then sorted by row; for an edge list
+/// already sorted by source it is already in order, and the sort only checks.
+/// Peak memory is the two CSRs (the former path also held two per-row endpoint
+/// arrays, 8 B/edge, at the same time).
+pub(crate) fn transpose_parts(
+    out_offsets: &[u64],
+    out_targets: &[u32],
+    ids: TransposeIds<'_>,
+    n_nodes: usize,
+) -> (Vec<u64>, Vec<u32>, Option<Vec<u32>>) {
+    let with_ids = !matches!(ids, TransposeIds::None);
+    use crate::parallel::*;
+    let m = out_targets.len();
+    if m == 0 || n_nodes == 0 {
+        return (vec![0; n_nodes + 1], Vec::new(), with_ids.then(Vec::new));
+    }
+    // Same chunking rule as `build` (serial on a rayon worker; see
+    // `parallel::in_worker`).
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    let threads = current_num_threads();
+    let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || in_worker();
+    let n_chunks = if serial {
+        1
+    } else {
+        threads.min((m / n_nodes).max(4))
+    };
+    let chunk_size = m.div_ceil(n_chunks);
+
+    // Pass 1: a target histogram per contiguous chunk of out-slots.
+    let hist = |keys: &[u32]| {
+        let mut h = vec![0u32; n_nodes];
+        for &k in keys {
+            h[k as usize] += 1;
+        }
+        h
+    };
+    let mut hists: Vec<Vec<u32>> = if serial {
+        vec![hist(out_targets)]
+    } else {
+        out_targets.par_chunks(chunk_size).map(hist).collect()
+    };
+    let mut offsets = vec![0u64; n_nodes + 1];
+    for h in &hists {
+        for (k, &c) in h.iter().enumerate() {
+            offsets[k + 1] += c as u64;
+        }
+    }
+    for i in 0..n_nodes {
+        offsets[i + 1] += offsets[i];
+    }
+    // Each chunk's histogram becomes its base cursor into every segment.
+    let mut running: Vec<u32> = (0..n_nodes).map(|k| offsets[k] as u32).collect();
+    for h in hists.iter_mut() {
+        for (k, slot) in h.iter_mut().enumerate() {
+            let cnt = *slot;
+            *slot = running[k];
+            running[k] += cnt;
+        }
+    }
+    drop(running);
+
+    // Pass 2: scatter (source, row) into each target's segment. Positions are
+    // disjoint across chunks (the base cursors partition each segment), so the
+    // writes never overlap; pointers cross threads as plain addresses, as in
+    // `build_parallel`.
+    let mut targets = vec![0u32; m];
+    let mut edge_ids = vec![0u32; if with_ids { m } else { 0 }];
+    let (t_addr, e_addr) = (
+        targets.as_mut_ptr() as usize,
+        edge_ids.as_mut_ptr() as usize,
+    );
+    let scatter = |(c, mut base): (usize, Vec<u32>)| {
+        let (start, end) = (c * chunk_size, ((c + 1) * chunk_size).min(m));
+        // The source owning slot `start`: the last node whose segment starts
+        // at or before it.
+        let mut owner = out_offsets.partition_point(|&o| o as usize <= start) - 1;
+        for k in start..end {
+            while out_offsets[owner + 1] as usize <= k {
+                owner += 1;
+            }
+            let key = out_targets[k] as usize;
+            let pos = base[key] as usize;
+            base[key] += 1;
+            // SAFETY: `pos < m` and is claimed by exactly one (chunk, slot).
+            unsafe {
+                *(t_addr as *mut u32).add(pos) = owner as u32;
+                match ids {
+                    TransposeIds::Rows(out_ids) => *(e_addr as *mut u32).add(pos) = out_ids[k],
+                    TransposeIds::Identity => *(e_addr as *mut u32).add(pos) = k as u32,
+                    TransposeIds::None => {}
+                }
+            }
+        }
+    };
+    if serial {
+        hists.into_iter().enumerate().for_each(scatter);
+    } else {
+        hists.into_par_iter().enumerate().for_each(scatter);
+    }
+
+    // Pass 3: restore original row order inside each segment.
+    // Slots arrive in slot order, which is row order for the identity, and
+    // without ids the order of the slots is what is asked for.
+    if !matches!(ids, TransposeIds::Rows(_)) {
+        return (offsets, targets, with_ids.then_some(edge_ids));
+    }
+    let sort_segment = |scratch: &mut Vec<(u32, u32)>, v: usize| {
+        let (s, e) = (offsets[v] as usize, offsets[v + 1] as usize);
+        // SAFETY: segments are disjoint across nodes and inside both buffers.
+        let (ts, es) = unsafe {
+            (
+                std::slice::from_raw_parts_mut((t_addr as *mut u32).add(s), e - s),
+                std::slice::from_raw_parts_mut((e_addr as *mut u32).add(s), e - s),
+            )
+        };
+        if es.windows(2).all(|w| w[0] < w[1]) {
+            return;
+        }
+        scratch.clear();
+        scratch.extend(es.iter().copied().zip(ts.iter().copied()));
+        scratch.sort_unstable_by_key(|&(row, _)| row); // rows are unique
+        for (k, &(row, src)) in scratch.iter().enumerate() {
+            es[k] = row;
+            ts[k] = src;
+        }
+    };
+    if serial {
+        let mut scratch = Vec::new();
+        (0..n_nodes).for_each(|v| sort_segment(&mut scratch, v));
+    } else {
+        (0..n_nodes)
+            .into_par_iter()
+            .for_each_init(Vec::new, sort_segment);
+    }
+
+    (offsets, targets, Some(edge_ids))
+}
+
+/// The edge ids [`transpose_parts`] reads and writes.
+#[derive(Clone, Copy)]
+pub(crate) enum TransposeIds<'a> {
+    /// The out-adjacency's ids: each in-segment is put in row order, and
+    /// its ids written.
+    Rows(&'a [u32]),
+    /// The out-adjacency's ids are the identity: slot order is row order,
+    /// and the ids are written.
+    Identity,
+    /// None: each in-segment in out-slot (source) order, no ids. That is
+    /// row order only when the out-ids are the identity; otherwise it is
+    /// for a view where only the set of neighbours matters (undirected).
+    None,
 }
 
 /// A symmetric, deduplicated, sorted undirected adjacency in flat CSR form.
@@ -851,7 +975,7 @@ struct Relabel {
     /// `original[v]`: the original id of node `v`.
     original: ScalarBuffer<u32>,
     /// `node[o]`: the node whose original id is `o`, built on first use.
-    node: OnceLock<Vec<u32>>,
+    node: OnceLock<Arc<[u32]>>,
 }
 
 impl Relabel {
@@ -862,7 +986,7 @@ impl Relabel {
             for (v, &o) in self.original.iter().enumerate() {
                 node[o as usize] = v as u32;
             }
-            node
+            node.into()
         })
     }
 }
@@ -885,27 +1009,29 @@ fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
         edge_ids.as_mut_ptr() as usize,
     );
     let offsets_ref = &offsets;
-    let copy = |o: usize| {
-        let v = node[o];
-        let (lo, hi) = (
-            adj.offsets[v as usize] as usize,
-            adj.offsets[v as usize + 1] as usize,
-        );
-        let at = offsets_ref[o] as usize;
-        for (i, k) in (lo..hi).enumerate() {
-            // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
-            // across nodes and inside both buffers, which outlive the pass.
-            unsafe {
-                *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
-                *(e_addr as *mut u32).add(at + i) = adj.edge_ids[k];
+    adj.edge_ids.with(|adj_ids| {
+        let copy = |o: usize| {
+            let v = node[o];
+            let (lo, hi) = (
+                adj.offsets[v as usize] as usize,
+                adj.offsets[v as usize + 1] as usize,
+            );
+            let at = offsets_ref[o] as usize;
+            for (i, k) in (lo..hi).enumerate() {
+                // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
+                // across nodes and inside both buffers, which outlive the pass.
+                unsafe {
+                    *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
+                    *(e_addr as *mut u32).add(at + i) = adj_ids[k];
+                }
             }
+        };
+        if in_worker() || m < (1 << 16) {
+            (0..n).for_each(copy);
+        } else {
+            (0..n).into_par_iter().for_each(copy);
         }
-    };
-    if in_worker() || m < (1 << 16) {
-        (0..n).for_each(copy);
-    } else {
-        (0..n).into_par_iter().for_each(copy);
-    }
+    });
     Adjacency {
         offsets: offsets.into(),
         targets: targets.into(),
@@ -942,7 +1068,15 @@ fn is_permutation(ids: &[u32]) -> bool {
 /// renamed. Each
 /// segment holds its rows in row order: the output is exactly
 /// [`Adjacency::build`] over the renamed endpoints, on any thread count.
-fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u32>, Vec<u32>) {
+///
+/// The edge ids are built as `ids` says (see [`IdsPlan`]); `node` is checked
+/// for the identity first.
+fn build_in_degree(
+    n: usize,
+    src: &[u32],
+    dst: &mut [u32],
+    ids: &mut KeepRows<'_>,
+) -> (Adjacency, Vec<u32>, Arc<[u32]>) {
     // See pass 1.
     const SAMPLE_MIN_EDGES: usize = 1 << 22;
     const SAMPLE_BLOCK: usize = 1 << 12;
@@ -1051,6 +1185,10 @@ fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u3
     for v in 0..n {
         offsets[v + 1] += offsets[v];
     }
+    // How the edge ids are had: none needed for rows already grouped by
+    // (renamed) source, else read back later, else built here.
+    let plan = IdsPlan::decide(src, Some(&node), ids);
+    let with_ids = plan.builds();
     // Each chunk's counts become its cursors into every segment, in place,
     // still indexed by original id.
     let addrs: Vec<usize> = outs.iter_mut().map(|h| h.as_mut_ptr() as usize).collect();
@@ -1083,7 +1221,7 @@ fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u3
     // Pass 2: scatter each row by its source's original id, its target
     // (renamed above). Positions are disjoint across chunks (the cursors partition
     // each segment), as in `build_parallel`.
-    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; m]);
+    let (mut targets, mut edge_ids) = (vec![0u32; m], vec![0u32; if with_ids { m } else { 0 }]);
     let (t_addr, e_addr) = (
         targets.as_mut_ptr() as usize,
         edge_ids.as_mut_ptr() as usize,
@@ -1097,7 +1235,9 @@ fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u3
             // SAFETY: `pos < m` and is claimed by exactly one (chunk, row).
             unsafe {
                 *(t_addr as *mut u32).add(pos) = dst[r];
-                *(e_addr as *mut u32).add(pos) = r as u32;
+                if with_ids {
+                    *(e_addr as *mut u32).add(pos) = r as u32;
+                }
             }
         }
     };
@@ -1106,12 +1246,68 @@ fn build_in_degree(n: usize, src: &[u32], dst: &mut [u32]) -> (Adjacency, Vec<u3
     } else {
         outs.into_par_iter().enumerate().for_each(scatter);
     }
+    let node: Arc<[u32]> = node.into();
+    let offsets: ScalarBuffer<u64> = offsets.into();
+    let edge_ids = plan.edge_ids(m, &offsets, Some(&node), edge_ids);
     let adjacency = Adjacency {
-        offsets: offsets.into(),
+        offsets,
         targets: targets.into(),
-        edge_ids: edge_ids.into(),
+        edge_ids,
     };
     (adjacency, original, node)
+}
+
+/// How a build has its out-adjacency's edge ids (#170).
+enum IdsPlan {
+    /// The rows are grouped by source: the identity, built only if read.
+    Identity,
+    /// Read the rows' sources back when the ids are first read.
+    Later(Arc<dyn RowSource>),
+    /// Build them with the adjacency.
+    Now,
+}
+
+impl IdsPlan {
+    /// The plan for the rows whose sources are `src` (`node[s]` for source
+    /// `s` when relabelled): the identity if they are grouped by source, else
+    /// what `rows` makes of them (a source to read them back from, or none,
+    /// to build them now). `rows` is not called for the identity.
+    fn decide(src: &[u32], node: Option<&[u32]>, rows: &mut KeepRows<'_>) -> IdsPlan {
+        let grouped = match node {
+            None => src.windows(2).all(|w| w[0] <= w[1]),
+            Some(node) => src
+                .windows(2)
+                .all(|w| node[w[0] as usize] <= node[w[1] as usize]),
+        };
+        if grouped {
+            return IdsPlan::Identity;
+        }
+        match rows(src) {
+            Some(source) => IdsPlan::Later(source),
+            None => IdsPlan::Now,
+        }
+    }
+
+    /// Whether the build writes the ids.
+    fn builds(&self) -> bool {
+        matches!(self, IdsPlan::Now)
+    }
+
+    /// The edge ids of an `m`-slot out-adjacency with `offsets`, given what
+    /// the build wrote (`built`, when it [`Self::builds`]).
+    fn edge_ids(
+        self,
+        m: usize,
+        offsets: &ScalarBuffer<u64>,
+        node: Option<&Arc<[u32]>>,
+        built: Vec<u32>,
+    ) -> EdgeIds {
+        match self {
+            IdsPlan::Identity => EdgeIds::identity(m),
+            IdsPlan::Later(source) => EdgeIds::from_rows(m, offsets.clone(), node.cloned(), source),
+            IdsPlan::Now => EdgeIds::from(built),
+        }
+    }
 }
 
 impl Topology {
@@ -1136,12 +1332,80 @@ impl Topology {
                 .all(|&d| (d as usize) < n_nodes),
             "dense endpoint id out of range (>= n_nodes)"
         );
+        Self::build_with_rows(
+            n_nodes,
+            src_dense,
+            dst_dense,
+            NodeOrder::AsGiven,
+            &mut |_| None,
+        )
+    }
+
+    /// [`Self::build_ordered`], with the out-adjacency's edge ids built as
+    /// `rows` says (#170): given the rows' sources (the dense ids given,
+    /// before any relabel), it returns a [`RowSource`] that reads them back
+    /// later (a [`SpilledRows`] file), and then the ids are not built until a
+    /// kernel reads them; or `None`, and they are built with the adjacency,
+    /// as [`Self::build_ordered`] builds them. Rows already grouped by source
+    /// need neither: their ids are the identity, and `rows` is not called.
+    ///
+    /// Every result is the same either way: the ids built late are exactly
+    /// the ones built eagerly.
+    ///
+    /// [`SpilledRows`]: crate::edge_ids::SpilledRows
+    pub fn build_with_rows(
+        n_nodes: usize,
+        src_dense: Vec<u32>,
+        dst_dense: Vec<u32>,
+        order: NodeOrder,
+        rows: &mut KeepRows<'_>,
+    ) -> Topology {
+        assert_eq!(src_dense.len(), dst_dense.len(), "src/dst length mismatch");
+        if order == NodeOrder::InDegree {
+            let mut dst_dense = dst_dense;
+            let (out, original, node) = build_in_degree(n_nodes, &src_dense, &mut dst_dense, rows);
+            drop((src_dense, dst_dense));
+            let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
+            return Topology {
+                n_nodes,
+                n_edges: out.targets.len(),
+                out,
+                inc: OnceLock::new(),
+                inc_loader: LazyIncoming::default(),
+                undirected: OnceLock::new(),
+                symmetric: OnceLock::new(),
+                self_transpose: false,
+                relabel: (!identity).then(|| {
+                    Arc::new(Relabel {
+                        original: original.into(),
+                        node: OnceLock::from(node),
+                    })
+                }),
+            };
+        }
+        debug_assert!(
+            src_dense
+                .iter()
+                .chain(&dst_dense)
+                .all(|&d| (d as usize) < n_nodes),
+            "dense endpoint id out of range (>= n_nodes)"
+        );
         let n_edges = src_dense.len();
-        let out = Adjacency::build(n_nodes, &src_dense, &dst_dense);
+        let plan = IdsPlan::decide(&src_dense, None, rows);
+        let (offsets, targets, ids) =
+            Adjacency::build_parts(n_nodes, &src_dense, &dst_dense, plan.builds());
+        let offsets: ScalarBuffer<u64> = offsets.into();
+        let edge_ids = plan.edge_ids(n_edges, &offsets, None, ids.unwrap_or_default());
+        let out = Adjacency {
+            offsets,
+            targets: targets.into(),
+            edge_ids,
+        };
         // `src_dense`/`dst_dense` are intentionally not retained: the transpose and
         // the undirected cache are both recoverable from the out-CSR (see
         // `incoming`), so keeping them would be a permanent 8 B/edge overhead paid
         // even by pipelines that never build the transpose.
+        drop((src_dense, dst_dense));
         Topology {
             n_nodes,
             n_edges,
@@ -1175,31 +1439,7 @@ impl Topology {
         dst_dense: Vec<u32>,
         order: NodeOrder,
     ) -> Topology {
-        match order {
-            NodeOrder::AsGiven => Self::build(n_nodes, src_dense, dst_dense),
-            NodeOrder::InDegree => {
-                let mut dst_dense = dst_dense;
-                let (out, original, node) = build_in_degree(n_nodes, &src_dense, &mut dst_dense);
-                drop((src_dense, dst_dense));
-                let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
-                Topology {
-                    n_nodes,
-                    n_edges: out.targets.len(),
-                    out,
-                    inc: OnceLock::new(),
-                    inc_loader: LazyIncoming::default(),
-                    undirected: OnceLock::new(),
-                    symmetric: OnceLock::new(),
-                    self_transpose: false,
-                    relabel: (!identity).then(|| {
-                        Arc::new(Relabel {
-                            original: original.into(),
-                            node: OnceLock::from(node),
-                        })
-                    }),
-                }
-            }
-        }
+        Self::build_with_rows(n_nodes, src_dense, dst_dense, order, &mut |_| None)
     }
 
     /// [`Self::build`] with the nodes renumbered by `original`, a permutation
@@ -1233,7 +1473,7 @@ impl Topology {
         rename(&mut dst_dense);
         let relabel = Relabel {
             original: original.into(),
-            node: OnceLock::from(node),
+            node: OnceLock::from(Arc::<[u32]>::from(node)),
         };
         let mut topology = Self::build(n_nodes, src_dense, dst_dense);
         topology.relabel = Some(Arc::new(relabel));
@@ -1365,7 +1605,7 @@ impl Topology {
             out: Adjacency {
                 offsets: offsets.into(),
                 targets: targets.into(),
-                edge_ids: (0..n_edges as u32).collect::<Vec<u32>>().into(),
+                edge_ids: EdgeIds::identity(n_edges),
             },
             inc: OnceLock::new(),
             inc_loader: LazyIncoming::default(),
@@ -1603,7 +1843,29 @@ impl Topology {
         use crate::parallel::*;
         let n = self.n_nodes;
         let out = &self.out;
-        let inc = self.incoming();
+        // Each segment is sorted and deduplicated, so only the set of
+        // in-neighbours matters, not their order. Without a mask, and with
+        // no in-adjacency at hand, they are transposed for this build alone,
+        // in slot order, from the targets: no row order, no edge ids, and no
+        // in-adjacency kept (#170).
+        let unordered;
+        let inc = if mask.is_none() && !self.incoming_is_cheap() {
+            let (offsets, targets, _) =
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::None, n);
+            let m = targets.len();
+            unordered = Adjacency {
+                offsets: offsets.into(),
+                targets: targets.into(),
+                edge_ids: EdgeIds::identity(m),
+            };
+            &unordered
+        } else {
+            self.incoming()
+        };
+        if mask.is_some() {
+            // Built once here, not on first read inside the parallel fill.
+            let _ = (out.edge_ids.get(), inc.edge_ids.get());
+        }
 
         let mut bound = vec![0u64; n + 1];
         for u in 0..n {
@@ -1620,10 +1882,22 @@ impl Topology {
             let seg = unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(start), cap) };
             let mut len = 0;
             for adj in [out, inc] {
-                for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-                    if w != u && mask.is_none_or(|m| m.keep(e)) {
-                        seg[len] = w;
-                        len += 1;
+                match mask {
+                    None => {
+                        for &w in adj.neighbors(u) {
+                            if w != u {
+                                seg[len] = w;
+                                len += 1;
+                            }
+                        }
+                    }
+                    Some(m) => {
+                        for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                            if w != u && m.keep(e) {
+                                seg[len] = w;
+                                len += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1930,22 +2204,23 @@ mod tests {
         for &(n, m) in &[(2000usize, 100_000usize), (50_000, 300_000), (16, 80_000)] {
             let keys: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
             let other: Vec<u32> = (0..m).map(|_| rng.gen_range(0..n as u32)).collect();
-            let serial = Adjacency::build_serial(n, &keys, &other);
+            let serial = Adjacency::build_serial(n, &keys, &other, true);
             for n_chunks in [2usize, 3, 8] {
-                let par = Adjacency::build_parallel(n, &keys, &other, n_chunks);
-                assert_eq!(
-                    serial.offsets, par.offsets,
-                    "offsets (n={n}, chunks={n_chunks})"
-                );
-                assert_eq!(
-                    serial.targets, par.targets,
-                    "targets (n={n}, chunks={n_chunks})"
-                );
-                assert_eq!(
-                    serial.edge_ids, par.edge_ids,
-                    "edge_ids (n={n}, chunks={n_chunks})"
-                );
+                let par = Adjacency::build_parallel(n, &keys, &other, n_chunks, true);
+                assert_eq!(serial.0, par.0, "offsets (n={n}, chunks={n_chunks})");
+                assert_eq!(serial.1, par.1, "targets (n={n}, chunks={n_chunks})");
+                assert_eq!(serial.2, par.2, "edge_ids (n={n}, chunks={n_chunks})");
+                // Without edge ids, the same offsets and targets (#170).
+                let bare = Adjacency::build_parallel(n, &keys, &other, n_chunks, false);
+                assert_eq!((&serial.0, &serial.1, None), (&bare.0, &bare.1, bare.2));
             }
+            let bare = Adjacency::build_serial(n, &keys, &other, false);
+            assert_eq!((&serial.0, &serial.1, None), (&bare.0, &bare.1, bare.2));
+            // The ids rebuilt from the keys alone are the ones the build wrote.
+            assert_eq!(
+                Some(crate::edge_ids::rows_by_key(&serial.0, &keys, None)),
+                serial.2
+            );
         }
     }
 

@@ -1161,6 +1161,63 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Edge ids are built only when a query reads them** (#170, part of
+  #155). `edge_ids`, the original row of each CSR slot, is 4 B an edge in
+  each built direction, and only a weight, an edge mask or an edge's row
+  reads it. It is now an `ursa_core::EdgeIds`, which builds itself on first
+  read and keeps what it built: from the identity when the rows are already
+  grouped by source (no source needed, #155), or from the rows' sources read
+  back (`RowSource`; the SQL engine writes them to an unlinked temporary
+  file in `TMPDIR`, `SpilledRows`, 4 B an edge, for an index of 65,536 edges
+  or more). Kernels branch once per call: PageRank, components, BFS/`hop`,
+  Louvain, label propagation, triangles, closeness, betweenness and degree
+  without a mask or weight read neighbours alone.
+
+  The in-adjacency is built without any edge ids: the first in-direction
+  kernel streams the spilled sources once and reads each row's target off
+  the out-adjacency, then a stable counting sort by target leaves every
+  in-segment in row order, as before (`transpose_rows`). Its own ids are
+  built the same way when first read. The undirected view (triangles,
+  clustering) transposes in slot order for its build alone, as only the set
+  of neighbours matters there: it reads no spill and keeps no in-adjacency.
+  Storing an index writes the ids without keeping them, and stored files are
+  unchanged (still version 5).
+
+  When the spill cannot be written (no temporary directory, or no room in
+  it), the index keeps its ids in memory, as before, and the session gets a
+  notice (`could not write the index's edge rows to …; its edge ids are kept
+  in memory (…)`); the query goes on. What a failed write wrote is freed at
+  once, as the file is unlinked when it is created.
+
+  Results are byte-identical: `ursa-core/tests/lazy_edge_ids.rs` runs every
+  kernel, plain, weighted and masked, over eager, in-memory and spilled ids
+  (sorted and unsorted rows, both node orders), checks that no plain kernel
+  builds them in either direction, and counts the spill's reads: none for
+  out-direction kernels and the undirected view, one stream for the first
+  transpose. R-MAT, built as the engine builds it (in-degree relabel), 4
+  threads, `ursa-core/examples/edge_ids_memory.rs`, eager → late; resident
+  memory after the kernel and peak RSS both include the 8 B/edge edge list
+  the build is given:
+
+  | R-MAT 64M | resident after | peak RSS | build + kernel |
+  |---|---|---|---|
+  | index only | 569 → 325 MiB | 1108 → 865 MiB | 1.4 → 1.0 s |
+  | PageRank (20 iterations) | 1165 → 614 MiB | 1254 → 975 MiB | 1.4 + 12.0 → 1.0 + 11.3 s |
+  | BFS (both directions) | 1174 → 624 MiB | 1177 → 992 MiB | 1.0 + 1.4 → 0.7 + 2.1 s |
+  | components (weak) | 610 → 369 MiB | 1106 → 863 MiB | 1.1 + 1.0 → 0.8 + 1.0 s |
+  | `hop` (2, from the hub) | 588 → 344 MiB | 1106 → 863 MiB | 1.1 + 0.22 → 0.8 + 0.23 s |
+  | Louvain (serial) | 615 → 369 MiB | 1335 → 1096 MiB | 1.1 + 13.9 → 0.8 + 14.2 s |
+  | weighted PageRank | 1156 → 1185 MiB | 1733 → 1733 MiB | ids and transpose 1.4–1.7 → 2.3–2.7 s |
+
+  At 16M edges: index 143 → 82 MiB, PageRank 292 → 155 MiB and BFS 289 →
+  158 MiB resident; peaks 279 → 219 MiB (index, components, `hop`), 317 →
+  248 MiB (PageRank), 297 → 252 MiB (BFS) and 338 → 278 MiB (Louvain). The
+  build is faster (it writes the sources once instead of scattering the
+  ids). The transpose alone takes 1.8–2.1 s at 64M streamed against
+  1.3–1.6 s eager, with a 4 B/edge transient target column; a weighted or
+  masked query rebuilds the ids once (about 1 s more at 64M, the weighted
+  iterations themselves unchanged), and in-ids read late take 1.8–2.1 s.
+
 - **`ursa serve`: the page holds its WebSocket in a worker, and a large part
   is not copied on the page** (URSA-7). `web/public/socket-transport.js`
   opens the socket in `socket-worker.js`, which assembles each reply and
@@ -2167,6 +2224,19 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `the node ids given are string but the graph's node ids are int64; …` (#271).
 
 ### Fixed
+
+- **Web Shell: the aggregated view's e2e checks wait for the cut's frame**
+  (URSA-19). A cut through the layout's hierarchy (#498) is drawn, and its
+  largest groups labelled, by the frame after the layout worker's answer;
+  but the view's test hook said it waited for nothing as soon as the answer
+  was in, so a check that read the labels then, under load before that
+  frame, found none (`a big graph: its largest groups are labelled with
+  their node counts: []`, seen over `ursa serve`). The hook's `cuts.waiting`
+  now also covers a cut, or the graph in place of one, that no frame has
+  drawn yet; and a new check holds the animation frames to see it wait.
+  The zoom into rmat also starts once the camera has given back the room
+  it made for the inspector's panel (#493): under load the first zoom's
+  cut was of a camera still moving (76 groups for the fitted 92).
 
 - **Web Shell: a `.graph` that fails downloads none of the graph view**
   (URSA-11). The pane opens with "Loading graph view…" once the engine has

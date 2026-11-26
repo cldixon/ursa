@@ -296,20 +296,24 @@ impl Sources {
     }
 }
 
-/// The in-neighbours of compact node `c` (node `u`) and their edge rows: as
+/// The in-neighbours of compact node `c` (node `u`) and, if `rows`, their
+/// edge rows (else none: the edge ids are then never built, #170): as
 /// compact ids from `sources`, or else as the transpose holds them.
 fn pulled_from<'a>(
     inc: &'a Adjacency,
     sources: Option<&'a Sources>,
     c: usize,
     u: u32,
+    rows: bool,
 ) -> (&'a [u32], &'a [u32]) {
-    match sources {
-        Some(s) => {
+    match (sources, rows) {
+        (Some(s), rows) => {
             let (lo, hi) = s.spans[c];
-            (&s.targets[lo..hi], &inc.edge_ids[lo..hi])
+            let ids: &[u32] = if rows { &inc.edge_ids[lo..hi] } else { &[] };
+            (&s.targets[lo..hi], ids)
         }
-        None => (inc.neighbors(u), inc.edge_ids(u)),
+        (None, true) => (inc.neighbors(u), inc.edge_ids(u)),
+        (None, false) => (inc.neighbors(u), &[]),
     }
 }
 
@@ -371,7 +375,7 @@ fn pagerank_over(
         Some(&out_deg),
         |c, share| {
             let u = node(c);
-            let (from, edges) = pulled_from(inc, sources.as_ref(), c, u);
+            let (from, edges) = pulled_from(inc, sources.as_ref(), c, u, mask.is_some());
             let mut acc = 0.0;
             match (mask, direct) {
                 // Fast path: unmasked full-graph pull.
@@ -465,7 +469,7 @@ fn pagerank_weighted_over(
         let u = node(c);
         let mut acc = 0.0;
         // In-neighbours and their edge rows are aligned element-for-element.
-        let (nbrs, edges) = pulled_from(inc, sources.as_ref(), c, u);
+        let (nbrs, edges) = pulled_from(inc, sources.as_ref(), c, u, true);
         for (&v, &e) in nbrs.iter().zip(edges) {
             if !mask.is_none_or(|m| m.keep(e)) {
                 continue;

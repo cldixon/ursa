@@ -159,7 +159,7 @@ use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffe
 use datafusion::arrow::datatypes::ArrowNativeType;
 use serde_json::{json, Value};
 use ursa_core::id_map::lookup_table_len;
-use ursa_core::{Adjacency, IdMap, Topology};
+use ursa_core::{Adjacency, EdgeIds, IdMap, Topology};
 
 use super::mapped::{Region, Unverified};
 use crate::graph::FileIdentity;
@@ -310,6 +310,22 @@ enum Data<'a> {
     Bytes(Buffer),
     /// The lookup table of an id map.
     IdTable(IdTable<'a>),
+    /// An adjacency's edge ids: read as they are when held, else built for
+    /// the write (once, kept until the write is done) and not kept on the
+    /// adjacency, so storing an index does not make it hold them (#170).
+    EdgeIds(&'a EdgeIds, OnceLock<ScalarBuffer<u32>>),
+}
+
+impl<'a> Data<'a> {
+    /// The edge ids `ids`, as a section.
+    fn edge_ids(ids: &'a EdgeIds) -> Self {
+        Data::EdgeIds(ids, OnceLock::new())
+    }
+}
+
+/// The edge ids of a [`Data::EdgeIds`] section.
+fn ids_of<'d>(ids: &'d EdgeIds, built: &'d OnceLock<ScalarBuffer<u32>>) -> &'d [u32] {
+    built.get_or_init(|| ids.detached())
 }
 
 /// The lookup table of `ids`, built when the file is written (not when it is
@@ -339,7 +355,7 @@ impl Data<'_> {
     fn width(&self) -> u64 {
         match self {
             Data::U64(_) | Data::F64(_) | Data::Ints(_) => 8,
-            Data::U32(_) | Data::StrOffsets(_) | Data::IdTable(_) => 4,
+            Data::U32(_) | Data::StrOffsets(_) | Data::IdTable(_) | Data::EdgeIds(..) => 4,
             Data::StrBytes(_) | Data::Bytes(_) => 1,
         }
     }
@@ -354,6 +370,7 @@ impl Data<'_> {
             Data::StrBytes(a) => str_bytes(a).len(),
             Data::Bytes(b) => b.len(),
             Data::IdTable(t) => return lookup_table_len(t.ids.len()),
+            Data::EdgeIds(ids, _) => ids.len(),
         }) as u64
     }
 }
@@ -407,7 +424,7 @@ impl<'a> Encoded<'a> {
         let mut sections: Vec<(u32, Data<'a>)> = vec![
             (OUT_OFFSETS, Data::U64(&out.offsets)),
             (OUT_TARGETS, Data::U32(&out.targets)),
-            (OUT_EDGE_IDS, Data::U32(&out.edge_ids)),
+            (OUT_EDGE_IDS, Data::edge_ids(&out.edge_ids)),
         ];
         // Cloning an Arrow array clones `Arc`s to its buffers, not the ids.
         if let Some(ints) = id_array.as_any().downcast_ref::<Int64Array>() {
@@ -627,7 +644,7 @@ impl<'a> EncodedChunk<'a> {
             vec![
                 (IN_OFFSETS, Data::U64(&incoming.offsets)),
                 (IN_TARGETS, Data::U32(&incoming.targets)),
-                (IN_EDGE_IDS, Data::U32(&incoming.edge_ids)),
+                (IN_EDGE_IDS, Data::edge_ids(&incoming.edge_ids)),
             ],
             start,
         )
@@ -759,6 +776,7 @@ fn data_crc(data: &Data<'_>) -> u32 {
             Data::StrBytes(a) => Some(str_bytes(a)),
             Data::Bytes(b) => Some(b.as_slice()),
             Data::IdTable(t) => Some(bytes_of(t.slots())),
+            Data::EdgeIds(ids, built) => Some(bytes_of(ids_of(ids, built))),
             Data::StrOffsets(_) => None,
         };
         if let Some(bytes) = bytes {
@@ -818,6 +836,7 @@ impl<W: Write> Sink<W> {
             Data::StrBytes(a) => self.put(str_bytes(a)),
             Data::Bytes(b) => self.put(b.as_slice()),
             Data::IdTable(t) => self.put_all(t.slots(), |x| x.to_le_bytes()),
+            Data::EdgeIds(ids, built) => self.put_all(ids_of(ids, built), |x| x.to_le_bytes()),
         }
     }
 
@@ -1569,7 +1588,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
     let out = Adjacency {
         offsets: scalars(data, &take(OUT_OFFSETS, 8, Some(n_nodes + 1))?),
         targets: scalars(data, &take(OUT_TARGETS, 4, Some(n_edges))?),
-        edge_ids: scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?),
+        edge_ids: scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?).into(),
     };
     let topology = match head.version {
         // No section CRCs to vouch for the arrays: check them in full.
@@ -1675,7 +1694,7 @@ fn mapped_incoming(
     Ok(Adjacency {
         offsets: scalars(data, &entry(IN_OFFSETS, 8, n_nodes + 1)?),
         targets: scalars(data, &entry(IN_TARGETS, 4, n_edges)?),
-        edge_ids: scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?),
+        edge_ids: scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?).into(),
     })
 }
 
