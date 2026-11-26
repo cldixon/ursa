@@ -60,6 +60,7 @@ nav = [
     { "Statements" = "sql/statements.md" },
     { "Pattern matching" = "sql/pattern-matching.md" },
     { "Differences from DuckDB" = "sql/duckdb.md" },
+    { "Coming from SQL/PGQ or DuckPGQ" = "sql/duckpgq.md" },
     { "Function reference" = "sql/reference/functions.md" },
     { "Result metadata" = "sql/reference/metadata.md" },
   ] },

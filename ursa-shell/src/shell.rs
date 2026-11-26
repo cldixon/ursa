@@ -335,6 +335,16 @@ impl<O: Write, E: Write> Shell<O, E> {
             .push((name.to_string(), args.to_string(), help.to_string()));
     }
 
+    /// Every dot-command this shell knows, `(name, args, help)`: its own
+    /// ([`COMMANDS`]), then the host's, in the order `.help` lists them.
+    pub fn commands(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        COMMANDS.iter().copied().chain(
+            self.host_commands
+                .iter()
+                .map(|(c, a, h)| (c.as_str(), a.as_str(), h.as_str())),
+        )
+    }
+
     /// Add the explore commands ([`EXPLORE_COMMANDS`]) as host commands:
     /// `.help` lists them and [`Self::feed`] hands them back, for the host to
     /// run with [`Self::explore`] and apply to its view.

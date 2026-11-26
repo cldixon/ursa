@@ -12,7 +12,9 @@
 //! request runs, and answers at once what bypasses the session's queue
 //! (§4.5): `cancel`, `memory`, and `hello` to the shared session once it has
 //! answered one. The first request must be `hello`, which attaches the
-//! connection to its session.
+//! connection to its session: from then on, the session's events
+//! (`{"event": …}`, a text frame of their own) come to it too, whichever
+//! connection's request caused them, each before that request's reply.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,9 +56,11 @@ enum Read {
     Closed,
 }
 
-/// What the writer writes.
-enum Outgoing {
+/// What a connection's writer writes.
+pub(crate) enum Outgoing {
     Reply(Option<u64>, Result<Reply, Error>),
+    /// An event of the session (`{"event": …}`), in a text frame.
+    Event(Value),
     Close(u16, &'static str),
 }
 
@@ -107,7 +111,7 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
         let id = request.id;
         let answer = |result| out.send(Outgoing::Reply(Some(id.into()), result));
         match (request.op.as_str(), &session) {
-            ("hello", _) => match attach(&shared, &mut session, &request.args) {
+            ("hello", _) => match attach(&shared, &mut session, &request.args, &out) {
                 // The shared session may be busy with another connection's
                 // request: say what it said before.
                 Ok(handle) if handle.shared && handle.hello.get().is_some() => {
@@ -163,6 +167,7 @@ fn attach(
     shared: &Shared,
     session: &mut Option<SessionHandle>,
     args: &Value,
+    out: &mpsc::UnboundedSender<Outgoing>,
 ) -> Result<SessionHandle, Error> {
     // The session checks it too; the shared session's later hellos are
     // answered here.
@@ -202,6 +207,8 @@ fn attach(
         kind: "crash",
         message: format!("cannot start a session: {e}"),
     })?;
+    // Its events come to this connection too, from now on.
+    handle.listen(out);
     *session = Some(handle.clone());
     Ok(handle)
 }
@@ -295,6 +302,7 @@ async fn write(
     while let Some(message) = outgoing.recv().await {
         let written = match message {
             Outgoing::Reply(id, outcome) => write_reply(&mut sink, id, outcome).await,
+            Outgoing::Event(event) => sink.send(Message::Text(event.to_string().into())).await,
             Outgoing::Close(code, reason) => {
                 let frame = CloseFrame {
                     code,

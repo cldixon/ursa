@@ -1046,6 +1046,59 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   triggers plus changes to `ursa-server` and `ursa-cli/src/serve.rs`. The
   socket run skips exactly the suite's 6 browser-only checks, which the suite
   now lists and holds it to: a run that skips any other check fails.
+- **SQL: DuckPGQ's algorithm names, and errors that point to the standard
+  form** (#298, #300). Each was an error before, so no query that ran
+  changes.
+  - `weakly_connected_component(pg, Student, know)` runs
+    `connected_components(mode => 'weak')` and returns DuckPGQ's column,
+    `componentid` (unquoted names fold to lower case, so DuckPGQ's
+    `componentId` finds it); `local_clustering_coefficient(pg, Student,
+    know)` runs `clustering_coefficient` and returns
+    `local_clustering_coefficient`. They take DuckPGQ's positional (graph,
+    vertex table, edge table) form, the implied pair on a graph of one edge
+    table, the named parameters of the function they run (not `mode`, which
+    the name fixes), and work inside `algorithms()`. Values stay NetworkX's.
+  - `ursa_functions()` lists them as rows of their own, after `algorithms`,
+    and has two new columns: `same_as`, the Ursa function a DuckPGQ name
+    runs, and `duckpgq`, true for the three functions DuckPGQ has by name
+    (`pagerank` too). They are other systems' spellings; Ursa keeps no old
+    names of its own. The function reference shows them.
+  - DuckPGQ's scalar path functions (`iterativelength`, `shortestpath`,
+    `reachability`, `cheapest_path_length`) say to use `GRAPH_TABLE … ANY
+    SHORTEST` or `shortest_path()`.
+  - A statement that starts with `MATCH` (Cypher, GQL) says to write
+    `SELECT * FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`. `FROM g`, a graph
+    read as a table, says to read `g.nodes` or `g.edges` (or the vertex and
+    edge tables, on a graph of several), use `GRAPH_TABLE`, or call a graph
+    function; `FROM g.nodes` on a graph of several vertex tables says why
+    there is none. A graph function named as a column of a vertex table
+    (`SELECT id, pagerank FROM Student`) names the pair in the join it
+    suggests: `JOIN pagerank(pg, student, know) USING (id)`.
+    `pagerank(pg, vertex => Student, edge => know)` says the pair is
+    positional.
+  - Docs: a "Coming from SQL/PGQ or DuckPGQ" page (what runs unchanged,
+    what differs, Ursa's extensions, the numeric differences from DuckPGQ,
+    and how to translate), and a section in the agent skill. The
+    conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
+    calls, and DuckPGQ's PageRank values are on its known differences.
+
+- **The Ursa Console's page: `ursa serve`'s link opens it** (URSA-12,
+  `design/console.md` §6). At `/console/`, with the shell still at `/`: a
+  sources and catalog column, the editor over the result tabs, and the
+  inspector over History, each panel an empty mount point labelled with the
+  issue that fills it. The columns and panels resize (drag a splitter, or
+  focus it and use the arrow keys), fold, and become drawers under 1024px;
+  skip links, F6 between panels and a visible focus ring keep it keyboard
+  reachable; light and dark come from the shell's tokens. The status bar
+  shows the connection (to the shared session, reconnecting when the server
+  goes, and saying when it was restarted with a new link), the engine's
+  version, the session's root, and the request running with a Cancel button
+  (`cancel {target}`, through `engine-client.js`'s new `cancel(reply)`).
+  `bun run build` builds it into `web/dist-console/`, never into the
+  deployed `web/dist/`; `ursa serve` serves both (`--assets` may be
+  repeated) and builds both in with `serve-embed`. The graph pane's styles
+  move from `style.css` into `graph-pane.css`, which the shell links; the
+  shell looks and behaves as before.
 
 ### Changed
 
@@ -1105,6 +1158,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   1.3–1.6 s eager, with a 4 B/edge transient target column; a weighted or
   masked query rebuilds the ids once (about 1 s more at 64M, the weighted
   iterations themselves unchanged), and in-ids read late take 1.8–2.1 s.
+
+- **`ursa serve`: the page holds its WebSocket in a worker, and a large part
+  is not copied on the page** (URSA-7). `web/public/socket-transport.js`
+  opens the socket in `socket-worker.js`, which assembles each reply and
+  posts it to the page with its parts' buffers transferred, as the wasm
+  engine's worker does. A part is no longer copied out of its frame
+  (`data.slice(8)`): it is the frame's buffer at `offset` 8, which
+  `engine-client.js`'s header now allows a part to carry. `.graph rmat`'s
+  8.4 MB of UGR took 100 to 120 ms of the page's thread in long tasks
+  before the reply was complete; it now takes none. Its first frame is
+  where the worker's is, within noise: medians of 24 runs each, at a load
+  average of 3 to 19 on 4 cores, 1,592 ms over the worker and 1,625 ms
+  over the socket (1,609 ms before this change). `web/tests/graph-timing.ts`
+  runs against `ursa serve` with `URSA_SERVE_TOKEN`, and stops at the first
+  frame with `FIRST_ONLY=1`.
 
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
   (behaviour change: `louvain` and `label_propagation` communities, the
@@ -1216,6 +1284,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   before, and the console's will be its History panel. `app.js` loses about
   250 lines of graph glue; the graph view behaves as before. A second host,
   `web/tests/pane-host/` (never deployed), proves it in the e2e test.
+
+- **The session sends events, and the console's catalog, sources,
+  completion and highlight operations** (URSA-13, URSA-15, URSA-16, the
+  protocol's part; `design/console.md` §4). `catalog` lists the session's
+  databases, schemas, tables (`table`, `view` or `external`) with their
+  columns, and its property graphs with their vertex and edge tables. After
+  any request that changes it (`CREATE`, `DROP`, `ATTACH`, `CREATE PROPERTY
+  GRAPH`, `.open`, a dataset load), the session sends `{"event":
+  "catalog"}`, found by comparing a fingerprint of the catalog before and
+  after: `ursa serve` sends it to every connection on the session, the
+  browser demo's worker posts it, both before the request's reply, and
+  `engine-client.js`'s `on("catalog", fn)` hears it. `sources.list {url}`
+  lists a directory under the session's root (symbolic links resolved, a
+  path outside refused, hidden files left out) or a bucket prefix (`s3://`,
+  `gs://`, `az://`, through `object_store`'s `list_with_delimiter` and the
+  CLI's credential chain), with each entry's format and size, never a
+  credential; `sources.attach {url, as}` is `ATTACH`. Both need capability
+  `sources`, which a session with a directory root reports in `hello`.
+  `complete {sql, cursor}` offers tables, columns (qualified after `t.`, an
+  alias's too), functions, graphs, keywords and dot-commands, without
+  running a query; `highlight {sql}` gives the shell's colouring as spans.
+  Their offsets are UTF-16 code units, as JavaScript's. The protocol
+  document gains an Events section, generated from
+  `ursa_shell::session::EVENTS`.
 
 - **A root per session, and `COPY … TO` to disk under it** (URSA-6,
   `design/console.md` §5). Relative paths resolve against the session's

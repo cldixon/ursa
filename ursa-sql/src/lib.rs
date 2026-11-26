@@ -195,8 +195,8 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
                 Err(e) => match duckdb::retry(&written, &e) {
                     Some(rewritten) => plan_and_run(ctx, rewritten)
                         .await
-                        .map_err(|e| duckdb::explain(&written, e)),
-                    None => Err(duckdb::explain(&written, e)),
+                        .map_err(|e| duckdb::explain(ctx, &written, e)),
+                    None => Err(duckdb::explain(ctx, &written, e)),
                 },
             }
         }
