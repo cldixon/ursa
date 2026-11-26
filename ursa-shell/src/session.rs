@@ -771,8 +771,12 @@ impl Session {
         }
         self.history.begin(op, &args);
         let outcome = self.run_op(op, args, parts).await;
-        let shown = self.shell.explorer().map(|e| e.shown());
-        self.history.finish(&outcome, shown);
+        // What a new drawing shows, for its entry: counted once, here (an
+        // explore step's reply says it; a search changes nothing).
+        let drawn = (op == "graph.open" && outcome.is_ok())
+            .then(|| self.shell.explorer().map(|e| e.shown()))
+            .flatten();
+        self.history.finish(&outcome, drawn);
         outcome
     }
 

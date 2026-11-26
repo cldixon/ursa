@@ -68,6 +68,8 @@ pub(super) struct History {
     /// The open drawing's number (0: none), and the last one given.
     drawing: u64,
     drawings: u64,
+    /// The nodes and edges the open drawing shows, as its last step left it.
+    shown: Option<(u64, u64)>,
 }
 
 /// A request that makes an entry, while it runs.
@@ -136,9 +138,9 @@ impl History {
         });
     }
 
-    /// The request that began has finished with `outcome`; `shown` is what
-    /// the open drawing shows now, if one is open.
-    pub(super) fn finish(&mut self, outcome: &Result<Reply, Error>, shown: Option<(usize, usize)>) {
+    /// The request that began has finished with `outcome`; `drawn` is what
+    /// a `graph.open` that drew shows.
+    pub(super) fn finish(&mut self, outcome: &Result<Reply, Error>, drawn: Option<(usize, usize)>) {
         let Some(running) = self.running.take() else {
             return;
         };
@@ -170,9 +172,14 @@ impl History {
             ("graph.open", Ok(_)) => {
                 self.drawings += 1;
                 self.drawing = self.drawings;
+                self.shown = drawn.map(|(n, e)| (n as u64, e as u64));
             }
             ("graph.explore" | "graph.find", Ok(reply)) => {
-                if let Some(err) = reply.result["err"].as_str().and_then(first_line) {
+                let r = &reply.result;
+                if let (Some(nodes), Some(edges)) = (r["nodes"].as_u64(), r["edges"].as_u64()) {
+                    self.shown = Some((nodes, edges));
+                }
+                if let Some(err) = r["err"].as_str().and_then(first_line) {
                     entry.insert("error".into(), json!(err));
                 }
             }
@@ -191,7 +198,7 @@ impl History {
         let unopened = running.op == "graph.open" && outcome.is_err();
         if running.op.starts_with("graph.") && self.drawing > 0 && !unopened {
             entry.insert("drawing".into(), json!(self.drawing));
-            if let Some((nodes, edges)) = shown {
+            if let Some((nodes, edges)) = self.shown {
                 entry.insert("nodes".into(), json!(nodes));
                 entry.insert("edges".into(), json!(edges));
             }
@@ -202,12 +209,13 @@ impl History {
     /// The open drawing was closed (`graph.close`, `start`).
     pub(super) fn closed_drawing(&mut self) {
         self.drawing = 0;
+        self.shown = None;
     }
 
     /// A new shell (`start`): what was being fed is gone.
     pub(super) fn restarted(&mut self) {
         self.fed.clear();
-        self.drawing = 0;
+        self.closed_drawing();
     }
 
     fn record(&mut self, running: Running, fields: Map<String, Value>) {
