@@ -173,6 +173,8 @@ Over the WebSocket, the JSON goes in a text frame, and each part follows in its 
 
 A reply is complete when its text frame and every part it lists have arrived. Frames of different replies don't interleave: the session sends one reply at a time.
 
+The page holds the socket in a worker of its own (`web/public/socket-worker.js`, URSA-7), not on its own thread: a large part is received there, and the complete reply is posted to the page with its parts' buffers transferred, as `engine-worker.js` posts its own. A part is not copied out of its frame: the client gives it as the frame's buffer with an `offset` of 8 (`engine-client.js`'s header).
+
 Part kinds:
 - **`ugr`:** a `GraphResult` or a `GraphDelta`, as `ursa-viz/UGR.md` defines them. No change to UGR.
 - **`arrow`:** an Arrow IPC stream (schema, then record batches), which the console decodes with `apache-arrow`'s JS reader. The `ursa.*` field metadata travels inside the schema.

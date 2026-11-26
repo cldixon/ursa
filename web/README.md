@@ -55,7 +55,11 @@ static assets and an R2 bucket.
     `engine-client.js` then picks `SocketTransport` (`socket-transport.js`):
     the same messages over a WebSocket at `/session` to a native session,
     the JSON in a text frame and each part in a binary frame after an 8-byte
-    header (`design/console.md` §4.2). The page's token travels in an
+    header (`design/console.md` §4.2). The socket is held in a worker of its
+    own (`socket-worker.js`), so a large part (`.graph rmat`'s 8.4 MB of
+    UGR) is received off the page's thread and reaches the page in one
+    `postMessage`, its buffer transferred and not copied: a part is its
+    frame's buffer, from byte 8 (URSA-7). The page's token travels in an
     `HttpOnly` cookie, which the script never sees. `bun
     scripts/e2e-serve.ts PORT` runs the e2e suite that way (see Test).
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
@@ -534,7 +538,10 @@ static assets and an R2 bucket.
     and the heaps (on rmat it fails if the view holds over 20 MiB or the
     layout worker over 60 MB, #501). It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
-    `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
+    `CHANNEL=shell` runs the shell. Against `ursa serve`, set
+    `URSA_SERVE_TOKEN` to the token of the link it printed; `FIRST_ONLY=1`
+    ends each run at the first frame, which is what comparing the worker and
+    the socket needs (URSA-7). `bun test tests/graph-timings.test.ts`
     tests the arithmetic.
 
     On `.graph rmat` (1M edges, headless Chromium, software WebGL2, median
