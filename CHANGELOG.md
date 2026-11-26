@@ -2017,6 +2017,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Web Shell: the aggregated view's e2e checks wait for the cut's frame**
+  (URSA-19). A cut through the layout's hierarchy (#498) is drawn, and its
+  largest groups labelled, by the frame after the layout worker's answer;
+  but the view's test hook said it waited for nothing as soon as the answer
+  was in, so a check that read the labels then, under load before that
+  frame, found none (`a big graph: its largest groups are labelled with
+  their node counts: []`, seen over `ursa serve`). The hook's `cuts.waiting`
+  now also covers a cut, or the graph in place of one, that no frame has
+  drawn yet; and a new check holds the animation frames to see it wait.
+
 - **Web Shell: a `.graph` that fails downloads none of the graph view**
   (URSA-11). The pane opens with "Loading graph view…" once the engine has
   taken 150 ms, and it began downloading `graph.js` and `ursa-viz` then; so
