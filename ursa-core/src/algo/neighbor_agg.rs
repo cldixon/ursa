@@ -9,7 +9,7 @@
 
 use crate::parallel::*;
 
-use crate::topology::{Direction, EdgeMask, Topology};
+use crate::topology::{Adjacency, Direction, EdgeMask, Topology};
 
 /// The supported neighbour aggregations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,23 +74,18 @@ fn aggregate_node(
     scratch: &mut Vec<f64>,
 ) -> Option<f64> {
     let out = topo.out();
-    let out_pairs = || out.neighbors(u).iter().zip(out.edge_ids(u));
+    let masked = mask.is_some();
+    let out_pairs = || pairs(out, u, masked);
     match direction {
         Direction::Out => fold_neighbors(out_pairs(), attr, mask, agg, scratch),
         Direction::In => {
             let inc = topo.incoming();
-            fold_neighbors(
-                inc.neighbors(u).iter().zip(inc.edge_ids(u)),
-                attr,
-                mask,
-                agg,
-                scratch,
-            )
+            fold_neighbors(pairs(inc, u, masked), attr, mask, agg, scratch)
         }
         Direction::Both => {
             let inc = topo.incoming();
             fold_neighbors(
-                out_pairs().chain(inc.neighbors(u).iter().zip(inc.edge_ids(u))),
+                out_pairs().chain(pairs(inc, u, masked)),
                 attr,
                 mask,
                 agg,
@@ -103,6 +98,18 @@ fn aggregate_node(
 /// Fold the present attribute values of a `(neighbour, edge_row)` iterator into one
 /// aggregate. Generic over the iterator so `Out`/`In` (a slice zip) and `Both`
 /// (a chained zip) monomorphize without boxing. A masked-out edge row is skipped.
+/// The `(neighbour, edge row)` pairs of `u` in `adj`. The rows are read only
+/// when `masked` (a mask is what reads them): otherwise each reads as 0,
+/// and the adjacency's edge ids are never built (#170).
+fn pairs(adj: &Adjacency, u: u32, masked: bool) -> impl Iterator<Item = (&u32, &u32)> {
+    const NO_ROW: u32 = 0;
+    let ids = masked.then(|| adj.edge_ids(u));
+    adj.neighbors(u)
+        .iter()
+        .enumerate()
+        .map(move |(i, v)| (v, ids.map_or(&NO_ROW, |ids| &ids[i])))
+}
+
 fn fold_neighbors<'a, I: Iterator<Item = (&'a u32, &'a u32)>>(
     neighbors: I,
     attr: &[Option<f64>],
