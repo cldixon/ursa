@@ -1082,6 +1082,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's e2e suites run in CI** (URSA-18). `web/tests/console-all.ts`
+  (`bun run test:console-all`) runs the console, editor and panels suites in
+  turn, each with its own `ursa serve`, prints a summary and fails if any
+  check does. `shell-e2e.yml` runs it in a third leg, "Ursa Console (browser
+  e2e over ursa serve)", built as the shell's socket leg is and sharing its
+  caches, on the same paths, and keeps the console's screenshots, light and
+  dark, as the `console-e2e` artifact on every run.
 - **The console's result tabs** (URSA-14, `design/console.md` §6). Each
   result the console runs opens in a tab of its own, labelled with its
   statement and row count (the ARIA tabs pattern; Delete or × closes it and

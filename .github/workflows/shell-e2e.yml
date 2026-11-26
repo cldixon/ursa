@@ -80,8 +80,6 @@ env:
   # this version drives, so the two always match.
   PLAYWRIGHT_VERSION: "1.63.0"
   PORT: "8788"
-  # The console's editor suite: "on" once URSA-21 lands (see its step).
-  CONSOLE_EDITOR_SUITE: "off"
 
 jobs:
   e2e:
@@ -248,30 +246,14 @@ jobs:
       # The console's suites (tests/console-all.ts): each starts its own
       # `ursa serve` from this build, on PORT, PORT + 1, ..., with the pages
       # from dist-console/ and dist/, and saves its screenshots in
-      # e2e-out/<suite>/. The editor's suite is a step of its own, below.
+      # e2e-out/<suite>/. It runs them all even when one fails.
       - name: Run the console suites
-        id: console
         if: matrix.suite == 'console'
         env:
           URSA_BIN: ${{ github.workspace }}/target/debug/ursa
         run: |
           mkdir -p e2e-out
-          bun run test:console-all "$PORT" "$URSA_BIN" e2e-out --skip editor 2>&1 | tee e2e-out/console.log
-
-      # The SQL editor's suite (tests/console-editor.ts). Off until URSA-21
-      # fixes its "Tab accepts it" check: set CONSOLE_EDITOR_SUITE to "on"
-      # (in the env above) to switch it on. It runs after the other suites
-      # whether or not they passed (but not when the build failed, which
-      # skipped them), so one failing hides nothing.
-      - name: Run the console editor suite
-        if: >-
-          !cancelled() && matrix.suite == 'console' && env.CONSOLE_EDITOR_SUITE == 'on'
-          && (steps.console.outcome == 'success' || steps.console.outcome == 'failure')
-        env:
-          URSA_BIN: ${{ github.workspace }}/target/debug/ursa
-        run: |
-          mkdir -p e2e-out
-          bun run test:console-all "$PORT" "$URSA_BIN" e2e-out --only editor 2>&1 | tee e2e-out/console-editor.log
+          bun run test:console-all "$PORT" "$URSA_BIN" e2e-out 2>&1 | tee e2e-out/console-all.log
 
       - name: Upload screenshots and logs
         if: failure() && matrix.suite == 'shell'

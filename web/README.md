@@ -1009,7 +1009,27 @@ statement at the cursor, the selection, and Shift+Ctrl+Enter stopping at the
 first error; errors at their statement with the engine's hint; a
 dot-command through `feed`; the running mark and Cancel; Esc then Tab
 leaving the editor; `insert()`; and the text kept across a reload. With a
-screenshot dir it saves `editor-*.png`. CI does not run these yet.
+screenshot dir it saves `editor-*.png`.
+
+`tests/console-all.ts` runs the three in turn, each a process of its own
+with its own `ursa serve` (the first on PORT, the next on PORT + 1, ...),
+then prints a summary of each suite's checks and every failed one, and exits
+1 if any check failed or any suite stopped early:
+
+```sh
+bun run test:console-all -- 9100 ../target/debug/ursa e2e-out   # [port] [ursa binary] [out dir]
+bun run test:console-all -- 9100 "" "" --only panels             # or --skip editor
+```
+
+With an out dir, each suite's screenshots and output go to
+`OUT/<suite>/` (`console`, `editor`, `panels`). Each runs in a process
+group of its own, killed once it exits, so a suite that throws cannot leave
+its server running. CI runs it as a third leg of `shell-e2e.yml`, "Ursa
+Console (browser e2e over ursa serve)", built exactly as the socket leg is
+(the same `.engine/`, `.data/` and cargo caches, `bun run build` and a debug
+`ursa-cli --features serve`), and uploads `e2e-out/`, the console's
+screenshots in light and dark and the logs, as the `console-e2e` artifact
+on every run, passed or failed.
 
 ## Datasets
 

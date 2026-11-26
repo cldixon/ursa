@@ -264,12 +264,18 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
   // ---------------------------------------------------------------- 100,000 rows
 
   await ev(() => (window as any).ursaConsole.run("SELECT * FROM range(100000)"));
-  await page.waitForFunction(() => (window as any).ursaConsole.results.selected()?.rows === 100000, null, { timeout: 30_000 });
+  // The table draws its first page on the next frame after the tab opens.
+  await page
+    .waitForFunction(() => {
+      const tab = (window as any).ursaConsole.results.selected();
+      return tab?.rows === 100000 && tab.table.state().shown.length > 0;
+    }, null, { timeout: 30_000 })
+    .catch(() => {});
   const big = await ev(() => {
     const tab = (window as any).ursaConsole.results.selected();
     return { count: tab.button.querySelector(".rs-tab-count").textContent, graph: tab.graph, state: tab.table.state() };
   });
-  check(big.count === "100k" && big.state.pages === 1 && big.state.shown[0][0] === "1" && big.state.shown[0][1] === "0", "results: a 100,000-row result opens with its first page", JSON.stringify({ count: big.count, pages: big.state.pages, first: big.state.shown[0] }));
+  check(big.count === "100k" && big.state.pages === 1 && big.state.shown[0]?.[0] === "1" && big.state.shown[0]?.[1] === "0", "results: a 100,000-row result opens with its first page", JSON.stringify({ count: big.count, pages: big.state.pages, first: big.state.shown[0] }));
 
   // Smooth: scroll through it a frame at a time; each frame draws its rows.
   const smooth = await ev(async () => {
