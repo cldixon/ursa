@@ -21,8 +21,9 @@
 //   one graph pane (graph-pane.js: graph.js draws one view at a time), which
 //   moves to the tab whose Graph view is shown, and draws its result there
 //   with `graph.open {result}`. Its commands (a double-click's `.expand 33`)
-//   go to the commands sink: until History takes it (setCommandsSink), a
-//   small list under the graph keeps them, and they run in the pane.
+//   go to the commands sink: History (history.js) takes it (setCommandsSink)
+//   and lists them, grouped under their drawing; without History, a small
+//   list under the graph keeps them. Either way they run in the pane.
 // - Export writes the whole result with `export {format, result}`, as CSV,
 //   Parquet, JSON or Arrow, downloaded as a file.
 // - The session keeps 16 results, within 256 MB: a tab whose result has gone
@@ -630,7 +631,8 @@ export function createResults({ mount, session }) {
       return false;
     }
     tab.idle.box.hidden = pane.isOpen();
-    logStep({ command: `.graph`, via: "results", result: tab.id, answer: r.out.trim().split(/\r?\n/)[0], dropped: false, error: false });
+    // History, once it has the sink, lists the drawing itself (the session's `activity`).
+    if (sink === listCommands) logStep({ command: `.graph`, via: "results", result: tab.id, answer: r.out.trim().split(/\r?\n/)[0], dropped: false, error: false });
     say(r.out.trim().split(/\r?\n/)[0]);
     return true;
   }
@@ -700,10 +702,12 @@ export function createResults({ mount, session }) {
      * Where the graph pane's commands go: fn(command, {via, current, result,
      * sql, exec}), resolving once it has run, as graph-pane.js's `commands`.
      * `exec(command)` runs it in the pane. History (URSA-17) takes this;
-     * until then the Results panel lists them under the graph. Null puts that back.
+     * without it the Results panel lists them under the graph (the Steps
+     * list), which null puts back.
      */
     setCommandsSink(fn) {
       sink = fn ?? listCommands;
+      stepsBox.hidden = sink !== listCommands || steps.length === 0;
     },
     /** The commands the default sink listed. */
     steps,

@@ -260,6 +260,17 @@ async fn it_stops_gracefully() {
         .is_err());
 }
 
+/// The next message that is not an `activity` event (which
+/// [`every_connection_on_a_session_hears_its_activity`] checks).
+async fn next_but_activity(socket: &mut common::Socket) -> Value {
+    loop {
+        let message = next_message(socket).await;
+        if message["event"] != "activity" {
+            return message;
+        }
+    }
+}
+
 /// The `catalog` event goes to every connection on the session, before the
 /// reply to the request that caused it (§4.4, §4.5).
 #[tokio::test(flavor = "multi_thread")]
@@ -276,23 +287,94 @@ async fn every_connection_on_a_session_hears_its_events() {
         &[],
     )
     .await;
-    assert_eq!(next_message(&mut a).await, json!({"event": "catalog"}));
-    let reply = next_message(&mut a).await;
+    assert_eq!(next_but_activity(&mut a).await, json!({"event": "catalog"}));
+    let reply = next_but_activity(&mut a).await;
     assert_eq!(
         (reply["id"].clone(), reply["ok"].clone()),
         (json!(1), json!(true)),
         "{reply}"
     );
-    assert_eq!(next_message(&mut b).await, json!({"event": "catalog"}));
+    assert_eq!(next_but_activity(&mut b).await, json!({"event": "catalog"}));
     // A query that changes nothing sends none: b's next message is its reply.
     send(&mut b, 1, "feed", json!({"line": "SELECT * FROM v;"}), &[]).await;
-    assert_eq!(next_message(&mut b).await["id"], 1);
+    assert_eq!(next_but_activity(&mut b).await["id"], 1);
     // Nor does another session hear this one's.
     send(&mut other, 1, "feed", json!({"line": "SELECT 1;"}), &[]).await;
-    assert_eq!(next_message(&mut other).await["id"], 1);
+    assert_eq!(next_but_activity(&mut other).await["id"], 1);
     // A connection that closed is not written to; the rest still are.
     drop(a);
     send(&mut b, 2, "feed", json!({"line": "DROP VIEW v;"}), &[]).await;
-    assert_eq!(next_message(&mut b).await, json!({"event": "catalog"}));
-    assert_eq!(next_message(&mut b).await["id"], 2);
+    assert_eq!(next_but_activity(&mut b).await, json!({"event": "catalog"}));
+    assert_eq!(next_but_activity(&mut b).await["id"], 2);
+}
+
+/// The `activity` event (URSA-17): every connection on the shared session
+/// hears what each ran, named by the `client` its own `hello` gave, before
+/// the reply; a connection that joins later reads it with `history`.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_connection_on_a_session_hears_its_activity() {
+    let server = Server::start().await;
+    let hello = |name: &str, kind: &str| json!({"protocol": 1, "session": "shared", "client": {"name": name, "kind": kind}});
+    let mut console = server.connect().await;
+    call(&mut console, 0, "hello", hello("console", "human"), &[]).await;
+    let mut agent = server.connect().await;
+    call(&mut agent, 0, "hello", hello("claude", "agent"), &[]).await;
+    let mut other = server.session(Some("new")).await.0;
+
+    send(
+        &mut console,
+        1,
+        "query",
+        json!({"sql": "SELECT 42 AS answer"}),
+        &[],
+    )
+    .await;
+    let event = next_message(&mut console).await;
+    assert_eq!(event["event"], "activity", "{event}");
+    assert_eq!(event["client"], json!({"name": "console", "kind": "human"}));
+    assert_eq!(
+        (
+            event["op"].as_str(),
+            event["summary"].as_str(),
+            event["rows"].as_u64()
+        ),
+        (Some("query"), Some("SELECT 42 AS answer"), Some(1)),
+        "{event}"
+    );
+    assert_eq!(next_message(&mut console).await["id"], 1);
+    // The second connection hears it too.
+    assert_eq!(next_message(&mut agent).await, event);
+
+    // The agent's request is the agent's, though the session is shared.
+    send(&mut agent, 1, "query", json!({"sql": "SELECT nope"}), &[]).await;
+    let failed = next_message(&mut console).await;
+    assert_eq!(failed["client"], json!({"name": "claude", "kind": "agent"}));
+    assert!(
+        failed["error"].as_str().unwrap().contains("nope"),
+        "{failed}"
+    );
+    assert_eq!(next_message(&mut agent).await, failed);
+    assert_eq!(next_message(&mut agent).await["id"], 1);
+
+    // A session of its own hears none of it.
+    let (listed, _) = call(&mut other, 1, "history", json!({}), &[]).await;
+    assert_eq!(listed["result"]["entries"], json!([]), "{listed}");
+
+    // A page that joins later reads what came before.
+    let (mut late, _) = server.session(Some("shared")).await;
+    let (listed, _) = call(&mut late, 1, "history", json!({}), &[]).await;
+    let entries = listed["result"]["entries"].as_array().unwrap();
+    let who: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["id"].as_u64().unwrap(),
+                e["client"]["name"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(who, [(1, "console"), (2, "claude")], "{listed}");
+    let mut first = event.clone();
+    first.as_object_mut().unwrap().remove("event");
+    assert_eq!(entries[0], first);
 }

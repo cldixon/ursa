@@ -98,6 +98,15 @@ pub const OPS: &[Op] = &[
                 that reaches the session has nothing running, so it answers `{}`",
     },
     Op {
+        name: "history",
+        args: "`limit?` (500)",
+        result: "`{entries: [{id, at, client, op, summary, ms, result?, rows?, drawing?, nodes?, edges?, error?}], limit}`",
+        about: "What the session's clients ran, oldest first: the last `limit` of the \
+                entries the `activity` event sent. The session keeps its last 500 (`limit` \
+                in the result); a client that joins late reads what came before here, and \
+                its `id`s tell it which events it has already",
+    },
+    Op {
         name: "start",
         args: "`commands?`, `shortcuts?`, `graphMaxEdges?`",
         result: "`{version, prompt, promptColor}`",
@@ -303,15 +312,34 @@ pub struct EventSpec {
 }
 
 /// Every event a session sends, in the protocol document's order.
-pub const EVENTS: &[EventSpec] = &[EventSpec {
-    name: "catalog",
-    fields: "—",
-    when: "After a request that changed what `catalog` answers: `CREATE`, `DROP`, \
-           `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, a loaded dataset, a \
-           `start`, through `feed`, `query` or `sources.attach`. Every client attached to \
-           the session gets it, before the reply to the request that caused it; clients \
-           fetch `catalog` again",
-}];
+pub const EVENTS: &[EventSpec] = &[
+    EventSpec {
+        name: "catalog",
+        fields: "—",
+        when: "After a request that changed what `catalog` answers: `CREATE`, `DROP`, \
+               `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, a loaded dataset, a \
+               `start`, through `feed`, `query` or `sources.attach`. Every client attached to \
+               the session gets it, before the reply to the request that caused it; clients \
+               fetch `catalog` again",
+    },
+    EventSpec {
+        name: "activity",
+        fields: "`id`, `at`, `client`, `op`, `summary`, `ms`, `result?`, `rows?`, `drawing?`, \
+                 `nodes?`, `edges?`, `error?`",
+        when: "After each request that ran something: a `query`, a statement `feed` \
+               completed (not a host's command, whose own requests make theirs), \
+               `sources.attach`, and the graph steps `graph.open`, `graph.explore` and \
+               `graph.find`; failed or cancelled ones too, with `error`. `client` is the \
+               `{name, kind}` its client gave `hello` (`null` if none); `at` is when it \
+               started (ms since the Unix epoch) and `ms` how long it took; `summary` what \
+               ran, as typed (`SELECT …`, `.expand 33`); `result` the kept result a query \
+               made or a drawing drew, `rows` a query's row count. `drawing` numbers the \
+               drawings: a `graph.open` starts one, and the graph steps after it belong to it; \
+               `nodes` and `edges` are what it shows after the step. Every client attached to \
+               the session gets it, after the request's other events and before its reply; \
+               `history` gives the last 500",
+    },
+];
 
 /// An event the session sends ([`Session::take_events`]): `{"event": name,
 /// ...fields}`.
@@ -635,6 +663,8 @@ pub struct Session {
     /// Whether a request that may change the catalog ran since it was last
     /// looked at.
     catalog_dirty: bool,
+    /// What the session's clients ran: `history`, and `activity` events.
+    history: history::History,
 }
 
 impl Session {
@@ -671,7 +701,16 @@ impl Session {
             results: Results::default(),
             catalog_seen: None,
             catalog_dirty: false,
+            history: history::History::default(),
         }
+    }
+
+    /// Say who sends the next requests: a client's `{name, kind}`, as its
+    /// `hello` gave it, for the history's entries and `activity` events. A
+    /// host that serves several clients on one session (`ursa serve`'s
+    /// shared session) sets it before each request; `hello` sets it too.
+    pub fn set_client(&mut self, client: Option<Value>) {
+        self.history.set_client(client);
     }
 
     /// Open [`Options::database`], if it is not open yet: as the CLI opens
@@ -712,13 +751,16 @@ impl Session {
     ///
     /// SQL and command errors are what `feed`, `graph.explore` and
     /// `graph.find` print; the other operations fail with an [`Error`].
+    ///
+    /// A request that runs something (a query, a statement, a graph step)
+    /// is kept in the session's history, and sent as an `activity` event
+    /// ([`Self::take_events`]).
     pub async fn handle(
         &mut self,
         op: &str,
         args: Value,
-        mut parts: Vec<Vec<u8>>,
+        parts: Vec<Vec<u8>>,
     ) -> std::result::Result<Reply, Error> {
-        let a = Args(&args);
         if !OPS.iter().any(|o| o.name == op) {
             return Err(Error::protocol(format!("unknown op {op}")));
         }
@@ -727,6 +769,21 @@ impl Session {
                 "the first request must be hello, not {op}"
             )));
         }
+        self.history.begin(op, &args);
+        let outcome = self.run_op(op, args, parts).await;
+        let shown = self.shell.explorer().map(|e| e.shown());
+        self.history.finish(&outcome, shown);
+        outcome
+    }
+
+    /// [`Self::handle`]'s operation `op`, past its checks.
+    async fn run_op(
+        &mut self,
+        op: &str,
+        args: Value,
+        mut parts: Vec<Vec<u8>>,
+    ) -> std::result::Result<Reply, Error> {
+        let a = Args(&args);
         if CHANGE_CATALOG.contains(&op) {
             // What it was before, the first time; marked before the request
             // runs, so that one cancelled halfway is still compared.
@@ -762,6 +819,7 @@ impl Session {
                     },
                 };
                 self.greeted = true;
+                self.history.hello(&args);
                 Ok(Reply::json(json!({
                     "protocol": PROTOCOL,
                     "version": self.options.version,
@@ -774,6 +832,10 @@ impl Session {
             // running, so there is nothing to stop.
             "cancel" => Ok(Reply::json(json!({}))),
             "memory" => Ok(Reply::json(memory())),
+            "history" => {
+                let limit = args.get("limit").and_then(Value::as_u64);
+                Ok(Reply::json(self.history.list(limit)))
+            }
             "query" => {
                 let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(1_000);
                 let (result, arrow) = self.query(a.str("sql")?, rows as usize).await?;
@@ -805,10 +867,13 @@ impl Session {
                 Ok(Reply::json(json!({})))
             }
             "start" => {
+                let mut history = std::mem::take(&mut self.history);
+                history.restarted();
                 *self = Session {
                     greeted: true,
                     catalog_seen: self.catalog_seen,
                     catalog_dirty: true,
+                    history,
                     ..Session::new(self.options.clone())
                 };
                 // The old session's database is closed: open it here.
@@ -994,6 +1059,7 @@ impl Session {
             }
             "graph.close" => {
                 self.close_graph();
+                self.history.closed_drawing();
                 Ok(Reply::json(json!({})))
             }
             other => unreachable!("{other} is in OPS but not handled"),
@@ -1112,20 +1178,23 @@ impl Session {
 
     /// The events the requests since the last call caused, to send before
     /// the last one's reply (`design/console.md` §4.5): `catalog`, if the
-    /// catalog changed. A host calls it after each request, whether it
-    /// succeeded, failed or was cancelled.
+    /// catalog changed, then `activity`, for a request that ran something
+    /// (one cancelled with its future dropped is sent as cancelled). A host
+    /// calls it after each request, whether it succeeded, failed or was
+    /// cancelled.
     pub async fn take_events(&mut self) -> Vec<Event> {
-        if !std::mem::take(&mut self.catalog_dirty) {
-            return Vec::new();
+        let mut events = Vec::new();
+        if std::mem::take(&mut self.catalog_dirty) {
+            let now = catalog::fingerprint(self.shell.context()).await;
+            let changed = self.catalog_seen.is_some_and(|seen| seen != now);
+            self.catalog_seen = Some(now);
+            if changed {
+                events.push(Event::catalog());
+            }
         }
-        let now = catalog::fingerprint(self.shell.context()).await;
-        let changed = self.catalog_seen.is_some_and(|seen| seen != now);
-        self.catalog_seen = Some(now);
-        if changed {
-            vec![Event::catalog()]
-        } else {
-            Vec::new()
-        }
+        // What ran: the request, or, if it was cancelled, what it was.
+        events.extend(self.history.take_events());
+        events
     }
 
     /// What `hello` says this session can do: the host's capabilities, and
@@ -1731,6 +1800,9 @@ fn upload_key(name: &str) -> String {
 mod catalog;
 #[path = "session_complete.rs"]
 mod complete;
+#[path = "session_history.rs"]
+mod history;
+pub use history::HISTORY_LIMIT;
 #[path = "session_sources.rs"]
 mod sources;
 
@@ -1741,3 +1813,7 @@ mod tests;
 #[cfg(test)]
 #[path = "session_ops_tests.rs"]
 mod ops_tests;
+
+#[cfg(test)]
+#[path = "session_history_tests.rs"]
+mod history_tests;

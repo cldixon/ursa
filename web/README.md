@@ -807,8 +807,8 @@ static assets and an R2 bucket.
   (`window.ursaConsole.panels`). The Results panel (URSA-14) is
   `results.js` (a tab per kept result, the ARIA tabs pattern; Graph, Plan,
   Export, Run again for a result that has gone; the page's one graph pane,
-  moved to the tab whose graph is shown, its commands to a sink History
-  will take with `results.setCommandsSink`) and `table.js` (the virtual
+  moved to the tab whose graph is shown, its commands to the sink History
+  takes with `results.setCommandsSink`) and `table.js` (the virtual
   table: Arrow IPC decoded in the page, paged with `fetch`, typed headers
   with the `ursa.*` role, sorting the loaded rows, copying a range), styled
   by `results.css`. `ursaConsole.run(sql)` is the run function
@@ -828,7 +828,17 @@ static assets and an R2 bucket.
   (`sources.list`), buckets added by prefix (kept per port), and Attach for
   `.ursa` files. Both hand their queries to the editor through
   `actions.js` (or run them with `query` when there is no editor), and
-  share `panels.css`. `bun run build` (or
+  share `panels.css`. The History panel is `history.js` (URSA-17,
+  `history.css`): the session's history, not the page's, from the
+  `activity` event and, on every connect, the `history` op, so every tab on
+  the shared session (and an agent's steps) shows the same list, live. Each
+  entry has its statement or command, its client, when it ran, how long it
+  took and its rows or error; graph steps are grouped under their drawing,
+  and a drawing under its query. Choosing an entry shows its result's tab,
+  or offers to run it again; Copy as SQL copies a script the shell replays.
+  It takes the graph pane's commands (`results.setCommandsSink`), so the
+  Results panel's Steps list under the graph shows only without it.
+  `bun run build` (or
   `bun run console` alone) copies it, with apache-arrow bundled as
   `vendor/arrow.mjs` and CodeMirror (MIT, pinned in `package.json`, from
   `scripts/codemirror.ts`) as `vendor/codemirror.mjs`, their licences
@@ -1010,6 +1020,18 @@ first error; errors at their statement with the engine's hint; a
 dot-command through `feed`; the running mark and Cancel; Esc then Tab
 leaving the editor; `insert()`; and the text kept across a reload. With a
 screenshot dir it saves `editor-*.png`. CI does not run these yet.
+
+`tests/console-history.ts` (`bun run test:console-history -- 9121`, the
+same arguments) tests the History panel over `ursa serve` with a root of its
+own: two queries and a double-click's `.expand` listed and attributed to
+the console, the step under its drawing under its query; a second page on
+the shared session seeing them live, and its own query showing on the
+first; a page opened later reading them with `history`; an agent's query
+marked as the agent's; choosing an entry re-opening its tab, or offering
+Run again once it is closed; the keyboard; and Copy as SQL giving a script
+that, run line by line in a session of its own as a share link runs, draws
+the same graph. With a screenshot dir it saves `history-light-1440x900.png`,
+`history-dark-1440x900.png` and History's column in each theme.
 
 ## Datasets
 

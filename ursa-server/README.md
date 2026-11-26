@@ -53,10 +53,13 @@ bound.serve_with_shutdown(async { tokio::signal::ctrl_c().await.ok(); }).await?;
   a time, in the order they came, from every connection attached to it.
 - **Events** (§4.4): after each request, the actor sends the events it
   caused (`Session::take_events`: `{"event": "catalog"}` when the catalog
-  changed) to every connection attached to the session, as text frames of
-  their own, and then the request's reply: a connection gets a request's
-  events before its reply, and a second tab on the shared session sees
-  another's changes.
+  changed, and `{"event": "activity", …}` for a request that ran something)
+  to every connection attached to the session, as text frames of their own,
+  and then the request's reply: a connection gets a request's events before
+  its reply, and a second tab on the shared session sees another's changes
+  and what it ran. Each request carries its connection's `hello` `client`,
+  which the actor gives the session (`Session::set_client`) before running
+  it, so the shared session's history names who ran what.
 - **`cancel {target}`** (native only) and `memory` bypass the queue: the
   server answers them itself.
   `cancel` stops one of the connection's own requests, queued or running,
