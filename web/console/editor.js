@@ -487,9 +487,10 @@ async function runOne(s) {
     return reply;
   }
   if (typeof results === "function") {
-    const reply = await results(s.text, { label: label(s.text), from: "editor" });
-    // A run() that reports failure in its reply rather than rejecting.
-    if (reply && reply.ok === false && reply.error) throw reply.error;
+    // results.js's run resolves to {tab}, {notices} or {error}: it shows the
+    // error in the Results panel too; the editor shows it at the statement.
+    const reply = await results(s.text);
+    if (reply?.error) throw reply.error;
     return reply;
   }
   const reply = await session.run("query", { sql: s.text }, { label: label(s.text) });
