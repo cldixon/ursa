@@ -1066,7 +1066,10 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   `ursa_shell::session::Options::read_only`). The shell's page keeps
   `COPY … TO 'name'` in memory, as in the browser demo; the shared session
   (the console's) writes it to disk under the root. `web/scripts/build.ts
-  --no-engine` builds the page without the wasm engine.
+  --no-engine` builds the page without the wasm engine. The Linux x86_64
+  release binary grows from 147.2 MB to 169.6 MB (115 to 132 MB stripped;
+  its archive from 40.9 to 47.0 MB): 18.7 MB for the server, 3.7 MB for the
+  page.
 
 ### Changed
 
