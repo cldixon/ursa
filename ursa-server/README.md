@@ -29,7 +29,9 @@ let config = ursa_server::Config {
 };
 let bound = ursa_server::bind(config).await?;
 println!("{}", bound.url());
-// Until Ctrl+C, then gracefully.
+// Until Ctrl+C, then gracefully. (`ursa serve` installs its handler before
+// it binds, so that a Ctrl+C while it starts is not lost: `ctrl_c()`'s is
+// installed only when first polled.)
 bound.serve_with_shutdown(async { tokio::signal::ctrl_c().await.ok(); }).await?;
 ```
 
