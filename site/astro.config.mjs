@@ -109,7 +109,10 @@ export default defineConfig({
 						{
 							label: "Coming from DuckDB",
 							collapsed: true,
-							items: [{ label: "Differences from DuckDB", slug: "docs/duckdb" }],
+							items: [
+								{ label: "Differences from DuckDB", slug: "docs/duckdb" },
+								{ label: "Coming from SQL/PGQ or DuckPGQ", slug: "docs/duckpgq" },
+							],
 						},
 						{
 							label: "Reference",

@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use serde_json::Value;
-use ursa_shell::session::{envelope, Options, Session};
+use ursa_shell::session::{envelope, Event, Options, Reply, Session};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -73,10 +73,12 @@ impl WebShell {
 
     /// Run the operation `op` with `args` (a JSON object, as text) and
     /// `parts` (an array of `Uint8Array`s), and resolve to `{message,
-    /// parts}`: `message` is the reply as the protocol's JSON text, `{"ok":
-    /// true, "result", "parts": [{"name", "kind", "bytes"}]}` or `{"ok":
-    /// false, "error": {"kind", "message"}}`, and `parts` the reply's binary
-    /// parts, each a `Uint8Array` with a buffer of its own, to transfer.
+    /// parts, events}`: `message` is the reply as the protocol's JSON text,
+    /// `{"ok": true, "result", "parts": [{"name", "kind", "bytes"}]}` or
+    /// `{"ok": false, "error": {"kind", "message"}}`; `parts` the reply's
+    /// binary parts, each a `Uint8Array` with a buffer of its own, to
+    /// transfer; and `events` the events the request caused, as JSON text of
+    /// an array (`[{"event": "catalog"}]`), to deliver before the reply.
     ///
     /// It rejects only when the request is not one: `args` that are not
     /// JSON, or a second call before the first resolved (the page runs one
@@ -90,7 +92,7 @@ impl WebShell {
             .collect();
         future_to_promise(async move {
             let args = args.map_err(|e| JsError::new(&format!("args: {e}")))?;
-            let outcome = handle(&session, &op, args, parts).await?;
+            let (outcome, events) = handle(&session, &op, args, parts).await?;
             let buffers = Array::new();
             if let Ok(reply) = &outcome {
                 for part in &reply.parts {
@@ -101,12 +103,16 @@ impl WebShell {
             let message = envelope(None, &outcome).to_string();
             Reflect::set(&answer, &"message".into(), &message.into())?;
             Reflect::set(&answer, &"parts".into(), &buffers)?;
+            let events: Vec<Value> = events.iter().map(Event::to_json).collect();
+            let events = Value::Array(events).to_string();
+            Reflect::set(&answer, &"events".into(), &events.into())?;
             Ok(answer.into())
         })
     }
 }
 
-/// [`WebShell::handle`]'s reply, or why there is none.
+/// [`WebShell::handle`]'s reply and the events its request caused, or why
+/// there is none.
 #[allow(
     clippy::await_holding_refcell_ref,
     reason = "the page sends one request at a time and waits for it; a second \
@@ -117,9 +123,10 @@ async fn handle(
     op: &str,
     args: Value,
     parts: Vec<Vec<u8>>,
-) -> Result<Result<ursa_shell::session::Reply, ursa_shell::session::Error>, JsError> {
+) -> Result<(Result<Reply, ursa_shell::session::Error>, Vec<Event>), JsError> {
     let mut session = session
         .try_borrow_mut()
         .map_err(|_| JsError::new("the shell is running a request; wait for it to resolve"))?;
-    Ok(session.handle(op, args, parts).await)
+    let outcome = session.handle(op, args, parts).await;
+    Ok((outcome, session.take_events().await))
 }

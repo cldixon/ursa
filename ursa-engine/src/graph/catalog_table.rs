@@ -22,6 +22,15 @@
 //! | `parameters` | list of {name, type, default, choices, range, doc}, call order |
 //! | `directions` | the `direction =>` values it accepts; empty if none     |
 //! | `outputs`    | list of {name, type, nullable}: its columns besides `id` |
+//! | `same_as`    | for another system's name, the Ursa function it runs; else NULL |
+//! | `duckpgq`    | whether DuckPGQ has the function by this name, with these columns |
+//!
+//! DuckPGQ's names for Ursa's functions (#298), `weakly_connected_component`
+//! and `local_clustering_coefficient`, are rows of their own, last: their own name, column and summary, the parameters
+//! of the function they run less the ones the name fixes, and `same_as`
+//! naming that function. They are other systems' spellings, not old names of
+//! Ursa's own. `duckpgq` is true on them and on `pagerank`, which DuckPGQ
+//! has by the same name.
 //!
 //! A parameter's `type` is how SQL writes it (`number`, `number or NULL`,
 //! `integer`, `integer or NULL`, `boolean`, `string`, `expression`, `query`
@@ -43,9 +52,11 @@ pub const NEIGHBORS_AGG_TYPE: &str =
     "Float64; UInt32 for count and n_unique; the values' type for min and max of strings, \
      dates or times";
 
+use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::array::{
     ArrayRef, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder,
 };
+use datafusion::arrow::compute::take_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
@@ -113,6 +124,8 @@ pub fn schema() -> SchemaRef {
         ),
         Field::new("directions", list(DataType::Utf8), false),
         Field::new("outputs", list(DataType::Struct(output_fields())), false),
+        Field::new("same_as", DataType::Utf8, true),
+        Field::new("duckpgq", DataType::Boolean, false),
     ]))
 }
 
@@ -145,13 +158,28 @@ pub fn functions_batch() -> Result<RecordBatch> {
         Arc::new(Field::new("item", DataType::Struct(output_fields()), true)),
     );
 
-    for spec in functions::specs() {
-        name.append_value(spec.name);
+    let mut same_as = StringBuilder::new();
+    let mut duckpgq = BooleanBuilder::new();
+
+    // The catalog's functions, then DuckPGQ's names for some of them (moved
+    // to the end below).
+    let rows = functions::specs()
+        .map(|spec| (spec.name, spec.summary.to_string(), spec, None))
+        .chain(
+            functions::DUCKPGQ_NAMES
+                .iter()
+                .map(|d| (d.name, d.summary(), d.spec(), Some(d))),
+        );
+    for (row_name, row_summary, spec, compat) in rows {
+        name.append_value(row_name);
         family.append_value(family_name(spec.family));
-        summary.append_value(spec.summary);
+        summary.append_value(row_summary);
         networkx.append_option(spec.networkx);
+        same_as.append_option(compat.map(|d| d.function));
+        duckpgq.append_value(compat.is_some() || functions::DUCKPGQ_SAME.contains(&row_name));
         let params = parameters.values();
-        for p in functions::sql_params(spec) {
+        let fixed = |p: &str| compat.is_some_and(|d| d.fixed.iter().any(|(f, _)| *f == p));
+        for p in functions::sql_params(spec).filter(|p| !fixed(p.name)) {
             params
                 .field_builder::<StringBuilder>(0)
                 .expect("name")
@@ -195,7 +223,7 @@ pub fn functions_batch() -> Result<RecordBatch> {
         for o in functions::outputs(spec) {
             outs.field_builder::<StringBuilder>(0)
                 .expect("name")
-                .append_value(o.name);
+                .append_value(compat.map_or(o.name, |d| d.column));
             // A neighbour aggregation's type depends on `agg` and the values.
             let ty = if spec.reads_attribute() {
                 NEIGHBORS_AGG_TYPE.to_string()
@@ -216,6 +244,8 @@ pub fn functions_batch() -> Result<RecordBatch> {
     for spec in TRAVERSALS {
         name.append_value(spec.name);
         family.append_value("traversal");
+        same_as.append_null();
+        duckpgq.append_value(false);
         summary.append_value(spec.summary);
         networkx.append_option(spec.networkx);
         let params = parameters.values();
@@ -287,6 +317,8 @@ pub fn functions_batch() -> Result<RecordBatch> {
 
     name.append_value(ALGORITHMS);
     family.append_value("combinator");
+    same_as.append_null();
+    duckpgq.append_value(false);
     summary.append_value(ALGORITHMS_SUMMARY);
     networkx.append_null();
     parameters.append(true);
@@ -301,8 +333,19 @@ pub fn functions_batch() -> Result<RecordBatch> {
         Arc::new(parameters.finish()),
         Arc::new(directions.finish()),
         Arc::new(outputs.finish()),
+        Arc::new(same_as.finish()),
+        Arc::new(duckpgq.finish()),
     ];
-    Ok(RecordBatch::try_new(schema(), columns)?)
+    let batch = RecordBatch::try_new(schema(), columns)?;
+    // DuckPGQ's names go last, after `algorithms`: they were built beside
+    // the catalog's functions, whose code they share.
+    let (specs, duckpgq) = (functions::specs().count(), functions::DUCKPGQ_NAMES.len());
+    let order: Vec<u32> = (0..specs)
+        .chain(specs + duckpgq..batch.num_rows())
+        .chain(specs..specs + duckpgq)
+        .map(|i| i as u32)
+        .collect();
+    Ok(take_record_batch(&batch, &UInt32Array::from(order))?)
 }
 
 #[cfg(test)]
@@ -312,7 +355,7 @@ mod tests {
     #[test]
     fn one_row_per_function() {
         let batch = functions_batch().unwrap();
-        let expected = functions::names().count();
+        let expected = functions::names().count() + functions::DUCKPGQ_NAMES.len();
         assert_eq!(batch.num_rows(), expected);
         assert_eq!(batch.schema(), schema());
     }

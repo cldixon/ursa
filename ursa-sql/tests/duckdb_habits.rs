@@ -307,7 +307,18 @@ async fn a_graph_function_named_as_a_column_says_to_join_it() {
         ),
         "{m}"
     );
+    // On a vertex table of a graph, the call names the pair, as DuckPGQ's
+    // does (#300).
     let m = err(&ctx, "SELECT degree FROM Student").await;
+    assert!(
+        m.ends_with(
+            "join its rows on id, as in SELECT * FROM student JOIN degree(pg, student, know) \
+             USING (id)"
+        ),
+        "{m}"
+    );
+    // On any other table, the general form.
+    let m = err(&ctx, "SELECT degree FROM School s").await;
     assert!(
         m.ends_with("join its rows on id, as in SELECT * FROM t JOIN degree(g) USING (id)"),
         "{m}"

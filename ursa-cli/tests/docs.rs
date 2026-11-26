@@ -588,5 +588,18 @@ fn function_section(row: &serde_json::Value) -> String {
     if !networkx.is_empty() {
         out.push_str(&format!("**NetworkX:** `{networkx}`\n\n"));
     }
+    // DuckPGQ's names (#298), and the functions DuckPGQ has by Ursa's name.
+    if row.get("duckpgq").and_then(|d| d.as_bool()) == Some(true) {
+        let call = format!("`{name}(graph, vertex_table, edge_table)`");
+        match text(row, "same_as") {
+            "" => out.push_str(&format!(
+                "**DuckPGQ:** {call}, with the same name and column.\n\n"
+            )),
+            ursa => out.push_str(&format!(
+                "**DuckPGQ:** {call} is DuckPGQ's call; it runs [`{ursa}`](#{ursa}) with \
+                 DuckPGQ's column name.\n\n"
+            )),
+        }
+    }
     out
 }

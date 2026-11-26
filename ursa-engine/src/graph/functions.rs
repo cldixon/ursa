@@ -81,6 +81,117 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         .chain([ALGORITHMS])
 }
 
+/// A DuckPGQ function name that Ursa runs as one of its own functions (#298):
+/// `weakly_connected_component(pg, Student, know)` is
+/// `connected_components(pg, Student, know, mode => 'weak')`, with DuckPGQ's
+/// column name.
+///
+/// These are other systems' spellings, accepted so DuckPGQ's queries run
+/// unchanged; they are not old names of Ursa's own (Ursa keeps none).
+/// `ursa_functions()` lists each as a row of its own, with `same_as` naming
+/// Ursa's function and `duckpgq` true.
+#[derive(Debug)]
+pub struct DuckPgqName {
+    /// DuckPGQ's name.
+    pub name: &'static str,
+    /// The Ursa function it runs.
+    pub function: &'static str,
+    /// Parameters the name fixes, as `(name, value)`; a call cannot give them.
+    pub fixed: &'static [(&'static str, &'static str)],
+    /// The output column, DuckPGQ's name for it. Unquoted identifiers are
+    /// folded to lower case, so DuckPGQ's `componentId` is `componentid`:
+    /// a query that writes `componentId` unquoted finds it.
+    pub column: &'static str,
+}
+
+/// DuckPGQ's names for Ursa's functions, where they differ. DuckPGQ's
+/// `pagerank` has Ursa's name and column already.
+pub const DUCKPGQ_NAMES: &[DuckPgqName] = &[
+    DuckPgqName {
+        name: "weakly_connected_component",
+        function: "connected_components",
+        fixed: &[("mode", "weak")],
+        column: "componentid",
+    },
+    DuckPgqName {
+        name: "local_clustering_coefficient",
+        function: "clustering_coefficient",
+        fixed: &[],
+        column: "local_clustering_coefficient",
+    },
+];
+
+/// The graph functions DuckPGQ has under the same name, with the same output
+/// column.
+pub const DUCKPGQ_SAME: &[&str] = &["pagerank"];
+
+/// DuckPGQ's name `name`, if Ursa runs it.
+pub fn duckpgq(name: &str) -> Option<&'static DuckPgqName> {
+    DUCKPGQ_NAMES.iter().find(|d| d.name == name)
+}
+
+impl DuckPgqName {
+    /// The Ursa function this name runs.
+    pub fn spec(&self) -> &'static FunctionSpec {
+        lookup(self.function).expect("a DuckPGQ name runs a function SQL has")
+    }
+
+    /// The Ursa call it is, as written: `connected_components(<graph>, mode
+    /// => 'weak')`.
+    pub fn ursa_call(&self) -> String {
+        let mut parts = vec!["<graph>".to_string()];
+        parts.extend(self.fixed.iter().map(|(p, v)| format!("{p} => '{v}'")));
+        format!("{}({})", self.function, parts.join(", "))
+    }
+
+    /// The `ursa_functions()` summary of the name.
+    pub fn summary(&self) -> String {
+        format!(
+            "DuckPGQ's name for {}, with DuckPGQ's column name, {}. Values are Ursa's: {}",
+            self.ursa_call(),
+            self.column,
+            self.spec().summary
+        )
+    }
+
+    /// The message for a call that gives one of the parameters the name
+    /// fixes, if `param` is one.
+    pub fn fixed_param(&self, param: &str) -> Option<String> {
+        self.fixed.iter().any(|(p, _)| *p == param).then(|| {
+            format!(
+                "{}() is DuckPGQ's name for {}, so it takes no '{param}'; for another \
+                 {param}, call {}({param} => …)",
+                self.name,
+                self.ursa_call(),
+                self.function
+            )
+        })
+    }
+}
+
+/// DuckPGQ's scalar path functions, the plumbing of its `MATCH` over a CSR,
+/// which Ursa does not have (#298), with what to write instead.
+pub const DUCKPGQ_PATH_FUNCTIONS: &[&str] = &[
+    "iterativelength",
+    "shortestpath",
+    "reachability",
+    "cheapest_path_length",
+];
+
+/// The message for a call of DuckPGQ's scalar path function `name`, if it is
+/// one.
+pub fn duckpgq_path_function(name: &str) -> Option<String> {
+    let name = name.to_ascii_lowercase();
+    DUCKPGQ_PATH_FUNCTIONS.contains(&name.as_str()).then(|| {
+        format!(
+            "{name}() is DuckPGQ's internal path function over its CSR, which Ursa does not \
+                 have. Find paths with GRAPH_TABLE (g MATCH p = ANY SHORTEST (a)-[e]->*(b) \
+                 COLUMNS (path_length(p) AS len)), or the table function shortest_path(g, \
+                 source => …, target => …)"
+        )
+    })
+}
+
 /// `describe`'s count of the edges left out of the graph because an endpoint
 /// is not a key of its vertex table (#311). SQL's own column: a Python graph
 /// has no vertex table, so it would always be 0 there.

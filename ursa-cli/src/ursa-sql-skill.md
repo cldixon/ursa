@@ -15,7 +15,7 @@ Never guess function names, parameters or defaults. Ask the engine:
 SELECT name, family, summary FROM ursa_functions() ORDER BY family, name;
 ```
 
-`ursa_functions()` has one row per graph function: `name`, `family` (`algorithm`, `statistic`, `traversal`, `combinator`), `summary`, `networkx` (the NetworkX call it matches), `parameters` (a list of `{name, type, default, choices, range, doc}`; `range` is the numbers a numeric parameter accepts, such as `between 0 and 1`, and a value outside it is an error), `directions` and `outputs`. Read it as JSON to see the parameters:
+`ursa_functions()` has one row per graph function: `name`, `family` (`algorithm`, `statistic`, `traversal`, `combinator`), `summary`, `networkx` (the NetworkX call it matches), `parameters` (a list of `{name, type, default, choices, range, doc}`; `range` is the numbers a numeric parameter accepts, such as `between 0 and 1`, and a value outside it is an error), `directions`, `outputs`, `same_as` (for DuckPGQ's name of a function, the Ursa function it runs) and `duckpgq` (true when DuckPGQ has the function by that name). Read it as JSON to see the parameters:
 
 ```bash
 ursa --format json -c "SELECT * FROM ursa_functions() WHERE name = 'pagerank'"
@@ -288,6 +288,15 @@ ORDER BY b.club;
 - For speed on a large graph, bind a node by its key: `(a WHERE a.id = 7)`, `a.id IN (1, 2)` or `a.id IN (SELECT …)`. Its path's edges are then followed on the graph index (as `hop` does) instead of joined to the whole edge table, and a search to a bound last node (`(b WHERE b.id = 9)`) stops there, as `shortest_path` does. Read only the keys of nodes you do not need properties of; reading an edge's columns (`e.since`) makes that edge a join. `EXPLAIN` shows `PathSearchExec` for each edge followed on the index.
 - Put conditions on the first node of a quantified edge: the search starts from the nodes they keep.
 - Not yet: a path variable, selector or mode on a path of several edges; conditions inside a quantified edge; aggregates in `COLUMNS` (aggregate outside the `GRAPH_TABLE`); `ONE ROW PER VERTEX`/`STEP`; label expressions with `&` or `!`; a pattern that reads a table outside it (join on its columns instead). Cypher's `{name: 'x'}` and `*1..3` are not SQL/PGQ: write `WHERE a.name = 'x'` and `-[e]->{1,3}`.
+
+## Coming from SQL/PGQ or DuckPGQ
+
+Write the standard form first; Ursa's additions are extensions, and a query that uses one runs on Ursa only.
+
+- **Standard (SQL/PGQ):** `CREATE PROPERTY GRAPH g VERTEX TABLES (person LABEL Person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows)`, and `SELECT * FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b) COLUMNS (a.id, b.id))`. A statement never starts with `MATCH`, and there is no `RETURN`: that is Cypher, and Ursa refuses it with the `GRAPH_TABLE` form.
+- **DuckPGQ's algorithm calls (no standard covers algorithms):** a table function with the graph, a vertex table and an edge table, by position: `pagerank(pg, Student, know)`. DuckPGQ's names run too, with DuckPGQ's columns: `weakly_connected_component(pg, Student, know)` returns `id, componentid` (it is `connected_components(mode => 'weak')`), and `local_clustering_coefficient(pg, Student, know)` returns `id, local_clustering_coefficient`. Unquoted names fold to lower case, so write `componentId` without quotes. Values are NetworkX's: DuckPGQ's PageRank scores differ (they sum to 0.94 on its test graph), the order of nodes does not.
+- **Ursa's extensions:** named parameters (`damping => 0.9`), the implied pair on a graph of one edge table (`pagerank(g)`), `g.nodes` and `g.edges`, `algorithms()`, `direction =>`, `hop`, `shortest_path`, `random_walk`, `induced_edges`, `neighbors_agg`, the statistics and layouts, and graphs without vertex tables.
+- **Not in Ursa:** DuckPGQ's scalar path functions (`iterativelength`, `shortestpath`, `reachability`, `cheapest_path_length`); match a path with `GRAPH_TABLE … ANY SHORTEST`, or call `shortest_path()`.
 
 ## The .ursa database file
 

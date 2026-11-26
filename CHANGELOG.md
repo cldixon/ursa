@@ -1046,6 +1046,41 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   triggers plus changes to `ursa-server` and `ursa-cli/src/serve.rs`. The
   socket run skips exactly the suite's 6 browser-only checks, which the suite
   now lists and holds it to: a run that skips any other check fails.
+- **SQL: DuckPGQ's algorithm names, and errors that point to the standard
+  form** (#298, #300). Each was an error before, so no query that ran
+  changes.
+  - `weakly_connected_component(pg, Student, know)` runs
+    `connected_components(mode => 'weak')` and returns DuckPGQ's column,
+    `componentid` (unquoted names fold to lower case, so DuckPGQ's
+    `componentId` finds it); `local_clustering_coefficient(pg, Student,
+    know)` runs `clustering_coefficient` and returns
+    `local_clustering_coefficient`. They take DuckPGQ's positional (graph,
+    vertex table, edge table) form, the implied pair on a graph of one edge
+    table, the named parameters of the function they run (not `mode`, which
+    the name fixes), and work inside `algorithms()`. Values stay NetworkX's.
+  - `ursa_functions()` lists them as rows of their own, after `algorithms`,
+    and has two new columns: `same_as`, the Ursa function a DuckPGQ name
+    runs, and `duckpgq`, true for the three functions DuckPGQ has by name
+    (`pagerank` too). They are other systems' spellings; Ursa keeps no old
+    names of its own. The function reference shows them.
+  - DuckPGQ's scalar path functions (`iterativelength`, `shortestpath`,
+    `reachability`, `cheapest_path_length`) say to use `GRAPH_TABLE … ANY
+    SHORTEST` or `shortest_path()`.
+  - A statement that starts with `MATCH` (Cypher, GQL) says to write
+    `SELECT * FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`. `FROM g`, a graph
+    read as a table, says to read `g.nodes` or `g.edges` (or the vertex and
+    edge tables, on a graph of several), use `GRAPH_TABLE`, or call a graph
+    function; `FROM g.nodes` on a graph of several vertex tables says why
+    there is none. A graph function named as a column of a vertex table
+    (`SELECT id, pagerank FROM Student`) names the pair in the join it
+    suggests: `JOIN pagerank(pg, student, know) USING (id)`.
+    `pagerank(pg, vertex => Student, edge => know)` says the pair is
+    positional.
+  - Docs: a "Coming from SQL/PGQ or DuckPGQ" page (what runs unchanged,
+    what differs, Ursa's extensions, the numeric differences from DuckPGQ,
+    and how to translate), and a section in the agent skill. The
+    conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
+    calls, and DuckPGQ's PageRank values are on its known differences.
 
 ### Changed
 
@@ -1159,6 +1194,30 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   before, and the console's will be its History panel. `app.js` loses about
   250 lines of graph glue; the graph view behaves as before. A second host,
   `web/tests/pane-host/` (never deployed), proves it in the e2e test.
+
+- **The session sends events, and the console's catalog, sources,
+  completion and highlight operations** (URSA-13, URSA-15, URSA-16, the
+  protocol's part; `design/console.md` §4). `catalog` lists the session's
+  databases, schemas, tables (`table`, `view` or `external`) with their
+  columns, and its property graphs with their vertex and edge tables. After
+  any request that changes it (`CREATE`, `DROP`, `ATTACH`, `CREATE PROPERTY
+  GRAPH`, `.open`, a dataset load), the session sends `{"event":
+  "catalog"}`, found by comparing a fingerprint of the catalog before and
+  after: `ursa serve` sends it to every connection on the session, the
+  browser demo's worker posts it, both before the request's reply, and
+  `engine-client.js`'s `on("catalog", fn)` hears it. `sources.list {url}`
+  lists a directory under the session's root (symbolic links resolved, a
+  path outside refused, hidden files left out) or a bucket prefix (`s3://`,
+  `gs://`, `az://`, through `object_store`'s `list_with_delimiter` and the
+  CLI's credential chain), with each entry's format and size, never a
+  credential; `sources.attach {url, as}` is `ATTACH`. Both need capability
+  `sources`, which a session with a directory root reports in `hello`.
+  `complete {sql, cursor}` offers tables, columns (qualified after `t.`, an
+  alias's too), functions, graphs, keywords and dot-commands, without
+  running a query; `highlight {sql}` gives the shell's colouring as spans.
+  Their offsets are UTF-16 code units, as JavaScript's. The protocol
+  document gains an Events section, generated from
+  `ursa_shell::session::EVENTS`.
 
 - **A root per session, and `COPY … TO` to disk under it** (URSA-6,
   `design/console.md` §5). Relative paths resolve against the session's
