@@ -279,10 +279,10 @@ pub(crate) fn of_index(
     let (mut src, mut dst) = (vec![0u32; m], vec![0u32; m]);
     let out = topology.out();
     for u in 0..n as u32 {
-        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+        out.for_each_neighbor_row(u, |v, e| {
             src[e as usize] = topology.original_id(u);
             dst[e as usize] = topology.original_id(v);
-        }
+        });
     }
     Ok(Some((
         EdgeList {

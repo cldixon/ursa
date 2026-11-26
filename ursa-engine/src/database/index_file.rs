@@ -159,7 +159,7 @@ use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffe
 use datafusion::arrow::datatypes::ArrowNativeType;
 use serde_json::{json, Value};
 use ursa_core::id_map::lookup_table_len;
-use ursa_core::{Adjacency, EdgeIds, IdMap, Topology};
+use ursa_core::{Adjacency, EdgeIds, IdMap, Packed, Topology};
 
 use super::mapped::{Region, Unverified};
 use crate::graph::FileIdentity;
@@ -169,8 +169,11 @@ pub const MAGIC: [u8; 8] = *b"URSAIDX\0";
 /// The last bytes of every index file.
 const END_MAGIC: [u8; 4] = *b"XDIU";
 /// The index file version this build writes. It reads this one and
-/// [`VERSION_4`] to [`VERSION_2`].
-pub const VERSION: u32 = 5;
+/// [`VERSION_5`] to [`VERSION_2`].
+pub const VERSION: u32 = 6;
+/// The version 0.13 wrote: version 6 with the out-adjacency's edge ids
+/// always stored, and no compressed layout.
+pub const VERSION_5: u32 = 5;
 /// The version 0.12 wrote: version 5 without the original node ids (its
 /// nodes are never relabelled, #172).
 pub const VERSION_4: u32 = 4;
@@ -213,6 +216,10 @@ const WEIGHTS_F64: u32 = 10;
 const KEPT_ROWS: u32 = 11;
 const ID_TABLE: u32 = 12;
 const ORIGINAL_IDS: u32 = 13;
+const OUT_BYTE_OFFSETS: u32 = 14;
+const OUT_BYTES: u32 = 15;
+const IN_BYTE_OFFSETS: u32 = 16;
+const IN_BYTES: u32 = 17;
 
 /// The version of the key's form. Version 2 (#327) is the portable key:
 /// paths inside the database's directory relative to it, and only the file
@@ -400,6 +407,8 @@ pub struct Encoded<'a> {
     sections: Vec<(u32, Data<'a>, u64)>,
     table_offset: u64,
     trailer_offset: u64,
+    /// The out-adjacency's edge ids, which an older version always stores.
+    out_ids: Option<&'a EdgeIds>,
 }
 
 impl<'a> Encoded<'a> {
@@ -421,11 +430,16 @@ impl<'a> Encoded<'a> {
         let id_array = ids.user_id_array();
         let mut flags = 0;
         let out = topology.out();
-        let mut sections: Vec<(u32, Data<'a>)> = vec![
-            (OUT_OFFSETS, Data::U64(&out.offsets)),
-            (OUT_TARGETS, Data::U32(&out.targets)),
-            (OUT_EDGE_IDS, Data::edge_ids(&out.edge_ids)),
-        ];
+        let mut sections: Vec<(u32, Data<'a>)> = adjacency_sections(
+            out,
+            [
+                OUT_OFFSETS,
+                OUT_TARGETS,
+                OUT_BYTE_OFFSETS,
+                OUT_BYTES,
+                OUT_EDGE_IDS,
+            ],
+        );
         // Cloning an Arrow array clones `Arc`s to its buffers, not the ids.
         if let Some(ints) = id_array.as_any().downcast_ref::<Int64Array>() {
             sections.push((IDS_INT64, Data::Ints(ints.clone())));
@@ -460,9 +474,10 @@ impl<'a> Encoded<'a> {
 
         let key = key.to_json().to_string().into_bytes();
         let (n_nodes, n_edges) = (topology.n_nodes() as u64, topology.n_edges() as u64);
-        Ok(Self::laid_out(
-            VERSION, flags, n_nodes, n_edges, n_dropped, key, sections,
-        ))
+        let mut encoded =
+            Self::laid_out(VERSION, flags, n_nodes, n_edges, n_dropped, key, sections);
+        encoded.out_ids = Some(&out.edge_ids);
+        Ok(encoded)
     }
 
     /// Place the sections after the header, key and table of a file of
@@ -501,6 +516,7 @@ impl<'a> Encoded<'a> {
             sections,
             table_offset,
             trailer_offset: align(at, 8),
+            out_ids: None,
         }
     }
 
@@ -526,8 +542,17 @@ impl<'a> Encoded<'a> {
         self.in_version(VERSION_4)
     }
 
-    /// This index laid out as an older `version`, which has no original node
-    /// ids and, before version 4, no lookup table.
+    /// This index laid out as version 5, as 0.13 wrote it (its edge ids
+    /// always stored): for tests of reading such a file. It must be in the
+    /// plain layout, as 0.13 had no other.
+    #[doc(hidden)]
+    pub fn as_version_5(self) -> Self {
+        self.in_version(VERSION_5)
+    }
+
+    /// This index laid out as an older `version`: its out-adjacency's edge
+    /// ids always stored, no compressed layout, before version 5 no original
+    /// node ids and, before version 4, no lookup table.
     fn in_version(self, version: u32) -> Self {
         let Self {
             flags,
@@ -536,15 +561,27 @@ impl<'a> Encoded<'a> {
             n_dropped,
             key,
             sections,
+            out_ids,
             ..
         } = self;
-        let sections = sections
+        assert!(
+            !sections.iter().any(|(k, _, _)| *k == OUT_BYTES),
+            "version {version} has no compressed layout"
+        );
+        let mut sections: Vec<(u32, Data<'a>)> = sections
             .into_iter()
-            .filter(|(k, _, _)| *k != ORIGINAL_IDS)
-            .filter(|(k, _, _)| version == VERSION_4 || *k != ID_TABLE)
+            .filter(|(k, _, _)| version == VERSION_5 || *k != ORIGINAL_IDS)
+            .filter(|(k, _, _)| version >= VERSION_4 || *k != ID_TABLE)
             .map(|(k, d, _)| (k, d))
             .collect();
-        Self::laid_out(version, flags, n_nodes, n_edges, n_dropped, key, sections)
+        if !sections.iter().any(|(k, _)| *k == OUT_EDGE_IDS) {
+            let ids = out_ids.expect("the out-adjacency's edge ids");
+            sections.insert(2, (OUT_EDGE_IDS, Data::edge_ids(ids)));
+        }
+        let mut encoded =
+            Self::laid_out(version, flags, n_nodes, n_edges, n_dropped, key, sections);
+        encoded.out_ids = out_ids;
+        encoded
     }
 
     /// The size of the main part, in bytes.
@@ -617,6 +654,26 @@ impl<'a> Encoded<'a> {
     }
 }
 
+/// The sections of the adjacency `adj`, of the kinds `[offsets, targets,
+/// byte offsets, bytes, edge ids]`: its slot offsets; its targets, or in the
+/// compressed layout (#173) its byte offsets and bytes; and its edge ids,
+/// unless they are the identity (#155), which a reader rebuilds for free.
+fn adjacency_sections(adj: &Adjacency, kinds: [u32; 5]) -> Vec<(u32, Data<'_>)> {
+    let [offsets, targets, byte_offsets, bytes, edge_ids] = kinds;
+    let mut sections = vec![(offsets, Data::U64(&adj.offsets))];
+    match &adj.packed {
+        None => sections.push((targets, Data::U32(&adj.targets))),
+        Some(p) => {
+            sections.push((byte_offsets, Data::U64(&p.byte_offsets)));
+            sections.push((bytes, Data::Bytes(p.bytes.inner().clone())));
+        }
+    }
+    if !adj.edge_ids.is_identity() {
+        sections.push((edge_ids, Data::edge_ids(&adj.edge_ids)));
+    }
+    sections
+}
+
 /// The identity of a file's main part: its length and CRC. A chunk is read
 /// from, or appended to, a file only while its main part is still this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -641,11 +698,16 @@ impl<'a> EncodedChunk<'a> {
         Self::new(
             CHUNK_INCOMING,
             Vec::new(),
-            vec![
-                (IN_OFFSETS, Data::U64(&incoming.offsets)),
-                (IN_TARGETS, Data::U32(&incoming.targets)),
-                (IN_EDGE_IDS, Data::edge_ids(&incoming.edge_ids)),
-            ],
+            adjacency_sections(
+                incoming,
+                [
+                    IN_OFFSETS,
+                    IN_TARGETS,
+                    IN_BYTE_OFFSETS,
+                    IN_BYTES,
+                    IN_EDGE_IDS,
+                ],
+            ),
             start,
         )
     }
@@ -1185,21 +1247,38 @@ fn read_incoming(
             .ok_or_else(|| format!("section {kind} is missing"))?;
         Ok::<_, DecodeError>(sections.swap_remove(i).1)
     };
-    match (take(IN_OFFSETS)?, take(IN_TARGETS)?, take(IN_EDGE_IDS)?) {
-        (Section::U64(offsets), Section::U32(targets), Section::U32(edge_ids))
-            if offsets.len() == n_nodes + 1
-                && targets.len() == n_edges
-                && edge_ids.len() == n_edges =>
-        {
-            Ok(Adjacency {
-                offsets: offsets.into(),
-                targets: targets.into(),
-                edge_ids: edge_ids.into(),
-                packed: None,
-            })
-        }
-        _ => Err("the in-adjacency is malformed".into()),
-    }
+    let malformed = || DecodeError::from("the in-adjacency is malformed");
+    let offsets = match take(IN_OFFSETS)? {
+        Section::U64(offsets) if offsets.len() == n_nodes + 1 => offsets,
+        _ => return Err(malformed()),
+    };
+    let edge_ids = match take(IN_EDGE_IDS) {
+        Ok(Section::U32(ids)) if ids.len() == n_edges => EdgeIds::from(ids),
+        Err(_) => EdgeIds::identity(n_edges),
+        Ok(_) => return Err(malformed()),
+    };
+    let (targets, packed) = match take(IN_TARGETS) {
+        Ok(Section::U32(targets)) if targets.len() == n_edges => (targets, None),
+        Ok(_) => return Err(malformed()),
+        Err(_) => match (take(IN_BYTE_OFFSETS)?, take(IN_BYTES)?) {
+            (Section::U64(byte_offsets), Section::Bytes(bytes))
+                if byte_offsets.len() == n_nodes + 1 =>
+            {
+                let packed = Packed {
+                    byte_offsets: byte_offsets.into(),
+                    bytes: bytes.into(),
+                };
+                (Vec::new(), Some(packed))
+            }
+            _ => return Err(malformed()),
+        },
+    };
+    Ok(Adjacency {
+        offsets: offsets.into(),
+        targets: targets.into(),
+        edge_ids,
+        packed,
+    })
 }
 
 /// Read the weight columns in `chunk` of the file at `path`, for a topology
@@ -1321,14 +1400,16 @@ impl<R: Read> Source<R> {
     ) -> Result<Section, DecodeError> {
         let n = usize::try_from(count).map_err(|e| e.to_string())?;
         Ok(match (kind, width) {
-            (OUT_OFFSETS | IN_OFFSETS, 8) => Section::U64(self.values(n, u64::from_le_bytes)?),
+            (OUT_OFFSETS | IN_OFFSETS | OUT_BYTE_OFFSETS | IN_BYTE_OFFSETS, 8) => {
+                Section::U64(self.values(n, u64::from_le_bytes)?)
+            }
             (OUT_TARGETS | OUT_EDGE_IDS | IN_TARGETS | IN_EDGE_IDS, 4) => {
                 Section::U32(self.values(n, u32::from_le_bytes)?)
             }
             (IDS_INT64, 8) => Section::I64(self.values(n, i64::from_le_bytes)?),
             (WEIGHTS_F64, 8) => Section::F64(self.values(n, f64::from_le_bytes)?),
             (IDS_STR_OFFSETS, 4) => Section::I32(self.values(n, i32::from_le_bytes)?),
-            (IDS_STR_BYTES | KEPT_ROWS, 1) => Section::Bytes(self.bytes(n)?),
+            (IDS_STR_BYTES | KEPT_ROWS | OUT_BYTES | IN_BYTES, 1) => Section::Bytes(self.bytes(n)?),
             _ => {
                 self.skip_to(offset + width * count)?;
                 Section::Bytes(Vec::new())
@@ -1403,7 +1484,7 @@ fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<H
         return Err("not an Ursa index file".into());
     }
     let version = u32_at(&header, 8);
-    if ![VERSION, VERSION_4, VERSION_3, VERSION_2].contains(&version) {
+    if ![VERSION, VERSION_5, VERSION_4, VERSION_3, VERSION_2].contains(&version) {
         return Err(format!(
             "index format version {version}; this build reads {VERSION_2} to {VERSION}"
         ));
@@ -1506,6 +1587,7 @@ fn read_head<R: Read + Seek>(file: &mut R, len: u64, key: &IndexKey) -> Result<H
 fn deferred_kind(kind: u32) -> Option<&'static str> {
     match kind {
         OUT_TARGETS => Some("targets"),
+        OUT_BYTES => Some("compressed targets"),
         OUT_EDGE_IDS => Some("edge ids"),
         _ => None,
     }
@@ -1586,11 +1668,41 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
         }
         Ok(*entry)
     };
+    let has = |kind: u32| head.sections.iter().any(|e| e.kind == kind);
+    // Only version 6 may leave out identity edge ids, or be compressed.
+    if head.version != VERSION && (!has(OUT_EDGE_IDS) || has(OUT_BYTES)) {
+        return Err(format!(
+            "the out-adjacency is not one of version {}",
+            head.version
+        ));
+    }
+    let offsets = scalars(data, &take(OUT_OFFSETS, 8, Some(n_nodes + 1))?);
+    let (targets, packed) = match has(OUT_BYTES) {
+        false => (scalars(data, &take(OUT_TARGETS, 4, Some(n_edges))?), None),
+        true => {
+            if has(OUT_TARGETS) {
+                return Err("the out-adjacency has both targets and compressed segments".into());
+            }
+            let byte_offsets = scalars(data, &take(OUT_BYTE_OFFSETS, 8, Some(n_nodes + 1))?);
+            let bytes = scalars::<u8>(data, &take(OUT_BYTES, 1, None)?);
+            (
+                ScalarBuffer::from(Vec::<u32>::new()),
+                Some(Packed {
+                    byte_offsets,
+                    bytes,
+                }),
+            )
+        }
+    };
+    let edge_ids = match has(OUT_EDGE_IDS) {
+        true => scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?).into(),
+        false => EdgeIds::identity(n_edges),
+    };
     let out = Adjacency {
-        offsets: scalars(data, &take(OUT_OFFSETS, 8, Some(n_nodes + 1))?),
-        targets: scalars(data, &take(OUT_TARGETS, 4, Some(n_edges))?),
-        edge_ids: scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?).into(),
-        packed: None,
+        offsets,
+        targets,
+        edge_ids,
+        packed,
     };
     let topology = match head.version {
         // No section CRCs to vouch for the arrays: check them in full.
@@ -1600,7 +1712,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
     // The nodes' original ids, if the build relabelled them (#172): only a
     // version 5 file has them, and only when it was relabelled.
     let topology = match head.sections.iter().any(|e| e.kind == ORIGINAL_IDS) {
-        true if head.version == VERSION => {
+        true if head.version >= VERSION_5 => {
             let original = scalars::<u32>(data, &take(ORIGINAL_IDS, 4, Some(n_nodes))?);
             topology.with_original_ids(original)?
         }
@@ -1632,7 +1744,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
     // The ids' lookup table, as it lies in the file; an older file has none,
     // and the id map builds it if a query looks an id up.
     let table = match head.version {
-        VERSION | VERSION_4 => {
+        VERSION | VERSION_5 | VERSION_4 => {
             let slots = usize::try_from(lookup_table_len(n_nodes)).map_err(|e| e.to_string())?;
             Some(scalars::<u32>(data, &take(ID_TABLE, 4, Some(slots))?))
         }
@@ -1693,11 +1805,40 @@ fn mapped_incoming(
             _ => Err("the in-adjacency is malformed".into()),
         }
     };
+    let has = |kind: u32| chunk.sections.iter().any(|s| s.0 == kind);
+    let (targets, packed) = match has(IN_BYTES) {
+        false => (scalars(data, &entry(IN_TARGETS, 4, n_edges)?), None),
+        true => {
+            let bytes = chunk
+                .sections
+                .iter()
+                .find(|s| s.0 == IN_BYTES && s.1 == 1)
+                .ok_or("the in-adjacency is malformed")?;
+            let bytes = Entry {
+                kind: IN_BYTES,
+                width: 1,
+                offset: bytes.2,
+                count: bytes.3,
+                crc: 0,
+            };
+            (
+                ScalarBuffer::from(Vec::<u32>::new()),
+                Some(Packed {
+                    byte_offsets: scalars(data, &entry(IN_BYTE_OFFSETS, 8, n_nodes + 1)?),
+                    bytes: scalars::<u8>(data, &bytes),
+                }),
+            )
+        }
+    };
+    let edge_ids = match has(IN_EDGE_IDS) {
+        true => scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?).into(),
+        false => EdgeIds::identity(n_edges),
+    };
     Ok(Adjacency {
         offsets: scalars(data, &entry(IN_OFFSETS, 8, n_nodes + 1)?),
-        targets: scalars(data, &entry(IN_TARGETS, 4, n_edges)?),
-        edge_ids: scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?).into(),
-        packed: None,
+        targets,
+        edge_ids,
+        packed,
     })
 }
 

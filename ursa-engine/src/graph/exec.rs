@@ -121,6 +121,7 @@ use super::path_search::{self, PathColumns, PathSearchNode, Search};
 use super::schema_metadata::{SchemaMetadataExec, SchemaMetadataNode};
 use super::traversal::{self, Traversal, TraversalParam, TraversalParamType};
 use crate::notices::{NoticeLevel, Notifier};
+use crate::options::IndexLayout;
 
 /// Plans Ursa's graph nodes.
 #[derive(Debug)]
@@ -1516,8 +1517,17 @@ async fn index_key(
             }
         }
     };
+    // A compressed index (#173) is another index of the same rows: cached
+    // and stored under a key of its own.
+    let fingerprint = match crate::options::index_layout(context.session_config()) {
+        IndexLayout::Plain => fingerprint,
+        IndexLayout::Compressed => format!("{fingerprint}{COMPRESSED_KEY}"),
+    };
     Ok(Some((fingerprint, files)))
 }
+
+/// What a compressed index's key adds to the edge plan's fingerprint (#173).
+const COMPRESSED_KEY: &str = "\n-- index layout: compressed --";
 
 /// The index of the graph the first algorithm in `plan` runs over, as the
 /// algorithm itself would find it: the session's cached one, or built (and
@@ -1875,14 +1885,19 @@ impl Gather {
 
 /// The index of everything `interner` was given; an empty graph of
 /// `id_type` ids if it was given no node and no edge.
-fn finish_index(mut interner: EdgeInterner, id_type: &DataType, notifier: &Notifier) -> GraphIndex {
+fn finish_index(
+    mut interner: EdgeInterner,
+    id_type: &DataType,
+    notifier: &Notifier,
+    layout: IndexLayout,
+) -> GraphIndex {
     let (n_dropped, kept) = (interner.n_dropped(), interner.kept_rows());
     let (ids, source, destination) = interner.finish();
     if ids.is_empty() {
         let (topology, ids) = ursa_io::topology::empty_topology(id_type);
         return GraphIndex::new(topology, ids).with_dropped(n_dropped, kept);
     }
-    let (topology, ids) = relabelled(ids, source, destination, notifier);
+    let (topology, ids) = relabelled(ids, source, destination, notifier, layout);
     GraphIndex::new(Arc::new(topology), Arc::new(ids)).with_dropped(n_dropped, kept)
 }
 
@@ -1938,20 +1953,34 @@ const RELABEL_MIN_EDGES: usize = 1 << 16;
 /// The topology of the edges `source -> destination` (dense ids of `ids`),
 /// its nodes relabelled for locality (#172) when it has
 /// [`RELABEL_MIN_EDGES`] edges or more, and `ids` renumbered with them.
+///
+/// In the compressed layout (`ursa.index_layout`, #173), the topology is
+/// then compressed, and its edge ids follow its sorted segments. They are
+/// built when first read, as the plain layout's are, from the rows' sources
+/// and targets: the targets are spilled too, before the build renames them.
 fn relabelled(
     ids: IdMap,
     source: Vec<u32>,
     destination: Vec<u32>,
     notifier: &Notifier,
+    layout: IndexLayout,
 ) -> (Topology, IdMap) {
     let order = match source.len() >= RELABEL_MIN_EDGES {
         true => NodeOrder::InDegree,
         false => NodeOrder::AsGiven,
     };
+    let targets = match layout {
+        IndexLayout::Plain => None,
+        IndexLayout::Compressed => spill(&destination, notifier),
+    };
     let topology =
         Topology::build_with_rows(ids.len(), source, destination, order, &mut |sources| {
             spill(sources, notifier)
         });
+    let topology = match layout {
+        IndexLayout::Plain => topology,
+        IndexLayout::Compressed => topology.compressed(targets),
+    };
     let ids = match topology.original_ids() {
         Some(original) => ids.reordered(original),
         None => ids,
@@ -2054,6 +2083,7 @@ fn take_chunk(
     graph: &str,
     id_type: &DataType,
     unique: Option<&KeyNames>,
+    layout: IndexLayout,
 ) -> Result<Option<GraphIndex>> {
     match chunk {
         Chunk::Nodes(keys) => interner
@@ -2065,7 +2095,12 @@ fn take_chunk(
             .map_err(|e| build_error(graph, e))?,
         Chunk::End => {
             let interner = std::mem::replace(interner, EdgeInterner::with_capacity(0));
-            return Ok(Some(finish_index(interner, id_type, &Notifier::silent())));
+            return Ok(Some(finish_index(
+                interner,
+                id_type,
+                &Notifier::silent(),
+                layout,
+            )));
         }
     }
     Ok(None)
@@ -2243,6 +2278,7 @@ fn intern_edges(
     graph: &str,
     id_type: &DataType,
     notifier: &Notifier,
+    layout: IndexLayout,
 ) -> Result<Option<GraphIndex>> {
     let error = |e| build_error(graph, e);
     let mut side = EdgeSide::new(nodes, hint);
@@ -2257,7 +2293,7 @@ fn intern_edges(
                     return Ok(None);
                 }
                 let interner = side.interner.take().expect("the node set is taken in");
-                return Ok(Some(finish_index(interner, id_type, notifier)));
+                return Ok(Some(finish_index(interner, id_type, notifier, layout)));
             }
             Chunk::Nodes(_) | Chunk::NodesDone => {
                 return Err(DataFusionError::Internal(format!(
@@ -2353,8 +2389,9 @@ async fn build_streamed_with(
         }
         let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
         let notifier = Notifier::of(context.session_config());
+        let layout = crate::options::index_layout(context.session_config());
         let interning = tokio::task::spawn_blocking(move || {
-            intern_edges(rx, nodes, hint, &graph, &id_type, &notifier)
+            intern_edges(rx, nodes, hint, &graph, &id_type, &notifier, layout)
         });
         // The reader owns the sender, so the interner sees the channel close
         // when the reader stops, on an error as at the end.
@@ -2382,12 +2419,18 @@ async fn build_streamed_with(
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Chunk>(2);
         let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
         let unique = shape.vertices.as_ref().and_then(|v| v.unique.clone());
+        let layout = crate::options::index_layout(context.session_config());
         let interning = async move {
             let mut interner = edge_interner(hint);
             while let Some(chunk) = rx.recv().await {
-                if let Some(index) =
-                    take_chunk(&mut interner, chunk, &graph, &id_type, unique.as_ref())?
-                {
+                if let Some(index) = take_chunk(
+                    &mut interner,
+                    chunk,
+                    &graph,
+                    &id_type,
+                    unique.as_ref(),
+                    layout,
+                )? {
                     return Ok(Some(index));
                 }
             }
@@ -2434,13 +2477,11 @@ impl<'a> RowCheck<'a> {
         let n = topology.n_edges();
         let out = topology.out();
         let (mut source, mut destination) = (vec![0u32; n], vec![0u32; n]);
-        for u in 0..topology.n_nodes() {
-            let slots = out.offsets[u] as usize..out.offsets[u + 1] as usize;
-            for slot in slots {
-                let row = out.edge_ids[slot] as usize;
-                source[row] = u as u32;
-                destination[row] = out.targets[slot];
-            }
+        for u in 0..topology.n_nodes() as u32 {
+            out.for_each_neighbor_row(u, |v, row| {
+                source[row as usize] = u;
+                destination[row as usize] = v;
+            });
         }
         Self {
             index,
@@ -2652,7 +2693,7 @@ mod tests {
             .map(|c| (c[0].as_ref(), c[1].as_ref()))
             .collect();
         let (ids, s, d) = IdMap::from_edge_batches(&rows).unwrap();
-        let (topology, ids) = relabelled(ids, s, d, &Notifier::silent());
+        let (topology, ids) = relabelled(ids, s, d, &Notifier::silent(), IndexLayout::Plain);
         let collected = GraphIndex::new(Arc::new(topology), Arc::new(ids));
         let expected = stored_bytes(&serial);
         assert_eq!(stored_bytes(&collected), expected);
@@ -2756,7 +2797,12 @@ mod tests {
             for edges in drain(&plan, &[0, 1], &context).await.unwrap() {
                 interner.push(edges[0].as_ref(), edges[1].as_ref()).unwrap();
             }
-            let before = finish_index(interner, &DataType::Int64, &Notifier::silent());
+            let before = finish_index(
+                interner,
+                &DataType::Int64,
+                &Notifier::silent(),
+                IndexLayout::Plain,
+            );
             assert!(before.ids.len() > 45_000, "{file}: {}", before.ids.len());
             assert!(before.n_dropped() > 0, "{file}");
             assert!(before.topology.n_edges() > 100_000, "{file}");

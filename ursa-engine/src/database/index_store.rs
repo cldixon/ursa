@@ -571,9 +571,10 @@ impl IndexStore {
 
     /// Store again, in the current format, `index`, just read from a file
     /// of an older format `version`: one 0.10 wrote (version 2), so later
-    /// processes map it instead of reading it whole, or one 0.11 wrote
+    /// processes map it instead of reading it whole; one 0.11 wrote
     /// (version 3), so they find its node ids' lookup table in the file
-    /// instead of building it. Its in-adjacency, if the file has one, is
+    /// instead of building it; or one 0.12 or 0.13 wrote (version 4 or 5),
+    /// so its edge ids are left out when they are the rows' own order. Its in-adjacency, if the file has one, is
     /// read first, to be stored with it; weights stored with it are
     /// evaluated again when next needed.
     fn upgrade(
@@ -588,7 +589,10 @@ impl IndexStore {
         // What a process pays for the old format, until the file is rewritten.
         let until = match version {
             index_file::VERSION_2 => "it is read whole",
-            _ => "each process that looks a node up by its id builds the ids' lookup table",
+            index_file::VERSION_3 => {
+                "each process that looks a node up by its id builds the ids' lookup table"
+            }
+            _ => "it holds edge ids that the current format leaves out (their rows' own order)",
         };
         if has_incoming {
             index.topology.incoming();

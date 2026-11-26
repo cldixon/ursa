@@ -938,6 +938,40 @@ struct Walker<'a, T> {
     /// Scratch for one path's nodes and edges.
     nodes: Vec<u32>,
     edges: Vec<u32>,
+    /// A compressed adjacency's steps from one node, in edge-row order.
+    steps: Steps,
+}
+
+/// One node's steps (next node, edge row) in each direction, in edge-row
+/// order, decoded from a compressed adjacency (#173), whose segments are in
+/// neighbour order: a search extends a prefix in edge-row order on either
+/// layout, so it finds the same paths in the same order.
+#[derive(Default)]
+struct Steps {
+    pairs: Vec<(u32, u32)>,
+    forward: (Vec<u32>, Vec<u32>),
+    backward: (Vec<u32>, Vec<u32>),
+}
+
+impl Steps {
+    /// Node `u`'s neighbours and edge rows in `adj`, in edge-row order, into
+    /// `into`.
+    fn fill(
+        pairs: &mut Vec<(u32, u32)>,
+        into: &mut (Vec<u32>, Vec<u32>),
+        adj: &ursa_core::Adjacency,
+        u: u32,
+    ) {
+        pairs.clear();
+        adj.for_each_neighbor_row(u, |v, e| pairs.push((e, v)));
+        pairs.sort_unstable();
+        into.0.clear();
+        into.1.clear();
+        for &(e, v) in pairs.iter() {
+            into.0.push(v);
+            into.1.push(e);
+        }
+    }
 }
 
 /// How far a pruned search with targets has reached them, counting the
@@ -992,6 +1026,7 @@ impl<'a, T: States> Walker<'a, T> {
             reach: Reach::default(),
             nodes: Vec::new(),
             edges: Vec::new(),
+            steps: Steps::default(),
         }
     }
 
@@ -1001,6 +1036,9 @@ impl<'a, T: States> Walker<'a, T> {
         let topology = self.plan.topology;
         let u = self.entries[at as usize].node;
         self.found.expanded += 1;
+        if topology.out().is_packed() {
+            return self.extend_packed(at, start, u);
+        }
         match self.plan.search.direction {
             Direction::Right => {
                 let a = topology.out();
@@ -1024,6 +1062,44 @@ impl<'a, T: States> Walker<'a, T> {
                 self.extend_with(at, start, steps)
             }
         }
+    }
+
+    /// [`Self::extend`] on a compressed topology: the steps decoded and put
+    /// in edge-row order first (see [`Steps`]).
+    fn extend_packed(&mut self, at: u32, start: u32, u: u32) -> Result<()> {
+        let topology = self.plan.topology;
+        let mut steps = std::mem::take(&mut self.steps);
+        let Steps {
+            pairs,
+            forward,
+            backward,
+        } = &mut steps;
+        let done = match self.plan.search.direction {
+            Direction::Right => {
+                Steps::fill(pairs, forward, topology.out(), u);
+                let (v, e) = (&forward.0, &forward.1);
+                self.extend_with(at, start, v.iter().copied().zip(e.iter().copied()))
+            }
+            Direction::Left => {
+                Steps::fill(pairs, forward, topology.incoming(), u);
+                let (v, e) = (&forward.0, &forward.1);
+                self.extend_with(at, start, v.iter().copied().zip(e.iter().copied()))
+            }
+            Direction::Any => {
+                Steps::fill(pairs, forward, topology.out(), u);
+                Steps::fill(pairs, backward, topology.incoming(), u);
+                let steps = Undirected {
+                    forward: (&forward.0, &forward.1),
+                    backward: (&backward.0, &backward.1),
+                    u,
+                    i: 0,
+                    j: 0,
+                };
+                self.extend_with(at, start, steps)
+            }
+        };
+        self.steps = steps;
+        done
     }
 
     /// [`Self::extend`] over the edges `steps` (next node, edge row), in
