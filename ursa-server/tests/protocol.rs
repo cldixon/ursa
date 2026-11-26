@@ -341,7 +341,8 @@ async fn every_connection_on_a_session_hears_its_activity() {
         (Some("query"), Some("SELECT 42 AS answer"), Some(1)),
         "{event}"
     );
-    assert_eq!(next_message(&mut console).await["id"], 1);
+    // Then the reply, with its rows.
+    assert_eq!(receive(&mut console).await.0["id"], 1);
     // The second connection hears it too.
     assert_eq!(next_message(&mut agent).await, event);
 
@@ -354,7 +355,7 @@ async fn every_connection_on_a_session_hears_its_activity() {
         "{failed}"
     );
     assert_eq!(next_message(&mut agent).await, failed);
-    assert_eq!(next_message(&mut agent).await["id"], 1);
+    assert_eq!(receive(&mut agent).await.0["id"], 1);
 
     // A session of its own hears none of it.
     let (listed, _) = call(&mut other, 1, "history", json!({}), &[]).await;
