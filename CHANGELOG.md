@@ -2279,6 +2279,17 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Console: the editor's Tab takes a completion list just opened, and a
+  dot-command inserted as a statement gets no `;`** (URSA-21). CodeMirror's
+  `acceptCompletion` declines for 75 ms after the list opens (its
+  `interactionDelay`, so that Enter pressed as a list appears makes a new
+  line), and a Tab pressed in that window fell through to indenting the
+  line: `tests/console-editor.ts` failed at "Tab accepts it" whenever it
+  pressed Tab that soon. Tab now takes the list whenever it is shown, as
+  soon as CodeMirror allows, unless the text, the cursor or the list changes
+  first. `ursaConsole.editor.insert(".graph karate", {statement: true})`
+  gave `.graph karate;`; a dot-command now gets no `;` (the Catalog panel's
+  graphs).
 - **Web Shell: the aggregated view's e2e checks wait for the cut's frame**
   (URSA-19). A cut through the layout's hierarchy (#498) is drawn, and its
   largest groups labelled, by the frame after the layout worker's answer;

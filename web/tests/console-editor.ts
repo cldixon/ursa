@@ -87,8 +87,14 @@ await open(link);
 const ed = <T>(fn: string) => page.evaluate(`(() => { const e = window.ursaConsole.editor; return ${fn}; })()`) as Promise<T>;
 /** Set the text and wait until the session's colours for it are painted. */
 async function setText(text: string) {
-  const before = await ed<number>("e.stats.highlights");
-  await page.evaluate((t) => (window as any).ursaConsole.editor.setText(t), text);
+  // Counted and set in one go: an answer for the text before, landing between
+  // the two, would count (and the wait end) before this text is coloured.
+  const before = await page.evaluate((t) => {
+    const e = (window as any).ursaConsole.editor;
+    const n = e.stats.highlights;
+    e.setText(t);
+    return n;
+  }, text);
   await page.waitForFunction((n) => (window as any).ursaConsole.editor.stats.highlights > n, before, { timeout: 10_000 });
 }
 /** Collect the editor's ursa:output events from now on. */
