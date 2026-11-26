@@ -1,0 +1,256 @@
+/* The console's SQL editor (editor.js, URSA-13): CodeMirror 6 in the Editor
+   panel. Its colours are the console's tokens (style.css, console.css), so
+   it follows the theme with them; the SQL's are the shell's terminal's
+   (web/public/app.js's THEMES), by the kind `highlight` gives each span, as
+   ursa-shell/src/highlight.rs colours them there:
+
+     keyword    bold, in the text's colour      \e[1m
+     string     yellow                          \e[33m
+     comment    italic, bright black            \e[3;90m
+     command    bold blue (xterm draws bold     \e[1;34m
+                in the bright colour)
+     arguments  bright black                    \e[90m
+     number     the text's colour
+
+   The e2e test (tests/console-editor.ts) checks each against the shell's
+   terminal, as drawn. */
+
+:root {
+  --sql-keyword: #12120f;
+  --sql-string: #a8650f;
+  --sql-comment: #6b6963;
+  --sql-command: #4b6cb0;
+  --sql-arguments: #6b6963;
+  --editor-selection: #1f3e8c33;
+  --editor-active-line: color-mix(in srgb, var(--fg) 3.5%, transparent);
+  --editor-match: color-mix(in srgb, var(--accent) 16%, transparent);
+  --editor-running: color-mix(in srgb, var(--accent) 9%, transparent);
+  --editor-error-bg: color-mix(in srgb, var(--error) 8%, var(--bg));
+  --editor-shadow: 0 8px 24px rgb(0 0 0 / 0.12), 0 1px 3px rgb(0 0 0 / 0.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --sql-keyword: #f4f1ea;
+    --sql-string: #ffd2a1;
+    --sql-comment: #8a877f;
+    --sql-command: #c8d6ff;
+    --sql-arguments: #8a877f;
+    --editor-selection: #aabfff40;
+    --editor-active-line: color-mix(in srgb, var(--fg) 4.5%, transparent);
+    --editor-error-bg: color-mix(in srgb, var(--error) 11%, var(--bg));
+    --editor-shadow: 0 8px 28px rgb(0 0 0 / 0.5), 0 1px 3px rgb(0 0 0 / 0.4);
+  }
+}
+:root[data-theme="dark"] {
+  --sql-keyword: #f4f1ea;
+  --sql-string: #ffd2a1;
+  --sql-comment: #8a877f;
+  --sql-command: #c8d6ff;
+  --sql-arguments: #8a877f;
+  --editor-selection: #aabfff40;
+  --editor-active-line: color-mix(in srgb, var(--fg) 4.5%, transparent);
+  --editor-error-bg: color-mix(in srgb, var(--error) 11%, var(--bg));
+  --editor-shadow: 0 8px 28px rgb(0 0 0 / 0.5), 0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+/* ---------------------------------------------------------------- frame */
+
+.panel-body.editor-mount {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.editor-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 6px;
+  min-width: 0;
+}
+.editor-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 10px 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.editor-run.all { padding-left: 10px; }
+.editor-run svg { width: 14px; height: 14px; color: var(--prompt); }
+.editor-run:hover { border-color: var(--faint); }
+.editor-run:disabled { opacity: 0.55; cursor: default; }
+.editor-keys {
+  margin-left: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+.editor-keys kbd {
+  font: inherit;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--side-bg);
+}
+.editor-host {
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+}
+.editor-host .cm-editor { height: 100%; }
+.editor-host .cm-scroller { scrollbar-color: var(--scrollbar) transparent; }
+.editor-host:has(.cm-focused) { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* ---------------------------------------------------------------- SQL colour */
+
+.cm-sql-keyword { color: var(--sql-keyword); font-weight: 700; }
+.cm-sql-string { color: var(--sql-string); }
+.cm-sql-comment { color: var(--sql-comment); font-style: italic; }
+.cm-sql-command { color: var(--sql-command); font-weight: 700; }
+.cm-sql-arguments { color: var(--sql-arguments); }
+
+/* ---------------------------------------------------------------- running */
+
+.cm-sql-running-line { background: var(--editor-running); box-shadow: inset 3px 0 0 var(--accent); }
+.cm-sql-running { animation: cm-sql-running 1.2s ease-in-out infinite alternate; }
+@keyframes cm-sql-running {
+  from { background: transparent; }
+  to { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-sql-running { animation: none; }
+}
+.editor-host .cm-editor[data-running] .cm-content { caret-color: var(--fg); }
+
+/* ---------------------------------------------------------------- errors */
+
+.editor-host .cm-lintRange-error {
+  background-image: none;
+  text-decoration: wavy underline var(--error);
+  text-decoration-skip-ink: none;
+  text-underline-offset: 3px;
+}
+.cm-sql-error {
+  margin: 4px 12px 6px 0;
+  padding: 6px 10px 7px;
+  border-left: 3px solid var(--error);
+  border-radius: 0 6px 6px 0;
+  background: var(--editor-error-bg);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.cm-sql-error-label {
+  color: var(--error);
+  font-weight: 700;
+}
+.cm-sql-error-hint { color: var(--muted); }
+.cm-sql-error-hint::before { content: "Hint: "; color: var(--fg); }
+
+/* ---------------------------------------------------------------- completion */
+
+.editor-host .cm-tooltip.cm-tooltip-autocomplete { padding: 4px; }
+.editor-host .cm-tooltip.cm-tooltip-autocomplete > ul {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  max-height: 18em;
+  min-width: 300px;
+  max-width: min(640px, 70vw);
+}
+.editor-host .cm-tooltip.cm-tooltip-autocomplete > ul > li {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 8px 3px 4px;
+  border-radius: 5px;
+  line-height: 1.4;
+}
+.editor-host .cm-tooltip-autocomplete ul li[aria-selected] {
+  background: color-mix(in srgb, var(--accent) 16%, var(--menu-bg));
+  color: var(--fg);
+}
+.editor-host .cm-completionLabel { flex: none; }
+.editor-host .cm-completionMatchedText { text-decoration: none; font-weight: 700; color: var(--prompt); }
+.editor-host .cm-completionDetail {
+  flex: 1;
+  min-width: 0;
+  margin-left: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: normal;
+  color: var(--muted);
+}
+.cm-sql-kind {
+  flex: none;
+  margin-left: auto;
+  padding-left: 14px;
+  color: var(--faint);
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+}
+li[aria-selected] .cm-sql-kind { color: var(--muted); }
+
+/* The kind's icon: a letter in a tinted square. */
+.editor-host .cm-completionIcon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-right: 6px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 4px;
+  font-family: system-ui, sans-serif;
+  font-size: 10.5px;
+  font-weight: 700;
+  opacity: 1;
+  box-sizing: border-box;
+  --icon: var(--muted);
+  color: var(--icon);
+  background: color-mix(in srgb, var(--icon) 14%, transparent);
+}
+.editor-host .cm-completionIcon::after { content: "·"; }
+.editor-host .cm-completionIcon-table { --icon: #2a78d6; }
+.editor-host .cm-completionIcon-table::after { content: "T"; }
+.editor-host .cm-completionIcon-view { --icon: #2a78d6; }
+.editor-host .cm-completionIcon-view::after { content: "V"; }
+.editor-host .cm-completionIcon-external { --icon: #2a78d6; }
+.editor-host .cm-completionIcon-external::after { content: "F"; }
+.editor-host .cm-completionIcon-schema { --icon: var(--muted); }
+.editor-host .cm-completionIcon-schema::after { content: "S"; }
+.editor-host .cm-completionIcon-column { --icon: #1baf7a; }
+.editor-host .cm-completionIcon-column::after { content: "C"; }
+.editor-host .cm-completionIcon-graph { --icon: #6250d6; }
+.editor-host .cm-completionIcon-graph::after { content: "G"; }
+.editor-host .cm-completionIcon-function { --icon: #c4491b; }
+.editor-host .cm-completionIcon-function::after { content: "ƒ"; font-style: italic; }
+.editor-host .cm-completionIcon-keyword { --icon: var(--muted); }
+.editor-host .cm-completionIcon-keyword::after { content: "K"; }
+.editor-host .cm-completionIcon-command { --icon: var(--sql-command); }
+.editor-host .cm-completionIcon-command::after { content: "."; font-size: 15px; line-height: 0; }
+:root[data-theme="dark"] .editor-host .cm-completionIcon-table,
+:root[data-theme="dark"] .editor-host .cm-completionIcon-view,
+:root[data-theme="dark"] .editor-host .cm-completionIcon-external { --icon: #6aa7ff; }
+:root[data-theme="dark"] .editor-host .cm-completionIcon-column { --icon: #3fcf8e; }
+:root[data-theme="dark"] .editor-host .cm-completionIcon-graph { --icon: #a99bff; }
+:root[data-theme="dark"] .editor-host .cm-completionIcon-function { --icon: #ff9f51; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-table,
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-view,
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-external { --icon: #6aa7ff; }
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-column { --icon: #3fcf8e; }
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-graph { --icon: #a99bff; }
+  :root:not([data-theme="light"]) .editor-host .cm-completionIcon-function { --icon: #ff9f51; }
+}
+.editor-host .cm-completionInfo { padding: 6px 10px; }
