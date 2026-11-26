@@ -21,7 +21,8 @@
 // - the statement running is marked, and the status bar's Cancel stops it;
 // - Esc then Tab leaves the editor;
 // - the text survives a reload, kept per server port;
-// - ursaConsole.editor.insert() for the other panels;
+// - ursaConsole.editor.insert() for the other panels: SQL ends with `;`, a
+//   dot-command with none;
 // - no page errors and no CSP violations.
 //
 // With a screenshot dir, it saves the editor in light and dark at 1440×900:
@@ -86,8 +87,14 @@ await open(link);
 const ed = <T>(fn: string) => page.evaluate(`(() => { const e = window.ursaConsole.editor; return ${fn}; })()`) as Promise<T>;
 /** Set the text and wait until the session's colours for it are painted. */
 async function setText(text: string) {
-  const before = await ed<number>("e.stats.highlights");
-  await page.evaluate((t) => (window as any).ursaConsole.editor.setText(t), text);
+  // Counted and set in one go: an answer for the text before, landing between
+  // the two, would count (and the wait end) before this text is coloured.
+  const before = await page.evaluate((t) => {
+    const e = (window as any).ursaConsole.editor;
+    const n = e.stats.highlights;
+    e.setText(t);
+    return n;
+  }, text);
   await page.waitForFunction((n) => (window as any).ursaConsole.editor.stats.highlights > n, before, { timeout: 10_000 });
 }
 /** Collect the editor's ursa:output events from now on. */
@@ -247,7 +254,11 @@ await theme("dark");
 await screenshot("editor-dark-1440x900-completion.png");
 await theme("light");
 check(offered[0]?.label === "karate_club" && offered[0]?.selected, "the table comes first, selected", JSON.stringify(offered[0]));
+// Tab at once, as soon as the list shows: within CodeMirror's interactionDelay
+// (75 ms), when its acceptCompletion declines; the editor's Tab takes the
+// list all the same (as soon as CodeMirror lets it), and never indents.
 await page.keyboard.press("Tab");
+await page.waitForFunction(() => (window as any).ursaConsole.editor.text !== "SELECT * FROM karate_c", null, { timeout: 2_000 }).catch(() => {});
 check((await ed<string>("e.text")) === "SELECT * FROM karate_club", "Tab accepts it", await ed<string>("e.text"));
 await page.keyboard.press(`${MOD}+Enter`);
 await page.waitForFunction(() => (window as any).editorOutputs.length > 0, null, { timeout: 30_000 });
@@ -376,6 +387,10 @@ check(!left.inEditor, "Esc then Tab leaves the editor", JSON.stringify(left));
 await setText("SELECT 1;");
 const inserted = await page.evaluate(() => (window as any).ursaConsole.editor.insert("SELECT count(*) AS n FROM karate_club", { statement: true, run: true }));
 check(inserted === true && (await ed<string>("e.text")) === "SELECT 1;\n\nSELECT count(*) AS n FROM karate_club;\n", "insert() adds a statement of its own and runs it", JSON.stringify(await ed<string>("e.text")));
+// A dot-command is a line of its own, not SQL: it gets no `;`.
+await page.evaluate(() => (window as any).ursaConsole.editor.insert(".graph karate", { statement: true, focus: false }));
+const withCommand = await ed<string>("e.text");
+check(withCommand.endsWith("\n\n.graph karate\n") && (await ed<string>("e.view.state.sliceDoc(e.view.state.selection.main.from, e.view.state.selection.main.to)")) === ".graph karate", "insert() of a dot-command as a statement adds no ;, and selects it", JSON.stringify(withCommand));
 
 // ---------------------------------------------------------------- kept
 

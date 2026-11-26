@@ -240,6 +240,34 @@ async function completeFromSession(context) {
   };
 }
 
+/** How long a Tab waits for CodeMirror to let it take a list just opened, in ms. */
+const TAB_ACCEPT_WAIT = 250;
+
+/**
+ * Tab with the completion list open: take the selected completion.
+ *
+ * CodeMirror's acceptCompletion declines for its `interactionDelay` (75 ms)
+ * after the list opens or changes, so that Enter pressed as a list appears
+ * makes a new line rather than taking it. Tab never makes a new line: with
+ * the list shown, it is for the list, as Tab is in the shell. So a Tab in
+ * that window is taken here (not passed on to indent the line) and the
+ * completion is accepted as soon as CodeMirror allows, unless the text, the
+ * cursor or the list has changed by then.
+ */
+function acceptWithTab(view) {
+  if (completionStatus(view.state) !== "active") return false;
+  if (acceptCompletion(view)) return true;
+  const { doc, selection } = view.state;
+  const until = Date.now() + TAB_ACCEPT_WAIT;
+  const retry = () => {
+    const now = view.state;
+    if (now.doc !== doc || !now.selection.eq(selection) || completionStatus(now) !== "active") return;
+    if (!acceptCompletion(view) && Date.now() < until) setTimeout(retry, 10);
+  };
+  setTimeout(retry, 10);
+  return true;
+}
+
 // ---------------------------------------------------------------- running
 
 const markRunning = StateEffect.define();
@@ -624,7 +652,7 @@ const state = EditorState.create({
         { key: "Mod-Enter", run: runCurrent, preventDefault: true },
         { key: "Shift-Mod-Enter", run: runAll, preventDefault: true },
         // Tab takes a completion when the list is open; otherwise it indents.
-        { key: "Tab", run: (view) => completionStatus(view.state) === "active" && acceptCompletion(view) },
+        { key: "Tab", run: acceptWithTab },
       ]),
     ),
     keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap, indentWithTab]),
@@ -697,7 +725,12 @@ const editor = {
       const before = end ? "\n\n" : "";
       from = end;
       to = doc.length;
-      insert = `${before}${text.trim()}${/;\s*$/.test(text) ? "" : ";"}\n`;
+      // SQL ends at its `;`; a dot-command is a line of its own and takes none
+      // (`.graph karate;` would name a graph `karate;`).
+      const body = text.trim();
+      const last = statements(body).at(-1);
+      const semicolon = !last || last.command || /;$/.test(body) ? "" : ";";
+      insert = `${before}${body}${semicolon}\n`;
       const start = from + before.length;
       view.dispatch({ changes: { from, to, insert }, selection: { anchor: start, head: start + insert.trimEnd().length - before.length }, scrollIntoView: true, userEvent: "input.paste" });
     } else {
