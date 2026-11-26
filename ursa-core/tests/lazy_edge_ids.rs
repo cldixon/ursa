@@ -32,7 +32,7 @@ fn next(state: &mut u64) -> u64 {
 /// sorted by source when `sorted`.
 fn rows(n: u32, m: usize, seed: u64, sorted: bool) -> (Vec<u32>, Vec<u32>) {
     let mut st = seed;
-    let mut pick = |st: &mut u64| {
+    let pick = |st: &mut u64| {
         // Squaring a uniform skews towards low ids: a few hubs.
         let x = (next(st) % n as u64) as f64 / n as f64;
         ((x * x) * n as f64) as u32
@@ -87,7 +87,10 @@ fn plain(t: &Topology) -> Vec<String> {
         format!("{:?}", connected_components_strong(t, None)),
         format!("{:?}", bfs_distances(t, 0, Direction::Out)),
         format!("{:?}", bfs_distances(t, 0, Direction::Both)),
-        format!("{:?}", k_hop_distances_masked(t, None, &[0, 3], 3, Direction::In)),
+        format!(
+            "{:?}",
+            k_hop_distances_masked(t, None, &[0, 3], 3, Direction::In)
+        ),
         format!("{:?}", louvain(t, None, 1.0, Some(1), false)),
         format!("{:?}", louvain(t, None, 1.0, Some(1), true)),
         format!("{:?}", label_propagation(t, None, 20, Some(1), false)),
@@ -132,7 +135,10 @@ fn rowed(t: &Topology) -> Vec<String> {
         format!("{:?}", pagerank_weighted(t, &w, mk, params)),
         format!("{:?}", connected_components_weak(t, mk)),
         format!("{:?}", connected_components_strong(t, mk)),
-        format!("{:?}", k_hop_distances_masked(t, mk, &[0, 3], 3, Direction::Both)),
+        format!(
+            "{:?}",
+            k_hop_distances_masked(t, mk, &[0, 3], 3, Direction::Both)
+        ),
         format!("{:?}", dijkstra_distances(t, &w, 0, Direction::Both)),
         format!("{:?}", louvain(t, mk, 1.0, Some(1), false)),
         format!("{:?}", louvain_weighted(t, &w, None, 1.0, Some(1), true)),
@@ -165,7 +171,10 @@ fn rowed(t: &Topology) -> Vec<String> {
 /// The graphs: unsorted rows (the ids must be read back) and sorted ones
 /// (the identity), over enough rows for the parallel builds, in both node
 /// orders.
-fn graphs() -> Vec<(String, u32, (Vec<u32>, Vec<u32>), NodeOrder)> {
+/// A named graph: its node count, rows and node order.
+type Graph = (String, u32, (Vec<u32>, Vec<u32>), NodeOrder);
+
+fn graphs() -> Vec<Graph> {
     let mut out = Vec::new();
     for (sorted, m) in [(false, 70_000), (true, 70_000), (false, 3_000)] {
         for order in [NodeOrder::AsGiven, NodeOrder::InDegree] {
@@ -192,7 +201,11 @@ fn late_ids_are_the_eager_ids() {
             assert_eq!(lazy.incoming().edge_ids.detached(), eager_in, "{name}");
             assert!(!lazy.incoming().edge_ids.is_built(), "{name} {ids:?}");
             // ... and the ids themselves.
-            assert_eq!(&lazy.out().edge_ids[..], &eager.out().edge_ids[..], "{name}");
+            assert_eq!(
+                &lazy.out().edge_ids[..],
+                &eager.out().edge_ids[..],
+                "{name}"
+            );
             assert_eq!(&lazy.incoming().edge_ids[..], &eager_in[..], "{name}");
             // An in-adjacency transposed after the out-ids are held.
             let late = build(n, &rows, order, ids);
@@ -236,7 +249,12 @@ fn sorted_rows_have_identity_ids_without_a_source() {
     );
     assert!(!asked, "grouped rows need no source");
     assert!(t.out().edge_ids.is_identity() && !t.out().edge_ids.is_built());
-    assert!(t.out().edge_ids.iter().enumerate().all(|(k, &e)| k as u32 == e));
+    assert!(t
+        .out()
+        .edge_ids
+        .iter()
+        .enumerate()
+        .all(|(k, &e)| k as u32 == e));
     // The default build of sorted rows is the same.
     let plain = Topology::build(1_000, rows.0, rows.1);
     assert!(plain.out().edge_ids.is_identity());

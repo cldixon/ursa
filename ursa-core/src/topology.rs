@@ -8,8 +8,9 @@
 //!    but attributes stay in the original Arrow columns. `edge_ids[k]` maps CSR
 //!    slot `k` back to its original row, so a weighted kernel can gather
 //!    `weight[edge_ids[k]]` on the fly. It is also the hook for future subgraph
-//!    views (a bitmask over the parent CSR instead of a rebuild after `filter`),
-//!    so it is materialized from day one even for unweighted use.
+//!    views (a bitmask over the parent CSR instead of a rebuild after `filter`).
+//!    It is built only when something reads it (#170, see [`EdgeIds`]): an
+//!    unweighted, unmasked pipeline never does.
 //! 3. **Directional laziness** — CSR gives out-neighbours; in-neighbours need the
 //!    transpose (CSC). The transpose is built on first demand and cached, so a
 //!    pull-based-PageRank-only pipeline never pays for the direction it never uses.
@@ -30,9 +31,9 @@ use arrow::array::{Array, BooleanArray};
 use arrow::buffer::ScalarBuffer;
 
 use crate::edge_ids::Rebuild;
-pub use crate::edge_ids::{EdgeIds, RowSource};
 #[cfg(unix)]
 pub use crate::edge_ids::SpilledRows;
+pub use crate::edge_ids::{EdgeIds, KeepRows, RowSource};
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
@@ -958,27 +959,27 @@ fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
     );
     let offsets_ref = &offsets;
     adj.edge_ids.with(|adj_ids| {
-    let copy = |o: usize| {
-        let v = node[o];
-        let (lo, hi) = (
-            adj.offsets[v as usize] as usize,
-            adj.offsets[v as usize + 1] as usize,
-        );
-        let at = offsets_ref[o] as usize;
-        for (i, k) in (lo..hi).enumerate() {
-            // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
-            // across nodes and inside both buffers, which outlive the pass.
-            unsafe {
-                *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
-                *(e_addr as *mut u32).add(at + i) = adj_ids[k];
+        let copy = |o: usize| {
+            let v = node[o];
+            let (lo, hi) = (
+                adj.offsets[v as usize] as usize,
+                adj.offsets[v as usize + 1] as usize,
+            );
+            let at = offsets_ref[o] as usize;
+            for (i, k) in (lo..hi).enumerate() {
+                // SAFETY: segments `offsets[o]..offsets[o + 1]` are disjoint
+                // across nodes and inside both buffers, which outlive the pass.
+                unsafe {
+                    *(t_addr as *mut u32).add(at + i) = relabel.original[adj.targets[k] as usize];
+                    *(e_addr as *mut u32).add(at + i) = adj_ids[k];
+                }
             }
+        };
+        if in_worker() || m < (1 << 16) {
+            (0..n).for_each(copy);
+        } else {
+            (0..n).into_par_iter().for_each(copy);
         }
-    };
-    if in_worker() || m < (1 << 16) {
-        (0..n).for_each(copy);
-    } else {
-        (0..n).into_par_iter().for_each(copy);
-    }
     });
     Adjacency {
         offsets: offsets.into(),
@@ -1023,7 +1024,7 @@ fn build_in_degree(
     n: usize,
     src: &[u32],
     dst: &mut [u32],
-    ids: &mut dyn FnMut(&[u32]) -> Option<Arc<dyn RowSource>>,
+    ids: &mut KeepRows<'_>,
 ) -> (Adjacency, Vec<u32>, Arc<[u32]>) {
     // See pass 1.
     const SAMPLE_MIN_EDGES: usize = 1 << 22;
@@ -1220,11 +1221,7 @@ impl IdsPlan {
     /// `s` when relabelled): the identity if they are grouped by source, else
     /// what `rows` makes of them (a source to read them back from, or none,
     /// to build them now). `rows` is not called for the identity.
-    fn decide(
-        src: &[u32],
-        node: Option<&[u32]>,
-        rows: &mut dyn FnMut(&[u32]) -> Option<Arc<dyn RowSource>>,
-    ) -> IdsPlan {
+    fn decide(src: &[u32], node: Option<&[u32]>, rows: &mut KeepRows<'_>) -> IdsPlan {
         let grouped = match node {
             None => src.windows(2).all(|w| w[0] <= w[1]),
             Some(node) => src
@@ -1284,7 +1281,13 @@ impl Topology {
                 .all(|&d| (d as usize) < n_nodes),
             "dense endpoint id out of range (>= n_nodes)"
         );
-        Self::build_with_rows(n_nodes, src_dense, dst_dense, NodeOrder::AsGiven, &mut |_| None)
+        Self::build_with_rows(
+            n_nodes,
+            src_dense,
+            dst_dense,
+            NodeOrder::AsGiven,
+            &mut |_| None,
+        )
     }
 
     /// [`Self::build_ordered`], with the out-adjacency's edge ids built as
@@ -1304,7 +1307,7 @@ impl Topology {
         src_dense: Vec<u32>,
         dst_dense: Vec<u32>,
         order: NodeOrder,
-        rows: &mut dyn FnMut(&[u32]) -> Option<Arc<dyn RowSource>>,
+        rows: &mut KeepRows<'_>,
     ) -> Topology {
         assert_eq!(src_dense.len(), dst_dense.len(), "src/dst length mismatch");
         if order == NodeOrder::InDegree {

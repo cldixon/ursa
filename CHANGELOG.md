@@ -1049,6 +1049,47 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **Edge ids are built only when a query reads them** (#170, part of
+  #155). `edge_ids`, the original row of each CSR slot, is 4 B an edge in
+  each built direction, and only a weight, an edge mask or an edge's row
+  reads it. It is now an `ursa_core::EdgeIds`, which builds itself on first
+  read and keeps what it built: from the identity when the rows are already
+  grouped by source (no source needed, #155), from the rows' sources read
+  back (`RowSource`; the SQL engine writes them to an unlinked temporary
+  file, `SpilledRows`, for an index of 65,536 edges or more), or, for the
+  in-adjacency, as the transpose of the out-adjacency's. Kernels branch
+  once per call: PageRank, components, BFS/`hop`, Louvain, label
+  propagation, triangles, closeness, betweenness and degree without a mask
+  or weight read neighbours alone. Storing an index writes the ids without
+  keeping them, and stored files are unchanged (still version 5).
+  Results are byte-identical: `ursa-core/tests/lazy_edge_ids.rs` runs every
+  kernel, plain, weighted and masked, over eager, in-memory and spilled ids
+  (sorted and unsorted rows, both node orders) and checks that no plain
+  kernel builds them. R-MAT, built as the engine builds it (in-degree
+  relabel), 4 threads, `ursa-core/examples/edge_ids_memory.rs`; resident
+  index after the kernel and peak RSS (the peak includes the 8 B/edge edge
+  list the build is given), eager → late:
+
+  | R-MAT 64M | resident after | peak RSS | kernel |
+  |---|---|---|---|
+  | index only | 569 → 325 MiB | 1107 → 862 MiB | |
+  | PageRank (20 iterations) | 1165 → 677 MiB | 1254 → 1156 MiB | 16.3 → 18.4 s |
+  | components (weak) | 613 → 366 MiB | 1108 → 864 MiB | 1.8 → 1.8 s |
+  | `hop` (2, from the hub) | 588 → 344 MiB | 1099 → 864 MiB | 0.24 → 0.24 s |
+  | BFS (both directions) | 1173 → 686 MiB | 1176 → 1172 MiB | 2.2 → 3.7 s |
+  | Louvain (serial) | 613 → 376 MiB | 1337 → 1094 MiB | 18.8 → 22.6 s |
+  | weighted PageRank | 1156 → 1185 MiB | 1733 → 1989 MiB | 52.7 → 58.0 s |
+
+  At 16M edges the same: index 143 → 82 MiB, PageRank 292 → 170 MiB
+  resident, peaks 279 → 219 MiB (index, components, `hop`) and 339 → 277
+  MiB (Louvain). The build is no slower (1.3–1.9 s at 64M either way: it
+  writes the sources once instead of scattering the ids). The cost is a
+  first transpose (PageRank, BFS in or both directions) that reads the
+  sources back to order the in-segments by row, about 1–2 s at 64M, and a
+  weighted or masked query that rebuilds the ids once (about 0.3 s and
+  4 B/edge transient at 64M). Louvain's 20% is run-to-run noise on a shared
+  machine: it reads no ids either way.
+
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
   (behaviour change: `louvain` and `label_propagation` communities, the
   last bits of floats and the order of unordered rows, #172). Dense node ids

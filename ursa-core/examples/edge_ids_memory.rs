@@ -146,8 +146,8 @@ fn main() {
         other => panic!("unknown --kernel {other}"),
     };
     let run = started.elapsed().as_secs_f64();
-    let built = t.out().edge_ids.is_built()
-        || t.incoming_if_built().is_some_and(|i| i.edge_ids.is_built());
+    let built =
+        t.out().edge_ids.is_built() || t.incoming_if_built().is_some_and(|i| i.edge_ids.is_built());
     println!(
         "{kernel} ids={} edges={edges} nodes={}: build {build:.2} s, kernel {run:.2} s, \
          rss over input: after build {:.0} MiB, end {:.0} MiB; peak {:.0} MiB; \

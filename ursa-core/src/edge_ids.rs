@@ -43,6 +43,13 @@ pub trait RowSource: Send + Sync {
     fn sources(&self) -> Vec<u32>;
 }
 
+/// What a build does with its rows' sources (see
+/// [`Topology::build_with_rows`]): keeps them somewhere it can read them back
+/// from, and returns that, or returns `None` to have the edge ids built now.
+///
+/// [`Topology::build_with_rows`]: crate::topology::Topology::build_with_rows
+pub type KeepRows<'a> = dyn FnMut(&[u32]) -> Option<Arc<dyn RowSource>> + 'a;
+
 /// The rows' sources, held in memory: no saving, but the reference a test
 /// compares a spilled source with.
 impl RowSource for Vec<u32> {
