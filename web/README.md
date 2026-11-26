@@ -41,7 +41,10 @@ static assets and an R2 bucket.
     `WebShell.handle`, which runs `ursa_shell::session::Session`: the
     operations are listed in `docs/reference/protocol.md`, generated from
     `ursa_shell::session::OPS` (the shell's own are `start`, `feed`,
-    `cancelInput`, `width`, `highlightAnsi` and `memory`). A
+    `cancelInput`, `width`, `highlightAnsi` and `memory`). Events
+    (`{event: "catalog"}`) come before the reply of the request that caused
+    them: the worker posts each as a message of its own, and
+    `client.on(name, fn)` hears them on either transport. A
     WebAssembly trap fails its request with kind `crash`, and the page
     connects again to a fresh session.
   - **The graph pane's styles** are `graph-pane.css`, which a host links
@@ -794,7 +797,16 @@ static assets and an R2 bucket.
   the session's root, and the running request with Cancel), styled by
   `console.css` over the shell's `style.css` and `graph-pane.css`. Each
   panel's body is a mount point for the issue named in its placeholder
-  (`window.ursaConsole.panels`). `bun run build` (or `bun run console`
+  (`window.ursaConsole.panels`). The Results panel (URSA-14) is
+  `results.js` (a tab per kept result, the ARIA tabs pattern; Graph, Plan,
+  Export, Run again for a result that has gone; the page's one graph pane,
+  moved to the tab whose graph is shown, its commands to a sink History
+  will take with `results.setCommandsSink`) and `table.js` (the virtual
+  table: Arrow IPC decoded in the page, paged with `fetch`, typed headers
+  with the `ursa.*` role, sorting the loaded rows, copying a range), styled
+  by `results.css`. `sqlbox.js` is a temporary textarea in the Editor panel
+  (Ctrl+Enter) until URSA-13; `ursaConsole.run(sql)` is the run function
+  the editor calls. `bun run build` (or `bun run console`
   alone) copies it, with apache-arrow bundled as `vendor/arrow.mjs`, into
   `dist-console/console/`: never into `dist/`, which is deployed. `bun run
   preview` serves it too, over the wasm engine (no Cancel there).
@@ -944,6 +956,12 @@ drawers with no sideways scroll; Cancel stopping a long query, with the
 session going on; the page saying the server stopped, then that it was
 restarted with a new link, and reconnecting once the link is opened; the
 shell still at `/`; and no page error or Content Security Policy violation.
+`tests/console-results.ts`, which it runs, checks the result tabs: DDL's
+notices, typed columns with their roles (`pagerank(karate)`), the tabs'
+keys, 100,000 rows paged and scrolled to the last, a sort of the loaded
+rows, copying, the Graph view of karate with a double-click's `.expand`
+reaching the commands sink, the Plan, a CSV export, and a result that has
+gone offering Run again. With a screenshot dir it saves `results-*.png`.
 CI does not run it yet.
 
 ## Datasets

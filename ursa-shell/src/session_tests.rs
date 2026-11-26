@@ -1450,15 +1450,32 @@ fn protocol_doc_lists_the_ops() {
             o.name, o.args, o.result, o.about
         );
     }
-    let start = doc.find(BEGIN).expect("the document marks the table") + BEGIN.len();
-    let end = doc[start..].find(END).expect("the table's end is marked") + start;
+    let mut events = String::from("| event | fields | when |\n|---|---|---|\n");
+    for e in EVENTS {
+        events += &format!("| `{}` | {} | {}. |\n", e.name, e.fields, e.when);
+    }
+    let mut doc = doc;
+    for (begin, end, text) in [
+        (BEGIN, END, table),
+        (
+            "<!-- events: generated from ursa_shell::session::EVENTS -->\n",
+            "<!-- /events -->",
+            events,
+        ),
+    ] {
+        let start = doc.find(begin).expect("the document marks the table") + begin.len();
+        let end = doc[start..].find(end).expect("the table's end is marked") + start;
+        if std::env::var_os("UPDATE_PROTOCOL_DOC").is_some() {
+            doc = format!("{}{text}{}", &doc[..start], &doc[end..]);
+        } else {
+            assert_eq!(
+                doc[start..end],
+                text,
+                "docs/reference/protocol.md is not OPS and EVENTS: run UPDATE_PROTOCOL_DOC=1 cargo test -p ursa-shell protocol_doc"
+            );
+        }
+    }
     if std::env::var_os("UPDATE_PROTOCOL_DOC").is_some() {
-        std::fs::write(path, format!("{}{table}{}", &doc[..start], &doc[end..])).unwrap();
-    } else {
-        assert_eq!(
-            doc[start..end],
-            table,
-            "docs/reference/protocol.md is not OPS: run UPDATE_PROTOCOL_DOC=1 cargo test -p ursa-shell protocol_doc"
-        );
+        std::fs::write(path, doc).unwrap();
     }
 }

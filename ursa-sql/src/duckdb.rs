@@ -22,8 +22,15 @@
 //!   function, `SELECT * FROM pagerank(g)`;
 //! - a graph function named as a column, `SELECT pagerank FROM g.nodes`: join
 //!   its rows on `id`;
+//! - a graph named as a table, `FROM g` (#300): read `g.nodes` or
+//!   `g.edges`, match a pattern with `GRAPH_TABLE`, or call a graph function;
+//!   and `FROM g.nodes` on a graph of several vertex tables, which has no
+//!   `nodes`: read the vertex table itself;
 //! - an unquoted file name, `FROM edges.csv`, read as schema `edges`, table
 //!   `csv`: quote the path;
+//! - DuckPGQ's scalar path functions (`iterativelength`, `shortestpath`,
+//!   `reachability`, `cheapest_path_length`), the plumbing of its `MATCH`:
+//!   find paths with `GRAPH_TABLE … ANY SHORTEST` or `shortest_path()` (#298);
 //! - `SET` of a name with no `ursa.` or `datafusion.` prefix;
 //! - `ORDER BY ALL` after `SELECT *`.
 
@@ -31,6 +38,7 @@ use std::ops::ControlFlow;
 
 use datafusion::common::{Column, SchemaError};
 use datafusion::error::DataFusionError;
+use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{CopyToSource, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Expr, Ident, ObjectName, OrderByKind, Query, Select, SelectItem, Set, SetExpr,
@@ -154,10 +162,16 @@ fn select_width(body: &SetExpr) -> Option<usize> {
 
 /// `err`, or a message that says what to write instead when it is one of the
 /// errors the module docs list.
-pub(crate) fn explain(statement: &DFStatement, err: DataFusionError) -> DataFusionError {
+pub(crate) fn explain(
+    ctx: &SessionContext,
+    statement: &DFStatement,
+    err: DataFusionError,
+) -> DataFusionError {
     let message = ursa_engine::user_message(&err);
     let hint = scalar_graph_call(statement, &message)
-        .or_else(|| graph_function_as_column(&err))
+        .or_else(|| duckpgq_path_call(&message))
+        .or_else(|| graph_as_table(ctx, statement, &message))
+        .or_else(|| graph_function_as_column(ctx, &err))
         .or_else(|| unquoted_file(statement, &message))
         .or_else(|| unknown_setting(statement, &message))
         .or_else(|| order_by_all(statement, &err));
@@ -171,7 +185,15 @@ pub(crate) fn explain(statement: &DFStatement, err: DataFusionError) -> DataFusi
 /// `ursa_functions` itself.
 fn is_graph_function(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name == functions::URSA_FUNCTIONS || functions::names().any(|n| n == name)
+    name == functions::URSA_FUNCTIONS
+        || functions::names().any(|n| n == name)
+        || functions::duckpgq(&name).is_some()
+}
+
+/// `SELECT iterativelength(…)`: one of DuckPGQ's scalar path functions.
+fn duckpgq_path_call(message: &str) -> Option<String> {
+    let rest = message.strip_prefix(matched::INVALID_FUNCTION)?;
+    functions::duckpgq_path_function(&rest[..rest.find('\'')?])
 }
 
 /// `SELECT pagerank(g)`: "pagerank is a table function: SELECT * FROM
@@ -227,8 +249,9 @@ fn field_not_found(err: &DataFusionError) -> Option<(&Column, &[Column])> {
 }
 
 /// `SELECT id, pagerank FROM g.nodes` (#300): pagerank is a function of the
-/// graph, not a column; join its rows on `id`.
-fn graph_function_as_column(err: &DataFusionError) -> Option<String> {
+/// graph, not a column; join its rows on `id`. On a vertex table of a graph
+/// (`FROM Student`), the call names the pair, as DuckPGQ's does.
+fn graph_function_as_column(ctx: &SessionContext, err: &DataFusionError) -> Option<String> {
     let (field, valid) = field_not_found(err)?;
     if !is_graph_function(&field.name) {
         return None;
@@ -243,13 +266,117 @@ fn graph_function_as_column(err: &DataFusionError) -> Option<String> {
     let name = &field.name;
     let (graph, from) = match graph {
         Some(g) => (g.to_string(), format!("{g}.nodes")),
-        None => ("g".to_string(), "t".to_string()),
+        None => valid
+            .iter()
+            .find_map(|c| vertex_table_pair(ctx, c.relation.as_ref()?.table()))
+            .unwrap_or_else(|| ("g".to_string(), "t".to_string())),
     };
     Some(format!(
         "{}\n{name} is a graph function, not a column: join its rows on id, as in SELECT * FROM \
          {from} JOIN {name}({graph}) USING (id)",
         ursa_engine::user_message(err)
     ))
+}
+
+/// `FROM g`, where `g` is a graph (#300): a graph is not a table. And `FROM
+/// g.nodes` (or `g.edges`) on a graph of several element tables, which has
+/// no implied pair and so no such tables.
+fn graph_as_table(ctx: &SessionContext, statement: &DFStatement, message: &str) -> Option<String> {
+    if !(message.starts_with(matched::TABLE_NOT_FOUND_START)
+        && message.ends_with(matched::TABLE_NOT_FOUND_END))
+    {
+        return None;
+    }
+    let registry = ursa_engine::graph::registry_of(ctx);
+    struct Graphs<'a>(&'a ursa_engine::graph::GraphRegistry);
+    impl Visitor for Graphs<'_> {
+        type Break = (
+            std::sync::Arc<ursa_engine::graph::PropertyGraph>,
+            Option<String>,
+        );
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+            let parts: Option<Vec<String>> = relation
+                .0
+                .iter()
+                .map(|p| {
+                    p.as_ident().map(|i| match i.quote_style {
+                        Some(_) => i.value.clone(),
+                        None => i.value.to_lowercase(),
+                    })
+                })
+                .collect();
+            let found = match parts.as_deref() {
+                Some([graph]) => self.0.get(graph).map(|g| (g, None)),
+                Some([graph, table]) if table == "nodes" || table == "edges" => {
+                    self.0.get(graph).map(|g| (g, Some(table.clone())))
+                }
+                _ => None,
+            };
+            match found {
+                Some(found) => ControlFlow::Break(found),
+                None => ControlFlow::Continue(()),
+            }
+        }
+    }
+    let (graph, table) = for_each(statement, &mut Graphs(&registry))?;
+    let g = &graph.name;
+    let one_pair = graph.default_pair().is_some();
+    let element_tables = || {
+        let vertices: Vec<&str> = graph
+            .vertex_tables
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        let edges: Vec<&str> = graph.edge_tables.iter().map(|e| e.name.as_str()).collect();
+        format!(
+            "its vertex tables are {} and its edge tables {}",
+            vertices.join(", "),
+            edges.join(", ")
+        )
+    };
+    let pattern = format!("GRAPH_TABLE ({g} MATCH (a)-[e]->(b) COLUMNS (a.id, b.id))");
+    match (table, one_pair) {
+        (None, true) => Some(format!(
+            "{message}; '{g}' is a graph, not a table: read its nodes or edges with FROM \
+             {g}.nodes or FROM {g}.edges, match a pattern with SELECT * FROM {pattern}, or call \
+             a graph function, as in SELECT * FROM pagerank({g})"
+        )),
+        (None, false) => Some(format!(
+            "{message}; '{g}' is a graph, not a table: {}. Read one of them by its own name, \
+             match a pattern with SELECT * FROM {pattern}, or call a graph function on a \
+             vertex table and an edge table, as in SELECT * FROM pagerank({g}, <vertex table>, \
+             <edge table>)",
+            element_tables()
+        )),
+        (Some(table), false) => Some(format!(
+            "{message}; graph '{g}' has several element tables, so it has no {g}.{table}: {}. \
+             Read one of them by its own name, or match a pattern with SELECT * FROM {pattern}",
+            element_tables()
+        )),
+        (Some(_), true) => None,
+    }
+}
+
+/// For `table`, a vertex table of a defined graph: the arguments of a call
+/// on it (`pg, student, know`, with an edge table between its rows), and
+/// the table.
+fn vertex_table_pair(ctx: &SessionContext, table: &str) -> Option<(String, String)> {
+    let registry = ursa_engine::graph::registry_of(ctx);
+    registry.names().into_iter().find_map(|name| {
+        let graph = registry.get(&name)?;
+        let vertex = graph
+            .vertex_tables
+            .iter()
+            .find(|v| v.table.table() == table || v.name == table)?;
+        let edge = graph
+            .edge_tables
+            .iter()
+            .find(|e| graph.pair(Some(&vertex.name), Some(&e.name)).is_ok())?;
+        Some((
+            format!("{}, {}, {}", graph.name, vertex.name, edge.name),
+            table.to_string(),
+        ))
+    })
 }
 
 /// The file extensions an unquoted `FROM edges.csv` is taken to name a

@@ -1250,7 +1250,8 @@ fn ursa_functions_lists_the_catalog() {
 {\"name\":\"direction\",\"type\":\"string\",\"default\":\"'out'\",\"choices\":[\"out\",\"in\",\"both\"],\
 \"range\":null,\"doc\":\"Follow out-edges, in-edges, or both (the undirected view).\"}],\
 \"directions\":[\"out\",\"in\",\"both\"],\
-\"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}]}]\n"
+\"outputs\":[{\"name\":\"pagerank\",\"type\":\"Float64\",\"nullable\":false}],\
+\"same_as\":null,\"duckpgq\":true}]\n"
     );
     let out = ok(ursa(&[
         "--format",
@@ -1284,6 +1285,8 @@ shortest_path,traversal,4,out in both
 random_walk,traversal,4,\"\"
 induced_edges,traversal,1,\"\"
 algorithms,combinator,0,\"\"
+weakly_connected_component,algorithm,0,\"\"
+local_clustering_coefficient,algorithm,0,\"\"
 "
     );
     assert_eq!(

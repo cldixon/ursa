@@ -109,6 +109,17 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     await call("close", { result: kept.result });
     const gone = JSON.parse((await shell.handle("fetch", JSON.stringify({ result: kept.result }), [])).message);
     if (gone.ok || gone.error.kind !== "not_found") throw new Error("a closed result was fetched");
+    // Events: a request that changes the catalog answers with {"event": "catalog"}.
+    const defined = await shell.handle("query", JSON.stringify({ sql: "CREATE VIEW parity_v AS SELECT 1 AS x" }), []);
+    if (JSON.stringify(JSON.parse(defined.events)) !== '[{"event":"catalog"}]') throw new Error(`events: ${defined.events}`);
+    const quiet = await shell.handle("query", JSON.stringify({ sql: "SELECT * FROM parity_v" }), []);
+    if (quiet.events !== "[]") throw new Error(`events of a query: ${quiet.events}`);
+    const catalog = await call("catalog", {});
+    if (!JSON.stringify(catalog).includes('"parity_v"')) throw new Error(`catalog: ${JSON.stringify(catalog)}`);
+    if (hello.capabilities.includes("sources")) throw new Error("the browser has sources");
+    const spans = await call("highlight", { sql: "SELECT 1" });
+    if (spans.spans.length !== 2) throw new Error(`highlight: ${JSON.stringify(spans)}`);
+    await call("feed", { line: "DROP VIEW parity_v;" });
     let shellOut = "";
     let shellErr = "";
     for (const line of sql.split("\n")) {

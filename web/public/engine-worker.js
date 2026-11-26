@@ -10,6 +10,8 @@
 //   request  {v: 1, id, op, args, parts: [{kind, name, bytes: ArrayBuffer}]}
 //   reply    {id, ok: true, result, parts: [{kind, name, bytes: ArrayBuffer}]}
 //            {id, ok: false, error: {kind, message}}
+//   event    {event, ...}: what a request caused (`catalog`), posted before
+//            its reply
 //
 // The parts' buffers are transferred, both ways. The operations are all the
 // session's (ursa_shell::session::OPS lists them; docs/reference/protocol.md
@@ -53,6 +55,7 @@ async function handle({ v, id, op, args = {}, parts = [] }) {
     await ready;
     shell ??= new WebShell();
     const answer = await shell.handle(op, JSON.stringify(args), parts.map((p) => new Uint8Array(p.bytes)));
+    for (const event of JSON.parse(answer.events ?? "[]")) postMessage(event);
     const reply = JSON.parse(answer.message);
     // Each part's bytes, in a buffer of its own: transferred, not copied.
     reply.parts = (reply.parts ?? []).map((p, i) => ({ ...p, bytes: answer.parts[i].buffer }));

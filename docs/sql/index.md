@@ -82,6 +82,7 @@ A few things differ:
 - [The shell](shell.md): dot-commands, init files and history.
 - [Statements](statements.md): reading and writing files, `CREATE PROPERTY GRAPH`, `SHOW GRAPHS`, `DESCRIBE GRAPH`, `ATTACH` and the settings.
 - [Differences from DuckDB](duckdb.md): what carries over from DuckDB, and what does not.
+- [Coming from SQL/PGQ or DuckPGQ](duckpgq.md): what runs unchanged, what differs, and Ursa's extensions.
 - [Function reference](reference/functions.md): every graph function, its parameters and its output.
 - [Result metadata](reference/metadata.md): how a result says what its columns are (a node, a metric, a path), for programs that read one.
 - [The agent skill](https://github.com/cldixon/ursa/tree/main/skills): teach a coding agent to write Ursa SQL.

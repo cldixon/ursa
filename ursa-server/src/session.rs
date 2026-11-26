@@ -26,6 +26,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use ursa_shell::session::{Error, Options, Reply, Session};
 
+use crate::wire::Outgoing;
 use crate::Config;
 
 /// What the server's sessions are.
@@ -66,13 +67,26 @@ pub(crate) struct SessionHandle {
     /// (`hello` bypasses the queue, §4.5).
     pub(crate) hello: Arc<OnceLock<Value>>,
     jobs: mpsc::UnboundedSender<Job>,
+    /// Where the session's events go: every connection attached to it.
+    listeners: Listeners,
 }
+
+/// The connections attached to a session, as their writers' queues: weak,
+/// so that a closed connection's writer still ends.
+type Listeners = Arc<Mutex<Vec<mpsc::WeakUnboundedSender<Outgoing>>>>;
 
 impl SessionHandle {
     /// Queue `job`. If the session has stopped (its engine panicked), the
     /// job is dropped, and its reply's receiver hears so.
     pub(crate) fn send(&self, job: Job) {
         let _ = self.jobs.send(job);
+    }
+
+    /// Send the session's events to `out` too, until it closes.
+    pub(crate) fn listen(&self, out: &mpsc::UnboundedSender<Outgoing>) {
+        let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        listeners.retain(|l| l.strong_count() > 0);
+        listeners.push(out.downgrade());
     }
 
     /// The session has stopped.
@@ -134,41 +148,79 @@ impl Sessions {
         let id = format!("s{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (jobs, queue) = mpsc::unbounded_channel();
         let engine = self.engine.handle();
-        spawn_actor(engine, self.options.clone(), queue, self.live.enter(), &id)?;
+        let listeners = Listeners::default();
+        let actor = Actor {
+            runtime: engine,
+            options: self.options.clone(),
+            queue,
+            listeners: Arc::clone(&listeners),
+            live: self.live.enter(),
+        };
+        actor.spawn(&id)?;
         Ok(SessionHandle {
             id,
             shared,
             hello: Arc::default(),
             jobs,
+            listeners,
         })
     }
 }
 
-/// Run a session on a thread of its own until every handle to it is
-/// dropped. A panic in the engine ends it too: the requests waiting then
-/// get no reply, which their connections report as a `crash`.
-fn spawn_actor(
+/// A session's thread, before it starts.
+struct Actor {
     runtime: Handle,
     options: Options,
-    mut queue: mpsc::UnboundedReceiver<Job>,
+    queue: mpsc::UnboundedReceiver<Job>,
+    listeners: Listeners,
     live: LiveGuard,
-    id: &str,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name(format!("ursa-session-{id}"))
-        .spawn(move || {
-            let _live = live;
-            let local = tokio::task::LocalSet::new();
-            runtime.block_on(local.run_until(async move {
-                let mut session = Session::new(options);
-                while let Some(job) = queue.recv().await {
-                    let outcome = run(&mut session, job.op, job.args, job.parts, job.cancel).await;
-                    // The connection may have closed meanwhile.
-                    let _ = job.reply.send(outcome);
-                }
-            }));
-        })?;
-    Ok(())
+}
+
+impl Actor {
+    /// Run the session on a thread of its own until every handle to it is
+    /// dropped. A panic in the engine ends it too: the requests waiting
+    /// then get no reply, which their connections report as a `crash`.
+    ///
+    /// After each request, the events it caused (`catalog`) go to every
+    /// connection attached to the session, and then its reply: a
+    /// connection's writer takes them in that order (§4.5).
+    fn spawn(self, id: &str) -> std::io::Result<()> {
+        let Actor {
+            runtime,
+            options,
+            mut queue,
+            listeners,
+            live,
+        } = self;
+        std::thread::Builder::new()
+            .name(format!("ursa-session-{id}"))
+            .spawn(move || {
+                let _live = live;
+                let local = tokio::task::LocalSet::new();
+                runtime.block_on(local.run_until(async move {
+                    let mut session = Session::new(options);
+                    while let Some(job) = queue.recv().await {
+                        let outcome =
+                            run(&mut session, job.op, job.args, job.parts, job.cancel).await;
+                        for event in session.take_events().await {
+                            broadcast(&listeners, &event.to_json());
+                        }
+                        // The connection may have closed meanwhile.
+                        let _ = job.reply.send(outcome);
+                    }
+                }));
+            })?;
+        Ok(())
+    }
+}
+
+/// Send `event` to every connection still attached.
+fn broadcast(listeners: &Listeners, event: &Value) {
+    let mut listeners = listeners.lock().unwrap_or_else(|e| e.into_inner());
+    listeners.retain(|l| match l.upgrade() {
+        Some(out) => out.send(Outgoing::Event(event.clone())).is_ok(),
+        None => false,
+    });
 }
 
 /// Run one request, unless it is cancelled first.

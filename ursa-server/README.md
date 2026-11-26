@@ -46,6 +46,12 @@ bound.serve_with_shutdown(async { tokio::signal::ctrl_c().await.ok(); }).await?;
   multi-threaded runtime, inside a `LocalSet`, so DataFusion's partitions
   still run on every core). Requests reach it over a channel and run one at
   a time, in the order they came, from every connection attached to it.
+- **Events** (§4.4): after each request, the actor sends the events it
+  caused (`Session::take_events`: `{"event": "catalog"}` when the catalog
+  changed) to every connection attached to the session, as text frames of
+  their own, and then the request's reply: a connection gets a request's
+  events before its reply, and a second tab on the shared session sees
+  another's changes.
 - **`cancel {target}`** (native only) and `memory` bypass the queue: the
   server answers them itself.
   `cancel` stops one of the connection's own requests, queued or running,
