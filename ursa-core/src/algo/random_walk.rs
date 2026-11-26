@@ -71,11 +71,14 @@ pub fn random_walk_masked(
             node_col.push(cur);
             for s in 1..=steps {
                 let nbrs = match mask {
-                    None => out.neighbors(cur),
+                    None => out.neighbors_in(cur, &mut kept),
                     Some(m) => {
                         kept.clear();
-                        let slots = out.neighbors(cur).iter().zip(out.edge_ids(cur));
-                        kept.extend(slots.filter(|(_, &e)| m.keep(e)).map(|(&v, _)| v));
+                        out.for_each_neighbor_row(cur, |v, e| {
+                            if m.keep(e) {
+                                kept.push(v);
+                            }
+                        });
                         &kept
                     }
                 };

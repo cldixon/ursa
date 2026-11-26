@@ -70,11 +70,11 @@ pub fn induced_edges(topo: &Topology, nodes: &[u32]) -> InducedEdges {
     // order and the result does not depend on the order of `members`.
     let mut found: Vec<(u32, u32, u32)> = Vec::new();
     for &u in &members {
-        for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+        out.for_each_neighbor_row(u, |v, e| {
             if is_marked(v) {
                 found.push((e, u, v));
             }
-        }
+        });
     }
     found.sort_unstable();
     let mut edges = InducedEdges {

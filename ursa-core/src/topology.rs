@@ -31,10 +31,10 @@ use arrow::array::{Array, BooleanArray};
 use arrow::buffer::ScalarBuffer;
 
 use crate::edge_ids::Rebuild;
-pub use crate::packed::Packed;
 #[cfg(unix)]
 pub use crate::edge_ids::SpilledRows;
 pub use crate::edge_ids::{EdgeIds, KeepRows, RowSource};
+pub use crate::packed::Packed;
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
@@ -1128,7 +1128,8 @@ impl Adjacency {
             |_, u| {
                 let (s, e) = (self.offsets[u] as usize, self.offsets[u + 1] as usize);
                 // SAFETY: node `u`'s slots are its own, inside `targets`.
-                let out = unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(s), e - s) };
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(s), e - s) };
                 let mut k = 0;
                 crate::packed::for_each(p.segment(u as u32), |v| {
                     out[k] = v;

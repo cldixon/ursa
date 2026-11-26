@@ -55,9 +55,11 @@ fn on_an_edge(topo: &Topology, mask: Option<&EdgeMask>) -> Vec<bool> {
             for (s, w) in seen.iter_mut().zip(out.offsets.windows(2)) {
                 *s = w[1] > w[0];
             }
-            for &v in out.targets.iter() {
-                seen[v as usize] = true;
-            }
+            out.for_each_segment(|_, targets| {
+                for &v in targets {
+                    seen[v as usize] = true;
+                }
+            });
         }
     }
     seen

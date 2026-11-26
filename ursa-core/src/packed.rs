@@ -208,7 +208,14 @@ mod tests {
             vec![0],
             vec![0, 0, 0],
             vec![5, 5, 127, 128, 255, 16_383, 16_384, 2_097_151, 2_097_152],
-            vec![1, 268_435_455, 268_435_456, u32::MAX - 1, u32::MAX, u32::MAX],
+            vec![
+                1,
+                268_435_455,
+                268_435_456,
+                u32::MAX - 1,
+                u32::MAX,
+                u32::MAX,
+            ],
         ] {
             let mut bytes = vec![0u8; segment_len(&values)];
             encode_segment(&values, &mut bytes);

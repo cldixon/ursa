@@ -52,7 +52,7 @@ use std::sync::Mutex;
 
 use super::linked::Linked;
 use crate::parallel::*;
-use crate::topology::{Adjacency, EdgeMask, Topology};
+use crate::topology::{Adjacency, EdgeMask, NeighborCursor, Topology};
 
 /// The fewest edges a components kernel takes its parallel form for. Below it
 /// the fixed costs (a bitset over the edges, per-thread scratch) are not worth
@@ -166,14 +166,13 @@ impl<'a> View<'a> {
     #[inline]
     fn each(&self, u: u32, mut f: impl FnMut(u32)) {
         let uo = self.node(u);
-        let nb = self.out.neighbors(uo);
         match self.mask {
-            None => nb.iter().for_each(|&v| f(self.at(v))),
-            Some(m) => nb
-                .iter()
-                .zip(self.out.edge_ids(uo))
-                .filter(|&(_, &e)| m.keep(e))
-                .for_each(|(&v, _)| f(self.at(v))),
+            None => self.out.for_each_neighbor(uo, |v| f(self.at(v))),
+            Some(m) => self.out.for_each_neighbor_row(uo, |v, e| {
+                if m.keep(e) {
+                    f(self.at(v));
+                }
+            }),
         }
     }
 
@@ -181,13 +180,17 @@ impl<'a> View<'a> {
     #[inline]
     fn any(&self, u: u32, mut f: impl FnMut(u32) -> bool) -> bool {
         let uo = self.node(u);
-        let nb = self.out.neighbors(uo);
         match self.mask {
-            None => nb.iter().any(|&v| f(self.at(v))),
-            Some(m) => nb
-                .iter()
-                .zip(self.out.edge_ids(uo))
-                .any(|(&v, &e)| m.keep(e) && f(self.at(v))),
+            None => self.out.any_neighbor(uo, |v| f(self.at(v))),
+            Some(m) => {
+                let ids = self.out.edge_ids(uo);
+                let mut k = 0;
+                self.out.any_neighbor(uo, |v| {
+                    let e = ids[k];
+                    k += 1;
+                    m.keep(e) && f(self.at(v))
+                })
+            }
         }
     }
 }
@@ -246,19 +249,13 @@ fn weak_over(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linked>) 
     for u in 0..width as u32 {
         let uo = node(u);
         match mask {
-            None => {
-                for &v in out.neighbors(uo) {
+            None => out.for_each_neighbor(uo, |v| ds.union(u, at(v))),
+            // Subgraph: only kept edges connect their endpoints.
+            Some(m) => out.for_each_neighbor_row(uo, |v, e| {
+                if m.keep(e) {
                     ds.union(u, at(v));
                 }
-            }
-            // Subgraph: only kept edges connect their endpoints.
-            Some(m) => {
-                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
-                    if m.keep(e) {
-                        ds.union(u, at(v));
-                    }
-                }
-            }
+            }),
         }
     }
     let labels: Vec<u32> = (0..width as u32).map(|u| ds.find(u)).collect();
@@ -341,6 +338,8 @@ fn each_candidate(view: &View, cand: &Bits, a: u32, b: u32, mut f: impl FnMut(u3
         return;
     }
     let mut u = a;
+    // A compressed adjacency's segment of `decoded`, decoded (#173).
+    let (mut buf, mut decoded) = (Vec::new(), None);
     for w in lo >> 6..=(hi - 1) >> 6 {
         let mut bits = cand.0[w].load(Relaxed);
         // Only this range's bits: a word at either end is shared.
@@ -356,7 +355,16 @@ fn each_candidate(view: &View, cand: &Bits, a: u32, b: u32, mut f: impl FnMut(u3
             while view.slot(u + 1) <= p {
                 u += 1;
             }
-            f(u, p, view.at(view.out.targets[p]));
+            let target = if view.out.is_packed() {
+                if decoded != Some(u) {
+                    view.out.neighbors_in(view.node(u), &mut buf);
+                    decoded = Some(u);
+                }
+                buf[p - view.slot(u)]
+            } else {
+                view.out.targets[p]
+            };
+            f(u, p, view.at(target));
         }
     }
 }
@@ -397,12 +405,13 @@ fn weak_parallel(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linke
     };
     ranges.par_iter().for_each(|&(a, b)| {
         let mut f = pool.take();
+        let mut nbuf = Vec::new();
         for u in a..b {
             let base = view.slot(u);
             let mut k = 0usize;
             // Masked-out edges keep their slot, so count every slot.
             let uo = view.node(u);
-            let nb = view.out.neighbors(uo);
+            let nb = view.out.neighbors_in(uo, &mut nbuf);
             match mask {
                 None => {
                     for &v in nb {
@@ -499,17 +508,18 @@ fn strong_over(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linked>
     let mut next_index: u32 = 0;
 
     // Explicit DFS: each frame is (node, cursor into its out-neighbours). Replaces
-    // recursion so a long path can't blow the native stack. A cursor fits `u32`
-    // because a node's degree is at most the edge count, capped at `u32::MAX`.
-    let mut call_stack: Vec<(u32, u32)> = Vec::new();
+    // recursion so a long path can't blow the native stack. The cursor reads
+    // either layout (#173).
+    let mut call_stack: Vec<(u32, NeighborCursor)> = Vec::new();
 
     for start in 0..n as u32 {
         if index[start as usize] != UNVISITED {
             continue;
         }
-        call_stack.push((start, 0));
-        while let Some(&(v, cursor)) = call_stack.last() {
-            if cursor == 0 {
+        call_stack.push((start, out.cursor(node(start))));
+        while let Some(&(v, _)) = call_stack.last() {
+            // A node is pushed only while unvisited.
+            if index[v as usize] == UNVISITED {
                 // First time we reach v: stamp its index/lowlink, push to SCC stack.
                 index[v as usize] = next_index;
                 lowlink[v as usize] = next_index;
@@ -517,16 +527,15 @@ fn strong_over(topo: &Topology, mask: Option<&EdgeMask>, linked: Option<&Linked>
                 scc_stack.push(v);
                 on_stack[v as usize] = true;
             }
-            let neighbors = out.neighbors(node(v));
-            if (cursor as usize) < neighbors.len() {
-                call_stack.last_mut().unwrap().1 = cursor + 1;
+            let step = out.advance(&mut call_stack.last_mut().unwrap().1);
+            if let Some((x, k)) = step {
                 // Subgraph: an edge masked out is not traversed (advance past it).
-                if mask.is_some_and(|m| !m.keep(out.edge_ids(node(v))[cursor as usize])) {
+                if mask.is_some_and(|m| !m.keep(out.edge_ids[k])) {
                     continue;
                 }
-                let w = at(neighbors[cursor as usize]);
+                let w = at(x);
                 if index[w as usize] == UNVISITED {
-                    call_stack.push((w, 0)); // descend into w
+                    call_stack.push((w, out.cursor(node(w)))); // descend into w
                 } else if on_stack[w as usize] {
                     // Edge to a node still on the SCC stack: relax v's lowlink.
                     lowlink[v as usize] = lowlink[v as usize].min(index[w as usize]);
@@ -841,8 +850,8 @@ fn tarjan_rest(view: &View, scc: &[AtomicU32], rest: &[u32]) {
     let mut lowlink = vec![0u32; n];
     let mut on_stack = vec![false; n];
     let mut scc_stack: Vec<u32> = Vec::new();
-    // (node, next edge slot, its end).
-    let mut call_stack: Vec<(u32, usize, usize)> = Vec::new();
+    // (node, its next out-neighbour).
+    let mut call_stack: Vec<(u32, NeighborCursor)> = Vec::new();
     let mut next_index = 0u32;
     for &start in rest {
         if index[start as usize] != NONE {
@@ -853,15 +862,14 @@ fn tarjan_rest(view: &View, scc: &[AtomicU32], rest: &[u32]) {
         next_index += 1;
         scc_stack.push(start);
         on_stack[start as usize] = true;
-        call_stack.push((start, view.slot(start), view.slot(start + 1)));
+        call_stack.push((start, out.cursor(view.node(start))));
         while let Some(top) = call_stack.last_mut() {
-            let (v, k, end) = *top;
-            if k < end {
-                top.1 = k + 1;
+            let v = top.0;
+            if let Some((x, k)) = out.advance(&mut top.1) {
                 if view.mask.is_some_and(|m| !m.keep(out.edge_ids[k])) {
                     continue;
                 }
-                let w = view.at(out.targets[k]);
+                let w = view.at(x);
                 if !open(w) {
                     continue;
                 }
@@ -871,7 +879,7 @@ fn tarjan_rest(view: &View, scc: &[AtomicU32], rest: &[u32]) {
                     next_index += 1;
                     scc_stack.push(w);
                     on_stack[w as usize] = true;
-                    call_stack.push((w, view.slot(w), view.slot(w + 1)));
+                    call_stack.push((w, out.cursor(view.node(w))));
                 } else if on_stack[w as usize] {
                     lowlink[v as usize] = lowlink[v as usize].min(index[w as usize]);
                 }
@@ -887,7 +895,7 @@ fn tarjan_rest(view: &View, scc: &[AtomicU32], rest: &[u32]) {
                     }
                 }
                 call_stack.pop();
-                if let Some(&(parent, _, _)) = call_stack.last() {
+                if let Some(&(parent, _)) = call_stack.last() {
                     lowlink[parent as usize] = lowlink[parent as usize].min(lowlink[v as usize]);
                 }
             }
@@ -915,8 +923,8 @@ fn tarjan_roots(view: &View, scc: Vec<u32>) -> Vec<u32> {
     let mut left = label.iter().filter(|&&l| l == NONE).count();
 
     let mut seen = vec![0u64; n.div_ceil(64)];
-    // (node, next edge slot, its end).
-    let mut stack: Vec<(u32, usize, usize)> = Vec::new();
+    // (node, its next out-neighbour).
+    let mut stack: Vec<(u32, NeighborCursor)> = Vec::new();
     let out = view.out;
     // Marks `v` visited; whether that was the last component to enter.
     let mut visit = |v: u32, seen: &mut [u64], left: &mut usize| -> bool {
@@ -938,27 +946,24 @@ fn tarjan_roots(view: &View, scc: Vec<u32>) -> Vec<u32> {
         if visit(start, &mut seen, &mut left) {
             break;
         }
-        stack.push((start, view.slot(start), view.slot(start + 1)));
+        stack.push((start, out.cursor(view.node(start))));
         while let Some(top) = stack.last_mut() {
             // The next edge to an unvisited node, if any.
-            let (mut k, end) = (top.1, top.2);
             let mut next = None;
-            while k < end {
+            while let Some((x, k)) = out.advance(&mut top.1) {
                 let keep = view.mask.is_none_or(|m| m.keep(out.edge_ids[k]));
-                let w = view.at(out.targets[k]);
-                k += 1;
+                let w = view.at(x);
                 if keep && seen[w as usize >> 6] >> (w & 63) & 1 == 0 {
                     next = Some(w);
                     break;
                 }
             }
-            top.1 = k;
             match next {
                 Some(w) => {
                     if visit(w, &mut seen, &mut left) {
                         break 'all;
                     }
-                    stack.push((w, view.slot(w), view.slot(w + 1)));
+                    stack.push((w, out.cursor(view.node(w))));
                 }
                 None => {
                     stack.pop();

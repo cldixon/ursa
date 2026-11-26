@@ -25,8 +25,8 @@
 pub mod algo;
 pub mod catalog;
 pub mod edge_ids;
-pub mod packed;
 pub mod id_map;
+pub mod packed;
 pub(crate) mod parallel;
 pub mod topology;
 

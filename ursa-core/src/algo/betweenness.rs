@@ -498,13 +498,15 @@ fn brandes_from_weighted(
     sigma[s as usize] = 1.0;
     heap.push(Reverse((TotalF64(0.0), s)));
 
+    // A compressed adjacency's neighbours, decoded (#173).
+    let mut nbuf = Vec::new();
     while let Some(Reverse((TotalF64(du), u))) = heap.pop() {
         if settled[u as usize] {
             continue;
         }
         settled[u as usize] = true;
         order.push(u);
-        for (&w_node, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+        for (&w_node, &e) in out.neighbors_in(u, &mut nbuf).iter().zip(out.edge_ids(u)) {
             if !mask.is_none_or(|m| m.keep(e)) {
                 continue; // edge not in the subgraph
             }
@@ -661,6 +663,8 @@ mod tests {
                 let mut order = Vec::new();
                 sigma[s as usize] = 1.0;
                 let kept = |e: u32| mask.is_none_or(|m| m.keep(e));
+                // A compressed adjacency's neighbours, decoded (#173).
+                let mut nbuf = Vec::new();
                 match w {
                     None => {
                         let mut dist = vec![-1i64; n];
@@ -671,7 +675,7 @@ mod tests {
                             let dv = dist[v as usize];
                             // Edge rows only under a mask (#170).
                             let ids = mask.map(|_| out.edge_ids(v));
-                            for (i, &x) in out.neighbors(v).iter().enumerate() {
+                            for (i, &x) in out.neighbors_in(v, &mut nbuf).iter().enumerate() {
                                 if ids.is_some_and(|ids| !kept(ids[i])) {
                                     continue;
                                 }
@@ -697,7 +701,8 @@ mod tests {
                                 continue;
                             }
                             order.push(u);
-                            for (&x, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                            let nb = out.neighbors_in(u, &mut nbuf);
+                            for (&x, &e) in nb.iter().zip(out.edge_ids(u)) {
                                 if !kept(e) || settled[x as usize] {
                                     continue;
                                 }
