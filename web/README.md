@@ -532,7 +532,10 @@ static assets and an R2 bucket.
     and the heaps (on rmat it fails if the view holds over 20 MiB or the
     layout worker over 60 MB, #501). It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
-    `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
+    `CHANNEL=shell` runs the shell. Against `ursa serve`, set
+    `URSA_SERVE_TOKEN` to the token of the link it printed; `FIRST_ONLY=1`
+    ends each run at the first frame, which is what comparing the worker and
+    the socket needs (URSA-7). `bun test tests/graph-timings.test.ts`
     tests the arithmetic.
 
     On `.graph rmat` (1M edges, headless Chromium, software WebGL2, median

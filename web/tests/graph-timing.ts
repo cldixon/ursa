@@ -96,24 +96,6 @@ for (let r = 0; r < runs; r++) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
   if (serveToken) await ctx.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: serveToken, url: base }]);
   const p = await ctx.newPage();
-  // Over the socket: when each large message reached the page's handler (ms
-  // after Enter, once known), its bytes, and the ms the handler took.
-  if (serveToken)
-    await p.addInitScript(() => {
-      const log: number[][] = ((window as any).__socketFrames = []);
-      addEventListener("keydown", (e) => e.key === "Enter" && ((window as any).__enter = performance.now()), true);
-      const set = Object.getOwnPropertyDescriptor(WebSocket.prototype, "onmessage")!.set!;
-      Object.defineProperty(WebSocket.prototype, "onmessage", {
-        set(fn) {
-          set.call(this, (e: MessageEvent) => {
-            const t0 = performance.now();
-            fn(e);
-            const bytes = typeof e.data === "string" ? e.data.length : e.data.byteLength;
-            if (bytes > 1 << 16) log.push([t0, bytes, performance.now() - t0]);
-          });
-        },
-      });
-    });
   p.on("pageerror", (e) => console.error(`page error: ${e.message}`));
   await p.goto(`${base}/?dataset=${dataset}`);
   await p.waitForFunction(() => {
@@ -144,12 +126,6 @@ for (let r = 0; r < runs; r++) {
   for (const [k, v] of Object.entries(t)) if (typeof v === "number" && k !== "enter") rel[k] = v;
   console.log(`run ${r + 1}:`, JSON.stringify(rel), "first status:", JSON.stringify(await status));
   const shown = t.actions.find((a: any) => a.command.startsWith(".graph"));
-  if (serveToken) {
-    const frames: number[][] = await p.evaluate(() => (window as any).__socketFrames);
-    const enter: number = await p.evaluate(() => (window as any).__enter);
-    for (const [at, bytes, ms] of frames.filter(([at]) => at >= enter))
-      console.log(`  socket: a frame of ${(bytes / 1e6).toFixed(1)} MB handled ${Math.round(at - enter)} ms after Enter, in ${ms.toFixed(1)} ms`);
-  }
   console.log(`  action ${JSON.stringify(shown?.command)}: engine ${shown?.engine} ms, view ${shown?.delta} ms, Enter to its frame shown ${shown?.frame} ms`);
   // The first drawing (#497): a coarse level of the layout's hierarchy,
   // then each level the layout comes to, until the graph itself. When the
