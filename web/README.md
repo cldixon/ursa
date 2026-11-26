@@ -805,7 +805,14 @@ static assets and an R2 bucket.
   `ursaConsole.run(sql)` (the Results panel's) or else `query`, dot-commands
   to `feed`; errors show at their statement; the text is kept per server
   port. Other panels put SQL in it with
-  `ursaConsole.editor.insert(text, {statement, run})`. `bun run build` (or
+  `ursaConsole.editor.insert(text, {statement, run})`. The Catalog panel is
+  `catalog.js` (URSA-15): the session's tables, views, columns and property
+  graphs as an ARIA tree, refetched on the `catalog` event, with a filter;
+  the Sources panel is `sources.js` (URSA-16): the root's folders and files
+  (`sources.list`), buckets added by prefix (kept per port), and Attach for
+  `.ursa` files. Both hand their queries to the editor through
+  `actions.js` (or run them with `query` when there is no editor), and
+  share `panels.css`. `bun run build` (or
   `bun run console` alone) copies it, with apache-arrow bundled as
   `vendor/arrow.mjs` and CodeMirror (MIT, pinned in `package.json`, from
   `scripts/codemirror.ts`) as `vendor/codemirror.mjs`, their licences
@@ -958,6 +965,19 @@ drawers with no sideways scroll; Cancel stopping a long query, with the
 session going on; the page saying the server stopped, then that it was
 restarted with a new link, and reconnecting once the link is opened; the
 shell still at `/`; and no page error or Content Security Policy violation.
+
+`tests/console-panels.ts` (`bun run test:console-panels -- 9061`, the same
+arguments) tests the Catalog and Sources panels over `ursa serve` with a
+root of its own in a temp directory (reached through a symbolic link): a
+CREATE TABLE showing on this page and a second one without a reload, what
+was open and the scroll kept across a refetch, kinds and types, the tree's
+ARIA attributes and keys, the filter, a table's query and a graph's
+`.graph` going to the editor (and running with no editor); browsing into
+folders and back up, formats and sizes, a Parquet file's query running,
+attaching a `.ursa` file and seeing its views and graph, a bucket that
+cannot be reached showing its error in the panel, buckets kept across a
+reload, and the panel without the `sources` capability. With a screenshot
+dir it saves `panels-light.png` and `panels-dark.png`.
 
 `tests/console-editor.ts` (`bun run test:console-editor -- 8982`, the same
 arguments) tests the SQL editor the same way: its colour spans are
