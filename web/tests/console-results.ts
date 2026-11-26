@@ -272,6 +272,8 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
 
   await ev(() => (window as any).ursaConsole.run("SELECT * FROM range(100000)"));
   await page.waitForFunction(() => (window as any).ursaConsole.results.selected()?.rows === 100000, null, { timeout: 30_000 });
+  // Its first rows are drawn in the frame after the tab is shown.
+  await page.waitForFunction(() => (window as any).ursaConsole.results.selected()?.table.state().shown.length > 0, null, { timeout: 10_000 }).catch(() => {});
   const big = await ev(() => {
     const tab = (window as any).ursaConsole.results.selected();
     return { count: tab.button.querySelector(".rs-tab-count").textContent, graph: tab.graph, state: tab.table.state() };
