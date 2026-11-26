@@ -491,6 +491,7 @@ async function runOne(s) {
     // error in the Results panel too; the editor shows it at the statement.
     const reply = await results(s.text);
     if (reply?.error) throw reply.error;
+    output({ kind: "query", text: s.text, reply, shown: true });
     return reply;
   }
   const reply = await session.run("query", { sql: s.text }, { label: label(s.text) });
@@ -500,11 +501,13 @@ async function runOne(s) {
 
 /**
  * What ran, for whoever shows it: an `ursa:output` event on the editor's
- * mount ({kind: "query" | "command", text, reply | out, err}). Until the
- * Results panel (URSA-14) takes query results, they are logged.
+ * mount ({kind: "query" | "command", text, reply, out?, err?, shown?}).
+ * `shown` says the Results panel (URSA-14's ursaConsole.run) has shown it;
+ * else it is logged.
  */
 function output(detail) {
   mount.dispatchEvent(new CustomEvent("ursa:output", { detail, bubbles: true }));
+  if (detail.shown) return;
   if (detail.kind === "query") console.info(`[editor] ${detail.text}: ${detail.reply.rows} rows in ${Math.round(detail.reply.ms)} ms`, detail.reply);
   else console.info(`[editor] ${detail.text}\n${stripAnsi(detail.out)}${stripAnsi(detail.err)}`);
 }
