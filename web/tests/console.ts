@@ -130,9 +130,11 @@ for (const [id, title, issue] of PANELS) {
   }, id);
   const visible = await panel.isVisible();
   const mount = await page.locator(`#${id} [data-mount="${id}"]`).count();
-  const placeholder = await page.locator(`#${id} .placeholder`).innerText();
+  // A panel its issue has filled has no placeholder, and something mounted.
+  const filled = (await page.locator(`#${id} .placeholder`).count()) === 0;
+  const placeholder = filled ? await page.locator(`#${id} [data-mount]`).evaluate((el) => (el.childElementCount ? "(mounted)" : "")) : await page.locator(`#${id} .placeholder`).innerText();
   check(
-    visible && name === title && mount === 1 && (!issue || placeholder.includes(issue)),
+    visible && name === title && mount === 1 && (filled ? placeholder === "(mounted)" : !issue || placeholder.includes(issue)),
     `the ${title} panel: labelled, with its mount point${issue ? ` and ${issue}` : ""}`,
     `${visible} ${name} ${mount} ${JSON.stringify(placeholder)}`,
   );
@@ -191,9 +193,9 @@ await page.keyboard.press("Shift+F6");
 check((await page.evaluate(() => document.activeElement?.id)) === "catalog", "Shift+F6 moves back");
 
 // Tab order: the header, then the left column, the editor and results, the
-// right column and the status bar.
+// right column and the status bar (the frame's: not what the panels hold).
 const tabOrder = await page.evaluate(() => {
-  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links"));
+  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links") && !el.closest("[data-mount]"));
   return all.map((el) => el.id || el.dataset.split || el.className);
 });
 const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];

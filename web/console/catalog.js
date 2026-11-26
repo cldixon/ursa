@@ -22,8 +22,8 @@ import { session } from "./session.js";
 import { useQuery, describe, quoteIdent, makeNote } from "./actions.js";
 
 /** The engine's default database and schema: tables there need no prefix. */
-const DEFAULT_DB = "ursa";
-const DEFAULT_SCHEMA = "main";
+const DEFAULT_DB = "datafusion";
+const DEFAULT_SCHEMA = "public";
 
 const ICONS = {
   database: '<svg viewBox="0 0 16 16"><ellipse cx="8" cy="4" rx="5.25" ry="2"/><path d="M2.75 4v8c0 1.1 2.35 2 5.25 2s5.25-.9 5.25-2V4M2.75 8c0 1.1 2.35 2 5.25 2s5.25-.9 5.25-2"/></svg>',
@@ -102,7 +102,7 @@ export function mountCatalog(mount) {
     const graphs = (catalog.graphs ?? []).map((g) => {
       const gn = node(`g/${g.name}`, { type: "graph", name: g.name, command: `.graph ${g.name}`, error: g.error, detail: g.error ? "unavailable" : `${(g.vertices ?? []).length} V · ${(g.edges ?? []).length} E` }, null);
       gn.children = [
-        ...(g.vertices ?? []).map((v) => node(`g/${g.name}/v/${v.name}`, { type: "vertex", name: v.name, sql: selectFrom(v.table), detail: v.table === v.name ? `key ${v.key}` : `${v.table} · key ${v.key}`, title: `vertex table ${v.table}, key ${v.key}` }, gn)),
+        ...(g.vertices ?? []).map((v) => node(`g/${g.name}/v/${v.name}`, { type: "vertex", name: v.name, sql: selectFrom(v.table), detail: v.table === v.name ? `key ${v.key}` : v.table, title: `vertex table ${v.table}, key ${v.key}` }, gn)),
         ...(g.edges ?? []).map((e) => node(`g/${g.name}/e/${e.name}`, { type: "edge", name: e.name, sql: selectFrom(e.table), detail: `${e.source} → ${e.destination}`, title: `edge table ${e.table}, from ${e.source} to ${e.destination}` }, gn)),
       ];
       return gn;

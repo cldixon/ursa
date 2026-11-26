@@ -33,7 +33,7 @@ const ICON = {
   plus: '<svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>',
   close: '<svg viewBox="0 0 16 16"><path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></svg>',
 };
-const FORMAT_LABEL = { parquet: "Parquet", csv: "CSV", json: "JSON", arrow: "Arrow", ursa: "Ursa DB" };
+const FORMAT_LABEL = { parquet: "parquet", csv: "csv", json: "json", arrow: "arrow", ursa: "ursa" };
 
 export function mountSources(mount) {
   mount.replaceChildren();
@@ -262,6 +262,8 @@ export function mountSources(mount) {
         steps.push([part, at]);
       }
     }
+    // At the top of a place, its button says where the list is.
+    crumbs.hidden = steps.length < 2;
     const ol = document.createElement("ol");
     steps.forEach(([label, url], i) => {
       const li = document.createElement("li");

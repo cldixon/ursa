@@ -7,8 +7,8 @@
 //   useQuery("SELECT * FROM t LIMIT 100", { from: "catalog" });
 //
 // In order, the first that is there:
-// 1. the Editor (URSA-13): `ursaConsole.editor.insert(text)`, which puts the
-//    text in the editor (and focuses it);
+// 1. the Editor (URSA-13): `ursaConsole.editor.insert(text, {statement:
+//    true})`, which puts it on a line of its own at the end, selected;
 // 2. the Results panel (URSA-14): `ursaConsole.run(text)`, which runs it into
 //    a tab of its own;
 // 3. neither (this console without them): a query runs on the session as
@@ -24,7 +24,8 @@ export async function useQuery(text, { label } = {}) {
   const ursa = window.ursaConsole ?? {};
   const editor = ursa.editor;
   if (editor && typeof editor.insert === "function") {
-    await editor.insert(text);
+    // A statement of its own: on its own line at the end, selected.
+    await editor.insert(text, { statement: true });
     return { how: "inserted" };
   }
   if (typeof ursa.run === "function") {
