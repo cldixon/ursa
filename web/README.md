@@ -55,7 +55,11 @@ static assets and an R2 bucket.
     `engine-client.js` then picks `SocketTransport` (`socket-transport.js`):
     the same messages over a WebSocket at `/session` to a native session,
     the JSON in a text frame and each part in a binary frame after an 8-byte
-    header (`design/console.md` §4.2). The page's token travels in an
+    header (`design/console.md` §4.2). The socket is held in a worker of its
+    own (`socket-worker.js`), so a large part (`.graph rmat`'s 8.4 MB of
+    UGR) is received off the page's thread and reaches the page in one
+    `postMessage`, its buffer transferred and not copied: a part is its
+    frame's buffer, from byte 8 (URSA-7). The page's token travels in an
     `HttpOnly` cookie, which the script never sees. `bun
     scripts/e2e-serve.ts PORT` runs the e2e suite that way (see Test).
   - **The terminal** is xterm.js (`@xterm/xterm`, copied into `dist/vendor/`
@@ -534,7 +538,10 @@ static assets and an R2 bucket.
     and the heaps (on rmat it fails if the view holds over 20 MiB or the
     layout worker over 60 MB, #501). It runs the full Chromium (`channel: "chromium"`), since
     Playwright's headless shell has no `measureUserAgentSpecificMemory`;
-    `CHANNEL=shell` runs the shell. `bun test tests/graph-timings.test.ts`
+    `CHANNEL=shell` runs the shell. Against `ursa serve`, set
+    `URSA_SERVE_TOKEN` to the token of the link it printed; `FIRST_ONLY=1`
+    ends each run at the first frame, which is what comparing the worker and
+    the socket needs (URSA-7). `bun test tests/graph-timings.test.ts`
     tests the arithmetic.
 
     On `.graph rmat` (1M edges, headless Chromium, software WebGL2, median
@@ -804,10 +811,21 @@ static assets and an R2 bucket.
   will take with `results.setCommandsSink`) and `table.js` (the virtual
   table: Arrow IPC decoded in the page, paged with `fetch`, typed headers
   with the `ursa.*` role, sorting the loaded rows, copying a range), styled
-  by `results.css`. `sqlbox.js` is a temporary textarea in the Editor panel
-  (Ctrl+Enter) until URSA-13; `ursaConsole.run(sql)` is the run function
-  the editor calls. `bun run build` (or `bun run console`
-  alone) copies it, with apache-arrow bundled as `vendor/arrow.mjs`, into
+  by `results.css`. `ursaConsole.run(sql)` is the run function
+  the editor calls.
+  The Editor panel is `editor.js` (URSA-13):
+  CodeMirror 6 coloured by the session's `highlight` (the shell's colours,
+  `editor.css`) and completed by its `complete`; Ctrl/Cmd+Enter runs the
+  statement at the cursor or the selection (`statements.js` splits them),
+  Shift with it every statement until one fails; SQL goes to
+  `ursaConsole.run(sql)` (the Results panel's) or else `query`, dot-commands
+  to `feed`; errors show at their statement; the text is kept per server
+  port. Other panels put SQL in it with
+  `ursaConsole.editor.insert(text, {statement, run})`. `bun run build` (or
+  `bun run console` alone) copies it, with apache-arrow bundled as
+  `vendor/arrow.mjs` and CodeMirror (MIT, pinned in `package.json`, from
+  `scripts/codemirror.ts`) as `vendor/codemirror.mjs`, their licences
+  beside them, into
   `dist-console/console/`: never into `dist/`, which is deployed. `bun run
   preview` serves it too, over the wasm engine (no Cancel there).
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
@@ -962,7 +980,16 @@ keys, 100,000 rows paged and scrolled to the last, a sort of the loaded
 rows, copying, the Graph view of karate with a double-click's `.expand`
 reaching the commands sink, the Plan, a CSV export, and a result that has
 gone offering Run again. With a screenshot dir it saves `results-*.png`.
-CI does not run it yet.
+
+`tests/console-editor.ts` (`bun run test:console-editor -- 8982`, the same
+arguments) tests the SQL editor the same way: its colour spans are
+`highlight`'s and each kind looks as the shell's terminal draws it, in both
+themes; completing a table's name, Tab, and Ctrl+Enter running it; the
+statement at the cursor, the selection, and Shift+Ctrl+Enter stopping at the
+first error; errors at their statement with the engine's hint; a
+dot-command through `feed`; the running mark and Cancel; Esc then Tab
+leaving the editor; `insert()`; and the text kept across a reload. With a
+screenshot dir it saves `editor-*.png`. CI does not run these yet.
 
 ## Datasets
 

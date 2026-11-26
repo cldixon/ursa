@@ -477,6 +477,10 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     groupXY: null,
     radii: new Map(),
     cutRest: 0,
+    // Whether a cut, or the graph in place of one, has come since the last
+    // frame: it, and its labels, are on the canvas once a frame has drawn
+    // them (URSA-19).
+    cutUndrawn: false,
     camera: null,
     labels: [],
     // What each frame of a coarse level cost, in ms: the time to the next
@@ -666,6 +670,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     placeBusy();
     cameraLooked();
     placeLabels();
+    state.cutUndrawn = false;
   };
   // Refinement at rest (#496). A frame at rest that does not fit in a frame
   // is not drawn at once: renderFrame leaves the canvas as it is, and the
@@ -777,6 +782,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
   const leaveCut = () => {
     view.clearLevel();
     placeLabels();
+    state.cutUndrawn = true;
     header();
     redraw(false);
   };
@@ -794,6 +800,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
       if (state.cuts.drop() || was) leaveCut();
       return;
     }
+    state.cutUndrawn = true;
     header();
     redraw(false);
   };
@@ -2105,10 +2112,12 @@ export function info() {
     // {groups, merged, nodes, groupsDrawn, edges, edgesDrawn, totalEdges}
     // (GraphView.cutInfo), or null when the graph itself is; whether cuts
     // are asked for (a large graph, laid out coarse to fine, full detail
-    // not forced), whether an answer is awaited, what the cuts took in
-    // the layout worker, in ms, and the labels on the canvas.
+    // not forced), whether an answer is awaited or the last one is still
+    // to be drawn (its discs and labels come with the next frame, URSA-19),
+    // what the cuts took in the layout worker, in ms, and the labels on
+    // the canvas.
     cut: current.view.cutInfo() ?? null,
-    cuts: { on: current.cuts.on, large: current.cuts.large, detail: !current.cuts.wanted, waiting: current.cuts.waiting || current.cutRest !== 0, ms: spread(current.cuts.took), last: current.cuts.took.at(-1) ?? null, prepared: current.cuts.prepared },
+    cuts: { on: current.cuts.on, large: current.cuts.large, detail: !current.cuts.wanted, waiting: current.cuts.waiting || current.cutRest !== 0 || current.cutUndrawn, ms: spread(current.cuts.took), last: current.cuts.took.at(-1) ?? null, prepared: current.cuts.prepared },
     groupLabels: current.labels.filter((l) => !l.hidden).map((l) => l.textContent),
     // A grouped drawing (#499): what it is grouped by, its groups and the
     // nodes they stand for, the open groups, each open group's radius in

@@ -119,7 +119,7 @@ check(await page.locator("#running").isHidden(), "no request is running");
 const PANELS: [string, string, string][] = [
   ["sources", "Sources", "URSA-16"],
   ["catalog", "Catalog", "URSA-15"],
-  ["editor", "Editor", "URSA-13"],
+  ["editor", "Editor", ""],
   ["results", "Results", ""],
   ["inspector", "Inspector", ""],
   ["history", "History", "URSA-17"],
@@ -132,9 +132,8 @@ for (const [id, title, issue] of PANELS) {
   }, id);
   const visible = await panel.isVisible();
   const mount = await page.locator(`#${id} [data-mount="${id}"]`).count();
-  // What the mount point shows: a placeholder, or what its issue put there
-  // (the temporary SQL box names URSA-13, which replaces it).
-  const placeholder = await page.locator(`#${id} [data-mount]`).innerText();
+  // A panel filled in has no placeholder.
+  const placeholder = issue ? await page.locator(`#${id} .placeholder`).innerText() : "";
   check(
     visible && name === title && mount === 1 && (!issue || placeholder.includes(issue)),
     `the ${title} panel: labelled, with its mount point${issue ? ` and ${issue}` : ""}`,
@@ -200,7 +199,7 @@ const tabOrder = await page.evaluate(() => {
   const all = [...document.querySelectorAll<HTMLElement>("button, a[href], textarea, [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links"));
   return all.map((el) => el.id || el.dataset.split || el.className);
 });
-const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "sql-input", "sql-run", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];
+const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "editor-run", "editor-run all", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];
 check(JSON.stringify(tabOrder) === JSON.stringify(expected), "the focus order follows the layout", tabOrder.join(" "));
 
 // The splitters' keys.

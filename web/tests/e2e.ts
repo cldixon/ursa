@@ -2213,6 +2213,9 @@ for (const scheme of ["light", "dark"] as const) {
   // `.graph detail on|off` force full detail and let it go; and zooming in
   // reaches the graph's own nodes, drawn as the graph is.
   {
+    // The cut asked for (true) or the graph itself (false), drawn: no answer
+    // awaited and none still to be drawn. A cut's discs and labels come
+    // with the frame after its answer (URSA-19).
     const cutDrawn = (want = true) =>
       r
         .waitForFunction((want) => { const g = (window as any).ursaShell.graph(); return g && !g.cuts.waiting && (g.cut !== null) === want; }, want, { timeout: 30_000, polling: 50 })
@@ -2246,9 +2249,14 @@ for (const scheme of ["light", "dark"] as const) {
       "a big graph: a click on a group selects its nodes",
       picked.slice(0, 160),
     );
-    // A click on empty space clears.
+    // A click on empty space clears. The camera then gives back the room
+    // it made for the inspector's panel (#493), over a few frames: the
+    // zoom below starts from where it is once it has (URSA-19: under load
+    // a cut was asked for between the room's frames, and the first zoom's
+    // cut was of a camera still moving).
     await r.mouse.click(box.x + 8, box.y + box.height - 8);
     await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    await roomSettled(r);
     check(/^aggregated: /.test(await statusNow()), "a big graph: a click on empty space clears the group's selection", (await statusNow()).slice(0, 80));
     // `a` forces full detail, and `a` again lets it go.
     await r.locator("#graph-stage canvas").focus();
@@ -2256,8 +2264,35 @@ for (const scheme of ["light", "dark"] as const) {
     const forced = await cutDrawn(false);
     const full = await graphInfo(r);
     check(forced && full.cut === null && full.cuts.detail && !full.cuts.on && !(await statusNow()).includes("aggregated") && full.groupLabels.length === 0, "a big graph: a forces full detail", `${JSON.stringify(full.cuts)}; ${(await statusNow()).slice(0, 80)}`);
+    // `a` again, with the animation frames held until the cut has come: a
+    // cut is drawn, and its groups labelled, by the frame after its answer,
+    // and until then the view says it waits (URSA-19: read in between, the
+    // labels were []).
+    await r.evaluate(() => {
+      const w = window as any;
+      const [raf, caf] = [window.requestAnimationFrame.bind(window), window.cancelAnimationFrame.bind(window)];
+      const held = new Map<number, FrameRequestCallback>();
+      let id = 0;
+      window.requestAnimationFrame = (cb) => (held.set(--id, cb), id);
+      window.cancelAnimationFrame = (n) => (held.has(n) ? held.delete(n) : caf(n));
+      w.__giveFrames = () => {
+        [window.requestAnimationFrame, window.cancelAnimationFrame] = [raf, caf];
+        for (const cb of held.values()) raf(cb);
+        held.clear();
+      };
+    });
     await r.keyboard.press("a");
-    check((await cutDrawn()) && /^aggregated: /.test(await statusNow()), "a big graph: a again aggregates it", (await statusNow()).slice(0, 80));
+    const came = await r.waitForFunction(() => (window as any).ursaShell.graph().cut !== null, null, { timeout: 30_000, polling: 50 }).then(() => true, () => false);
+    const held = await graphInfo(r);
+    await r.evaluate(() => (window as any).__giveFrames());
+    const again = (await cutDrawn()) && /^aggregated: /.test(await statusNow());
+    const labelled = (await graphInfo(r)).groupLabels;
+    check(again, "a big graph: a again aggregates it", (await statusNow()).slice(0, 80));
+    check(
+      came && held.cuts.waiting && held.groupLabels.length === 0 && labelled.length >= 1,
+      "a big graph: a cut and its labels are drawn by the frame after it comes, and the view waits for that frame",
+      `frames held: the cut ${came ? "came" : "did not come"}, waiting ${held.cuts.waiting}, labels ${JSON.stringify(held.groupLabels)}; then ${JSON.stringify(labelled)}`,
+    );
     // Zooming in on the middle opens the groups in view, down to the
     // graph's own nodes: then the graph itself is drawn.
     const sizes: number[] = [];

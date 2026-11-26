@@ -73,10 +73,21 @@ impl Linked {
         };
         (0..n as u32).into_par_iter().for_each(|u| {
             let mut any = false;
-            for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
-                if mask.is_none_or(|m| m.keep(e)) {
-                    any = true;
-                    set(v);
+            match mask {
+                // No edge ids to read without a mask (#170).
+                None => {
+                    for &v in out.neighbors(u) {
+                        any = true;
+                        set(v);
+                    }
+                }
+                Some(m) => {
+                    for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                        if m.keep(e) {
+                            any = true;
+                            set(v);
+                        }
+                    }
                 }
             }
             if any {

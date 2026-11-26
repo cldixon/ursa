@@ -47,21 +47,24 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
 
   check(
-    (await page.locator("#results .rs-empty").isVisible()) && (await page.locator("#editor .sqlbox-note").innerText()).includes("URSA-13"),
-    "results: an empty Results panel says what comes, and the SQL box says it is temporary",
+    (await page.locator("#results .rs-empty").isVisible()) && (await page.locator("#editor .cm-editor").count()) === 1,
+    "results: an empty Results panel says what comes, beside the editor",
   );
 
-  // ---------------------------------------------------------------- DDL in the box
+  // ---------------------------------------------------------------- DDL from the editor
 
-  const box = page.locator("#sql-input");
-  await box.fill("CREATE VIEW members AS SELECT * FROM 'karate_nodes.parquet';");
-  await box.press("Control+Enter");
+  await page.waitForFunction(() => (window as any).ursaConsole?.editor, null, { timeout: 30_000 });
+  await page.evaluate(() => {
+    const editor = (window as any).ursaConsole.editor;
+    editor.setText("CREATE VIEW members AS SELECT * FROM 'karate_nodes.parquet';");
+    editor.runCurrent();
+  });
   await page.waitForSelector(".rs-message:not([hidden])", { timeout: 30_000 });
   const ddl = {
     message: await page.locator(".rs-message").innerText(),
     tabs: await page.locator(".rs-tab").count(),
   };
-  check(/CREATE VIEW members .*OK/.test(ddl.message) && ddl.tabs === 0, "results: Ctrl+Enter in the box runs a CREATE, which says OK and opens no tab", JSON.stringify(ddl));
+  check(/CREATE VIEW members .*OK/.test(ddl.message) && ddl.tabs === 0, "results: the editor runs a CREATE, which says OK and opens no tab", JSON.stringify(ddl));
   const created = await ev(async () => {
     const run = (window as any).ursaConsole.run;
     const a = await run("CREATE VIEW ties AS SELECT * FROM 'karate_edges.parquet'");

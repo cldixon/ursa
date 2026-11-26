@@ -1,5 +1,4 @@
-/* The Results panel (results.js, table.js) and the temporary SQL box
-   (sqlbox.js): URSA-14. On top of style.css's tokens and console.css's. */
+/* The Results panel (results.js, table.js): URSA-14. On top of style.css's tokens and console.css's. */
 
 :root {
   --rs-tabs-bg: var(--side-bg);
@@ -477,84 +476,8 @@
 .rs-plan-wait, .rs-plan-error { margin: 14px 16px; color: var(--muted); font-size: 13px; }
 .rs-plan-error { color: var(--error); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
 
-/* ---------------------------------------------------------------- the temporary SQL box */
-
-.sqlbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.sqlbox-note {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
-  border-bottom: 1px dashed var(--placeholder-border);
-  color: var(--muted);
-  font-size: 12px;
-}
-.sqlbox-note .issue {
-  padding: 1px 8px;
-  border: 1px dashed color-mix(in srgb, var(--rs-warn) 70%, transparent);
-  border-radius: 999px;
-  color: color-mix(in srgb, var(--rs-warn) 80%, var(--fg));
-  font-family: var(--mono);
-  font-size: 11px;
-}
-.sqlbox-input {
-  flex: 1;
-  min-height: 40px;
-  margin: 0;
-  padding: 12px 14px;
-  border: 0;
-  outline: 0;
-  resize: none;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--mono);
-  font-size: 13.5px;
-  line-height: 1.55;
-  caret-color: var(--prompt);
-  scrollbar-color: var(--scrollbar) transparent;
-}
-.sqlbox-input::placeholder { color: var(--faint); }
-.sqlbox-input:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sqlbox-bar {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 10px;
-  border-top: 1px solid var(--border);
-}
-.sqlbox-run {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 12px 0 9px;
-  border: 1px solid var(--fg);
-  border-radius: 7px;
-  background: var(--fg);
-  color: var(--bg);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-.sqlbox-run svg { width: 14px; height: 14px; }
-.sqlbox-run:hover { opacity: 0.88; }
-.sqlbox-run:disabled { opacity: 0.5; cursor: default; }
-.sqlbox-keys { color: var(--muted); font-size: 12px; }
-.sqlbox-keys kbd {
-  padding: 0 5px;
-  border: 1px solid var(--border);
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  font-family: var(--mono);
-  font-size: 11px;
-}
-
 @media (max-width: 640px) {
   .rs-meta { display: none; }
   .rs-view-tab span { display: none; }
   .rs-tools { justify-content: space-between; }
-  .sqlbox-keys { display: none; }
 }
