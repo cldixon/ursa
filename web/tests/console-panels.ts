@@ -245,8 +245,8 @@ check(/SELECT \* FROM karate_nodes LIMIT 100;?\s*$/.test(afterTable), "clicking 
 check(!(await page.evaluate(() => (window as any).sent.some((r: any) => r.op === "query"))), "and does not run it");
 await row(page, "g/karate").focus();
 await page.keyboard.press("Enter");
-await page.waitForFunction(() => /\.graph karate;?\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
-check(/\.graph karate;?\s*$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor", JSON.stringify(((await editorText()) ?? "").slice(-40)));
+await page.waitForFunction(() => /\.graph karate\n?$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
+check(/\.graph karate\n?$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor, without a ;", JSON.stringify(((await editorText()) ?? "").slice(-40)));
 // With neither an editor nor the Results panel's run, the query runs on the
 // session itself, and the panel says what came back.
 const ran = await page.evaluate(async () => {

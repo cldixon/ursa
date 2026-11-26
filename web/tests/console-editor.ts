@@ -21,7 +21,8 @@
 // - the statement running is marked, and the status bar's Cancel stops it;
 // - Esc then Tab leaves the editor;
 // - the text survives a reload, kept per server port;
-// - ursaConsole.editor.insert() for the other panels;
+// - ursaConsole.editor.insert() for the other panels: SQL ends with `;`, a
+//   dot-command with none;
 // - no page errors and no CSP violations.
 //
 // With a screenshot dir, it saves the editor in light and dark at 1440×900:
@@ -247,7 +248,11 @@ await theme("dark");
 await screenshot("editor-dark-1440x900-completion.png");
 await theme("light");
 check(offered[0]?.label === "karate_club" && offered[0]?.selected, "the table comes first, selected", JSON.stringify(offered[0]));
+// Tab at once, as soon as the list shows: within CodeMirror's interactionDelay
+// (75 ms), when its acceptCompletion declines; the editor's Tab takes the
+// list all the same (as soon as CodeMirror lets it), and never indents.
 await page.keyboard.press("Tab");
+await page.waitForFunction(() => (window as any).ursaConsole.editor.text !== "SELECT * FROM karate_c", null, { timeout: 2_000 }).catch(() => {});
 check((await ed<string>("e.text")) === "SELECT * FROM karate_club", "Tab accepts it", await ed<string>("e.text"));
 await page.keyboard.press(`${MOD}+Enter`);
 await page.waitForFunction(() => (window as any).editorOutputs.length > 0, null, { timeout: 30_000 });
@@ -376,6 +381,10 @@ check(!left.inEditor, "Esc then Tab leaves the editor", JSON.stringify(left));
 await setText("SELECT 1;");
 const inserted = await page.evaluate(() => (window as any).ursaConsole.editor.insert("SELECT count(*) AS n FROM karate_club", { statement: true, run: true }));
 check(inserted === true && (await ed<string>("e.text")) === "SELECT 1;\n\nSELECT count(*) AS n FROM karate_club;\n", "insert() adds a statement of its own and runs it", JSON.stringify(await ed<string>("e.text")));
+// A dot-command is a line of its own, not SQL: it gets no `;`.
+await page.evaluate(() => (window as any).ursaConsole.editor.insert(".graph karate", { statement: true, focus: false }));
+const withCommand = await ed<string>("e.text");
+check(withCommand.endsWith("\n\n.graph karate\n") && (await ed<string>("e.view.state.sliceDoc(e.view.state.selection.main.from, e.view.state.selection.main.to)")) === ".graph karate", "insert() of a dot-command as a statement adds no ;, and selects it", JSON.stringify(withCommand));
 
 // ---------------------------------------------------------------- kept
 
