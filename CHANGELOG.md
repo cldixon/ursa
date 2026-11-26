@@ -1082,6 +1082,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's SQL editor** (URSA-13, `design/console.md` §6):
+  CodeMirror 6 in the Editor panel. Its SQL is coloured by the session's
+  `highlight`, so it looks exactly as the shell's terminal colours it, in
+  light and dark, and completed by its `complete`: tables, views, columns
+  (after `t.` too), graphs, functions, keywords and dot-commands, each with
+  its kind and detail. Ctrl/Cmd+Enter runs the statement at the cursor, or
+  the selection; Shift+Ctrl/Cmd+Enter runs every statement in turn and stops
+  at the first error. The statement running is marked, and the status bar's
+  Cancel stops it. An error shows at its statement: a squiggle under what it
+  names (or where the parser stopped) and the message with the engine's hint.
+  Dot-commands run through `feed`, as the shell's do. The text is kept across
+  a reload, per server port. Tab indents and accepts a completion; Esc then
+  Tab leaves the editor. Other panels put SQL in it with
+  `ursaConsole.editor.insert(text, {statement, run})`. CodeMirror's packages
+  (MIT) are pinned and bundled into `vendor/codemirror.mjs`, with their
+  licences; the build refuses one that isn't MIT. `tests/console-editor.ts`
+  tests it over `ursa serve`.
+
 - **The Ursa Console's page: `ursa serve`'s link opens it** (URSA-12,
   `design/console.md` §6). At `/console/`, with the shell still at `/`: a
   sources and catalog column, the editor over the result tabs, and the
