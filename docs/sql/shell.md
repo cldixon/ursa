@@ -304,6 +304,24 @@ ursa --skill > ~/.claude/skills/ursa-sql/SKILL.md
 
 An agent should read results as `--format json` or `--format ndjson` (see [Reading results in a program](#reading-results-in-a-program)): a table shows at most 40 rows, while CSV and JSON write every row.
 
+## In a browser tab: `ursa serve`
+
+`ursa serve` runs the same shell in a browser tab on your machine, over a local WebSocket to this native engine, with the graph view beside it:
+
+```bash
+ursa serve                 # in memory, in the current directory
+ursa serve data/           # relative paths in queries are data/'s
+ursa serve club.ursa       # the database, as `ursa club.ursa` opens it
+```
+
+It prints a link with a one-time token and opens it in your default browser; `--no-open` only prints it. It listens on `127.0.0.1` and `::1` only, on port 4280 or the next free one (`--port N`). Ctrl+C stops it.
+
+A directory, or a database file's own directory, is where relative paths resolve, and where the server writes: `COPY … TO`, `.output` and `.once` take a relative path under it. The shell's tab keeps what `COPY … TO 'name'` writes in the session, as the [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) in the browser does (`.files` lists them).
+
+`--read-only` writes no files, for pairing with an agent: `COPY … TO`, `INSERT INTO` a table of files, `.output`, `.once`, `ATTACH` of a database that does not exist, and anything that would change the database (opened read-only) are refused. Views and tables in memory still work.
+
+The release binaries (the installers' and GitHub's) have the page built in. A build with `cargo install ursa-cli --features serve` has not: pass `--assets DIR`, a `web/dist` built from Ursa's repository.
+
 ## History
 
 The shell keeps the lines you type in `~/.ursa_history`, so the up arrow reaches earlier sessions. To keep it elsewhere, set `URSA_HISTORY` to a file name. To keep none, set `URSA_HISTORY` to an empty string or start the shell with `--no-history`.

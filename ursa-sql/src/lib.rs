@@ -139,6 +139,12 @@ pub(crate) async fn run(ctx: &SessionContext, statement: UrsaStatement) -> Resul
     match statement {
         UrsaStatement::DataFusion(mut statement) => {
             let state = ctx.state();
+            // A read-only session (`ursa serve --read-only`) copies nothing,
+            // not even into its files in memory.
+            if let DFStatement::CopyTo(copy) = statement.as_ref() {
+                ursa_engine::paths::check_writable(state.config())
+                    .map_err(|e| copy_refused(&copy.target, e))?;
+            }
             // A COPY target or external table location in object storage needs
             // its store registered before DataFusion plans the write or read.
             // In a session that keeps its files in memory (the browser), a
@@ -223,6 +229,9 @@ async fn plan_and_run(ctx: &SessionContext, statement: DFStatement) -> Result<Da
     // A column an inner join equates with a node key is one (#431).
     let plan = ursa_engine::graph::provenance::carry_through_joins(plan)?;
     ursa_engine::graph::check_ddl(&state, &plan).await?;
+    if ursa_engine::paths::is_read_only(state.config()) {
+        refuse_writes(&plan)?;
+    }
     // A session that keeps its files in memory (the browser) writes them
     // itself, and cannot run DataFusion's file sinks (#517).
     if ursa_engine::session_files::takes_copy(&state) {
@@ -315,6 +324,52 @@ fn check_inserts(
             }
         }
         Ok(TreeNodeRecursion::Continue)
+    })?;
+    refused
+}
+
+/// Refuse what writes in a read-only session
+/// (`ursa_engine::paths::set_read_only`): a `COPY … TO` anywhere in `plan`
+/// (an `EXPLAIN`'s too), and an `INSERT` (or other change) to a table that
+/// is not in memory, such as a table of files.
+fn refuse_writes(plan: &datafusion::logical_expr::LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::{source_as_provider, MemTable};
+    use datafusion::logical_expr::{LogicalPlan, WriteOp};
+    let mut refused = Ok(());
+    plan.apply(|node| {
+        let why = match node {
+            LogicalPlan::Copy(copy) => Some(copy_refused(
+                &copy.output_url,
+                DataFusionError::Plan(ursa_engine::paths::READ_ONLY.into()),
+            )),
+            LogicalPlan::Dml(dml) => {
+                let in_memory = source_as_provider(&dml.target)
+                    .is_ok_and(|table| table.downcast_ref::<MemTable>().is_some());
+                (!in_memory).then(|| {
+                    let op = match &dml.op {
+                        WriteOp::Insert(_) => "INSERT INTO",
+                        WriteOp::Delete => "DELETE FROM",
+                        WriteOp::Update => "UPDATE",
+                        WriteOp::Truncate => "TRUNCATE",
+                        _ => "a write to",
+                    };
+                    DataFusionError::Plan(format!(
+                        "{op} {} cannot change it: {}",
+                        dml.table_name,
+                        ursa_engine::paths::READ_ONLY
+                    ))
+                })
+            }
+            _ => None,
+        };
+        match why {
+            Some(e) => {
+                refused = Err(e);
+                Ok(TreeNodeRecursion::Stop)
+            }
+            None => Ok(TreeNodeRecursion::Continue),
+        }
     })?;
     refused
 }

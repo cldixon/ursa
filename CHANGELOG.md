@@ -1082,6 +1082,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's Catalog and Sources panels** (URSA-15, URSA-16,
+  `design/console.md` §6). The Catalog is a tree of the session's
+  databases, schemas, tables and views (marked by kind) and their columns
+  with types, and a section for property graphs with their vertex and edge
+  tables. It follows the session as it changes, from any tab or agent on
+  it, keeping what was open and the scroll; it has a filter and the ARIA
+  tree's keys. Choosing a table puts `SELECT * FROM … LIMIT 100` in the
+  editor; a graph, `.graph <name>`. Sources lists the session's root (`ursa
+  serve DIR`) with each file's format and size, browses into folders, and
+  browses buckets added by their `s3://`, `gs://` or `az://` prefix (kept
+  per server). Choosing a file puts its query in the editor and runs it; a
+  `.ursa` file can be attached. Errors, such as a bucket's missing
+  credentials, show in the panel. Without the `sources` capability (the
+  browser demo) the panel says so. `tests/console-panels.ts` tests both
+  over `ursa serve`. The console's `session.onEvent` now also reaches the
+  connection being opened, so a panel that listens while the page connects
+  hears its first events.
+
 - **The console's SQL editor** (URSA-13, `design/console.md` §6):
   CodeMirror 6 in the Editor panel. Its SQL is coloured by the session's
   `highlight`, so it looks exactly as the shell's terminal colours it, in
@@ -1117,6 +1135,29 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   repeated) and builds both in with `serve-embed`. The graph pane's styles
   move from `style.css` into `graph-pane.css`, which the shell links; the
   shell looks and behaves as before.
+- **`ursa serve` in the release binaries, with a database file,
+  `--read-only` and `--no-open`** (URSA-4, `design/console.md` §5). The
+  release and nightly binaries have `ursa serve` with its page built in
+  (`serve-embed`: `cli-build.yml` builds the page once, with `bun
+  scripts/build.ts --no-engine`, and every platform embeds it); the crates
+  on crates.io still have no page. `ursa serve club.ursa` opens the
+  database in every session as `ursa club.ursa` does, rooted in its
+  directory; `ursa serve DIR` roots the sessions in DIR (relative paths,
+  `.read`, `ATTACH` and writes resolve under it), and with neither the
+  session is in memory, in the current directory: the server no longer
+  changes the process's working directory. It opens its link in the
+  default browser unless `--no-open`, on port 4280 or the next free one.
+  `--read-only` writes no files, for pairing with an agent: `COPY … TO`,
+  `INSERT INTO` a table of files, `.output`, `.once`, `ATTACH` of a
+  database that does not exist, and what changes the database (opened
+  read-only) are refused by the engine (`ursa_engine::paths::set_read_only`,
+  `ursa_shell::session::Options::read_only`). The shell's page keeps
+  `COPY … TO 'name'` in memory, as in the browser demo; the shared session
+  (the console's) writes it to disk under the root. `web/scripts/build.ts
+  --no-engine` builds the page without the wasm engine. The Linux x86_64
+  release binary grows from 147.2 MB to 169.6 MB (115 to 132 MB stripped;
+  its archive from 40.9 to 47.0 MB): 18.7 MB for the server, 3.7 MB for the
+  page.
 
 ### Changed
 

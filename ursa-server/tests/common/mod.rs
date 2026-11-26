@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,8 +31,13 @@ pub struct Server {
 
 impl Server {
     pub async fn start() -> Server {
-        // The session reads relative paths against the process's directory,
-        // which `ursa serve` sets to the root: a test names a file in full.
+        Server::start_with(|_, _| {}).await
+    }
+
+    /// A server whose config `change` changes, given the served directory.
+    pub async fn start_with(change: impl FnOnce(&Path, &mut ursa_server::Config)) -> Server {
+        // The sessions' root: relative paths in their queries resolve
+        // against it.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ties.csv"), "src,dst\n1,2\n2,3\n3,1\n").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -52,12 +59,15 @@ impl Server {
         )
         .unwrap();
         std::fs::write(console.join("console").join("console.js"), "export {};").unwrap();
-        let config = ursa_server::Config {
+        let mut config = ursa_server::Config {
             root: dir.path().to_path_buf(),
+            database: None,
+            read_only: false,
             port: 0,
             assets: ursa_server::Assets::Dirs(vec![console, assets]),
             version: "test".into(),
         };
+        change(dir.path(), &mut config);
         let bound = ursa_server::bind(config).await.unwrap();
         let (port, token, url) = (bound.port(), bound.token().to_string(), bound.url());
         let (stop, stopped) = oneshot::channel::<()>();

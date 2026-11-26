@@ -12,6 +12,8 @@
 // window.ursaConsole is also what the e2e test (tests/console.ts) reads.
 import { session } from "./session.js";
 import { setupLayout } from "./layout.js";
+import { mountCatalog } from "./catalog.js";
+import { mountSources } from "./sources.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -128,3 +130,7 @@ showState();
 session.start();
 
 window.ursaConsole = { session, panels: layout.panels, layout };
+
+// The panels (each module's header says what it does).
+window.ursaConsole.catalog = mountCatalog(layout.panels.catalog); // URSA-15
+window.ursaConsole.sources = mountSources(layout.panels.sources); // URSA-16

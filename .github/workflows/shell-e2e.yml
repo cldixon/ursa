@@ -219,7 +219,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build -p ursa-cli --features serve --locked
 
-      # e2e-serve.ts starts `ursa serve .data --port PORT --assets dist`, reads
+      # e2e-serve.ts starts `ursa serve .data --port PORT --no-open --assets dist`, reads
       # the token from the link it prints, runs the suite with it, and stops
       # the server with Ctrl+C, failing if it does not stop gracefully.
       - name: Run the e2e suite over ursa serve
