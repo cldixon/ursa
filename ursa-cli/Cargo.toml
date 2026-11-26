@@ -30,7 +30,10 @@ aws-profile = ["ursa-engine/aws-profile"]
 # checkout, its own `web/dist`.
 serve = ["dep:ursa-server"]
 # `serve` with the page's files built into the binary: builds only from a
-# checkout, after `cd web && bun run engine && bun run build`.
+# checkout, after `cd web && bun scripts/build.ts --no-engine` (`bun run
+# build` without the wasm engine, which `ursa serve` does not use). The
+# release binaries have it (.github/workflows/cli-build.yml); the published
+# crate does not.
 serve-embed = ["serve", "ursa-server/embed"]
 
 [dependencies]

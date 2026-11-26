@@ -15,6 +15,8 @@ async fn it_listens_on_loopback_only() {
     let server = Server::start().await;
     let config = ursa_server::Config {
         root: PathBuf::from("."),
+        database: None,
+        read_only: false,
         port: 0,
         assets: ursa_server::Assets::Dirs(vec![]),
         version: "test".into(),
@@ -43,6 +45,8 @@ async fn it_listens_on_loopback_only() {
     // A taken port: the next free one.
     let config = ursa_server::Config {
         root: PathBuf::from("."),
+        database: None,
+        read_only: false,
         port: server.port,
         assets: ursa_server::Assets::Dirs(vec![]),
         version: "test".into(),

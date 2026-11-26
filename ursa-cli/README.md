@@ -40,7 +40,9 @@ Graphs are defined with SQL/PGQ `CREATE PROPERTY GRAPH`. Algorithms and traversa
 
 For scripts and programs, `ursa -c "<sql>"`, `ursa -f script.sql` and SQL on stdin run and exit; a script may use the shell's dot-commands (`.mode`, `.timer on`, `.read`), as in DuckDB. `--format json` writes results for a program to read. `ursa --skill` prints a guide to writing Ursa SQL for coding agents, and `ursa --help` ends with where to start.
 
-`ursa serve [DIR]`, in a build with the `serve` feature (`cargo install ursa-cli --features serve`), opens the shell in a browser tab on your machine, over a local WebSocket to the native engine: it prints a link with a one-time token, and Ctrl+C stops it. A build from crates.io has no page built in: pass `--assets DIR`, a `web/dist` from Ursa's repository built with `bun run build`.
+`ursa serve [club.ursa | DIR]` opens the shell in a browser tab on your machine, over a local WebSocket to the native engine. It prints a link with a one-time token and opens it in your default browser (`--no-open` only prints it); Ctrl+C stops it. A database file is opened as `ursa club.ursa` opens one, and relative paths in queries resolve against its directory; a directory is the sessions' root; with neither, the session is in memory, in the current directory. `--port N` picks the port (4280 by default, or the next free one), and `--read-only` writes no files: `COPY … TO`, `INSERT INTO` a table of files, `.output`, `.once`, and anything that changes the database (opened read-only) are refused, for pairing with an agent.
+
+The release binaries (the installers' and GitHub's) have `ursa serve` with its page built in (the `serve-embed` feature). `cargo install ursa-cli --features serve` builds it without the page: pass `--assets DIR`, a `web/dist` from Ursa's repository built with `bun run build`.
 
 The engine is built on [Apache DataFusion](https://datafusion.apache.org/). It runs the same algorithms as Ursa's Python library ([`ursa-graph`](https://pypi.org/project/ursa-graph/)) and gives the same values.
 

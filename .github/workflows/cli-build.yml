@@ -4,6 +4,13 @@ name: Build ursa-cli
 # build that can run on its runner, and uploads one archive per platform with
 # its .sha256 file, as artifacts named ursa-cli-<target>. Publishes nothing.
 #
+# The binaries have `ursa serve` with its page built in (ursa-cli's
+# `serve-embed` feature, design/console.md §5): the `page` job builds the
+# page once (`web/dist`, by web/scripts/build.ts, without the wasm engine,
+# which `ursa serve` does not use), and each platform's build embeds it. The
+# crates published to crates.io have no page in them: `cargo install
+# ursa-cli --features serve` serves one from a directory (`--assets`).
+#
 # Called by release-cli.yml (stable releases) and nightly-cli.yml (the rolling
 # nightly prerelease), which publish what this builds.
 #
@@ -36,8 +43,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  page:
+    name: Build the page for ursa serve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml. The graph view is built for wasm32.
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: page-wasm32
+
+      - name: Read the wasm-bindgen version from Cargo.lock
+        id: wb
+        shell: bash
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # wasm-bindgen-cli must match the wasm-bindgen crate exactly.
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      # `bun run build` without the wasm engine: the page `ursa serve` embeds.
+      - name: Build the page
+        working-directory: web
+        shell: bash
+        run: |
+          bun install --frozen-lockfile
+          bun scripts/build.ts --no-engine
+          test -f dist/index.html
+          du -sh dist
+
+      # Not named ursa-cli-*: the release jobs download those as the archives.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: page-dist
+          path: web/dist/
+          if-no-files-found: error
+          retention-days: 3
+
   build:
     name: Build (${{ matrix.target }})
+    needs: page
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -67,9 +124,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The page, where `serve-embed` builds it in from (ursa-server's
+      # `embed`: web/dist).
+      - uses: actions/download-artifact@v4
+        with:
+          name: page-dist
+          path: web/dist
+
       - name: Build
         shell: bash
-        run: cargo build --release --locked -p ursa-cli --target "$TARGET"
+        run: cargo build --release --locked -p ursa-cli --features serve-embed --target "$TARGET"
 
       - name: Smoke test
         if: matrix.native
@@ -89,6 +153,30 @@ jobs:
             SELECT count(*) AS n FROM pagerank(karate, direction => 'both');")
           echo "$out"
           test "$(echo "$out" | tr -d '\r' | tail -n 1)" = "34"
+
+      # `ursa serve` with the page built in: it prints its link and serves
+      # the page, marked for the socket, with no web/dist beside it.
+      - name: Smoke test ursa serve
+        if: matrix.native
+        shell: bash
+        run: |
+          bin="$PWD/target/$TARGET/release/ursa"
+          rm -rf web/dist
+          mkdir -p serve-smoke
+          cd serve-smoke
+          "$bin" serve --no-open --port 4280 > serve.log 2>&1 &
+          pid=$!
+          port=
+          for _ in $(seq 60); do
+            port=$(sed -n 's|.*http://127\.0\.0\.1:\([0-9]*\)/?token=.*|\1|p' serve.log | head -n 1)
+            [[ -n "$port" ]] && break
+            sleep 1
+          done
+          cat serve.log
+          test -n "$port"
+          curl -sf "http://127.0.0.1:$port/" -o page.html
+          kill "$pid" || true
+          grep -q 'content="socket"' page.html
 
       - name: Package
         shell: bash

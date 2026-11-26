@@ -821,7 +821,14 @@ static assets and an R2 bucket.
   `ursaConsole.run(sql)` (the Results panel's) or else `query`, dot-commands
   to `feed`; errors show at their statement; the text is kept per server
   port. Other panels put SQL in it with
-  `ursaConsole.editor.insert(text, {statement, run})`. `bun run build` (or
+  `ursaConsole.editor.insert(text, {statement, run})`. The Catalog panel is
+  `catalog.js` (URSA-15): the session's tables, views, columns and property
+  graphs as an ARIA tree, refetched on the `catalog` event, with a filter;
+  the Sources panel is `sources.js` (URSA-16): the root's folders and files
+  (`sources.list`), buckets added by prefix (kept per port), and Attach for
+  `.ursa` files. Both hand their queries to the editor through
+  `actions.js` (or run them with `query` when there is no editor), and
+  share `panels.css`. `bun run build` (or
   `bun run console` alone) copies it, with apache-arrow bundled as
   `vendor/arrow.mjs` and CodeMirror (MIT, pinned in `package.json`, from
   `scripts/codemirror.ts`) as `vendor/codemirror.mjs`, their licences
@@ -922,7 +929,7 @@ cargo build --release -p ursa-cli --features serve
 bun scripts/e2e-serve.ts 8901                 # [port] [ursa binary]; URSA_BIN= also names it
 ```
 
-It starts `ursa serve .data --port PORT --assets dist`, reads the token from
+It starts `ursa serve .data --port PORT --no-open --assets dist`, reads the token from
 the link it prints, and runs the suite with `URSA_SERVE_TOKEN` set: every
 browser context gets the token's cookie, and the suite skips (printing `skip`)
 the 6 checks of what only the browser demo has: the engine's crash (a
@@ -980,6 +987,19 @@ keys, 100,000 rows paged and scrolled to the last, a sort of the loaded
 rows, copying, the Graph view of karate with a double-click's `.expand`
 reaching the commands sink, the Plan, a CSV export, and a result that has
 gone offering Run again. With a screenshot dir it saves `results-*.png`.
+
+`tests/console-panels.ts` (`bun run test:console-panels -- 9061`, the same
+arguments) tests the Catalog and Sources panels over `ursa serve` with a
+root of its own in a temp directory (reached through a symbolic link): a
+CREATE TABLE showing on this page and a second one without a reload, what
+was open and the scroll kept across a refetch, kinds and types, the tree's
+ARIA attributes and keys, the filter, a table's query and a graph's
+`.graph` going to the editor (and running with no editor); browsing into
+folders and back up, formats and sizes, a Parquet file's query running,
+attaching a `.ursa` file and seeing its views and graph, a bucket that
+cannot be reached showing its error in the panel, buckets kept across a
+reload, and the panel without the `sources` capability. With a screenshot
+dir it saves `panels-light.png` and `panels-dark.png`.
 
 `tests/console-editor.ts` (`bun run test:console-editor -- 8982`, the same
 arguments) tests the SQL editor the same way: its colour spans are

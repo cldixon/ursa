@@ -466,6 +466,17 @@ fn free_space(path: &Path) -> Option<u64> {
     }
 }
 
+/// What the error [`Database::open`] gives when another process (or another
+/// session of this one) holds the lock begins with, after the name.
+const IN_USE: &str = " is in use by another process";
+
+/// Whether `e` is [`Database::open`]'s error for a database another process,
+/// or another session of this one, has open for writing: one that can still
+/// be opened read-only.
+pub fn is_in_use(e: &DataFusionError) -> bool {
+    matches!(e.find_root(), DataFusionError::Execution(message) if message.contains(IN_USE))
+}
+
 /// Take the exclusive lock on `lock`, retrying until `timeout` has passed.
 fn acquire(lock: &File, name: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
@@ -478,9 +489,9 @@ fn acquire(lock: &File, name: &str, timeout: Duration) -> Result<()> {
                         .map(|pid| format!(" (process {pid})"))
                         .unwrap_or_default();
                     return Err(DataFusionError::Execution(format!(
-                        "{name} is in use by another process{holder}, which has it open for \
-                         writing; open it read-only to query it meanwhile (ursa --readonly \
-                         {name}), or wait for that process to finish"
+                        "{name}{IN_USE}{holder}, which has it open for writing; open it \
+                         read-only to query it meanwhile (ursa --readonly {name}), or wait \
+                         for that process to finish"
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(50));

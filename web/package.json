@@ -29,6 +29,7 @@
     "upload:engine": "bun scripts/upload-engine.ts",
     "test:e2e": "bun tests/e2e.ts",
     "test:console": "bun tests/console.ts",
+    "test:console-panels": "bun tests/console-panels.ts",
     "test:console-editor": "bun tests/console-editor.ts",
     "preview": "bun scripts/preview.ts"
   }

@@ -13,6 +13,8 @@
 import { session } from "./session.js";
 import { setupLayout } from "./layout.js";
 import { createResults } from "./results.js";
+import { mountCatalog } from "./catalog.js";
+import { mountSources } from "./sources.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -134,3 +136,7 @@ const results = createResults({ mount: layout.panels.results, session });
 const run = (sql) => results.run(sql);
 
 window.ursaConsole = { session, panels: layout.panels, layout, results, run };
+
+// The panels (each module's header says what it does).
+window.ursaConsole.catalog = mountCatalog(layout.panels.catalog); // URSA-15
+window.ursaConsole.sources = mountSources(layout.panels.sources); // URSA-16

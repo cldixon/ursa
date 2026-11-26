@@ -3,7 +3,7 @@
 //
 //   bun scripts/e2e-serve.ts [port] [ursa binary]      (URSA_BIN= also names the binary)
 //
-// It starts `ursa serve .data --port PORT` (a build with `--features serve`;
+// It starts `ursa serve .data --port PORT --no-open` (a build with `--features serve`;
 // by default $CARGO_TARGET_DIR/release/ursa), reads the token from the URL it
 // prints, and runs the suite with URSA_SERVE_TOKEN set, which gives every
 // browser context the token's cookie and skips the checks of browser-only
@@ -15,7 +15,7 @@ import { cargoTargetDir, DATA_DIR, WEB } from "./common";
 
 const port = Number(Bun.argv[2] ?? 8901);
 const bin = Bun.argv[3] ?? process.env.URSA_BIN ?? join(cargoTargetDir(), "release", "ursa");
-const server = Bun.spawn([bin, "serve", DATA_DIR, "--port", String(port), "--assets", join(WEB, "dist")], {
+const server = Bun.spawn([bin, "serve", DATA_DIR, "--port", String(port), "--no-open", "--assets", join(WEB, "dist")], {
   stdout: "pipe",
   stderr: "inherit",
 });

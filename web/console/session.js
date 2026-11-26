@@ -53,7 +53,9 @@ class Session {
   onEvent(event, fn) {
     if (!this.eventListeners.has(event)) this.eventListeners.set(event, new Set());
     this.eventListeners.get(event).add(fn);
-    const off = this.client?.on(event, fn);
+    // On the connection, or the one being opened (whose listeners were
+    // added before this one came).
+    const off = (this.client ?? this.opening)?.on(event, fn);
     return () => {
       this.eventListeners.get(event).delete(fn);
       off?.();
@@ -98,9 +100,12 @@ class Session {
     let client;
     const transport = watched(defaultTransport(), (message) => this.lost(client, message));
     client = connect(transport, CLIENT, { session: "shared" });
+    this.opening = client;
     for (const [event, fns] of this.eventListeners) for (const fn of fns) client.on(event, fn);
     try {
-      const hello = await client.ready;
+      const hello = await client.ready.finally(() => {
+        if (this.opening === client) this.opening = null;
+      });
       this.client = client;
       this.hello = hello;
       this.reason = null;
