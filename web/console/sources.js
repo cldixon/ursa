@@ -6,8 +6,8 @@
 //   back up.
 // - "Add a bucket" takes an `s3://`, `gs://` or `az://` prefix and browses
 //   it. Buckets added are kept in this browser for this server (its port).
-// - Choosing a file hands `SELECT * FROM '<url>' LIMIT 100` to the editor
-//   (actions.js): under the root, by its path relative to it, which the
+// - Choosing a file hands `SELECT * FROM '<url>' LIMIT 100` to the editor,
+//   which runs it (actions.js): under the root, by its path relative to it, which the
 //   session's queries resolve against. A database file (.ursa) is attached
 //   (`sources.attach`), and its tables show in the Catalog.
 // - Without the `sources` capability (the browser demo, or a session with
@@ -365,7 +365,7 @@ export function mountSources(mount) {
     if (entry.format === "ursa") return attach(entry);
     const sql = `SELECT * FROM ${quoteString(queryPath(entry.url))} LIMIT 100`;
     note(sql, "pending");
-    const outcome = await useQuery(sql, { label: `SELECT from ${entry.name}` });
+    const outcome = await useQuery(sql, { label: `SELECT from ${entry.name}`, run: true });
     note(outcome.how === "ran" ? `${sql} — ${describe(outcome, sql)}` : describe(outcome, sql), outcome.how === "failed" ? "error" : "info");
     mount.dispatchEvent(new CustomEvent("ursa-sources-use", { bubbles: true, detail: { text: sql, outcome } }));
   }

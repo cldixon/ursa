@@ -14,12 +14,12 @@
 // - Catalog: a CREATE TABLE shows without a reload, on this page and on a
 //   second page on the shared session; what was open stays open across a
 //   refetch; tables, views and graphs are marked by kind, columns have
-//   their types; the filter; the ARIA tree's keys; choosing a table hands
-//   `SELECT * FROM … LIMIT 100` to the editor (ursaConsole.editor.insert),
-//   or, with no editor, runs it; a graph hands `.graph karate`.
+//   their types; the filter; the ARIA tree's keys; choosing a table puts
+//   `SELECT * FROM … LIMIT 100` in the editor (ursaConsole.editor.insert),
+//   or, with no editor, runs it; a graph puts `.graph karate` there.
 // - Sources: the root's folders and files with their formats and sizes;
 //   browsing into a folder and back up (the path, Backspace); a Parquet
-//   file's query runs; attaching club.ursa shows its views and graph in the
+//   file's query goes to the editor and runs; attaching club.ursa shows its views and graph in the
 //   Catalog; a bucket that cannot be reached shows its error in the panel;
 //   buckets are kept across a reload; without the `sources` capability the
 //   panel says so and shows no controls.
@@ -209,22 +209,48 @@ check((await page.locator("#catalog .catalog-state").textContent())?.includes("N
 await page.locator("#catalog .filter-input").press("Escape");
 check((await page.inputValue("#catalog .filter-input")) === "" && (await treeRows(page, "graphs")).length === 3, "Esc clears the filter");
 
-// Choosing: with no editor, the query runs on the session.
-await row(page, "t/datafusion/public/karate_nodes").locator(".name").click();
-const ran = await noteSays(page, "catalog", /rows/);
-check(/SELECT \* FROM karate_nodes LIMIT 100/.test(ran) && /34 rows/.test(ran), "clicking a table runs SELECT * FROM it LIMIT 100 (no editor yet)", ran);
-// With an editor (URSA-13's insert), it is handed to the editor.
+// Choosing. What the page sends the session is recorded: {op, sql, ok}.
 await page.evaluate(() => {
-  (window as any).inserted = [];
-  (window as any).ursaConsole.editor = { insert: (text: string) => (window as any).inserted.push(text) };
+  const w = window as any;
+  const s = w.ursaConsole.session;
+  const run = s.run.bind(s);
+  w.sent = [];
+  s.run = (op: string, args: any = {}, opts?: any) => {
+    const record = { op, text: args.sql ?? args.line ?? args.url, ok: null as null | boolean };
+    w.sent.push(record);
+    const reply = run(op, args, opts);
+    reply.then(() => (record.ok = true), () => (record.ok = false));
+    return reply;
+  };
 });
-await row(page, "t/datafusion/public/hubs").locator(".name").click();
+const editorText = () => page.evaluate(() => (window as any).ursaConsole.editor?.text ?? null);
+const hasEditor = (await editorText()) !== null;
+check(hasEditor, "the editor (URSA-13) is there to hand queries to");
+// A table goes to the editor, as a statement of its own, not run yet; a
+// graph's .graph too (click, then Enter).
+await row(page, "t/datafusion/public/karate_nodes").locator(".name").click();
+await page.waitForFunction(() => /SELECT \* FROM karate_nodes LIMIT 100\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
+const afterTable = (await editorText()) ?? "";
+check(/SELECT \* FROM karate_nodes LIMIT 100\s*$/.test(afterTable), "clicking a table puts SELECT * FROM it LIMIT 100 in the editor", JSON.stringify(afterTable.slice(-80)));
+check(!(await page.evaluate(() => (window as any).sent.some((r: any) => r.op === "query"))), "and does not run it");
 await row(page, "g/karate").focus();
 await page.keyboard.press("Enter");
-await page.waitForFunction(() => (window as any).inserted.length >= 2, null, { timeout: 5000 }).catch(() => {});
-const inserted = await page.evaluate(() => (window as any).inserted);
-check(JSON.stringify(inserted) === JSON.stringify(["SELECT * FROM hubs LIMIT 100", ".graph karate"]), "with the editor, a table's query and a graph's .graph go to it (click, Enter)", JSON.stringify(inserted));
-await page.evaluate(() => delete (window as any).ursaConsole.editor);
+await page.waitForFunction(() => /\.graph karate\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
+check(/\.graph karate\s*$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor", JSON.stringify(((await editorText()) ?? "").slice(-40)));
+// Without an editor, the query runs on the session, and the panel says what came back.
+const ran = await page.evaluate(async () => {
+  const w = window as any;
+  const editor = w.ursaConsole.editor;
+  delete w.ursaConsole.editor;
+  try {
+    (document.querySelector('#catalog [data-key="t/datafusion/public/karate_nodes"] .name') as HTMLElement).click();
+    for (let i = 0; i < 100 && !/rows/.test(document.querySelector("#catalog .panel-note")!.textContent!); i++) await new Promise((r) => setTimeout(r, 100));
+    return document.querySelector("#catalog .panel-note")!.textContent;
+  } finally {
+    w.ursaConsole.editor = editor;
+  }
+});
+check(/SELECT \* FROM karate_nodes LIMIT 100/.test(ran ?? "") && /34 rows/.test(ran ?? ""), "with no editor, clicking a table runs its query", ran ?? "");
 
 // ---------------------------------------------------------------- sources
 
@@ -246,8 +272,10 @@ check(crumbs.join("/") === `${root.split("/").pop()}/data/karate`, "the path abo
 check((await page.evaluate(() => document.activeElement?.closest(".entry")?.getAttribute("data-name"))) === "..", "the keyboard is in the new folder's list");
 
 await page.locator('#sources .entry[data-name="karate_nodes.parquet"] .entry-main').click();
-const parquet = await noteSays(page, "sources", /rows|fail|cannot/i);
-check(/SELECT \* FROM 'data\/karate\/karate_nodes\.parquet' LIMIT 100/.test(parquet) && /34 rows/.test(parquet), "clicking a Parquet file runs its query, by its path under the root", parquet);
+const PARQUET_SQL = "SELECT * FROM 'data/karate/karate_nodes.parquet' LIMIT 100";
+await page.waitForFunction((q) => (window as any).sent.some((r: any) => r.op === "query" && r.text === q && r.ok !== null), PARQUET_SQL, { timeout: 20_000 }).catch(() => {});
+const parquetRun = await page.evaluate((q) => (window as any).sent.find((r: any) => r.op === "query" && r.text === q), PARQUET_SQL);
+check(Boolean(parquetRun?.ok) && ((await editorText()) ?? "").trimEnd().endsWith(PARQUET_SQL), "clicking a Parquet file puts its query in the editor and runs it, by its path under the root", JSON.stringify(parquetRun));
 
 // Keys: Down, then Backspace goes up.
 await page.locator('#sources .entry[data-name="karate_nodes.parquet"] .entry-main').focus();

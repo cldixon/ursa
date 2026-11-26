@@ -15,18 +15,24 @@
 //    `query` and the panel says what came back (how many rows, how long); a
 //    command, which `query` cannot run, is copied to the clipboard.
 //
-// It resolves to what happened: {how: "inserted" | "run" | "ran" | "copied"
-// | "failed", rows?, ms?, error?}, which the panels show.
+// With `run`, the editor runs it too (the Sources panel's files, whose
+// query is a look at the file); without, it waits there to be run or
+// edited (the Catalog's tables and graphs).
+//
+// It resolves to what happened: {how: "inserted" | "inserted and run" |
+// "run" | "ran" | "copied" | "failed", rows?, ms?, error?}, which the
+// panels show.
 import { session } from "./session.js";
 
 /** Hand `text` (SQL, or a dot-command) to the editor, or run it. */
-export async function useQuery(text, { label } = {}) {
+export async function useQuery(text, { label, run = false } = {}) {
   const ursa = window.ursaConsole ?? {};
   const editor = ursa.editor;
   if (editor && typeof editor.insert === "function") {
-    // A statement of its own: on its own line at the end, selected.
-    await editor.insert(text, { statement: true });
-    return { how: "inserted" };
+    // A statement of its own: on its own line at the end, selected, and
+    // with `run`, run as Ctrl+Enter would.
+    await editor.insert(text, { statement: true, run });
+    return { how: run ? "inserted and run" : "inserted" };
   }
   if (typeof ursa.run === "function") {
     await ursa.run(text);
@@ -54,7 +60,9 @@ export async function useQuery(text, { label } = {}) {
 export function describe(outcome, text) {
   switch (outcome.how) {
     case "inserted":
-      return "In the editor.";
+      return `In the editor: ${text}`;
+    case "inserted and run":
+      return `Running in the editor: ${text}`;
     case "run":
       return "Running in Results.";
     case "copied":
