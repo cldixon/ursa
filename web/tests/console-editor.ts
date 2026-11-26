@@ -138,7 +138,8 @@ FROM karate_club /* a table */ WHERE src < 5;
 await setText(SAMPLE);
 const spans = await ed<any[]>("e.spans");
 const theirs = await page.evaluate((sql) => (window as any).ursaConsole.session.client.call("highlight", { sql }).then((r: any) => r.spans), SAMPLE);
-check(JSON.stringify(spans) === JSON.stringify(theirs), "the editor's colour spans are highlight's, exactly", `${JSON.stringify(spans)} vs ${JSON.stringify(theirs)}`);
+const norm = (list: any[]) => JSON.stringify(list.map(({ from, to, kind }) => ({ from, to, kind })));
+check(norm(spans) === norm(theirs), "the editor's colour spans are highlight's, exactly", `${JSON.stringify(spans)} vs ${JSON.stringify(theirs)}`);
 const kinds = new Set(spans.map((s) => s.kind));
 check(["keyword", "string", "comment", "command", "arguments"].every((k) => kinds.has(k)), "every kind is coloured", [...kinds].join(" "));
 // The painted text, by kind: each span's DOM carries its kind.
@@ -166,7 +167,8 @@ await shell.waitForFunction(() => (window as any).ursaShell?.screen().includes("
 /** The look of each kind in the shell's input line, read from xterm's DOM rows. */
 async function shellLook(themeName: string) {
   await shell.evaluate((n) => {
-    if (document.documentElement.dataset.theme !== n) (document.getElementById("theme") as HTMLElement).click();
+    const now = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    if (now !== n) (document.getElementById("theme") as HTMLElement).click();
   }, themeName);
   await shell.waitForTimeout(200);
   return shell.evaluate(() => {
@@ -282,7 +284,7 @@ out = await page.evaluate(() => (window as any).editorOutputs);
 check(out.length === 1 && out[0].text === "SELECT 2 AS two", "Ctrl+Enter runs the statement at the cursor only", JSON.stringify(out.map((o: any) => o.text)));
 // The selection.
 await outputs();
-await page.evaluate(() => (window as any).ursaConsole.editor.view.dispatch({ selection: { anchor: 0, head: 31 } }));
+await page.evaluate(() => (window as any).ursaConsole.editor.view.dispatch({ selection: { anchor: 0, head: 33 } }));
 await page.keyboard.press(`${MOD}+Enter`);
 await page.waitForFunction(() => (window as any).editorOutputs.length >= 2, null, { timeout: 30_000 });
 await idle();

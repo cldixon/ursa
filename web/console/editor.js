@@ -322,10 +322,11 @@ const errors = StateField.define({
     }
     return kept;
   },
+  // Each below the last line of its statement.
   provide: (f) =>
-    EditorView.decorations.from(f, (value) =>
+    EditorView.decorations.compute([f], (state) =>
       Decoration.set(
-        value.map((error) => Decoration.widget({ widget: new ErrorWidget(error), block: true, side: 1 }).range(error.lineEnd ?? error.to)),
+        state.field(f).map((error) => Decoration.widget({ widget: new ErrorWidget(error), block: true, side: 1 }).range(state.doc.lineAt(Math.min(error.to, state.doc.length)).to)),
         true,
       ),
     ),
@@ -333,10 +334,8 @@ const errors = StateField.define({
 
 /** Show `list` (replacing what is shown), as widgets and as the lint package's squiggles. */
 function showErrors(view, list) {
-  const doc = view.state.doc;
-  const withLines = list.map((e) => ({ ...e, lineEnd: doc.lineAt(e.to).to }));
   view.dispatch(
-    { effects: setErrors.of(withLines) },
+    { effects: setErrors.of(list) },
     setDiagnostics(
       view.state,
       list
@@ -379,7 +378,11 @@ function placeError(s, e) {
   let at = s.from;
   let until = s.to;
   const pos = message.match(/at Line: (\d+), Column: (\d+)/);
-  const quoted = [...message.matchAll(/['"`]([^'"`\s]{1,128})['"`]/g)].map((q) => q[1]);
+  // The names it gives: quoted, or after "named", "field", "column", "table"…
+  const quoted = [
+    ...[...message.matchAll(/['"`]([^'"`\s]{1,128})['"`]/g)].map((q) => q[1]),
+    ...[...message.matchAll(/(?<=\b(?:named|field|column|table|function|graph)\s+)([A-Za-z_][\w$.]{0,127})/gi)].map((q) => q[1]),
+  ];
   if (pos) {
     const lines = s.text.split("\n");
     const line = Number(pos[1]) - 1;
