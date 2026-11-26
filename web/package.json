@@ -6,6 +6,7 @@
     "@fontsource/ibm-plex-mono": "5.3.0",
     "@xterm/addon-fit": "0.11.0",
     "@xterm/xterm": "6.0.0",
+    "apache-arrow": "21.2.0",
     "cf": "1.0.0-beta.21",
     "typescript": "6.0.3",
     "wrangler": "4.152.0"
@@ -13,6 +14,7 @@
   "scripts": {
     "engine": "bun scripts/engine.ts",
     "build": "bun scripts/build.ts",
+    "console": "bun scripts/console.ts",
     "viz": "bun scripts/viz.ts",
     "check": "cf workers types && tsc -p .",
     "dev": "bun run build && cf dev",
@@ -20,6 +22,7 @@
     "upload:data": "bun scripts/upload-data.ts",
     "upload:engine": "bun scripts/upload-engine.ts",
     "test:e2e": "bun tests/e2e.ts",
+    "test:console": "bun tests/console.ts",
     "preview": "bun scripts/preview.ts"
   }
 }

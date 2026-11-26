@@ -47,6 +47,9 @@ static assets and an R2 bucket.
     `client.on(name, fn)` hears them on either transport. A
     WebAssembly trap fails its request with kind `crash`, and the page
     connects again to a fresh session.
+  - **The graph pane's styles** are `graph-pane.css`, which a host links
+    after `style.css` (whose tokens it uses): the shell, the console and the
+    pane host.
   - **`ursa serve`** (`ursa-server`) serves the same page with
     `<meta name="ursa-transport" content="socket">` in its index, and
     `engine-client.js` then picks `SocketTransport` (`socket-transport.js`):
@@ -784,6 +787,20 @@ static assets and an R2 bucket.
   a cross-origin resource could only be added if it sends CORP or CORS
   headers. The page has no inline script: the theme is
   set before the first paint by `public/theme.js`.
+- `console/`: the Ursa Console (`design/console.md` §6), `ursa serve`'s
+  page at `/console/` (the shell stays at `/`). Plain modules, no framework:
+  `console.html` (the page), `layout.js` (three columns of panels, the
+  splitters, folding, the drawers under 1024px, skip links and F6),
+  `session.js` (one engine client on the shared session, reconnecting when
+  it goes, and the requests running, which `cancel` stops) and
+  `console.js` (the theme and the status bar: the connection, the engine,
+  the session's root, and the running request with Cancel), styled by
+  `console.css` over the shell's `style.css` and `graph-pane.css`. Each
+  panel's body is a mount point for the issue named in its placeholder
+  (`window.ursaConsole.panels`). `bun run build` (or `bun run console`
+  alone) copies it, with apache-arrow bundled as `vendor/arrow.mjs`, into
+  `dist-console/console/`: never into `dist/`, which is deployed. `bun run
+  preview` serves it too, over the wasm engine (no Cancel there).
 - `scripts/`: building the engine, assembling `dist/`, and uploading to R2.
   `build.ts` also builds the graph view (`scripts/viz.ts`: `ursa-viz` with
   its `web` feature and the `wasm-release` profile, then wasm-bindgen) into
@@ -912,6 +929,25 @@ takes about 25, for a suite about a minute slower), and runs
 cargo cache. A failed run uploads the screenshots and the server's and suite's
 logs as the `shell-e2e` artifact (the worker) or `shell-e2e-serve` (the
 socket).
+
+The console's own test, `tests/console.ts`, starts `ursa serve` itself
+(it stops and restarts it), with `dist-console` and `dist`:
+
+```sh
+bun run build && cargo build --release -p ursa-cli --features serve
+bun run test:console -- 8981                  # [port] [ursa binary] [screenshot dir]
+```
+
+It opens the link `ursa serve` prints and checks that the console connects
+to the shared session and names the engine and the session's root; the six
+panels with their labels and mount points, in both themes; the skip links,
+F6, the focus order and rings, the splitters' keys and drag, folding, the
+side columns' buttons, and the layout kept across a reload; a phone's
+drawers with no sideways scroll; Cancel stopping a long query, with the
+session going on; the page saying the server stopped, then that it was
+restarted with a new link, and reconnecting once the link is opened; the
+shell still at `/`; and no page error or Content Security Policy violation.
+CI does not run it yet.
 
 ## Datasets
 

@@ -1082,6 +1082,24 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The Ursa Console's page: `ursa serve`'s link opens it** (URSA-12,
+  `design/console.md` §6). At `/console/`, with the shell still at `/`: a
+  sources and catalog column, the editor over the result tabs, and the
+  inspector over History, each panel an empty mount point labelled with the
+  issue that fills it. The columns and panels resize (drag a splitter, or
+  focus it and use the arrow keys), fold, and become drawers under 1024px;
+  skip links, F6 between panels and a visible focus ring keep it keyboard
+  reachable; light and dark come from the shell's tokens. The status bar
+  shows the connection (to the shared session, reconnecting when the server
+  goes, and saying when it was restarted with a new link), the engine's
+  version, the session's root, and the request running with a Cancel button
+  (`cancel {target}`, through `engine-client.js`'s new `cancel(reply)`).
+  `bun run build` builds it into `web/dist-console/`, never into the
+  deployed `web/dist/`; `ursa serve` serves both (`--assets` may be
+  repeated) and builds both in with `serve-embed`. The graph pane's styles
+  move from `style.css` into `graph-pane.css`, which the shell links; the
+  shell looks and behaves as before.
+
 ### Changed
 
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**

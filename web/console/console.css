@@ -1,0 +1,318 @@
+/* The Ursa Console (design/console.md §6). On top of the shell's style.css,
+   whose tokens (colours, light and dark), fonts, header bar and theme button
+   it uses as they are, and graph-pane.css. Its own tokens below are mixed
+   from the shell's, so they follow the theme with them. */
+
+:root {
+  /* The side columns, a shade off the ground; the panels' headers. */
+  --side-bg: color-mix(in srgb, var(--fg) 2.5%, var(--bg));
+  --head-fg: var(--muted);
+  --splitter-hover: color-mix(in srgb, var(--accent) 55%, transparent);
+  --placeholder-border: color-mix(in srgb, var(--fg) 14%, var(--bg));
+  --chip-bg: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  --chip-fg: color-mix(in srgb, var(--accent) 80%, var(--fg));
+  --status-bg: var(--side-bg);
+  /* The connection's dot: the state is in words beside it too. */
+  --state-ok: #1d8a5f;
+  --state-wait: #b7791f;
+  --state-down: var(--error);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --side-bg: color-mix(in srgb, var(--fg) 3.5%, var(--bg));
+    --state-ok: #3fcf8e;
+    --state-wait: #f0b54a;
+  }
+}
+:root[data-theme="dark"] {
+  --side-bg: color-mix(in srgb, var(--fg) 3.5%, var(--bg));
+  --state-ok: #3fcf8e;
+  --state-wait: #f0b54a;
+}
+
+.console-page { overflow: hidden; }
+
+/* Hidden but read: the status bar's announcements and labels. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Everything the keyboard reaches shows it. */
+.console-page :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.panel:focus-visible,
+.statusbar:focus-visible {
+  outline-offset: -2px;
+}
+
+/* ---------------------------------------------------------------- skip links */
+
+.skip-links a {
+  position: absolute;
+  z-index: 100;
+  top: 8px;
+  left: 8px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--fg);
+  color: var(--bg);
+  font-size: 14px;
+  text-decoration: none;
+  transform: translateY(-200%);
+}
+.skip-links a:focus-visible { transform: none; outline-offset: 2px; }
+
+/* ---------------------------------------------------------------- header */
+
+.console-head .console-head-side { display: flex; align-items: center; gap: 6px; }
+.console-head .console-head-side.right { justify-content: flex-end; }
+.icon-button {
+  width: 34px;
+  height: 34px;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+}
+.icon-button svg { width: 18px; height: 18px; display: block; }
+.icon-button .fill { fill: currentColor; opacity: 0; }
+.icon-button[aria-expanded="true"] .fill { opacity: 0.35; }
+.icon-button:hover, .theme:hover { color: var(--prompt); }
+
+/* ---------------------------------------------------------------- columns */
+
+.console {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.column {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.column[hidden], .splitter[hidden], .panel-body[hidden] { display: none; }
+.column.side { flex: none; background: var(--side-bg); }
+.column.left { width: var(--left-width, 272px); }
+.column.right { width: var(--right-width, 300px); }
+.column.main { flex: 1; min-width: 320px; }
+
+/* ---------------------------------------------------------------- panels */
+
+.panel {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.panel:not(.folded) { min-height: 96px; }
+.panel.folded { flex: none; }
+.panel + .panel { border-top: 1px solid var(--border); }
+.panel-head {
+  flex: none;
+  margin: 0;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 8px 0 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--head-fg);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.panel-toggle:hover { color: var(--fg); }
+.panel-toggle .chevron { width: 12px; height: 12px; transition: transform 0.12s; }
+.panel-toggle[aria-expanded="false"] .chevron { transform: rotate(-90deg); }
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-color: var(--scrollbar) transparent;
+}
+
+/* An empty panel: what will be here, and the issue that brings it. */
+.placeholder {
+  margin: 4px 12px 12px;
+  padding: 14px 16px 16px;
+  border: 1px dashed var(--placeholder-border);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.placeholder p { margin: 0; }
+.placeholder .what { margin: 8px 0 4px; color: var(--fg); font-size: 14px; font-weight: 600; }
+.placeholder .issue {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--chip-bg);
+  color: var(--chip-fg);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.main .placeholder { max-width: 520px; }
+
+/* ---------------------------------------------------------------- splitters */
+
+/* A thin line, with a wider grip to drag and a focus ring to show. */
+.splitter {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  background: var(--border);
+  touch-action: none;
+}
+.splitter.columns { width: 1px; cursor: col-resize; }
+.splitter.rows { height: 1px; cursor: row-resize; }
+.splitter::after { content: ""; position: absolute; }
+.splitter.columns::after { inset: 0 -4px; }
+.splitter.rows::after { inset: -4px 0; }
+.splitter:hover, .splitter.dragging { background: var(--splitter-hover); }
+.splitter.columns:hover, .splitter.columns.dragging, .splitter.columns:focus-visible { box-shadow: 0 0 0 1px var(--splitter-hover); }
+.splitter.rows:hover, .splitter.rows.dragging, .splitter.rows:focus-visible { box-shadow: 0 0 0 1px var(--splitter-hover); }
+.splitter:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; background: var(--accent); }
+/* The panel after a row splitter draws no border of its own. */
+.splitter.rows + .panel { border-top: 0; }
+body.resizing-columns { cursor: col-resize; user-select: none; }
+body.resizing-rows { cursor: row-resize; user-select: none; }
+
+/* ---------------------------------------------------------------- status bar */
+
+.statusbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 30px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  background: var(--status-bg);
+  color: var(--muted);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.status-connection, .status-running, .status-session { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.status-running[hidden] { display: none; }
+#connection { overflow: hidden; text-overflow: ellipsis; }
+.status-session { margin-left: auto; gap: 16px; }
+.statusbar .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--state-wait); }
+.statusbar[data-state="connected"] .dot { background: var(--state-ok); }
+.statusbar[data-state="reconnecting"] .dot { background: var(--state-down); }
+.statusbar[data-state="connected"] #connection { color: var(--fg); }
+.statusbar[data-state="reconnecting"] #connection { color: var(--error); }
+.statusbar[data-state="reconnecting"] .status-session { opacity: 0.55; }
+.retry-in:empty { display: none; }
+.status-button {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.status-button:hover { color: var(--prompt); border-color: currentColor; }
+.status-button[hidden] { display: none; }
+.status-button:disabled { opacity: 0.6; cursor: default; }
+.status-running { color: var(--fg); }
+.status-running .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.spinner {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: console-spin 0.8s linear infinite;
+}
+@keyframes console-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; border-color: var(--accent); }
+  .panel-toggle .chevron { transition: none; }
+}
+.status-session .root, .status-session .engine { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.status-session .root[hidden], .status-session .engine[hidden] { display: none; }
+.status-session .root svg { flex: none; width: 14px; height: 14px; }
+/* A long root keeps its end, which names it: cut from the left (the path
+   itself, in its <bdi>, still reads left to right). */
+.status-session .root .root-clip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  max-width: 42vw;
+}
+
+/* ---------------------------------------------------------------- narrow */
+
+/* Under 1024px: the side columns are drawers over the editor, one at a
+   time, shown by the header's buttons and closed by Esc or the scrim. */
+.scrim { display: none; }
+@media (max-width: 1023px) {
+  .column.side {
+    position: absolute;
+    z-index: 20;
+    top: 0;
+    bottom: 0;
+    width: min(340px, calc(100% - 48px));
+    box-shadow: 0 10px 32px #00000038;
+    border: 0;
+  }
+  .column.left { left: 0; border-right: 1px solid var(--border); }
+  .column.right { right: 0; border-left: 1px solid var(--border); }
+  .column.main { min-width: 0; }
+  .scrim:not([hidden]) {
+    display: block;
+    position: absolute;
+    z-index: 15;
+    inset: 0;
+    background: color-mix(in srgb, var(--bg) 45%, transparent);
+  }
+}
+
+/* A phone: the shell's one-row bar keeps the console's name, and the status
+   bar what matters most: the connection and the request running. */
+@media (max-width: 640px) {
+  .console-head { justify-content: space-between; }
+  .console-head .brand { order: 0; }
+  .console-head .brand .label { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+  .console-head .console-head-side { flex: none; }
+  .statusbar { gap: 10px; padding: 0 10px; }
+  .status-session .engine { display: none; }
+  .status-session .root .root-clip { max-width: 30vw; }
+  .placeholder { margin: 4px 10px 10px; }
+}
+@media (max-width: 420px) {
+  .status-session { display: none; }
+}

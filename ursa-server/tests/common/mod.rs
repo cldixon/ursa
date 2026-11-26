@@ -15,10 +15,13 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 pub type Socket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
-/// A running server, serving a directory with one CSV and a page.
+/// A running server, serving a directory with one CSV, and the pages: the
+/// shell's (`dist`) and the console's (`dist-console`).
 pub struct Server {
     pub port: u16,
     pub token: String,
+    /// The link `ursa serve` prints.
+    pub url: String,
     pub dir: tempfile::TempDir,
     stop: Option<oneshot::Sender<()>>,
     pub served: Option<JoinHandle<std::io::Result<()>>>,
@@ -41,14 +44,22 @@ impl Server {
         )
         .unwrap();
         std::fs::write(assets.join("app.js"), "export {};").unwrap();
+        let console = dir.path().join("dist-console");
+        std::fs::create_dir_all(console.join("console")).unwrap();
+        std::fs::write(
+            console.join("console").join("index.html"),
+            "<!doctype html><html><head><title>console</title></head></html>",
+        )
+        .unwrap();
+        std::fs::write(console.join("console").join("console.js"), "export {};").unwrap();
         let config = ursa_server::Config {
             root: dir.path().to_path_buf(),
             port: 0,
-            assets: ursa_server::Assets::Dirs(vec![assets]),
+            assets: ursa_server::Assets::Dirs(vec![console, assets]),
             version: "test".into(),
         };
         let bound = ursa_server::bind(config).await.unwrap();
-        let (port, token) = (bound.port(), bound.token().to_string());
+        let (port, token, url) = (bound.port(), bound.token().to_string(), bound.url());
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(bound.serve_with_shutdown(async {
             let _ = stopped.await;
@@ -56,6 +67,7 @@ impl Server {
         Server {
             port,
             token,
+            url,
             dir,
             stop: Some(stop),
             served: Some(served),
