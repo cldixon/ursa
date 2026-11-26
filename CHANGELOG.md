@@ -2290,6 +2290,11 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   first. `ursaConsole.editor.insert(".graph karate", {statement: true})`
   gave `.graph karate;`; a dot-command now gets no `;` (the Catalog panel's
   graphs).
+- **`ursa serve`: `cancel`'s reply always comes before its target's
+  `cancelled`.** The server told the target to stop before handing `cancel`'s
+  own reply to the writer, so the target's `cancelled` could be written first
+  (`ursa-server/tests/protocol.rs`, `cancel_stops_a_running_request`, failed in
+  CI). The reply is now queued first, as the protocol says.
 - **`ursa serve` no longer panics on Ctrl+C** (URSA-22). It sometimes
   exited 101 (a panic: `JoinHandle polled after completion`) instead of
   stopping with "Stopping.": when a listener ended between the two polls of
