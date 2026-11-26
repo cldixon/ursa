@@ -15,10 +15,13 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 pub type Socket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
-/// A running server, serving a directory with one CSV and a page.
+/// A running server, serving a directory with one CSV, and the pages: the
+/// shell's (`dist`) and the console's (`dist-console`).
 pub struct Server {
     pub port: u16,
     pub token: String,
+    /// The link `ursa serve` prints.
+    pub url: String,
     pub dir: tempfile::TempDir,
     stop: Option<oneshot::Sender<()>>,
     pub served: Option<JoinHandle<std::io::Result<()>>>,
@@ -41,14 +44,22 @@ impl Server {
         )
         .unwrap();
         std::fs::write(assets.join("app.js"), "export {};").unwrap();
+        let console = dir.path().join("dist-console");
+        std::fs::create_dir_all(console.join("console")).unwrap();
+        std::fs::write(
+            console.join("console").join("index.html"),
+            "<!doctype html><html><head><title>console</title></head></html>",
+        )
+        .unwrap();
+        std::fs::write(console.join("console").join("console.js"), "export {};").unwrap();
         let config = ursa_server::Config {
             root: dir.path().to_path_buf(),
             port: 0,
-            assets: ursa_server::Assets::Dirs(vec![assets]),
+            assets: ursa_server::Assets::Dirs(vec![console, assets]),
             version: "test".into(),
         };
         let bound = ursa_server::bind(config).await.unwrap();
-        let (port, token) = (bound.port(), bound.token().to_string());
+        let (port, token, url) = (bound.port(), bound.token().to_string(), bound.url());
         let (stop, stopped) = oneshot::channel::<()>();
         let served = tokio::spawn(bound.serve_with_shutdown(async {
             let _ = stopped.await;
@@ -56,6 +67,7 @@ impl Server {
         Server {
             port,
             token,
+            url,
             dir,
             stop: Some(stop),
             served: Some(served),
@@ -180,16 +192,26 @@ pub async fn send(socket: &mut Socket, id: u32, op: &str, args: Value, parts: &[
     }
 }
 
-/// The next reply: its JSON and its parts.
-pub async fn receive(socket: &mut Socket) -> (Value, Vec<Vec<u8>>) {
+/// The next message, a reply or an event: its JSON.
+pub async fn next_message(socket: &mut Socket) -> Value {
     let text = loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => break text,
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            other => panic!("no reply: {other:?}"),
+            other => panic!("no message: {other:?}"),
         }
     };
-    let reply: Value = serde_json::from_str(&text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The next reply, past any events: its JSON and its parts.
+pub async fn receive(socket: &mut Socket) -> (Value, Vec<Vec<u8>>) {
+    let reply = loop {
+        let message = next_message(socket).await;
+        if message.get("event").is_none() {
+            break message;
+        }
+    };
     let mut bytes = Vec::new();
     for (index, part) in reply["parts"].as_array().into_iter().flatten().enumerate() {
         let Some(Ok(Message::Binary(frame))) = socket.next().await else {

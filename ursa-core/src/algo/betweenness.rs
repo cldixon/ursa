@@ -669,8 +669,10 @@ mod tests {
                         while let Some(v) = queue.pop_front() {
                             order.push(v);
                             let dv = dist[v as usize];
-                            for (&x, &e) in out.neighbors(v).iter().zip(out.edge_ids(v)) {
-                                if !kept(e) {
+                            // Edge rows only under a mask (#170).
+                            let ids = mask.map(|_| out.edge_ids(v));
+                            for (i, &x) in out.neighbors(v).iter().enumerate() {
+                                if ids.is_some_and(|ids| !kept(ids[i])) {
                                     continue;
                                 }
                                 if dist[x as usize] < 0 {

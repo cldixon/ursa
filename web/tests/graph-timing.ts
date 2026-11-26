@@ -2,7 +2,14 @@
 // use, in headless Chromium, against a running site: `bun run preview`
 // (http://localhost:8788).
 //
-//   bun tests/graph-timing.ts [url] [runs] [dataset]      (WHEEL_MS=, CHANNEL=shell)
+//   bun tests/graph-timing.ts [url] [runs] [dataset]      (WHEEL_MS=, CHANNEL=shell, FIRST_ONLY=1)
+//
+// Against `ursa serve` (the native engine over a WebSocket, URSA-7), set
+// URSA_SERVE_TOKEN to the token in the link it printed, as
+// scripts/e2e-serve.ts does: every context then carries its cookie. With
+// FIRST_ONLY=1 a run ends at the first frame (the steps up to the layout's
+// end, and the page's long tasks), which is what comparing the two
+// transports needs, and the rest is skipped.
 //
 // Each run is a fresh browser context (nothing cached), the dataset loaded
 // (rmat unless named), then `.graph <dataset>` typed. Everything it prints
@@ -63,7 +70,9 @@ const wheelMs = Number(process.env.WHEEL_MS ?? 5000);
 // mode) has it, so that is what runs unless CHANNEL=shell, or it is not
 // installed. Without the flag the browser answers after a garbage collection
 // of its own choosing, up to a minute later.
-const args = ["--enable-blink-features=ForceEagerMeasureMemory"];
+const serveToken = process.env.URSA_SERVE_TOKEN ?? "";
+const firstOnly = process.env.FIRST_ONLY === "1";
+const args = ["--enable-blink-features=ForceEagerMeasureMemory", ...(serveToken ? ["--disable-features=LocalNetworkAccessChecks"] : [])];
 const browser =
   process.env.CHANNEL === "shell"
     ? await chromium.launch({ args })
@@ -85,6 +94,7 @@ const slow: string[] = [];
 const mb = (bytes: number | null | undefined) => (bytes == null ? "–" : `${(bytes / 2 ** 20).toFixed(1)} MiB`);
 for (let r = 0; r < runs; r++) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
+  if (serveToken) await ctx.addCookies([{ name: `ursa_token_${new URL(base).port}`, value: serveToken, url: base }]);
   const p = await ctx.newPage();
   p.on("pageerror", (e) => console.error(`page error: ${e.message}`));
   await p.goto(`${base}/?dataset=${dataset}`);
@@ -146,6 +156,13 @@ for (let r = 0; r < runs; r++) {
   // (the run fails if their median is over 30 ms, or if the graph itself
   // is not reached). Then full detail is forced (`.graph detail on`):
   // everything below is of the million edges themselves, as before #498.
+  if (firstOnly) {
+    rel.shown = shown?.frame;
+    console.log("  main-thread tasks over 50 ms since Enter [start, ms]:", JSON.stringify(t.longTasks.filter((l: any) => l.start + l.duration > 0).map((l: any) => [l.start, l.duration])));
+    all.push(rel);
+    await ctx.close();
+    continue;
+  }
   if (dataset === "rmat") {
     const graph = () => p.evaluate(() => (window as any).ursaShell.graph());
     const cutAtRest = () => p.waitForFunction(() => { const g = (window as any).ursaShell.graph(); return g && !g.cuts.waiting; }, null, { timeout: 60_000, polling: 50 });
@@ -363,7 +380,7 @@ const keys = Object.keys(all[0]).filter((k) => !steps.includes(k)).sort((a, b) =
 console.log("median ms from Enter:");
 for (const k of keys) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);
 console.log("median, in use:");
-for (const k of steps) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);
+for (const k of steps.filter((k) => all.some((x) => k in x))) console.log(`  ${k.padEnd(16)} ${median(all.map((x) => x[k]))}`);
 await browser.close();
 if (slow.length) {
   console.error("\nFAIL:\n" + slow.join("\n"));

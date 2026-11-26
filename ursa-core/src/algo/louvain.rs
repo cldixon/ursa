@@ -1135,6 +1135,17 @@ impl Graph {
         // Under a subgraph mask, only kept edges enter the working graph. The
         // histogram and scatter below share this predicate so segment sizes match.
         let keep = |e: u32| mask.is_none_or(|m| m.keep(e));
+        // Each out-slot of node `uo`: its neighbour, and its edge row when a
+        // mask or a weight reads it. Without either, the edge ids are never
+        // read, so never built (#170); the row then reads as 0, unused.
+        let ids = (mask.is_some() || weights.is_some()).then(|| &out.edge_ids[..]);
+        let slots = |uo: u32| {
+            let lo = out.offsets[uo as usize] as usize;
+            out.neighbors(uo)
+                .iter()
+                .enumerate()
+                .map(move |(i, &v)| (v, ids.map_or(0, |ids| ids[lo + i])))
+        };
 
         // Source-node chunks of roughly equal out-slot count. Chunk count is capped
         // by mean degree, as in `transpose`, so the per-chunk histograms (n u32s
@@ -1164,7 +1175,7 @@ impl Graph {
             let mut h = vec![0u32; n];
             for u in lo as u32..hi as u32 {
                 let uo = node(u);
-                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
+                for (v, e) in slots(uo) {
                     let v = at(v);
                     if keep(e) && u != v {
                         h[u as usize] += 1;
@@ -1208,7 +1219,7 @@ impl Graph {
             let mut loops = vec![0.0f64; hi - lo];
             for u in lo as u32..hi as u32 {
                 let uo = node(u);
-                for (&v, &e) in out.neighbors(uo).iter().zip(out.edge_ids(uo)) {
+                for (v, e) in slots(uo) {
                     if !keep(e) {
                         continue;
                     }

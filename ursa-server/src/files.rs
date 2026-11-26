@@ -1,10 +1,14 @@
 //! The page's files, and the served directory's data files at `/data/`.
 //!
-//! The page's files hold no data and need no token (§5). `/` with the run's
-//! token sets it as a cookie and drops it from the address; the index is
-//! served with a `<meta name="ursa-transport" content="socket">`, which tells
-//! the page to talk to this server (`socket-transport.js`) and not start the
-//! wasm engine. `/data/PATH` serves a file under the root directory (no `..`,
+//! The page's files hold no data and need no token (§5). There are two
+//! pages: the console at `/console/` (`web/console/`, built into
+//! `web/dist-console/console/`), which `ursa serve`'s link opens, and the
+//! Web Shell at `/` (`web/dist/index.html`), where the browser demo's
+//! addresses and share links have it. Either, with the run's token, sets it
+//! as a cookie and drops it from the address; each is served with a
+//! `<meta name="ursa-transport" content="socket">`, which tells the page to
+//! talk to this server (`socket-transport.js`) and not start the wasm
+//! engine. `/data/PATH` serves a file under the root directory (no `..`,
 //! no hidden names) to a page with the token, with `HEAD` and byte ranges, as
 //! the deploy serves the datasets; a range is read from the file, not the
 //! whole file.
@@ -86,6 +90,30 @@ fn decode(path: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// The console's address, beside the shell's `/`.
+pub const CONSOLE: &str = "/console/";
+
+/// The console's page, among the page's files.
+const CONSOLE_INDEX: &str = "console/index.html";
+
+/// The page served at `path`, if `path` is one: the shell's index, or the
+/// console's.
+fn page(path: &str) -> Option<&'static str> {
+    match path {
+        "/" | "/index.html" => Some("index.html"),
+        "/console/" | "/console/index.html" => Some(CONSOLE_INDEX),
+        _ => None,
+    }
+}
+
+/// Whether `assets` have the console's page (`bun run build` makes it).
+pub(crate) fn has_console(assets: &Assets) -> bool {
+    match assets {
+        Assets::Dirs(dirs) => dirs.iter().any(|dir| within(dir, CONSOLE_INDEX).is_some()),
+        Assets::Embedded => embedded(CONSOLE_INDEX).is_some(),
+    }
+}
+
 /// The page's file at `path` (`index.html`, `app.js`, …).
 async fn page_file(assets: &Assets, path: &str) -> Option<Cow<'static, [u8]>> {
     match assets {
@@ -105,7 +133,17 @@ fn embedded(path: &str) -> Option<Cow<'static, [u8]>> {
     #[exclude = "engine/*"]
     struct Ui;
 
-    Ui::get(&pieces(path)?.join("/")).map(|file| file.data)
+    /// `web/dist-console`: the console's own files, under `console/`. A build
+    /// without them serves the shell alone.
+    #[derive(rust_embed::RustEmbed)]
+    #[folder = "../web/dist-console"]
+    #[allow_missing = true]
+    struct Console;
+
+    let path = pieces(path)?.join("/");
+    Console::get(&path)
+        .or_else(|| Ui::get(&path))
+        .map(|file| file.data)
 }
 
 #[cfg(not(feature = "embed"))]
@@ -123,8 +161,16 @@ pub(crate) async fn asset(State(shared): State<Arc<Shared>>, request: Request) -
     let Some(path) = decode(uri.path()) else {
         return not_found();
     };
-    if path == "/" || path == "/index.html" {
-        return index(&shared, uri.query()).await;
+    if let Some(file) = page(&path) {
+        return index(&shared, &path, file, uri.query()).await;
+    }
+    // The console's own files are beside its page: its address ends in `/`.
+    if path == "/console" {
+        let location = match uri.query() {
+            Some(query) => format!("{CONSOLE}?{query}"),
+            None => CONSOLE.to_string(),
+        };
+        return (StatusCode::PERMANENT_REDIRECT, [(LOCATION, location)]).into_response();
     }
     let Some(bytes) = page_file(&shared.config.assets, &path).await else {
         return not_found();
@@ -147,10 +193,11 @@ pub(crate) async fn asset(State(shared): State<Arc<Shared>>, request: Request) -
         .into_response()
 }
 
-/// `/`: the shell's page, for this server. With `?token=`, a cookie for the
-/// token and a redirect to the same page without it, so the token is never
-/// in the address the page shares (`.share` links).
-async fn index(shared: &Shared, query: Option<&str>) -> Response {
+/// A page (`/`, the shell, or `/console/`), from its `file`, for this
+/// server. With `?token=`, a cookie for the token and a redirect to the same
+/// page without it, so the token is never in the address the page shares
+/// (`.share` links).
+async fn index(shared: &Shared, path: &str, file: &str, query: Option<&str>) -> Response {
     if let Some(token) = query_param(query, "token") {
         if !token_ok(shared, Some(&token), &HeaderMap::new()) {
             return (
@@ -165,9 +212,9 @@ async fn index(shared: &Shared, query: Option<&str>) -> Response {
             .filter(|p| !p.is_empty() && p.split_once('=').map_or(*p, |(k, _)| k) != "token")
             .collect();
         let location = if rest.is_empty() {
-            "/".to_string()
+            path.to_string()
         } else {
-            format!("/?{}", rest.join("&"))
+            format!("{path}?{}", rest.join("&"))
         };
         return (
             StatusCode::SEE_OTHER,
@@ -175,7 +222,7 @@ async fn index(shared: &Shared, query: Option<&str>) -> Response {
         )
             .into_response();
     }
-    let Some(html) = page_file(&shared.config.assets, "index.html").await else {
+    let Some(html) = page_file(&shared.config.assets, file).await else {
         return (
             StatusCode::NOT_FOUND,
             "this ursa has no page to serve: build web/ (bun run build) and pass --assets web/dist\n",

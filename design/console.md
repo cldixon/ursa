@@ -112,7 +112,7 @@ The graph view (`graph.js`, `graph-worker.js` and the `ursa-viz` wasm) never tou
 ### The web side
 
 - **`engine-client.js`:** `connect(transport)` returns `{call(op, args), on(event, fn), close()}`. `WorkerTransport` wraps today's worker; `SocketTransport` opens `ws://127.0.0.1:PORT/session`. `app.js`'s `engine()` becomes a call to this client, with no other change.
-- **The console:** a second entry point beside the shell (`web/console.html`), sharing `engine-client.js` and the graph modules. The graph modules stop writing to the terminal directly: they call a `commands` sink the host provides (the terminal in the shell, the history panel in the console). Done in C1 (URSA-8): `graph-pane.js`'s `createPane({container, engine, commands, status})` is the pane for any host. It owns its markup, search, Esc, the not-shown counts and the theme, and runs the graph commands itself (`pane.exec(line)`); the sink, `commands(command, {via, current})`, receives what the view, the inspector and the search ask to run, and the host hands each back to `pane.exec` once it has shown it.
+- **The console:** a second entry point beside the shell (`web/console/`, served at `/console/`; URSA-12), sharing `engine-client.js` and the graph modules. The graph modules stop writing to the terminal directly: they call a `commands` sink the host provides (the terminal in the shell, the history panel in the console). Done in C1 (URSA-8): `graph-pane.js`'s `createPane({container, engine, commands, status})` is the pane for any host. It owns its markup, search, Esc, the not-shown counts and the theme, and runs the graph commands itself (`pane.exec(line)`); the sink, `commands(command, {via, current})`, receives what the view, the inspector and the search ask to run, and the host hands each back to `pane.exec` once it has shown it.
 
 ## 4. The session protocol
 
@@ -173,6 +173,8 @@ Over the WebSocket, the JSON goes in a text frame, and each part follows in its 
 
 A reply is complete when its text frame and every part it lists have arrived. Frames of different replies don't interleave: the session sends one reply at a time.
 
+The page holds the socket in a worker of its own (`web/public/socket-worker.js`, URSA-7), not on its own thread: a large part is received there, and the complete reply is posted to the page with its parts' buffers transferred, as `engine-worker.js` posts its own. A part is not copied out of its frame: the client gives it as the frame's buffer with an `offset` of 8 (`engine-client.js`'s header).
+
 Part kinds:
 - **`ugr`:** a `GraphResult` or a `GraphDelta`, as `ursa-viz/UGR.md` defines them. No change to UGR.
 - **`arrow`:** an Arrow IPC stream (schema, then record batches), which the console decodes with `apache-arrow`'s JS reader. The `ursa.*` field metadata travels inside the schema.
@@ -198,7 +200,7 @@ Part kinds:
 | `export` | `result?`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes`; without `result`, the last result |
 | `close` | `result` | `{}` |
 | `explain` | `sql` | `{plan}`: the plan as text |
-| `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
+| `complete` | `sql`, `cursor` | `{from, to, items: [{label, kind, detail}]}`: tables, columns (qualified after `t.`), functions, graphs, keywords, dot-commands |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
 - `columns` gives each column's `{name, type, nullable, metadata}`; `metadata` is the schema's own, where `ursa.pattern` sits for a `GRAPH_TABLE` result.
@@ -206,17 +208,24 @@ Part kinds:
 - `query` collects every row before it replies, as its reply gives the whole result's count and the shell's last result holds every row. Sending the first rows sooner needs `rows` to come later (an event, or `fetch`'s `more`): C2.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
+- `complete` and `highlight` count offsets (`cursor`, `from`, `to`) in UTF-16 code units, as JavaScript strings and CodeMirror do. `complete`'s items replace `from`..`to`, the word at the cursor; it reads the catalog and the function registry and runs no query. `highlight` gives no span for plain text. *(URSA-13.)*
 
 **Catalog and sources.**
 
 | op | args | result |
 |---|---|---|
-| `catalog` | — | `{databases: [{name, schemas: [{name, tables: [{name, kind, columns}]}]}], graphs: [{name, vertices, edges}]}` |
+| `catalog` | — | `{databases: [{name, schemas: [{name, tables: [{name, kind, columns: [{name, type, nullable}]}]}]}], graphs: [{name, vertices, edges}]}` |
 | `sources.list` | `url`: a directory or a bucket prefix (`file:///data/`, `s3://bucket/prefix/`) | `{entries: [{name, url, kind: "dir" \| "file", format, bytes}]}` |
-| `sources.attach` | `url`, `as` | `{}`: the same as `ATTACH` |
+| `sources.attach` | `url`, `as?` | `{}`: the same as `ATTACH` |
 | `files`, `addFile` | as today | as today, for uploads into `memory://uploads` |
 
 `catalog` changes are announced: after any statement that changes the catalog, the session sends `{"event": "catalog"}`, and clients refetch.
+
+As built *(URSA-15, URSA-16)*:
+- `catalog`'s databases are the session's catalogs. `kind` is `table`, `view` or `external` (a table of files, DataFusion's `ListingTable`). `information_schema` and the graphs' own schemas (`<graph>.nodes`, `<graph>.edges`) are left out: graphs are under `graphs`, each `{name, vertices: [{name, table, key}], edges: [{name, table, source, destination}]}`; a graph of the database that could not be defined has no tables and an `error`.
+- The `catalog` event is found by comparing a fingerprint of what `catalog` answers before and after each request that may change it (`start`, `feed`, `query`, `sources.attach`), not by reading statements. That catches `CREATE`, `DROP`, `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, `.read` scripts and dataset loads alike, and a request that failed or was cancelled halfway. `Session::take_events` gives a request's events; the host sends them before its reply.
+- `sources.list` and `sources.attach` need capability `sources`, which a session with a directory root has (`ursa serve DIR`); the browser demo has none. A local directory is listed only under the root: the path asked for is resolved through its symbolic links and refused (`protocol`) outside the root, and entries whose links lead outside, and hidden ones, are left out. Local directories are read with `std::fs`, to resolve each entry's links; bucket prefixes (`s3://`, `gs://`, `az://`) with `object_store`'s `list_with_delimiter`, through the session's object-store registry and its credential chain. Entries are directories first, then by name; `format` (`parquet`, `csv`, `json`, `arrow`, `ursa` or `null`) is from the extension, and `bytes` is `null` for a directory. A URL in a reply is `scheme://bucket/key` or `file:///path`: no credentials, query strings or signatures.
+- `sources.attach {url, as?}` runs `ATTACH 'url' [AS as]` (a `file://` URL as its path). `ATTACH … AS` is not supported yet, so `as` fails as the statement does.
 
 **Graphs.**
 
@@ -250,11 +259,13 @@ The terminal UI runs on these over either transport.
 |---|---|---|
 | `progress` | while a request runs, at most every 250 ms | `for`, `phase`, `rows?`, `bytes?` |
 | `notice` | the engine reports something (an index built, a setting adjusted) | `text`, `for?` |
-| `catalog` | the catalog changed | — |
+| `catalog` | the catalog changed (built: URSA-15) | — |
 | `graph` | the open graph changed | `by: client`, `nodes`, `edges`; with a `ugr` part, a delta |
 | `activity` | another client ran something (§9) | `client`, `op`, `summary` |
 
 The `graph` and `activity` events matter once a second client is attached. With one client they are sent and can be ignored.
+
+Every event goes to every connection attached to the session, whichever one's request caused it. Over the WebSocket, an event is a text frame of its own, never between a reply's frames; over `postMessage`, the worker posts it as a message of its own. `engine-client.js` hands it to `client.on(name, fn)`.
 
 ### 4.5 Ordering and concurrency
 
@@ -282,6 +293,7 @@ ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 - **The argument** is a database file, opened as the CLI opens one, or a directory. Relative paths in queries resolve against it, and the sources panel starts there. With no argument, it is an in-memory session rooted at the current directory. The session's root is the directory (a database file's own directory), set with `ursa_shell::session::Options::root`, not by changing the process's working directory. A rooted session reads any file, as the CLI does, but writes only under its root: `COPY … TO` (to disk, `Options::copy_to_disk`), `.output` and `.once` take a relative path with no `..` and no symbolic link out of the root, and `INSERT INTO` a table of files must be into files under it (`ursa_engine::paths`). `memory://uploads` holds only the files a page adds.
 - **The port** is a fixed default (proposed 4280), so bookmarks work. If it's taken, the server uses the next free port and says so.
 - **Startup** prints the URL with its token and opens it in the default browser unless `--no-open`. Ctrl+C stops the server and closes the session.
+- **The pages:** the console at `/console/`, which the printed link opens, and the web shell at `/`, where the demo's addresses and share links have it. *(Decided in URSA-12: the console as the index would have moved the shell, its share links and its e2e suite; a path of its own moves nothing.)*
 - **`--read-only`** refuses statements that write: `COPY TO`, `CREATE` in an attached database, `INSERT`, and the rest. It is meant for pairing with an agent (§9).
 - **Sessions:** `hello {session: "new"}` (the shell's choice) gives a tab a session of its own; `hello {session: "shared"}` (the default) attaches it to the server's one shared session, which every tab and agent that asks for it sees (§9). A shared session's requests from every connection run in one queue. *(Changed by the spike, #536, and URSA-3: one session per process did not fit the shell, whose `start` replaces its session.)*
 - **Ctrl+C stops it gracefully:** no new connections, every running request cancelled, every WebSocket closed (code 1001, "the server stopped"), and the sessions ended.
@@ -291,7 +303,7 @@ ursa serve [DATABASE | DIRECTORY] [--port N] [--no-open] [--read-only]
 The native engine reads any file and any bucket the user's credentials reach, so the server must be reachable only by the user's own browser tab.
 
 - **Bind to `127.0.0.1` and `::1` only.** There is no flag to bind elsewhere in v1.
-- **A token:** 32 random bytes, base64url, made at startup, in the printed link (`/?token=…`). The server takes it from the URL once: it answers with an `HttpOnly`, `SameSite=Strict` cookie named for its port (`ursa_token_4280`; cookies are shared across a host's ports) and a redirect to the same address without it, so the token never reaches the page's scripts or its share links. The WebSocket (`/session`) and the served directory's files (`/data/`, with byte ranges) need it: the cookie, or `?token=` for clients that are not browsers. The page's own files need no token: they hold no data. *(Changed by the spike, #536: it was kept in `sessionStorage`.)*
+- **A token:** 32 random bytes, base64url, made at startup, in the printed link (`/console/?token=…`; either page takes it). The server takes it from the URL once: it answers with an `HttpOnly`, `SameSite=Strict` cookie named for its port (`ursa_token_4280`; cookies are shared across a host's ports) and a redirect to the same address without it, so the token never reaches the page's scripts or its share links. The WebSocket (`/session`) and the served directory's files (`/data/`, with byte ranges) need it: the cookie, or `?token=` for clients that are not browsers. The page's own files need no token: they hold no data. *(Changed by the spike, #536: it was kept in `sessionStorage`.)*
 - **`Origin` must be the server's own,** `http://127.0.0.1:PORT` or `http://localhost:PORT`, on every WebSocket upgrade. This stops other sites' pages from connecting, even ones that learned the token.
 - **`Host` must be `127.0.0.1:PORT` or `localhost:PORT`.** This stops DNS rebinding.
 - **The same security headers as the deploy:** `web/src/headers.ts` (a CSP with `connect-src 'self'`, COOP, COEP and CORP). The console works cross-origin isolated, as the shell does.
@@ -326,6 +338,13 @@ The console is what the shell can't be: several results, a real editor, panels.
 - **The editor is CodeMirror 6.** It's small and modular, and the `complete` and `highlight` operations feed it.
 
 The console is plain JavaScript modules served as they are, like the shell, with no framework. The spike's console page is far smaller than this sketch (§11).
+
+**The frame (URSA-12).** `web/console/`: `console.html` (the page), `layout.js`, `session.js` and `console.js`, with `console.css` over the shell's `style.css` (its tokens, fonts, bar and theme button) and `graph-pane.css`. `bun run build` copies them, with apache-arrow bundled as one module, into `web/dist-console/console/`: a directory of its own, so the deployed `web/dist/` gains nothing, which `ursa serve` serves ahead of `web/dist/` (and embeds beside it).
+
+- **Panels:** each panel's body is a mount point (`window.ursaConsole.panels.editor` and the rest) labelled with its issue: the editor (URSA-13), the result tabs (URSA-14), the catalog (URSA-15), the sources (URSA-16) and History (URSA-17); the inspector's is not yet assigned. Splitters (`role="separator"`) resize the side columns and share each column between its two panels, by pointer or arrow keys; a panel's title folds it; the header's buttons show and hide the side columns, which are drawers under 1024px. Skip links and F6 move between panels. Sizes are kept in the browser.
+- **The session:** `session.js` holds one engine client on the shared session, and connects again when it goes (after 0.5 s, then longer, up to every 10 s), saying why when it can tell: the server is not running (no answer), or it was restarted (its `/data/` answers 401 to this page's token, so its new link must be opened). Later panels listen with `session.on("connect", fn)`, for every (re)connection, and `session.onEvent(event, fn)`.
+- **The status bar:** the connection, the engine (`hello`'s `version` and `transport`), the session's root (`session.cwd`), and the console's running request (the oldest it waits for) with its time and Cancel, which sends `cancel {target}` (`engine-client.js`'s `cancel(reply)`) where `hello`'s capabilities list `cancel`.
+- **The editor (URSA-13):** `editor.js`, CodeMirror 6 (pinned, bundled as `vendor/codemirror.mjs`, MIT). No CodeMirror language: `highlight` colours it after each pause in typing (about 40 ms), as decorations by kind in the terminal's palette, kept and mapped through edits until the next reply, and saved with the text so a reload paints at once. `complete` feeds its completion list. Ctrl/Cmd+Enter runs the statement at the cursor or the selection; Shift with it, every statement until one fails. The statements are split in the page (`statements.js`: `;` outside strings, quoted names, dollar quotes and comments; a dot-command is a line where a statement starts). SQL goes to `ursaConsole.run(sql)` (the Results panel's), dot-commands to `feed`. The protocol's errors carry no position, so an error is placed at the line and column a parse error names, else at the first word it quotes that the statement has, else across the statement. Other panels insert SQL with `ursaConsole.editor.insert(text, {statement, run})`. `highlight` and `complete` wait in the session's queue behind a running query, so while one runs, new text stays uncoloured and completion waits.
 
 ## 7. The web shell
 
