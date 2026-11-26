@@ -82,11 +82,15 @@ function watch(p: Page, name: string) {
 const connected = (p: Page) => p.waitForFunction(() => (window as any).ursaConsole?.session.state === "connected", null, { timeout: 30_000 });
 /** History's entries on `p`, oldest first. */
 const entries = (p: Page) => p.evaluate(() => (window as any).ursaConsole.history.entries());
-/** Wait until `p`'s History has an entry matching `fn` (a predicate's source); whether it came. */
-const waitEntry = (p: Page, fn: string, timeout = 20_000) =>
-  p
-    .waitForFunction((src) => (window as any).ursaConsole.history.entries().some(new Function("e", `return (${src})(e)`) as any), fn, { timeout })
-    .then(() => true, () => false);
+/** Wait until `p`'s History has an entry for which `fn(entry, arg)` holds; whether it came. */
+async function waitEntry<A>(p: Page, fn: (e: any, arg: A) => boolean, arg: A, timeout = 20_000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    if ((await entries(p)).some((e: any) => fn(e, arg))) return true;
+    await Bun.sleep(100);
+  }
+  return false;
+}
 const rowFor = (p: Page, text: string) => p.locator("#history .hx-row", { hasText: text });
 
 const page = await context.newPage();
@@ -153,7 +157,7 @@ const canvas = page.locator("#results-graph-stage canvas");
 const box = (await canvas.boundingBox())!;
 const at = await page.evaluate((id) => (window as any).ursaConsole.results.pane().view().nodePlace(id), target);
 await page.mouse.dblclick(box.x + at.x, box.y + at.y);
-const stepped = await waitEntry(page, `(e) => e.op === "graph.explore" && /^\\.expand /.test(e.summary)`, 30_000);
+const stepped = await waitEntry(page, (e) => e.op === "graph.explore" && e.summary.startsWith(".expand "), null, 30_000);
 const all = await entries(page);
 const step = all.find((e: any) => e.op === "graph.explore");
 const opened = all.find((e: any) => e.op === "graph.open");
@@ -199,7 +203,7 @@ check(/console ran query .*pagerank.*34 rows/.test(label ?? ""), "a row's label 
 
 // An error shows as one.
 await run(page, "SELECT nope FROM members");
-const failed = await waitEntry(page, `(e) => e.error && /nope/.test(e.summary)`);
+const failed = await waitEntry(page, (e) => Boolean(e.error) && e.summary.includes("nope"), null);
 await page.waitForTimeout(100);
 const failedRow = page.locator("#history .hx-item.failed .hx-error");
 check(failed && (await failedRow.count()) === 1 && /nope/.test(await failedRow.innerText()), "a failed query shows its error", failed ? await failedRow.innerText() : "no entry");
@@ -215,7 +219,7 @@ check((await second.locator("#history .hx-row", { hasText: ".expand" }).count())
 // The other way: the second page's query shows here as it runs.
 const Q3 = "SELECT count(*) AS members FROM members";
 await run(second, Q3);
-check(await waitEntry(page, `(e) => e.summary === ${JSON.stringify(Q3)}`), "a query on the second page shows on the first, live");
+check(await waitEntry(page, (e, q) => e.summary === q, Q3), "a query on the second page shows on the first, live");
 const announced = await page
   .waitForFunction((q) => (document.querySelector('#history [aria-live="polite"]')?.textContent ?? "").includes("count(*)"), Q3, { timeout: 5_000 })
   .then(() => true, () => false);
@@ -231,8 +235,12 @@ const agentRan = await second.evaluate(async () => {
   client.close();
   return true;
 }).catch((e) => String(e));
-const agent = await waitEntry(page, `(e) => e.client?.kind === "agent" && e.client?.name === "claude"`);
-check(agentRan === true && agent && (await page.locator("#history .hx-client.agent", { hasText: "claude" }).count()) === 1, "an agent's query shows as the agent's", String(agentRan));
+const agent = await waitEntry(page, (e) => e.client?.kind === "agent" && e.client?.name === "claude", null);
+const marked = await page
+  .locator("#history .hx-client.agent", { hasText: "claude" })
+  .waitFor({ timeout: 5_000 })
+  .then(() => true, () => false);
+check(agentRan === true && agent && marked, "an agent's query shows as the agent's", `${agentRan} ${agent} ${marked}`);
 
 // ---------------------------------------------------------------- late
 
@@ -359,6 +367,12 @@ if (shots) {
   // Show the drawing, with History scrolled to its end.
   await page.evaluate((id) => (window as any).ursaConsole.results.tabs().find((t: any) => t.id === id)?.show("graph"), r2.id);
   await page.waitForTimeout(1200);
+  // History from the drawn query on: its drawing, its step, the error, the agent.
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#history .hx-item.depth-0")].find((li) => li.textContent!.includes("hop(karate"));
+    const scroller = document.querySelector("#history .hx-scroll")!;
+    if (row) scroller.scrollTop = (row as HTMLElement).offsetTop - 4;
+  });
   for (const theme of ["light", "dark"] as const) {
     await page.evaluate((t) => (document.documentElement.dataset.theme = t), theme);
     await page.evaluate(() => (document.activeElement as HTMLElement)?.blur?.());

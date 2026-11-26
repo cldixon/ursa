@@ -41,7 +41,7 @@
 .hx-copy:disabled { opacity: 0.5; cursor: default; }
 .hx-copy.done { border-color: color-mix(in srgb, var(--state-ok) 60%, var(--border)); color: var(--state-ok); }
 
-.hx-scroll { flex: 1; min-height: 0; overflow: auto; padding: 0 6px 10px; scrollbar-gutter: stable; }
+.hx-scroll { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 0 6px 10px; scrollbar-gutter: stable; }
 
 /* ---------------------------------------------------------------- the list */
 
@@ -133,8 +133,8 @@
 .hx-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--hx-human); }
 .hx-client.agent { padding: 0 5px 0 3px; border-radius: 9px; background: var(--hx-agent-bg); color: var(--hx-agent); }
 .hx-client.agent svg { width: 12px; height: 12px; }
-.hx-id { font-family: var(--mono); font-size: 11px; }
-.hx-via { font-style: italic; }
+.hx-outcome { margin-left: auto; padding-left: 8px; white-space: nowrap; color: color-mix(in srgb, var(--fg) 70%, var(--muted)); }
+.hx-via { color: var(--muted); font-size: 11.5px; font-style: italic; }
 .hx-item.failed > .hx-row .hx-outcome { color: var(--error); font-weight: 500; }
 
 .hx-error {

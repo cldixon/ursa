@@ -345,9 +345,9 @@ export function mountHistory(mount, { session, results = null } = {}) {
     time.title = new Date(e.at).toLocaleString();
     const took = text("span", "hx-ms", duration(e.ms));
     const result = text("span", "hx-outcome", outcome(e));
-    meta.append(client, sep(), time, sep(), took, sep(), result);
-    if (e.result && e.op === "query") meta.append(sep(), text("span", "hx-id", e.result));
-    if (e.via) meta.append(sep(), text("span", "hx-via", VIA[e.via] ?? e.via));
+    meta.append(client, sep(), time, sep(), took, result);
+    if (e.result && e.op === "query") result.title = `Kept by the session as ${e.result}`;
+    if (e.via) statement.append(text("span", "hx-via", ` · ${VIA[e.via] ?? e.via}`));
     body.append(statement, meta);
     if (e.error && e.error !== "cancelled") body.append(text("span", "hx-error", e.error));
     button.append(mark, body);
