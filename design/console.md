@@ -198,7 +198,7 @@ Part kinds:
 | `export` | `result?`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes`; without `result`, the last result |
 | `close` | `result` | `{}` |
 | `explain` | `sql` | `{plan}`: the plan as text |
-| `complete` | `sql`, `cursor` | `{items: [{label, kind, detail}]}`: tables, columns, functions |
+| `complete` | `sql`, `cursor` | `{from, to, items: [{label, kind, detail}]}`: tables, columns (qualified after `t.`), functions, graphs, keywords, dot-commands |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
 - `columns` gives each column's `{name, type, nullable, metadata}`; `metadata` is the schema's own, where `ursa.pattern` sits for a `GRAPH_TABLE` result.
@@ -206,17 +206,24 @@ Part kinds:
 - `query` collects every row before it replies, as its reply gives the whole result's count and the shell's last result holds every row. Sending the first rows sooner needs `rows` to come later (an event, or `fetch`'s `more`): C2.
 - `.graph` of a result, export and paging all name it, instead of "the last result".
 - A statement with no rows (`CREATE`, `SET`) gives `columns: []` and a `notices` line.
+- `complete` and `highlight` count offsets (`cursor`, `from`, `to`) in UTF-16 code units, as JavaScript strings and CodeMirror do. `complete`'s items replace `from`..`to`, the word at the cursor; it reads the catalog and the function registry and runs no query. `highlight` gives no span for plain text. *(URSA-13.)*
 
 **Catalog and sources.**
 
 | op | args | result |
 |---|---|---|
-| `catalog` | — | `{databases: [{name, schemas: [{name, tables: [{name, kind, columns}]}]}], graphs: [{name, vertices, edges}]}` |
+| `catalog` | — | `{databases: [{name, schemas: [{name, tables: [{name, kind, columns: [{name, type, nullable}]}]}]}], graphs: [{name, vertices, edges}]}` |
 | `sources.list` | `url`: a directory or a bucket prefix (`file:///data/`, `s3://bucket/prefix/`) | `{entries: [{name, url, kind: "dir" \| "file", format, bytes}]}` |
-| `sources.attach` | `url`, `as` | `{}`: the same as `ATTACH` |
+| `sources.attach` | `url`, `as?` | `{}`: the same as `ATTACH` |
 | `files`, `addFile` | as today | as today, for uploads into `memory://uploads` |
 
 `catalog` changes are announced: after any statement that changes the catalog, the session sends `{"event": "catalog"}`, and clients refetch.
+
+As built *(URSA-15, URSA-16)*:
+- `catalog`'s databases are the session's catalogs. `kind` is `table`, `view` or `external` (a table of files, DataFusion's `ListingTable`). `information_schema` and the graphs' own schemas (`<graph>.nodes`, `<graph>.edges`) are left out: graphs are under `graphs`, each `{name, vertices: [{name, table, key}], edges: [{name, table, source, destination}]}`; a graph of the database that could not be defined has no tables and an `error`.
+- The `catalog` event is found by comparing a fingerprint of what `catalog` answers before and after each request that may change it (`start`, `feed`, `query`, `sources.attach`), not by reading statements. That catches `CREATE`, `DROP`, `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, `.read` scripts and dataset loads alike, and a request that failed or was cancelled halfway. `Session::take_events` gives a request's events; the host sends them before its reply.
+- `sources.list` and `sources.attach` need capability `sources`, which a session with a directory root has (`ursa serve DIR`); the browser demo has none. A local directory is listed only under the root: the path asked for is resolved through its symbolic links and refused (`protocol`) outside the root, and entries whose links lead outside, and hidden ones, are left out. Local directories are read with `std::fs`, to resolve each entry's links; bucket prefixes (`s3://`, `gs://`, `az://`) with `object_store`'s `list_with_delimiter`, through the session's object-store registry and its credential chain. Entries are directories first, then by name; `format` (`parquet`, `csv`, `json`, `arrow`, `ursa` or `null`) is from the extension, and `bytes` is `null` for a directory. A URL in a reply is `scheme://bucket/key` or `file:///path`: no credentials, query strings or signatures.
+- `sources.attach {url, as?}` runs `ATTACH 'url' [AS as]` (a `file://` URL as its path). `ATTACH … AS` is not supported yet, so `as` fails as the statement does.
 
 **Graphs.**
 
@@ -250,11 +257,13 @@ The terminal UI runs on these over either transport.
 |---|---|---|
 | `progress` | while a request runs, at most every 250 ms | `for`, `phase`, `rows?`, `bytes?` |
 | `notice` | the engine reports something (an index built, a setting adjusted) | `text`, `for?` |
-| `catalog` | the catalog changed | — |
+| `catalog` | the catalog changed (built: URSA-15) | — |
 | `graph` | the open graph changed | `by: client`, `nodes`, `edges`; with a `ugr` part, a delta |
 | `activity` | another client ran something (§9) | `client`, `op`, `summary` |
 
 The `graph` and `activity` events matter once a second client is attached. With one client they are sent and can be ignored.
+
+Every event goes to every connection attached to the session, whichever one's request caused it. Over the WebSocket, an event is a text frame of its own, never between a reply's frames; over `postMessage`, the worker posts it as a message of its own. `engine-client.js` hands it to `client.on(name, fn)`.
 
 ### 4.5 Ordering and concurrency
 

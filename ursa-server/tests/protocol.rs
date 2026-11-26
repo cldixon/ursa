@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{call, feed, receive, send, Server};
+use common::{call, feed, next_message, receive, send, Server};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
@@ -258,4 +258,41 @@ async fn it_stops_gracefully() {
     assert!(tokio::net::TcpStream::connect(("127.0.0.1", server.port))
         .await
         .is_err());
+}
+
+/// The `catalog` event goes to every connection on the session, before the
+/// reply to the request that caused it (§4.4, §4.5).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_connection_on_a_session_hears_its_events() {
+    let server = Server::start().await;
+    let (mut a, _) = server.session(Some("shared")).await;
+    let (mut b, _) = server.session(Some("shared")).await;
+    let (mut other, _) = server.session(Some("new")).await;
+    send(
+        &mut a,
+        1,
+        "query",
+        json!({"sql": "CREATE VIEW v AS SELECT 1 AS x"}),
+        &[],
+    )
+    .await;
+    assert_eq!(next_message(&mut a).await, json!({"event": "catalog"}));
+    let reply = next_message(&mut a).await;
+    assert_eq!(
+        (reply["id"].clone(), reply["ok"].clone()),
+        (json!(1), json!(true)),
+        "{reply}"
+    );
+    assert_eq!(next_message(&mut b).await, json!({"event": "catalog"}));
+    // A query that changes nothing sends none: b's next message is its reply.
+    send(&mut b, 1, "feed", json!({"line": "SELECT * FROM v;"}), &[]).await;
+    assert_eq!(next_message(&mut b).await["id"], 1);
+    // Nor does another session hear this one's.
+    send(&mut other, 1, "feed", json!({"line": "SELECT 1;"}), &[]).await;
+    assert_eq!(next_message(&mut other).await["id"], 1);
+    // A connection that closed is not written to; the rest still are.
+    drop(a);
+    send(&mut b, 2, "feed", json!({"line": "DROP VIEW v;"}), &[]).await;
+    assert_eq!(next_message(&mut b).await, json!({"event": "catalog"}));
+    assert_eq!(next_message(&mut b).await["id"], 2);
 }

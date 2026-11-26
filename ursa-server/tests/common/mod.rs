@@ -192,16 +192,26 @@ pub async fn send(socket: &mut Socket, id: u32, op: &str, args: Value, parts: &[
     }
 }
 
-/// The next reply: its JSON and its parts.
-pub async fn receive(socket: &mut Socket) -> (Value, Vec<Vec<u8>>) {
+/// The next message, a reply or an event: its JSON.
+pub async fn next_message(socket: &mut Socket) -> Value {
     let text = loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => break text,
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-            other => panic!("no reply: {other:?}"),
+            other => panic!("no message: {other:?}"),
         }
     };
-    let reply: Value = serde_json::from_str(&text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The next reply, past any events: its JSON and its parts.
+pub async fn receive(socket: &mut Socket) -> (Value, Vec<Vec<u8>>) {
+    let reply = loop {
+        let message = next_message(socket).await;
+        if message.get("event").is_none() {
+            break message;
+        }
+    };
     let mut bytes = Vec::new();
     for (index, part) in reply["parts"].as_array().into_iter().flatten().enumerate() {
         let Some(Ok(Message::Binary(frame))) = socket.next().await else {

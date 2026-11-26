@@ -41,7 +41,10 @@ static assets and an R2 bucket.
     `WebShell.handle`, which runs `ursa_shell::session::Session`: the
     operations are listed in `docs/reference/protocol.md`, generated from
     `ursa_shell::session::OPS` (the shell's own are `start`, `feed`,
-    `cancelInput`, `width`, `highlightAnsi` and `memory`). A
+    `cancelInput`, `width`, `highlightAnsi` and `memory`). Events
+    (`{event: "catalog"}`) come before the reply of the request that caused
+    them: the worker posts each as a message of its own, and
+    `client.on(name, fn)` hears them on either transport. A
     WebAssembly trap fails its request with kind `crash`, and the page
     connects again to a fresh session.
   - **The graph pane's styles** are `graph-pane.css`, which a host links
