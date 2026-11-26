@@ -4798,6 +4798,7 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "tokio",
+ "tungstenite",
  "ursa-engine",
  "ursa-server",
  "ursa-shell",
