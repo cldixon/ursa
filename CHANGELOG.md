@@ -1054,41 +1054,57 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   each built direction, and only a weight, an edge mask or an edge's row
   reads it. It is now an `ursa_core::EdgeIds`, which builds itself on first
   read and keeps what it built: from the identity when the rows are already
-  grouped by source (no source needed, #155), from the rows' sources read
+  grouped by source (no source needed, #155), or from the rows' sources read
   back (`RowSource`; the SQL engine writes them to an unlinked temporary
-  file, `SpilledRows`, for an index of 65,536 edges or more), or, for the
-  in-adjacency, as the transpose of the out-adjacency's. Kernels branch
-  once per call: PageRank, components, BFS/`hop`, Louvain, label
-  propagation, triangles, closeness, betweenness and degree without a mask
-  or weight read neighbours alone. Storing an index writes the ids without
-  keeping them, and stored files are unchanged (still version 5).
+  file in `TMPDIR`, `SpilledRows`, 4 B an edge, for an index of 65,536 edges
+  or more). Kernels branch once per call: PageRank, components, BFS/`hop`,
+  Louvain, label propagation, triangles, closeness, betweenness and degree
+  without a mask or weight read neighbours alone.
+
+  The in-adjacency is built without any edge ids: the first in-direction
+  kernel streams the spilled sources once and reads each row's target off
+  the out-adjacency, then a stable counting sort by target leaves every
+  in-segment in row order, as before (`transpose_rows`). Its own ids are
+  built the same way when first read. The undirected view (triangles,
+  clustering) transposes in slot order for its build alone, as only the set
+  of neighbours matters there: it reads no spill and keeps no in-adjacency.
+  Storing an index writes the ids without keeping them, and stored files are
+  unchanged (still version 5).
+
+  When the spill cannot be written (no temporary directory, or no room in
+  it), the index keeps its ids in memory, as before, and the session gets a
+  notice (`could not write the index's edge rows to …; its edge ids are kept
+  in memory (…)`); the query goes on. What a failed write wrote is freed at
+  once, as the file is unlinked when it is created.
+
   Results are byte-identical: `ursa-core/tests/lazy_edge_ids.rs` runs every
   kernel, plain, weighted and masked, over eager, in-memory and spilled ids
-  (sorted and unsorted rows, both node orders) and checks that no plain
-  kernel builds them. R-MAT, built as the engine builds it (in-degree
-  relabel), 4 threads, `ursa-core/examples/edge_ids_memory.rs`; resident
-  index after the kernel and peak RSS (the peak includes the 8 B/edge edge
-  list the build is given), eager → late:
+  (sorted and unsorted rows, both node orders), checks that no plain kernel
+  builds them in either direction, and counts the spill's reads: none for
+  out-direction kernels and the undirected view, one stream for the first
+  transpose. R-MAT, built as the engine builds it (in-degree relabel), 4
+  threads, `ursa-core/examples/edge_ids_memory.rs`, eager → late; resident
+  memory after the kernel and peak RSS both include the 8 B/edge edge list
+  the build is given:
 
-  | R-MAT 64M | resident after | peak RSS | kernel |
+  | R-MAT 64M | resident after | peak RSS | build + kernel |
   |---|---|---|---|
-  | index only | 569 → 325 MiB | 1107 → 862 MiB | |
-  | PageRank (20 iterations) | 1165 → 677 MiB | 1254 → 1156 MiB | 16.3 → 18.4 s |
-  | components (weak) | 613 → 366 MiB | 1108 → 864 MiB | 1.8 → 1.8 s |
-  | `hop` (2, from the hub) | 588 → 344 MiB | 1099 → 864 MiB | 0.24 → 0.24 s |
-  | BFS (both directions) | 1173 → 686 MiB | 1176 → 1172 MiB | 2.2 → 3.7 s |
-  | Louvain (serial) | 613 → 376 MiB | 1337 → 1094 MiB | 18.8 → 22.6 s |
-  | weighted PageRank | 1156 → 1185 MiB | 1733 → 1989 MiB | 52.7 → 58.0 s |
+  | index only | 569 → 325 MiB | 1108 → 865 MiB | 1.4 → 1.0 s |
+  | PageRank (20 iterations) | 1165 → 614 MiB | 1254 → 975 MiB | 1.4 + 12.0 → 1.0 + 11.3 s |
+  | BFS (both directions) | 1174 → 624 MiB | 1177 → 992 MiB | 1.0 + 1.4 → 0.7 + 2.1 s |
+  | components (weak) | 610 → 369 MiB | 1106 → 863 MiB | 1.1 + 1.0 → 0.8 + 1.0 s |
+  | `hop` (2, from the hub) | 588 → 344 MiB | 1106 → 863 MiB | 1.1 + 0.22 → 0.8 + 0.23 s |
+  | Louvain (serial) | 615 → 369 MiB | 1335 → 1096 MiB | 1.1 + 13.9 → 0.8 + 14.2 s |
+  | weighted PageRank | 1156 → 1185 MiB | 1733 → 1733 MiB | ids and transpose 1.4–1.7 → 2.3–2.7 s |
 
-  At 16M edges the same: index 143 → 82 MiB, PageRank 292 → 170 MiB
-  resident, peaks 279 → 219 MiB (index, components, `hop`) and 339 → 277
-  MiB (Louvain). The build is no slower (1.3–1.9 s at 64M either way: it
-  writes the sources once instead of scattering the ids). The cost is a
-  first transpose (PageRank, BFS in or both directions) that reads the
-  sources back to order the in-segments by row, about 1–2 s at 64M, and a
-  weighted or masked query that rebuilds the ids once (about 0.3 s and
-  4 B/edge transient at 64M). Louvain's 20% is run-to-run noise on a shared
-  machine: it reads no ids either way.
+  At 16M edges: index 143 → 82 MiB, PageRank 292 → 155 MiB and BFS 289 →
+  158 MiB resident; peaks 279 → 219 MiB (index, components, `hop`), 317 →
+  248 MiB (PageRank), 297 → 252 MiB (BFS) and 338 → 278 MiB (Louvain). The
+  build is faster (it writes the sources once instead of scattering the
+  ids). The transpose alone takes 1.8–2.1 s at 64M streamed against
+  1.3–1.6 s eager, with a 4 B/edge transient target column; a weighted or
+  masked query rebuilds the ids once (about 1 s more at 64M, the weighted
+  iterations themselves unchanged), and in-ids read late take 1.8–2.1 s.
 
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
   (behaviour change: `louvain` and `label_propagation` communities, the

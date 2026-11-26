@@ -2247,7 +2247,7 @@ fn intern_edges(
                     return Ok(None);
                 }
                 let interner = side.interner.take().expect("the node set is taken in");
-                return Ok(Some(finish_index(interner, id_type, &notifier)));
+                return Ok(Some(finish_index(interner, id_type, notifier)));
             }
             Chunk::Nodes(_) | Chunk::NodesDone => {
                 return Err(DataFusionError::Internal(format!(
