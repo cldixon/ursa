@@ -80,3 +80,9 @@ kind   = "unsupported"
 issue  = 414
 reason = "A GRAPH_TABLE that refers to tables outside it."
 error  = "GRAPH_TABLE cannot refer to tables outside it yet"
+
+[[difference]]
+id     = "duckpgq/pagerank/1"
+kind   = "numeric-reference"
+issue  = 298
+reason = "Results stay pinned to NetworkX (decided 2026-11-06): Ursa's scores sum to 1, DuckPGQ's to 0.94. Every DuckPGQ score is Ursa's times about 0.94, node 4's too, whose score is only the teleport term (it has no in-edges); no node here lacks out-edges, so dangling nodes are not the cause. The order of the nodes is the same (duckpgq/pagerank/2)."

@@ -593,6 +593,8 @@ shortest_path,traversal
 random_walk,traversal
 induced_edges,traversal
 algorithms,combinator
+weakly_connected_component,algorithm
+local_clustering_coefficient,algorithm
 "
     );
     assert_eq!(

@@ -36,6 +36,11 @@
 // `crash` is set when the engine stopped (`crash`, or the transport closed):
 // the page then connects again, to a fresh session.
 //
+// `on(event, fn)` calls fn(message) for each event of that name the session
+// sends, such as {event: "catalog"} once the catalog changed, and returns a
+// function that stops it. An event a request caused comes before its reply,
+// on either transport; on a shared session, every client gets it.
+//
 // Requests run one at a time, in the order they were sent.
 
 import { SocketTransport, servedOverSocket } from "./socket-transport.js";
@@ -67,7 +72,14 @@ export function connect(transport, client = { name: "shell", kind: "human" }, { 
       else call.reject(problem(message.error));
     },
     event(message) {
-      for (const fn of listeners.get(message.event) ?? []) fn(message);
+      for (const fn of listeners.get(message.event) ?? []) {
+        // A listener that throws must not stop the others, or the replies.
+        try {
+          fn(message);
+        } catch (e) {
+          console.error(e);
+        }
+      }
     },
     fail: (message) => fail(stopped(message)),
   });

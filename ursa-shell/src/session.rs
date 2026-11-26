@@ -187,6 +187,58 @@ pub const OPS: &[Op] = &[
                 gone, or that kept only its first rows",
     },
     Op {
+        name: "catalog",
+        args: "—",
+        result: "`{databases: [{name, schemas: [{name, tables: [{name, kind, columns: [{name, type, nullable}]}]}]}], graphs: [{name, vertices, edges}]}`",
+        about: "What the session has defined, read from its catalog without running a query. \
+                A database is one of the session's catalogs; `kind` is `table`, `view` or \
+                `external` (a table of files); `information_schema` and the graphs' own \
+                schemas (`<graph>.nodes`) are left out. A graph's `vertices` are \
+                `[{name, table, key}]` and its `edges` `[{name, table, source, destination}]`; \
+                a graph of the database that could not be defined has none, and its `error`. \
+                The `catalog` event says when this has changed",
+    },
+    Op {
+        name: "sources.list",
+        args: "`url`",
+        result: "`{entries: [{name, url, kind: \"dir\" \\| \"file\", format, bytes}]}`",
+        about: "Capability `sources`. The entries of a directory under the session's root \
+                (a path relative to it, or a `file://` URL) or of a bucket prefix (`s3://`, \
+                `gs://`, `az://`), directories first, then by name. `format` is `parquet`, \
+                `csv`, `json`, `arrow`, `ursa` or `null`, from the extension; `bytes` is \
+                `null` for a directory. A path outside the root, there or through a \
+                symbolic link, fails with `protocol`; hidden files, and entries whose links \
+                lead outside, are left out. URLs carry no credentials",
+    },
+    Op {
+        name: "sources.attach",
+        args: "`url`, `as?`",
+        result: "`{}`",
+        about: "Capability `sources`. Runs `ATTACH 'url' [AS name]`, as a statement would \
+                (a `file://` URL as its path)",
+    },
+    Op {
+        name: "complete",
+        args: "`sql`, `cursor`",
+        result: "`{from, to, items: [{label, kind, detail}]}`",
+        about: "Completions for the word at `cursor`, which replace `from`..`to`: after \
+                `t.`, the columns of the table `t` names or aliases (or the tables of the \
+                schema `t`); else the statement's tables' columns, tables and views, \
+                property graphs, functions (DataFusion's and the graph functions) and \
+                keywords; at the start of a line, dot-commands. `kind` is `column`, \
+                `table`, `view`, `external`, `schema`, `graph`, `function`, `keyword` or \
+                `command`. Offsets are UTF-16 code units, as JavaScript counts them. Runs \
+                no query",
+    },
+    Op {
+        name: "highlight",
+        args: "`sql`",
+        result: "`{spans: [{from, to, kind}]}`",
+        about: "The shell's colouring of `sql` (`ursa_shell::highlight::pieces`) as \
+                spans: `kind` is `keyword`, `string`, `number`, `comment`, `command` or \
+                `arguments`; plain text has none. Offsets are UTF-16 code units",
+    },
+    Op {
         name: "graph.open",
         args: "`text?`, `result?`",
         result: "`{skipped}`; `ugr` (`ugr`), `positions?` (`f32`)",
@@ -226,6 +278,63 @@ pub const OPS: &[Op] = &[
         about: "Closes the open graph",
     },
 ];
+
+/// One event of the protocol (`docs/reference/protocol.md`, generated from
+/// [`EVENTS`]): `{"event": name, ...fields}`, sent unprompted.
+#[derive(Debug, Clone, Copy)]
+pub struct EventSpec {
+    /// The event's name, as `event` gives it.
+    pub name: &'static str,
+    /// Its other fields.
+    pub fields: &'static str,
+    /// When the session sends it.
+    pub when: &'static str,
+}
+
+/// Every event a session sends, in the protocol document's order.
+pub const EVENTS: &[EventSpec] = &[EventSpec {
+    name: "catalog",
+    fields: "—",
+    when: "After a request that changed what `catalog` answers: `CREATE`, `DROP`, \
+           `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, a loaded dataset, a \
+           `start`, through `feed`, `query` or `sources.attach`. Every client attached to \
+           the session gets it, before the reply to the request that caused it; clients \
+           fetch `catalog` again",
+}];
+
+/// An event the session sends ([`Session::take_events`]): `{"event": name,
+/// ...fields}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    pub name: &'static str,
+    /// Its other fields: a JSON object.
+    pub fields: Value,
+}
+
+impl Event {
+    /// The catalog changed.
+    pub fn catalog() -> Event {
+        Event {
+            name: "catalog",
+            fields: json!({}),
+        }
+    }
+
+    /// The event as the protocol's JSON.
+    pub fn to_json(&self) -> Value {
+        let mut message = json!({"event": self.name});
+        if let Value::Object(fields) = &self.fields {
+            for (k, v) in fields {
+                message[k] = v.clone();
+            }
+        }
+        message
+    }
+}
+
+/// The operations that may change the catalog: after each, the session
+/// compares it with what it was ([`Session::take_events`]).
+const CHANGE_CATALOG: &[&str] = &["start", "feed", "query", "sources.attach"];
 
 /// How a session is set up.
 #[derive(Debug, Clone)]
@@ -494,6 +603,12 @@ pub struct Session {
     greeted: bool,
     /// The results `query` kept, for `fetch`, `export`, `graph.open`.
     results: Results,
+    /// The catalog's fingerprint when last looked at, for the `catalog`
+    /// event; `None` until a request that may change it.
+    catalog_seen: Option<u64>,
+    /// Whether a request that may change the catalog ran since it was last
+    /// looked at.
+    catalog_dirty: bool,
 }
 
 impl Session {
@@ -526,6 +641,8 @@ impl Session {
             options,
             greeted: false,
             results: Results::default(),
+            catalog_seen: None,
+            catalog_dirty: false,
         }
     }
 
@@ -550,6 +667,14 @@ impl Session {
             return Err(Error::protocol(format!(
                 "the first request must be hello, not {op}"
             )));
+        }
+        if CHANGE_CATALOG.contains(&op) {
+            // What it was before, the first time; marked before the request
+            // runs, so that one cancelled halfway is still compared.
+            if self.catalog_seen.is_none() {
+                self.catalog_seen = Some(catalog::fingerprint(self.shell.context()).await);
+            }
+            self.catalog_dirty = true;
         }
         match op {
             "hello" => {
@@ -577,7 +702,7 @@ impl Session {
                     "protocol": PROTOCOL,
                     "version": self.options.version,
                     "transport": self.options.transport,
-                    "capabilities": self.options.capabilities,
+                    "capabilities": self.capabilities(),
                     "session": {"kind": kind},
                 })))
             }
@@ -610,6 +735,8 @@ impl Session {
             "start" => {
                 *self = Session {
                     greeted: true,
+                    catalog_seen: self.catalog_seen,
+                    catalog_dirty: true,
                     ..Session::new(self.options.clone())
                 };
                 if let Some(commands) = args.get("commands").and_then(Value::as_array) {
@@ -684,6 +811,33 @@ impl Session {
                     }],
                 })
             }
+            "catalog" => Ok(Reply::json(catalog::catalog(self.shell.context()).await)),
+            "sources.list" => {
+                let root = self.sources_root()?;
+                let listed = sources::list(self.shell.context(), &root, a.str("url")?).await?;
+                Ok(Reply::json(listed))
+            }
+            "sources.attach" => {
+                self.sources_root()?;
+                let sql = sources::attach_sql(a.str("url")?, a.str_opt("as"))?;
+                self.run_sql(&sql).await?;
+                Ok(Reply::json(json!({})))
+            }
+            "complete" => {
+                let sql = a.str("sql")?;
+                let cursor = args.get("cursor").and_then(Value::as_u64);
+                let cursor = cursor.ok_or_else(|| Error::protocol("complete needs a cursor"))?;
+                let commands = self
+                    .shell
+                    .commands()
+                    .map(|(name, _, help)| (name.to_string(), help.to_string()))
+                    .collect();
+                let ctx = self.shell.context();
+                Ok(Reply::json(
+                    complete::complete(ctx, commands, sql, cursor as usize).await,
+                ))
+            }
+            "highlight" => Ok(Reply::json(complete::highlight(a.str("sql")?))),
             "graph.open" => {
                 let text = a.str_opt("text").unwrap_or("");
                 let graph = match a.id_opt("result")? {
@@ -835,6 +989,57 @@ impl Session {
             "notices": notices,
         });
         Ok((result, arrow))
+    }
+
+    /// The events the requests since the last call caused, to send before
+    /// the last one's reply (`design/console.md` §4.5): `catalog`, if the
+    /// catalog changed. A host calls it after each request, whether it
+    /// succeeded, failed or was cancelled.
+    pub async fn take_events(&mut self) -> Vec<Event> {
+        if !std::mem::take(&mut self.catalog_dirty) {
+            return Vec::new();
+        }
+        let now = catalog::fingerprint(self.shell.context()).await;
+        let changed = self.catalog_seen.is_some_and(|seen| seen != now);
+        self.catalog_seen = Some(now);
+        if changed {
+            vec![Event::catalog()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// What `hello` says this session can do: the host's capabilities, and
+    /// `sources` for a session with a directory root.
+    fn capabilities(&self) -> Vec<&'static str> {
+        let mut capabilities = self.options.capabilities.clone();
+        if matches!(self.options.root, Some(Root::Dir(_))) && !capabilities.contains(&"sources") {
+            capabilities.push("sources");
+        }
+        capabilities
+    }
+
+    /// The directory root `sources.list` and `sources.attach` need.
+    fn sources_root(&self) -> std::result::Result<Root, Error> {
+        match &self.options.root {
+            Some(root @ Root::Dir(_)) => Ok(root.clone()),
+            _ => Err(Error::protocol(
+                "this session has no sources: only a session with a directory root \
+                 (ursa serve DIR) lists and attaches files",
+            )),
+        }
+    }
+
+    /// Run `sql`'s statements to their end, keeping no result.
+    async fn run_sql(&mut self, sql: &str) -> Result<()> {
+        let ctx = self.shell.context().clone();
+        for (statement, text) in ursa_sql::parse_sql_with_text_for(&ctx, sql)? {
+            ursa_sql::execute_with_text(&ctx, statement, &text)
+                .await?
+                .collect()
+                .await?;
+        }
+        Ok(())
     }
 
     /// `rows` rows of the kept result `id` from `offset`, as an Arrow IPC
@@ -1403,6 +1608,17 @@ fn upload_key(name: &str) -> String {
     }
 }
 
+#[path = "session_catalog.rs"]
+mod catalog;
+#[path = "session_complete.rs"]
+mod complete;
+#[path = "session_sources.rs"]
+mod sources;
+
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_ops_tests.rs"]
+mod ops_tests;

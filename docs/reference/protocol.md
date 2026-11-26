@@ -37,7 +37,7 @@ The error kinds:
 | `protocol` | a bad request: an unknown op, a missing argument, a request before `hello`, a version the session does not speak |
 | `crash` | the engine is in an unknown state (a WebAssembly trap, a closed socket): start a new session |
 
-An **event**, from the session, unprompted: `{"event": "catalog"}`.
+An **event**, from the session, unprompted: `{"event": "catalog"}`. Events are listed [below](#events).
 
 ## Parts
 
@@ -73,7 +73,7 @@ The shell's last result is apart from these: `feed`'s statements and `query` bot
 
 ## Order
 
-One request runs at a time, in arrival order. A reply comes after every event its request caused. `cancel` and `hello` go ahead of the queue on a host that can cancel (capability `cancel`); the browser demo cannot.
+One request runs at a time, in arrival order. A reply comes after every event its request caused: over `postMessage`, the worker posts them first; over the WebSocket, each is a text frame of its own, written before the reply's. `cancel` and `hello` go ahead of the queue on a host that can cancel (capability `cancel`); the browser demo cannot.
 
 ## Versions
 
@@ -102,6 +102,11 @@ The table is generated from `ursa_shell::session::OPS`, and a test keeps the two
 | `addFile` | `name`; the file as the request's one part | `{url}` | Puts a file in the session's files, at `memory://uploads/`. |
 | `files` | — | `{files: [{name, url, bytes}]}` | The session's files: added ones, and those `COPY … TO 'name'` wrote. |
 | `export` | `format`, `result?` | `{}`; `bytes` (`bytes`) | A kept result, or without `result` the last result, every row, as `csv`, `json`, `arrow` or `parquet`. `not_found` for a result that has gone, or that kept only its first rows. |
+| `catalog` | — | `{databases: [{name, schemas: [{name, tables: [{name, kind, columns: [{name, type, nullable}]}]}]}], graphs: [{name, vertices, edges}]}` | What the session has defined, read from its catalog without running a query. A database is one of the session's catalogs; `kind` is `table`, `view` or `external` (a table of files); `information_schema` and the graphs' own schemas (`<graph>.nodes`) are left out. A graph's `vertices` are `[{name, table, key}]` and its `edges` `[{name, table, source, destination}]`; a graph of the database that could not be defined has none, and its `error`. The `catalog` event says when this has changed. |
+| `sources.list` | `url` | `{entries: [{name, url, kind: "dir" \| "file", format, bytes}]}` | Capability `sources`. The entries of a directory under the session's root (a path relative to it, or a `file://` URL) or of a bucket prefix (`s3://`, `gs://`, `az://`), directories first, then by name. `format` is `parquet`, `csv`, `json`, `arrow`, `ursa` or `null`, from the extension; `bytes` is `null` for a directory. A path outside the root, there or through a symbolic link, fails with `protocol`; hidden files, and entries whose links lead outside, are left out. URLs carry no credentials. |
+| `sources.attach` | `url`, `as?` | `{}` | Capability `sources`. Runs `ATTACH 'url' [AS name]`, as a statement would (a `file://` URL as its path). |
+| `complete` | `sql`, `cursor` | `{from, to, items: [{label, kind, detail}]}` | Completions for the word at `cursor`, which replace `from`..`to`: after `t.`, the columns of the table `t` names or aliases (or the tables of the schema `t`); else the statement's tables' columns, tables and views, property graphs, functions (DataFusion's and the graph functions) and keywords; at the start of a line, dot-commands. `kind` is `column`, `table`, `view`, `external`, `schema`, `graph`, `function`, `keyword` or `command`. Offsets are UTF-16 code units, as JavaScript counts them. Runs no query. |
+| `highlight` | `sql` | `{spans: [{from, to, kind}]}` | The shell's colouring of `sql` (`ursa_shell::highlight::pieces`) as spans: `kind` is `keyword`, `string`, `number`, `comment`, `command` or `arguments`; plain text has none. Offsets are UTF-16 code units. |
 | `graph.open` | `text?`, `result?` | `{skipped}`; `ugr` (`ugr`), `positions?` (`f32`) | Opens a graph to draw (`.graph TEXT`). A `text` that names no source draws the kept `result`, or without it the last result. `positions`, every `x` then every `y`, only with `POSITIONS`. |
 | `graph.explore` | `command` | `{out, err, nodes, edges, delta: null}`; `delta?` (`ugr`) | Runs `.expand`, `.hide`, `.show`, `.undo`, `.redo` or `.graph history` on the open graph; `delta` only when the graph changed. |
 | `graph.find` | `command` | `{out, err, matches, notShown, notShownTotal}`; `selected` (`u32`) | Runs `.find`: the matches shown, as node slots, the best first. |
@@ -109,3 +114,13 @@ The table is generated from `ursa_shell::session::OPS`, and a test keeps the two
 | `graph.inspect` | `node, key, neighbours?` or `edge, src, dst` | inspect's JSON, with `ms` | What the graph's tables say of a node or an edge. |
 | `graph.close` | — | `{}` | Closes the open graph. |
 <!-- /ops -->
+
+## Events
+
+An event is `{"event": name, ...fields}`, with no `id`. The session sends it to every client attached to it, whichever client's request caused it, and before that request's reply. `engine-client.js` gives them to `client.on(name, fn)`. The table is generated from `ursa_shell::session::EVENTS`; a host gets a request's events from `Session::take_events`.
+
+<!-- events: generated from ursa_shell::session::EVENTS -->
+| event | fields | when |
+|---|---|---|
+| `catalog` | — | After a request that changed what `catalog` answers: `CREATE`, `DROP`, `ALTER`, `ATTACH`, `CREATE PROPERTY GRAPH`, `.open`, a loaded dataset, a `start`, through `feed`, `query` or `sources.attach`. Every client attached to the session gets it, before the reply to the request that caused it; clients fetch `catalog` again. |
+<!-- /events -->

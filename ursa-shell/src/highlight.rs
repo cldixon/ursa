@@ -26,7 +26,7 @@ pub const ERROR: &str = "\x1b[31m";
 pub const RESET: &str = "\x1b[0m";
 
 /// The words shown as keywords: SQL's common ones and SQL/PGQ's.
-const KEYWORDS: &[&str] = &[
+pub const KEYWORDS: &[&str] = &[
     "acyclic",
     "all",
     "analyze",
