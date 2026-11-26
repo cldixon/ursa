@@ -1161,6 +1161,21 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Changed
 
+- **`ursa serve`: the page holds its WebSocket in a worker, and a large part
+  is not copied on the page** (URSA-7). `web/public/socket-transport.js`
+  opens the socket in `socket-worker.js`, which assembles each reply and
+  posts it to the page with its parts' buffers transferred, as the wasm
+  engine's worker does. A part is no longer copied out of its frame
+  (`data.slice(8)`): it is the frame's buffer at `offset` 8, which
+  `engine-client.js`'s header now allows a part to carry. `.graph rmat`'s
+  8.4 MB of UGR took 100 to 120 ms of the page's thread in long tasks
+  before the reply was complete; it now takes none. Its first frame is
+  where the worker's is, within noise: medians of 24 runs each, at a load
+  average of 3 to 19 on 4 cores, 1,592 ms over the worker and 1,625 ms
+  over the socket (1,609 ms before this change). `web/tests/graph-timing.ts`
+  runs against `ursa serve` with `URSA_SERVE_TOKEN`, and stops at the first
+  frame with `FIRST_ONLY=1`.
+
 - **SQL: an index of 65,536 edges or more numbers its nodes by in-degree**
   (behaviour change: `louvain` and `label_propagation` communities, the
   last bits of floats and the order of unordered rows, #172). Dense node ids

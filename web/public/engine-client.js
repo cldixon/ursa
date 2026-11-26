@@ -8,6 +8,9 @@
 //
 // - WorkerTransport: the browser demo's engine, ursa-wasm in a Web Worker
 //   (engine-worker.js), over postMessage. Binary parts are transferred.
+// - SocketTransport (socket-transport.js): `ursa serve`'s native engine, over
+//   a WebSocket held in a worker (socket-worker.js). Binary parts are
+//   transferred from it too.
 //
 // A transport carries these messages (docs/reference/protocol.md):
 //
@@ -16,7 +19,11 @@
 //            {id, ok: false, error: {kind, message}}
 //   event    {event, ...}
 //
-// where a part's `bytes` is its ArrayBuffer. A transport is an object with:
+// where a part's `bytes` is its ArrayBuffer. A reply's part may also carry
+// `offset`: the part is its buffer from that many bytes on (a multiple of 8;
+// none is 0). SocketTransport gives each part so, the binary frame it came
+// in, past its 8-byte header, rather than copy it out (URSA-7). A transport
+// is an object with:
 //
 //   open({reply, event, fail})  start; resolves once requests can be sent.
 //                               Calls reply(message) for each reply, in full
@@ -146,8 +153,8 @@ export function defaultTransport() {
 function flatten({ result = {}, parts = [] }) {
   const out = { ...result };
   for (const part of parts) {
-    const buffer = part.bytes;
-    out[part.name] = part.kind === "f32" ? new Float32Array(buffer) : part.kind === "u32" ? new Uint32Array(buffer) : new Uint8Array(buffer);
+    const { bytes: buffer, offset = 0 } = part;
+    out[part.name] = part.kind === "f32" ? new Float32Array(buffer, offset) : part.kind === "u32" ? new Uint32Array(buffer, offset) : new Uint8Array(buffer, offset);
   }
   return out;
 }
