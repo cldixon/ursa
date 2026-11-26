@@ -30,17 +30,32 @@ use arrow::buffer::ScalarBuffer;
 /// dense ids the topology was built from (before any locality relabel): what
 /// rebuilding an out-adjacency's edge ids needs (see [`EdgeIds`]).
 ///
-/// Called at most once per topology for its out-adjacency (the ids are
-/// cached once built), and again for a transient rebuild (an in-adjacency's
-/// transpose, or a stored index's write) while they are not.
+/// Read whole when the out-adjacency's ids are built, and streamed a block
+/// at a time when the in-adjacency is (its row order, and later its ids):
+/// see [`transpose_rows`].
 pub trait RowSource: Send + Sync {
-    /// The source of every row, `n_edges` of them, in row order.
+    /// The number of rows.
+    fn len(&self) -> usize;
+
+    /// Whether there are no rows.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The sources of rows `start..start + out.len()`, into `out`.
     ///
     /// # Panics
     ///
     /// May panic if the rows can no longer be read (a spill file's read
     /// failing): there is no result to fall back on.
-    fn sources(&self) -> Vec<u32>;
+    fn read(&self, start: usize, out: &mut [u32]);
+
+    /// The source of every row, in row order.
+    fn sources(&self) -> Vec<u32> {
+        let mut out = vec![0u32; self.len()];
+        self.read(0, &mut out);
+        out
+    }
 }
 
 /// What a build does with its rows' sources (see
@@ -53,8 +68,12 @@ pub type KeepRows<'a> = dyn FnMut(&[u32]) -> Option<Arc<dyn RowSource>> + 'a;
 /// The rows' sources, held in memory: no saving, but the reference a test
 /// compares a spilled source with.
 impl RowSource for Vec<u32> {
-    fn sources(&self) -> Vec<u32> {
-        self.clone()
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn read(&self, start: usize, out: &mut [u32]) {
+        out.copy_from_slice(&self[start..start + out.len()]);
     }
 }
 
@@ -74,10 +93,14 @@ impl SpilledRows {
     /// directory, a full disk) leaves nothing behind, and the caller keeps
     /// the ids in memory instead.
     pub fn write(sources: &[u32]) -> std::io::Result<SpilledRows> {
+        Self::write_in(&std::env::temp_dir(), sources)
+    }
+
+    /// [`Self::write`], in the directory `dir`.
+    pub fn write_in(dir: &std::path::Path, sources: &[u32]) -> std::io::Result<SpilledRows> {
         use std::io::Write;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -112,24 +135,28 @@ impl SpilledRows {
 
 #[cfg(unix)]
 impl RowSource for SpilledRows {
-    fn sources(&self) -> Vec<u32> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn read(&self, start: usize, out: &mut [u32]) {
         use std::os::unix::fs::FileExt;
-        let mut out = Vec::with_capacity(self.len);
-        let mut bytes = vec![0u8; 1 << 20];
-        let mut at = 0usize;
-        while at < self.len {
-            let n = (self.len - at).min(bytes.len() / 4);
-            let buf = &mut bytes[..n * 4];
+        assert!(
+            start + out.len() <= self.len,
+            "reading past the spilled rows"
+        );
+        // A MiB of bytes at a time.
+        const PER: usize = 1 << 18;
+        let mut bytes = vec![0u8; out.len().min(PER) * 4];
+        for (i, chunk) in out.chunks_mut(PER).enumerate() {
+            let buf = &mut bytes[..chunk.len() * 4];
             self.file
-                .read_exact_at(buf, (at * 4) as u64)
+                .read_exact_at(buf, ((start + i * PER) * 4) as u64)
                 .unwrap_or_else(|e| panic!("reading back the spilled edge rows failed: {e}"));
-            out.extend(
-                buf.chunks_exact(4)
-                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            );
-            at += n;
+            for (v, b) in chunk.iter_mut().zip(buf.chunks_exact(4)) {
+                *v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
         }
-        out
     }
 }
 
@@ -258,6 +285,17 @@ impl EdgeIds {
         }
     }
 
+    /// The rows' sources these ids would be built from, and the node of
+    /// each original id, when they are an out-adjacency's not yet built.
+    pub(crate) fn rows_source(&self) -> Option<(&dyn RowSource, Option<&[u32]>)> {
+        match &self.0.rebuild {
+            Rebuild::Rows { source, node, .. } if !self.is_built() => {
+                Some((source.as_ref(), node.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
     /// The ids, without keeping them if they are not held: the held ones
     /// (a reference, not a copy), or a fresh build that the caller owns.
     pub fn detached(&self) -> ScalarBuffer<u32> {
@@ -292,11 +330,25 @@ impl EdgeIds {
                 out_targets,
                 out_ids,
                 n_nodes,
-            } => out_ids
-                .with(|ids| {
-                    crate::topology::transpose_parts(out_offsets, out_targets, ids, *n_nodes).2
-                })
-                .into(),
+            } => {
+                use crate::topology::{transpose_parts, TransposeIds};
+                let parts = |ids: TransposeIds<'_>| {
+                    transpose_parts(out_offsets, out_targets, ids, *n_nodes).2
+                };
+                let ids = if out_ids.is_built() {
+                    parts(TransposeIds::Rows(out_ids.get()))
+                } else if out_ids.is_identity() {
+                    parts(TransposeIds::Identity)
+                } else if let Some((source, node)) = out_ids.rows_source() {
+                    // Streamed from the sources: the out-ids are not built.
+                    let (_, rows) =
+                        transpose_rows(out_offsets, out_targets, source, node, InSlot::Row);
+                    Some(rows)
+                } else {
+                    out_ids.with(|ids| parts(TransposeIds::Rows(ids)))
+                };
+                ids.unwrap_or_default().into()
+            }
         }
     }
 }
@@ -419,4 +471,157 @@ pub(crate) fn rows_by_key(offsets: &[u64], keys: &[u32], node: Option<&[u32]>) -
         }
     });
     ids
+}
+
+/// What [`transpose_rows`] writes into each in-slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InSlot {
+    /// The row's source: the in-adjacency's targets.
+    Source,
+    /// The row itself: the in-adjacency's edge ids.
+    Row,
+}
+
+/// The in-adjacency of an out-adjacency whose segments hold their rows in
+/// row order (`out_offsets`, `out_targets`), its rows' sources read from
+/// `source` (node `node[o]` for original id `o`): its offsets, and for each
+/// in-slot the row's source or the row itself (`what`). Each in-segment
+/// lists its rows in row order, as the eager transpose leaves it, without
+/// building the out-adjacency's edge ids or sorting a segment (#170).
+///
+/// The sources are streamed in row order, and each row's target is read off
+/// the out-adjacency: row `r` with source `s` is the next unread slot of
+/// `s`'s segment, its rows being in row order. A stable counting sort by
+/// target then places it. In parallel, over contiguous chunks of rows, as
+/// [`rows_by_key`] does: the sources are read a block at a time, up to
+/// three times (each chunk's sources, then its targets, then the scatter,
+/// which reads them only to write them), and the transient memory is the
+/// per-chunk cursors and the rows' targets (4 B/edge).
+pub(crate) fn transpose_rows(
+    out_offsets: &[u64],
+    out_targets: &[u32],
+    source: &dyn RowSource,
+    node: Option<&[u32]>,
+    what: InSlot,
+) -> (Vec<u64>, Vec<u32>) {
+    use crate::parallel::*;
+    let n = out_offsets.len() - 1;
+    let m = out_targets.len();
+    assert_eq!(
+        source.len(),
+        m,
+        "the edge rows read back are not the rows the index was built from"
+    );
+    let key = |k: u32| node.map_or(k, |node| node[k as usize]) as usize;
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    let serial = m < PARALLEL_MIN_EDGES || n == 0 || current_num_threads() <= 1 || in_worker();
+    // Two sets of `n`-long cursors a chunk: chunks are capped at `m / n`
+    // over two, within about 4 B/edge, as in the build.
+    let n_chunks = if serial {
+        1
+    } else {
+        current_num_threads().min((m / n / 2).max(2))
+    };
+    let chunk = m.div_ceil(n_chunks).max(1);
+    let ranges: Vec<(usize, usize)> = (0..n_chunks)
+        .map(|c| (c * chunk, ((c + 1) * chunk).min(m)))
+        .collect();
+    // Call `f(row, source node)` for rows `lo..hi`, reading a block at a time.
+    let each = |(lo, hi): (usize, usize), f: &mut dyn FnMut(usize, usize)| {
+        const BLOCK: usize = 1 << 16;
+        let mut buf = vec![0u32; BLOCK.min(hi.saturating_sub(lo))];
+        let mut at = lo;
+        while at < hi {
+            let len = (hi - at).min(BLOCK);
+            source.read(at, &mut buf[..len]);
+            for (i, &s) in buf[..len].iter().enumerate() {
+                f(at + i, key(s));
+            }
+            at += len;
+        }
+    };
+    let map_chunks = |f: &(dyn Fn((usize, usize)) -> Vec<u32> + Sync)| -> Vec<Vec<u32>> {
+        if serial {
+            ranges.iter().map(|&r| f(r)).collect()
+        } else {
+            ranges.par_iter().map(|&r| f(r)).collect()
+        }
+    };
+    // Each chunk's counts per node, made in place its cursors into every
+    // segment that `starts` gives, in chunk order.
+    let to_cursors = |hists: &mut [Vec<u32>], starts: &dyn Fn(usize) -> u32| {
+        let mut running: Vec<u32> = (0..n).map(starts).collect();
+        for h in hists.iter_mut() {
+            for (slot, run) in h.iter_mut().zip(running.iter_mut()) {
+                let cnt = *slot;
+                *slot = *run;
+                *run += cnt;
+            }
+        }
+    };
+
+    // Pass 1: each chunk's rows per source, made its cursors into the
+    // out-segments.
+    let mut outs = map_chunks(&|r| {
+        let mut h = vec![0u32; n];
+        each(r, &mut |_, s| h[s] += 1);
+        h
+    });
+    to_cursors(&mut outs, &|v| out_offsets[v] as u32);
+    // Pass 2: each row's target, read off its source's next out-slot (a
+    // transient column, 4 B/edge, so the scatter reads it in order rather
+    // than gathering it again), and each chunk's rows per target.
+    let mut dst = vec![0u32; m];
+    let d_addr = dst.as_mut_ptr() as usize;
+    let targets_of = |(c, mut cur): (usize, Vec<u32>)| {
+        let mut h = vec![0u32; n];
+        each(ranges[c], &mut |row, s| {
+            let v = out_targets[cur[s] as usize];
+            cur[s] += 1;
+            h[v as usize] += 1;
+            // SAFETY: `row < m`, and in this chunk's rows alone.
+            unsafe { *(d_addr as *mut u32).add(row) = v };
+        });
+        h
+    };
+    let mut ins: Vec<Vec<u32>> = if serial {
+        outs.into_iter().enumerate().map(targets_of).collect()
+    } else {
+        outs.into_par_iter().enumerate().map(targets_of).collect()
+    };
+    let mut offsets = vec![0u64; n + 1];
+    for h in &ins {
+        for (v, &c) in h.iter().enumerate() {
+            offsets[v + 1] += u64::from(c);
+        }
+    }
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    to_cursors(&mut ins, &|v| offsets[v] as u32);
+    // Pass 3: a stable counting sort of the rows by target. Each chunk owns
+    // its cursors' slots (they partition every segment), so the writes
+    // never overlap.
+    let mut slots = vec![0u32; m];
+    let addr = slots.as_mut_ptr() as usize;
+    let dst = &dst;
+    let scatter = |(c, mut pos): (usize, Vec<u32>)| {
+        let mut put = |row: usize, value: u32| {
+            let v = dst[row] as usize;
+            let at = pos[v] as usize;
+            pos[v] += 1;
+            // SAFETY: `at < m`, and claimed by this (chunk, row) alone.
+            unsafe { *(addr as *mut u32).add(at) = value };
+        };
+        match what {
+            InSlot::Source => each(ranges[c], &mut |row, s| put(row, s as u32)),
+            InSlot::Row => (ranges[c].0..ranges[c].1).for_each(|row| put(row, row as u32)),
+        }
+    };
+    if serial {
+        ins.into_iter().enumerate().for_each(scatter);
+    } else {
+        ins.into_par_iter().enumerate().for_each(scatter);
+    }
+    (offsets, slots)
 }

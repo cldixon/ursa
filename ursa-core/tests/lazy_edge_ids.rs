@@ -8,6 +8,7 @@
 //! each, plain, weighted and masked; and an unweighted, unmasked kernel must
 //! never build them.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ursa_core::algo::{
@@ -259,4 +260,146 @@ fn sorted_rows_have_identity_ids_without_a_source() {
     let plain = Topology::build(1_000, rows.0, rows.1);
     assert!(plain.out().edge_ids.is_identity());
     assert_eq!(plain.out().edge_ids, t.out().edge_ids);
+}
+
+/// The rows' sources, counting how they are read: whole (to build the
+/// out-adjacency's edge ids) or streamed a block at a time (to transpose).
+#[derive(Default)]
+struct Counted {
+    rows: Vec<u32>,
+    whole: AtomicUsize,
+    streamed: AtomicUsize,
+}
+
+impl RowSource for Counted {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn read(&self, start: usize, out: &mut [u32]) {
+        self.streamed.fetch_add(out.len(), Ordering::Relaxed);
+        out.copy_from_slice(&self.rows[start..start + out.len()]);
+    }
+
+    fn sources(&self) -> Vec<u32> {
+        self.whole.fetch_add(1, Ordering::Relaxed);
+        self.rows.clone()
+    }
+}
+
+impl Counted {
+    /// (whole reads, rows streamed).
+    fn reads(&self) -> (usize, usize) {
+        (
+            self.whole.load(Ordering::Relaxed),
+            self.streamed.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn counted(n: u32, (s, d): &(Vec<u32>, Vec<u32>), order: NodeOrder) -> (Topology, Arc<Counted>) {
+    let source = Arc::new(Counted {
+        rows: s.clone(),
+        ..Counted::default()
+    });
+    let kept = Arc::clone(&source);
+    let t = Topology::build_with_rows(n as usize, s.clone(), d.clone(), order, &mut |_| {
+        Some(Arc::clone(&kept) as Arc<dyn RowSource>)
+    });
+    (t, source)
+}
+
+fn no_ids(t: &Topology) -> bool {
+    !t.out().edge_ids.is_built() && t.incoming_if_built().is_none_or(|i| !i.edge_ids.is_built())
+}
+
+#[test]
+fn plain_kernels_never_build_ids_or_read_the_rows_whole() {
+    let params = PageRankParams {
+        damping: 0.85,
+        max_iter: 20,
+        tol: 0.0,
+    };
+    for (name, n, rows, order) in graphs() {
+        let m = rows.0.len();
+        if rows.0.windows(2).all(|w| w[0] <= w[1]) {
+            continue; // identity ids: no source at all
+        }
+        let eager = build(n, &rows, order, Ids::Eager);
+
+        // Out-adjacency kernels, and the undirected view: the rows are not
+        // read at all, and no in-adjacency is built.
+        let (t, source) = counted(n, &rows, order);
+        assert_eq!(
+            triangle_count(&t, None),
+            triangle_count(&eager, None),
+            "{name}"
+        );
+        assert_eq!(
+            connected_components_weak(&t, None),
+            connected_components_weak(&eager, None)
+        );
+        assert_eq!(
+            k_hop_distances_masked(&t, None, &[0, 3], 3, Direction::Out),
+            k_hop_distances_masked(&eager, None, &[0, 3], 3, Direction::Out)
+        );
+        assert_eq!(
+            louvain(&t, None, 1.0, Some(1), true),
+            louvain(&eager, None, 1.0, Some(1), true)
+        );
+        assert!(t.incoming_if_built().is_none(), "{name}");
+        assert_eq!(source.reads(), (0, 0), "{name}");
+        assert!(no_ids(&t), "{name}");
+
+        // The first in-direction kernel transposes: it streams the rows
+        // (three passes) once and builds no ids; later ones read nothing.
+        for first in ["pagerank", "bfs in", "bfs both"] {
+            let (t, source) = counted(n, &rows, order);
+            let run = |t: &Topology, which: &str| match which {
+                "pagerank" => format!("{:?}", pagerank(t, None, params)),
+                "bfs in" => format!("{:?}", bfs_distances(t, 0, Direction::In)),
+                _ => format!("{:?}", bfs_distances(t, 0, Direction::Both)),
+            };
+            assert_eq!(run(&t, first), run(&eager, first), "{name} {first}");
+            assert_eq!(source.reads(), (0, 3 * m), "{name} {first}");
+            for then in ["pagerank", "bfs in", "bfs both"] {
+                assert_eq!(run(&t, then), run(&eager, then), "{name} {then}");
+            }
+            assert_eq!(triangle_count(&t, None), triangle_count(&eager, None));
+            assert_eq!(source.reads(), (0, 3 * m), "{name} {first}");
+            assert!(no_ids(&t), "{name} {first}");
+            assert_eq!(t.incoming().targets, eager.incoming().targets, "{name}");
+            // The in-ids, read now, are streamed too: the out-ids are still
+            // not built.
+            assert_eq!(&t.incoming().edge_ids[..], &eager.incoming().edge_ids[..]);
+            assert_eq!(source.reads(), (0, 5 * m), "{name} {first}");
+            assert!(!t.out().edge_ids.is_built(), "{name} {first}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_spill_that_cannot_be_written_is_an_error_and_the_ids_stay_in_memory() {
+    let dir = std::env::temp_dir().join("ursa-no-such-dir-170");
+    assert!(!dir.exists());
+    let err = ursa_core::topology::SpilledRows::write_in(&dir, &[1, 2, 3]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(!dir.exists());
+    // A build that cannot spill keeps its ids in memory: the eager build.
+    let rows = rows(500, 80_000, 9, false);
+    let t = Topology::build_with_rows(
+        500,
+        rows.0.clone(),
+        rows.1.clone(),
+        NodeOrder::InDegree,
+        &mut |src| {
+            ursa_core::topology::SpilledRows::write_in(&dir, src)
+                .ok()
+                .map(|r| Arc::new(r) as Arc<dyn RowSource>)
+        },
+    );
+    assert!(t.out().edge_ids.is_built());
+    let eager = build(500, &rows, NodeOrder::InDegree, Ids::Eager);
+    assert_eq!(t.out().edge_ids, eager.out().edge_ids);
 }

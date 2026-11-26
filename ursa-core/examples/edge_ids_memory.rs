@@ -15,7 +15,8 @@
 //!     --kernel pagerank --edges 16000000 --ids late
 //! ```
 //!
-//! Kernels: `none` (the index alone), `pagerank`, `components` (weak),
+//! Kernels: `none` (the index alone), `transpose` (the in-adjacency alone),
+//! `in-ids` (its edge ids too), `pagerank`, `components` (weak),
 //! `hop` (2 hops out of the hub), `bfs` (from the hub, both directions),
 //! `louvain` (serial, seed 1), and `weighted-pagerank` (which reads the edge
 //! ids, so pays the rebuild). The R-MAT edges are rmat_kernel's (Graph500
@@ -119,9 +120,25 @@ fn main() {
     let started = Instant::now();
     let hash = match kernel.as_str() {
         "none" => 0,
+        // The in-adjacency alone, then its edge ids too.
+        "transpose" => fnv(t.incoming().targets.iter().map(|&x| u64::from(x))),
+        "in-ids" => {
+            t.incoming();
+            let at = Instant::now();
+            let h = fnv(t.incoming().edge_ids.iter().map(|&x| u64::from(x)));
+            println!("in-ids alone: {:.2} s", at.elapsed().as_secs_f64());
+            h
+        }
         "pagerank" => fnv(pagerank(&t, None, params).iter().map(|x| x.to_bits())),
         "weighted-pagerank" => {
             let w: Vec<f64> = (0..t.n_edges()).map(|e| (e % 7) as f64 + 1.0).collect();
+            // The ids and the transpose apart from the iterations.
+            let at = Instant::now();
+            let _ = (t.out().edge_ids.get(), t.incoming().edge_ids.get());
+            println!(
+                "weighted: ids and transpose {:.2} s",
+                at.elapsed().as_secs_f64()
+            );
             fnv(pagerank_weighted(&t, &w, None, params)
                 .iter()
                 .map(|x| x.to_bits()))

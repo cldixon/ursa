@@ -440,33 +440,59 @@ impl Adjacency {
 
     /// The transpose of `out` (grouped by target instead of source), with each
     /// node's segment in original row order, exactly as [`Self::build`] would
-    /// produce it from the per-row endpoints, but without materializing them
-    /// (see [`transpose_parts`]).
+    /// produce it from the per-row endpoints, but without materializing them.
     ///
     /// Its edge ids are kept when `out`'s are held (a pipeline that reads
-    /// them reads them in both directions); otherwise `out`'s are built for
-    /// the pass and dropped, and the transpose's are rebuilt from them when
-    /// read (#170).
+    /// them reads them in both directions). Otherwise none are built (#170):
+    /// for identity out-ids the slot order is the row order; for out-ids
+    /// that would be rebuilt from the rows' sources, those sources are
+    /// streamed once to place each row ([`transpose_rows`]); and the
+    /// transpose's own ids are built from the same when first read.
+    ///
+    /// [`transpose_rows`]: crate::edge_ids::transpose_rows
     fn transpose(out: &Adjacency, n_nodes: usize) -> Adjacency {
-        let held = out.edge_ids.is_built();
-        let (offsets, targets, edge_ids) = out
-            .edge_ids
-            .with(|ids| transpose_parts(&out.offsets, &out.targets, ids, n_nodes));
-        let m = targets.len();
-        let edge_ids = match held {
-            true => EdgeIds::from(edge_ids),
-            false => {
-                drop(edge_ids);
-                EdgeIds::lazy(
-                    m,
-                    Rebuild::Transpose {
-                        out_offsets: out.offsets.clone(),
-                        out_targets: out.targets.clone(),
-                        out_ids: out.edge_ids.clone(),
-                        n_nodes,
-                    },
-                )
-            }
+        let ids = &out.edge_ids;
+        let lazy = |m: usize| {
+            EdgeIds::lazy(
+                m,
+                Rebuild::Transpose {
+                    out_offsets: out.offsets.clone(),
+                    out_targets: out.targets.clone(),
+                    out_ids: ids.clone(),
+                    n_nodes,
+                },
+            )
+        };
+        let (offsets, targets, edge_ids) = if ids.is_built() {
+            let (o, t, e) = transpose_parts(
+                &out.offsets,
+                &out.targets,
+                TransposeIds::Rows(ids.get()),
+                n_nodes,
+            );
+            (o, t, EdgeIds::from(e.unwrap_or_default()))
+        } else if ids.is_identity() {
+            let (o, t, _) =
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::None, n_nodes);
+            let m = t.len();
+            (o, t, lazy(m))
+        } else if let Some((source, node)) = ids.rows_source() {
+            let (o, t) = crate::edge_ids::transpose_rows(
+                &out.offsets,
+                &out.targets,
+                source,
+                node,
+                crate::edge_ids::InSlot::Source,
+            );
+            let m = t.len();
+            (o, t, lazy(m))
+        } else {
+            // Ids of another kind (a reversed topology's): built for the pass.
+            let (o, t, _) = ids.with(|ids| {
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::Rows(ids), n_nodes)
+            });
+            let m = t.len();
+            (o, t, lazy(m))
         };
         Adjacency {
             offsets: offsets.into(),
@@ -517,13 +543,14 @@ impl Adjacency {
 pub(crate) fn transpose_parts(
     out_offsets: &[u64],
     out_targets: &[u32],
-    out_ids: &[u32],
+    ids: TransposeIds<'_>,
     n_nodes: usize,
-) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+) -> (Vec<u64>, Vec<u32>, Option<Vec<u32>>) {
+    let with_ids = !matches!(ids, TransposeIds::None);
     use crate::parallel::*;
     let m = out_targets.len();
     if m == 0 || n_nodes == 0 {
-        return (vec![0; n_nodes + 1], Vec::new(), Vec::new());
+        return (vec![0; n_nodes + 1], Vec::new(), with_ids.then(Vec::new));
     }
     // Same chunking rule as `build` (serial on a rayon worker; see
     // `parallel::in_worker`).
@@ -575,7 +602,7 @@ pub(crate) fn transpose_parts(
     // writes never overlap; pointers cross threads as plain addresses, as in
     // `build_parallel`.
     let mut targets = vec![0u32; m];
-    let mut edge_ids = vec![0u32; m];
+    let mut edge_ids = vec![0u32; if with_ids { m } else { 0 }];
     let (t_addr, e_addr) = (
         targets.as_mut_ptr() as usize,
         edge_ids.as_mut_ptr() as usize,
@@ -595,7 +622,11 @@ pub(crate) fn transpose_parts(
             // SAFETY: `pos < m` and is claimed by exactly one (chunk, slot).
             unsafe {
                 *(t_addr as *mut u32).add(pos) = owner as u32;
-                *(e_addr as *mut u32).add(pos) = out_ids[k];
+                match ids {
+                    TransposeIds::Rows(out_ids) => *(e_addr as *mut u32).add(pos) = out_ids[k],
+                    TransposeIds::Identity => *(e_addr as *mut u32).add(pos) = k as u32,
+                    TransposeIds::None => {}
+                }
             }
         }
     };
@@ -606,6 +637,11 @@ pub(crate) fn transpose_parts(
     }
 
     // Pass 3: restore original row order inside each segment.
+    // Slots arrive in slot order, which is row order for the identity, and
+    // without ids the order of the slots is what is asked for.
+    if !matches!(ids, TransposeIds::Rows(_)) {
+        return (offsets, targets, with_ids.then_some(edge_ids));
+    }
     let sort_segment = |scratch: &mut Vec<(u32, u32)>, v: usize| {
         let (s, e) = (offsets[v] as usize, offsets[v + 1] as usize);
         // SAFETY: segments are disjoint across nodes and inside both buffers.
@@ -635,7 +671,22 @@ pub(crate) fn transpose_parts(
             .for_each_init(Vec::new, sort_segment);
     }
 
-    (offsets, targets, edge_ids)
+    (offsets, targets, Some(edge_ids))
+}
+
+/// The edge ids [`transpose_parts`] reads and writes.
+#[derive(Clone, Copy)]
+pub(crate) enum TransposeIds<'a> {
+    /// The out-adjacency's ids: each in-segment is put in row order, and
+    /// its ids written.
+    Rows(&'a [u32]),
+    /// The out-adjacency's ids are the identity: slot order is row order,
+    /// and the ids are written.
+    Identity,
+    /// None: each in-segment in out-slot (source) order, no ids. That is
+    /// row order only when the out-ids are the identity; otherwise it is
+    /// for a view where only the set of neighbours matters (undirected).
+    None,
 }
 
 /// A symmetric, deduplicated, sorted undirected adjacency in flat CSR form.
@@ -1792,7 +1843,25 @@ impl Topology {
         use crate::parallel::*;
         let n = self.n_nodes;
         let out = &self.out;
-        let inc = self.incoming();
+        // Each segment is sorted and deduplicated, so only the set of
+        // in-neighbours matters, not their order. Without a mask, and with
+        // no in-adjacency at hand, they are transposed for this build alone,
+        // in slot order, from the targets: no row order, no edge ids, and no
+        // in-adjacency kept (#170).
+        let unordered;
+        let inc = if mask.is_none() && !self.incoming_is_cheap() {
+            let (offsets, targets, _) =
+                transpose_parts(&out.offsets, &out.targets, TransposeIds::None, n);
+            let m = targets.len();
+            unordered = Adjacency {
+                offsets: offsets.into(),
+                targets: targets.into(),
+                edge_ids: EdgeIds::identity(m),
+            };
+            &unordered
+        } else {
+            self.incoming()
+        };
         if mask.is_some() {
             // Built once here, not on first read inside the parallel fill.
             let _ = (out.edge_ids.get(), inc.edge_ids.get());
