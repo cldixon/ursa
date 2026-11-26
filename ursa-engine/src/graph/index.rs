@@ -929,7 +929,11 @@ async fn build_noticed(
     };
     notifier.say(level, || {
         format!(
-            "built the index for {} ({} edges){}{outcome}",
+            "built the {}index for {} ({} edges){}{outcome}",
+            match index.topology.is_compressed() {
+                true => "compressed ",
+                false => "",
+            },
             info.graph(),
             notices::count(index.topology.n_edges() as u64),
             took(started)

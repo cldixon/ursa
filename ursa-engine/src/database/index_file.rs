@@ -2491,7 +2491,7 @@ mod tests {
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(
             decode(&bytes, &key()).unwrap_err(),
-            "index format version 1; this build reads 2 to 5"
+            "index format version 1; this build reads 2 to 6"
         );
     }
 
