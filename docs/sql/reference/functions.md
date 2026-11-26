@@ -14,7 +14,7 @@ A `node ids` or `node id` parameter takes integers or strings: a list, a query o
 
 ## Algorithms
 
-[`degree`](#degree) · [`pagerank`](#pagerank) · [`connected_components`](#connected_components) · [`triangle_count`](#triangle_count) · [`clustering_coefficient`](#clustering_coefficient) · [`betweenness`](#betweenness) · [`closeness`](#closeness) · [`label_propagation`](#label_propagation) · [`louvain`](#louvain)
+[`degree`](#degree) · [`pagerank`](#pagerank) · [`connected_components`](#connected_components) · [`triangle_count`](#triangle_count) · [`clustering_coefficient`](#clustering_coefficient) · [`betweenness`](#betweenness) · [`closeness`](#closeness) · [`label_propagation`](#label_propagation) · [`louvain`](#louvain) · [`weakly_connected_component`](#weakly_connected_component) · [`local_clustering_coefficient`](#local_clustering_coefficient)
 
 ### degree
 
@@ -55,6 +55,8 @@ pagerank(graph, damping => 0.85, max_iter => 30, tol => 1e-6, weight => NULL, di
 **Returns:** One row per node: `id` (the node), `pagerank` (Float64)
 
 **NetworkX:** `nx.pagerank(G, alpha=damping) (in: nx.pagerank(G.reverse()); both: nx.pagerank(U))`
+
+**DuckPGQ:** `pagerank(graph, vertex_table, edge_table)`, with the same name and column.
 
 ### connected_components
 
@@ -172,6 +174,34 @@ louvain(graph, weight => NULL, resolution => 1.0, seed => NULL, parallel => fals
 **Returns:** One row per node: `id` (the node), `louvain` (UInt32)
 
 **NetworkX:** `nx.community.louvain_communities(U)`
+
+### weakly_connected_component
+
+DuckPGQ's name for connected_components(<graph>, mode => 'weak'), with DuckPGQ's column name, componentid. Values are Ursa's: A component label per node: weak (ignoring direction) or strong.
+
+```text
+weakly_connected_component(graph)
+```
+
+**Returns:** One row per node: `id` (the node), `componentid` (UInt32)
+
+**NetworkX:** `nx.connected_components(U) (strong: nx.strongly_connected_components(G))`
+
+**DuckPGQ:** `weakly_connected_component(graph, vertex_table, edge_table)` is DuckPGQ's call; it runs [`connected_components`](#connected_components) with DuckPGQ's column name.
+
+### local_clustering_coefficient
+
+DuckPGQ's name for clustering_coefficient(<graph>), with DuckPGQ's column name, local_clustering_coefficient. Values are Ursa's: Local clustering coefficient, derived from the triangle counts.
+
+```text
+local_clustering_coefficient(graph)
+```
+
+**Returns:** One row per node: `id` (the node), `local_clustering_coefficient` (Float64)
+
+**NetworkX:** `nx.clustering(U)`
+
+**DuckPGQ:** `local_clustering_coefficient(graph, vertex_table, edge_table)` is DuckPGQ's call; it runs [`clustering_coefficient`](#clustering_coefficient) with DuckPGQ's column name.
 
 ## Statistics
 

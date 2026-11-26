@@ -80,8 +80,8 @@ use ursa_core::algo::AggKind;
 use ursa_core::catalog::{Call, FunctionSpec};
 
 use super::functions::{
-    self, did_you_mean, is_per_node, nested_signature, plan, signature, Given, Literal, ALGORITHMS,
-    VALUES_QUERY,
+    self, did_you_mean, is_per_node, nested_signature, plan, signature, DuckPgqName, Given,
+    Literal, ALGORITHMS, VALUES_QUERY,
 };
 use super::kernels;
 use super::node::{
@@ -117,6 +117,8 @@ enum Target {
     Algorithms,
     /// A traversal.
     Traversal(&'static TraversalSpec),
+    /// DuckPGQ's name for a catalog function (#298).
+    DuckPgq(&'static DuckPgqName),
 }
 
 impl Target {
@@ -125,6 +127,7 @@ impl Target {
             Target::Function(spec) => spec.name,
             Target::Algorithms => ALGORITHMS,
             Target::Traversal(spec) => spec.name,
+            Target::DuckPgq(d) => d.name,
         }
     }
 
@@ -134,6 +137,7 @@ impl Target {
             Target::Function(spec) => signature(spec),
             Target::Algorithms => ALGORITHMS_SIGNATURE.to_string(),
             Target::Traversal(spec) => spec.signature(),
+            Target::DuckPgq(d) => format!("{}(<graph>, <vertex table>, <edge table>)", d.name),
         }
     }
 }
@@ -185,7 +189,12 @@ impl RelationPlanner for GraphFunctions {
             Target::Function(spec)
         } else if let Some(spec) = traversal::lookup(&function_name) {
             Target::Traversal(spec)
+        } else if let Some(d) = functions::duckpgq(&function_name) {
+            Target::DuckPgq(d)
         } else {
+            if let Some(why) = functions::duckpgq_path_function(&function_name) {
+                return Err(plan(why));
+            }
             // Not ours, unless its first argument names a graph: then it is a
             // misspelled graph function.
             if self.first_argument_is_a_graph(args, context) {
@@ -254,6 +263,26 @@ impl RelationPlanner for GraphFunctions {
                         weight,
                     })
                     .collect();
+                (outputs, is_per_node(spec))
+            }
+            Target::DuckPgq(d) => {
+                let spec = d.spec();
+                let rest = duckpgq_args(d, rest, context)?;
+                let (call, weight) =
+                    resolve_call(spec, rest, context, &mut weights, "").map_err(|e| match e {
+                        DataFusionError::Plan(m) => plan(format!(
+                            "{}() is DuckPGQ's name for {}: {m}",
+                            d.name,
+                            d.ursa_call()
+                        )),
+                        other => other,
+                    })?;
+                let outputs = vec![Output {
+                    name: d.column.to_string(),
+                    call,
+                    field: 0,
+                    weight,
+                }];
                 (outputs, is_per_node(spec))
             }
             Target::Algorithms => (algorithms(rest, context, &mut weights)?, true),
@@ -819,6 +848,19 @@ impl NodeIds<'_> {
     }
 }
 
+/// Names a call might give the vertex or edge table by, which it takes by
+/// position instead.
+const PAIR_NAMES: &[&str] = &[
+    "vertex",
+    "vertices",
+    "vertex_table",
+    "vertex_label",
+    "edge",
+    "edges",
+    "edge_table",
+    "edge_label",
+];
+
 /// From this many elements, a list of literal node ids is planned as a
 /// column in memory, not as `VALUES` (see [`NodeIds::literal_ids`]).
 const LITERAL_IDS_MIN: usize = 65;
@@ -830,6 +872,30 @@ const NODE_IDS_TABLE: &str = "node_ids";
 /// a type Arrow casts to it.
 fn castable(from: &DataType, id_type: &DataType) -> bool {
     from == &DataType::Null || can_cast_types(from, id_type)
+}
+
+/// The arguments of a call by DuckPGQ's name `d`, after the graph: the
+/// parameters `d` fixes added, and refused when the call gives one.
+fn duckpgq_args(
+    d: &DuckPgqName,
+    mut args: Vec<FunctionArg>,
+    context: &dyn RelationPlannerContext,
+) -> Result<Vec<FunctionArg>> {
+    for arg in &args {
+        if let FunctionArg::Named { name, .. } = arg {
+            if let Some(why) = d.fixed_param(&context.normalize_ident(name.clone())) {
+                return Err(plan(why));
+            }
+        }
+    }
+    args.extend(d.fixed.iter().map(|(name, value)| FunctionArg::Named {
+        name: ast::Ident::new(*name),
+        arg: FunctionArgExpr::Expr(ast::Expr::value(ast::Value::SingleQuotedString(
+            value.to_string(),
+        ))),
+        operator: FunctionArgOperator::RightArrow,
+    }));
+    Ok(args)
 }
 
 /// "there is no graph function 'pagerenk'; did you mean 'pagerank'?", with
@@ -1056,7 +1122,9 @@ fn algorithms(
                 t.signature()
             )));
         }
-        let Some(spec) = functions::lookup(&name) else {
+        // DuckPGQ's names run here too (#298), with their own column.
+        let compat = functions::duckpgq(&name);
+        let Some(spec) = functions::lookup(&name).or(compat.map(DuckPgqName::spec)) else {
             return Err(no_such_function(&name, &prefix, per_node().collect()));
         };
         if !is_per_node(spec) {
@@ -1104,13 +1172,19 @@ fn algorithms(
                 nested_signature(spec)
             )));
         }
+        let nested_args = match compat {
+            Some(d) => duckpgq_args(d, nested_args, context)
+                .map_err(|e| plan(format!("{prefix}{}", crate::user_message(&e))))?,
+            None => nested_args,
+        };
         let (call, weight) = resolve_call(spec, nested_args, context, weights, &prefix)?;
         let several = spec.outputs.len() > 1;
         for (field, o) in spec.outputs.iter().enumerate() {
-            let column = match (&key, several) {
-                (Some(key), true) => format!("{key}_{}", o.name),
-                (Some(key), false) => key.clone(),
-                (None, _) => o.name.to_string(),
+            let column = match (&key, several, compat) {
+                (Some(key), true, _) => format!("{key}_{}", o.name),
+                (Some(key), false, _) => key.clone(),
+                (None, _, Some(d)) => d.column.to_string(),
+                (None, _, None) => o.name.to_string(),
             };
             outputs.push(Output {
                 name: column,
@@ -2090,6 +2164,25 @@ impl GraphFunctions {
             };
             labels.push(context.normalize_ident(ident));
         }
+        let rest: Vec<FunctionArg> = args.collect();
+        // The pair is positional, as in DuckPGQ; a name for it is not read.
+        if labels.is_empty() && !matches!(target, Target::Algorithms) {
+            let pair_name = rest.iter().find_map(|arg| match arg {
+                FunctionArg::Named { name, .. } => {
+                    let name = context.normalize_ident(name.clone());
+                    PAIR_NAMES.contains(&name.as_str()).then_some(name)
+                }
+                _ => None,
+            });
+            if let Some(param) = pair_name {
+                return Err(plan(format!(
+                    "{name}() takes the vertex table and the edge table by position, right \
+                     after the graph, not as '{param} =>': write {name}({}, <vertex table>, \
+                     <edge table>), then any named parameters",
+                    graph.name
+                )));
+            }
+        }
         let pair = match labels.as_slice() {
             [] => graph.pair(None, None)?,
             [vertex, edge] => graph.pair(Some(vertex), Some(edge))?,
@@ -2104,7 +2197,7 @@ impl GraphFunctions {
                 )))
             }
         };
-        Ok((Arc::new(pair), named_args(args.collect())))
+        Ok((Arc::new(pair), named_args(rest)))
     }
 
     /// The graph called `name`.
