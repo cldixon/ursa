@@ -1046,6 +1046,41 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   triggers plus changes to `ursa-server` and `ursa-cli/src/serve.rs`. The
   socket run skips exactly the suite's 6 browser-only checks, which the suite
   now lists and holds it to: a run that skips any other check fails.
+- **SQL: DuckPGQ's algorithm names, and errors that point to the standard
+  form** (#298, #300). Each was an error before, so no query that ran
+  changes.
+  - `weakly_connected_component(pg, Student, know)` runs
+    `connected_components(mode => 'weak')` and returns DuckPGQ's column,
+    `componentid` (unquoted names fold to lower case, so DuckPGQ's
+    `componentId` finds it); `local_clustering_coefficient(pg, Student,
+    know)` runs `clustering_coefficient` and returns
+    `local_clustering_coefficient`. They take DuckPGQ's positional (graph,
+    vertex table, edge table) form, the implied pair on a graph of one edge
+    table, the named parameters of the function they run (not `mode`, which
+    the name fixes), and work inside `algorithms()`. Values stay NetworkX's.
+  - `ursa_functions()` lists them as rows of their own, after `algorithms`,
+    and has two new columns: `same_as`, the Ursa function a DuckPGQ name
+    runs, and `duckpgq`, true for the three functions DuckPGQ has by name
+    (`pagerank` too). They are other systems' spellings; Ursa keeps no old
+    names of its own. The function reference shows them.
+  - DuckPGQ's scalar path functions (`iterativelength`, `shortestpath`,
+    `reachability`, `cheapest_path_length`) say to use `GRAPH_TABLE … ANY
+    SHORTEST` or `shortest_path()`.
+  - A statement that starts with `MATCH` (Cypher, GQL) says to write
+    `SELECT * FROM GRAPH_TABLE (g MATCH … COLUMNS (…))`. `FROM g`, a graph
+    read as a table, says to read `g.nodes` or `g.edges` (or the vertex and
+    edge tables, on a graph of several), use `GRAPH_TABLE`, or call a graph
+    function; `FROM g.nodes` on a graph of several vertex tables says why
+    there is none. A graph function named as a column of a vertex table
+    (`SELECT id, pagerank FROM Student`) names the pair in the join it
+    suggests: `JOIN pagerank(pg, student, know) USING (id)`.
+    `pagerank(pg, vertex => Student, edge => know)` says the pair is
+    positional.
+  - Docs: a "Coming from SQL/PGQ or DuckPGQ" page (what runs unchanged,
+    what differs, Ursa's extensions, the numeric differences from DuckPGQ,
+    and how to translate), and a section in the agent skill. The
+    conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
+    calls, and DuckPGQ's PageRank values are on its known differences.
 
 - **The Ursa Console's page: `ursa serve`'s link opens it** (URSA-12,
   `design/console.md` §6). At `/console/`, with the shell still at `/`: a

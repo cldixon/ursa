@@ -261,6 +261,11 @@ impl<'a> UrsaParser<'a> {
         {
             return Err(DataFusionError::NotImplemented(ALTER_GRAPH.to_string()));
         }
+        // Cypher's `MATCH (a)-[]->(b) RETURN …` (or GQL's) as a statement
+        // (#300): SQL/PGQ matches inside GRAPH_TABLE, in FROM.
+        if self.word(0, "MATCH") || (self.word(0, "OPTIONAL") && self.word(1, "MATCH")) {
+            return Err(DataFusionError::NotImplemented(CYPHER_MATCH.to_string()));
+        }
         if let Some(message) = self.duckdb_statement() {
             return Err(DataFusionError::NotImplemented(message.to_string()));
         }
@@ -478,6 +483,12 @@ const DUCKDB_STATEMENTS: &[(&str, &str)] = &[
          and SELECT * FROM ursa_functions() for the graph functions",
     ),
 ];
+
+/// The refusal for a statement that starts with `MATCH`, as Cypher's and
+/// GQL's do (#300).
+const CYPHER_MATCH: &str = "a statement cannot start with MATCH: that is Cypher's or GQL's form. \
+     In SQL/PGQ a pattern goes in GRAPH_TABLE, in FROM, and COLUMNS takes the place of RETURN: \
+     SELECT * FROM GRAPH_TABLE (g MATCH (a)-[e]->(b) COLUMNS (a.id AS a, b.id AS b))";
 
 /// The refusal for `ALTER [PROPERTY] GRAPH`.
 const ALTER_GRAPH: &str = "ALTER PROPERTY GRAPH is not supported; use CREATE OR REPLACE \
