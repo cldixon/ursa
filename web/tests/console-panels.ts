@@ -28,7 +28,7 @@
 // With a screenshot dir, it saves both panels, populated, in light and dark
 // at 1440×900 (panels-light.png, panels-dark.png).
 import { chromium, type Page } from "playwright";
-import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cargoTargetDir, DATA_DIR, WEB } from "../scripts/common";
@@ -62,11 +62,16 @@ writeFileSync(
   }),
 );
 
-const server = Bun.spawn([bin, "serve", root, "--port", String(port), "--no-open", "--assets", join(WEB, "dist-console"), "--assets", join(WEB, "dist")], { stdout: "pipe", stderr: "inherit" });
+// Served through a symbolic link, as web/.data is: the session's root is
+// the link, its entries' URLs the real path.
+const served = `${root}-link`;
+symlinkSync(root, served);
+const server = Bun.spawn([bin, "serve", served, "--port", String(port), "--no-open", "--assets", join(WEB, "dist-console"), "--assets", join(WEB, "dist")], { stdout: "pipe", stderr: "inherit" });
 // A run that throws still stops the server and removes the root.
 process.on("exit", () => {
   server.kill();
   rmSync(root, { recursive: true, force: true });
+  rmSync(served, { force: true });
 });
 let printed = "";
 let link: string | undefined;
@@ -273,7 +278,7 @@ await page.waitForSelector('#sources .entry[data-name="karate_nodes.parquet"]');
 const inKarate = await entries(page);
 check(inKarate[0] === "up .." && inKarate.some((e) => /^file karate_nodes\.parquet parquet \d+(\.\d)? K?B$/.test(e)) && inKarate.some((e) => e.startsWith("file karate_edges.csv csv")), "browsing into folders: Parquet and CSV, sized", inKarate.join("|"));
 const crumbs = await page.$$eval("#sources .crumbs li", (els) => els.map((e) => e.textContent));
-check(crumbs.join("/") === `${root.split("/").pop()}/data/karate`, "the path above the list", crumbs.join("/"));
+check(crumbs.join("/") === `${served.split("/").pop()}/data/karate`, "the path above the list", crumbs.join("/"));
 check((await page.evaluate(() => document.activeElement?.closest(".entry")?.getAttribute("data-name"))) === "..", "the keyboard is in the new folder's list");
 
 await page.locator('#sources .entry[data-name="karate_nodes.parquet"] .entry-main').click();
@@ -382,7 +387,6 @@ if (shots) {
 await browser.close();
 server.kill("SIGINT");
 await Promise.race([server.exited, Bun.sleep(5000)]);
-rmSync(root, { recursive: true, force: true });
 check(errors.length === 0, "no page errors in the run", errors.join("; "));
 console.log(failures.length ? `\n${failures.length} failed:\n- ${failures.join("\n- ")}` : "\nall passed");
 process.exit(failures.length ? 1 : 0);

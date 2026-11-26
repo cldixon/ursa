@@ -193,6 +193,13 @@ export function mountSources(mount) {
     try {
       const reply = await client.call("sources.list", { url });
       if (id !== listing) return;
+      // The root as its entries' URLs have it (the real path: hello's may
+      // go through a symbolic link).
+      if (place === "root" && url === "" && reply.entries?.length) {
+        const first = reply.entries[0];
+        const path = first.url.replace(/\/$/, "");
+        rootUrl = path.slice(0, path.lastIndexOf("/") + 1);
+      }
       renderEntries(reply.entries ?? []);
       if (focus) list.querySelector('[tabindex="0"]')?.focus();
     } catch (e) {

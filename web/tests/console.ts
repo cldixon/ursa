@@ -44,7 +44,7 @@ const FOREVER = "SELECT sum(value) AS s FROM range(0, 100000000000)";
 
 /** Start `ursa serve`; resolves to it and the link it printed. */
 async function serve() {
-  const server = Bun.spawn([bin, "serve", DATA_DIR, "--port", String(port), "--assets", join(WEB, "dist-console"), "--assets", join(WEB, "dist")], {
+  const server = Bun.spawn([bin, "serve", DATA_DIR, "--port", String(port), "--no-open", "--assets", join(WEB, "dist-console"), "--assets", join(WEB, "dist")], {
     stdout: "pipe",
     stderr: "inherit",
   });
@@ -109,7 +109,7 @@ const hello = await page.evaluate(() => (window as any).ursaConsole.session.hell
 check(hello?.session?.kind === "shared", "the console's session is the shared one", JSON.stringify(hello?.session));
 check(hello?.transport === "native" && (await text("#engine")).includes(`ursa ${hello.version}`) && (await text("#engine")).includes("native"), "the status bar names the engine", await text("#engine"));
 const root = realpathSync(DATA_DIR);
-check((await page.locator("#root-path").textContent()) === hello?.session?.cwd && hello?.session?.cwd === root, "the status bar shows the session's root", `${await page.locator("#root-path").textContent()} (served ${root})`);
+check((await page.locator("#root-path").textContent()) === hello?.session?.cwd && realpathSync(hello?.session?.cwd ?? "") === root, "the status bar shows the session's root", `${await page.locator("#root-path").textContent()} (served ${root})`);
 check(await page.locator("#running").isHidden(), "no request is running");
 
 // ---------------------------------------------------------------- panels
@@ -193,9 +193,9 @@ await page.keyboard.press("Shift+F6");
 check((await page.evaluate(() => document.activeElement?.id)) === "catalog", "Shift+F6 moves back");
 
 // Tab order: the header, then the left column, the editor and results, the
-// right column and the status bar (the frame's: not what the panels hold).
+// right column and the status bar (not what the Sources and Catalog panels hold: their own tests check them).
 const tabOrder = await page.evaluate(() => {
-  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links") && !el.closest("[data-mount]"));
+  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links") && !el.closest('[data-mount="sources"], [data-mount="catalog"]'));
   return all.map((el) => el.id || el.dataset.split || el.className);
 });
 const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "editor-run", "editor-run all", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];
