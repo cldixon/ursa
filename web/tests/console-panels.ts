@@ -63,6 +63,11 @@ writeFileSync(
 );
 
 const server = Bun.spawn([bin, "serve", root, "--port", String(port), "--no-open", "--assets", join(WEB, "dist-console"), "--assets", join(WEB, "dist")], { stdout: "pipe", stderr: "inherit" });
+// A run that throws still stops the server and removes the root.
+process.on("exit", () => {
+  server.kill();
+  rmSync(root, { recursive: true, force: true });
+});
 let printed = "";
 let link: string | undefined;
 {
@@ -229,14 +234,14 @@ check(hasEditor, "the editor (URSA-13) is there to hand queries to");
 // A table goes to the editor, as a statement of its own, not run yet; a
 // graph's .graph too (click, then Enter).
 await row(page, "t/datafusion/public/karate_nodes").locator(".name").click();
-await page.waitForFunction(() => /SELECT \* FROM karate_nodes LIMIT 100\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
+await page.waitForFunction(() => /SELECT \* FROM karate_nodes LIMIT 100;?\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
 const afterTable = (await editorText()) ?? "";
-check(/SELECT \* FROM karate_nodes LIMIT 100\s*$/.test(afterTable), "clicking a table puts SELECT * FROM it LIMIT 100 in the editor", JSON.stringify(afterTable.slice(-80)));
+check(/SELECT \* FROM karate_nodes LIMIT 100;?\s*$/.test(afterTable), "clicking a table puts SELECT * FROM it LIMIT 100 in the editor", JSON.stringify(afterTable.slice(-80)));
 check(!(await page.evaluate(() => (window as any).sent.some((r: any) => r.op === "query"))), "and does not run it");
 await row(page, "g/karate").focus();
 await page.keyboard.press("Enter");
-await page.waitForFunction(() => /\.graph karate\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
-check(/\.graph karate\s*$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor", JSON.stringify(((await editorText()) ?? "").slice(-40)));
+await page.waitForFunction(() => /\.graph karate;?\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
+check(/\.graph karate;?\s*$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor", JSON.stringify(((await editorText()) ?? "").slice(-40)));
 // Without an editor, the query runs on the session, and the panel says what came back.
 const ran = await page.evaluate(async () => {
   const w = window as any;
@@ -275,7 +280,7 @@ await page.locator('#sources .entry[data-name="karate_nodes.parquet"] .entry-mai
 const PARQUET_SQL = "SELECT * FROM 'data/karate/karate_nodes.parquet' LIMIT 100";
 await page.waitForFunction((q) => (window as any).sent.some((r: any) => r.op === "query" && r.text === q && r.ok !== null), PARQUET_SQL, { timeout: 20_000 }).catch(() => {});
 const parquetRun = await page.evaluate((q) => (window as any).sent.find((r: any) => r.op === "query" && r.text === q), PARQUET_SQL);
-check(Boolean(parquetRun?.ok) && ((await editorText()) ?? "").trimEnd().endsWith(PARQUET_SQL), "clicking a Parquet file puts its query in the editor and runs it, by its path under the root", JSON.stringify(parquetRun));
+check(Boolean(parquetRun?.ok) && ((await editorText()) ?? "").trimEnd().replace(/;$/, "").endsWith(PARQUET_SQL), "clicking a Parquet file puts its query in the editor and runs it, by its path under the root", JSON.stringify(parquetRun));
 
 // Keys: Down, then Backspace goes up.
 await page.locator('#sources .entry[data-name="karate_nodes.parquet"] .entry-main').focus();
@@ -344,8 +349,10 @@ check(/No files to browse/.test(off.text) && off.controls === 0, "with no source
 
 if (shots) {
   mkdirSync(shots, { recursive: true });
-  // The karate club's tables and graph again (the attach began a fresh
-  // session), the data folder, a table open, nothing filtered.
+  // The karate club's tables and graph again, in a fresh session (the
+  // attached database file keeps no tables), the data folder, a table
+  // open, nothing filtered.
+  await page.evaluate(() => (window as any).ursaConsole.session.run("start", {}));
   for (const statement of [
     "CREATE TABLE karate_nodes AS SELECT * FROM 'data/karate/karate_nodes.parquet'",
     "CREATE TABLE karate_edges AS SELECT * FROM 'data/karate/karate_edges.parquet'",
