@@ -193,11 +193,11 @@ Part kinds:
 
 | op | args | result, parts |
 |---|---|---|
-| `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, metadata, rows, more, ms, notices}`; `arrow`: the first `rows` rows |
+| `query` | `sql`, `rows` (default 1,000), `params?` | `{result, columns, metadata, rows, more, ms, notices, graph}`; `arrow`: the first `rows` rows; `graph` the rule the result draws by, or `null` (URSA-14) |
 | `fetch` | `result`, `offset`, `rows` | `{rows, more}`; `arrow` |
 | `export` | `result?`, `format` (`csv`, `parquet`, `json`, `arrow`) | `bytes`; without `result`, the last result |
 | `close` | `result` | `{}` |
-| `explain` | `sql` | `{plan}`: the plan as text |
+| `explain` | `sql` | `{plan, ms}`: the last statement's plans as text (URSA-14) |
 | `complete` | `sql`, `cursor` | `{from, to, items: [{label, kind, detail}]}`: tables, columns (qualified after `t.`), functions, graphs, keywords, dot-commands |
 | `highlight` | `sql` | `{spans: [{from, to, kind}]}`, from `ursa_shell::highlight::pieces` |
 
