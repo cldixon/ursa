@@ -273,6 +273,15 @@ pub(crate) fn read(schema: &Schema) -> Result<Reading> {
     read_named(schema, &cols)
 }
 
+/// The rule that would draw a result of `schema` as `.graph` with no clause
+/// draws it, or why none would (rule 6). It reads the schema only: a
+/// client asks it of each result (the console's Graph tab, through the
+/// session's `query`) before drawing it. Drawing can still fail on the rows
+/// themselves (a node key the graph does not have).
+pub fn rule_of(schema: &Schema) -> Result<Rule> {
+    Ok(read(schema)?.shape.rule())
+}
+
 /// The result's columns and their types, for a message.
 fn columns_of(schema: &Schema) -> String {
     let columns: Vec<String> = schema

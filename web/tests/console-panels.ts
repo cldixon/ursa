@@ -247,20 +247,24 @@ await row(page, "g/karate").focus();
 await page.keyboard.press("Enter");
 await page.waitForFunction(() => /\.graph karate;?\s*$/.test((window as any).ursaConsole.editor.text), null, { timeout: 5000 }).catch(() => {});
 check(/\.graph karate;?\s*$/.test((await editorText()) ?? ""), "Enter on a graph puts .graph karate in the editor", JSON.stringify(((await editorText()) ?? "").slice(-40)));
-// Without an editor, the query runs on the session, and the panel says what came back.
+// With neither an editor nor the Results panel's run, the query runs on the
+// session itself, and the panel says what came back.
 const ran = await page.evaluate(async () => {
   const w = window as any;
   const editor = w.ursaConsole.editor;
+  const run = w.ursaConsole.run;
   delete w.ursaConsole.editor;
+  delete w.ursaConsole.run;
   try {
     (document.querySelector('#catalog [data-key="t/datafusion/public/karate_nodes"] .name') as HTMLElement).click();
     for (let i = 0; i < 100 && !/rows/.test(document.querySelector("#catalog .panel-note")!.textContent!); i++) await new Promise((r) => setTimeout(r, 100));
     return document.querySelector("#catalog .panel-note")!.textContent;
   } finally {
     w.ursaConsole.editor = editor;
+    w.ursaConsole.run = run;
   }
 });
-check(/SELECT \* FROM karate_nodes LIMIT 100/.test(ran ?? "") && /34 rows/.test(ran ?? ""), "with no editor, clicking a table runs its query", ran ?? "");
+check(/SELECT \* FROM karate_nodes LIMIT 100/.test(ran ?? "") && /34 rows/.test(ran ?? ""), "with no editor and no Results panel, clicking a table runs its query on the session", ran ?? "");
 
 // ---------------------------------------------------------------- sources
 

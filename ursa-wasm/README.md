@@ -48,7 +48,7 @@ term.write((result.out + result.err).replaceAll("\n", "\r\n")); // ANSI colour, 
   page's own dot-commands), `feed` (one typed line: `flow` is `continue`,
   `exit` or `host`), `cancelInput`, `width`, `highlightAnsi`, `memory`
   (`{bytes, kind: "wasm"}`, the WebAssembly memory), `query` (rows as Arrow
-  IPC), `addFile`, `files`, `export`, and the graph view's `graph.open`,
+  IPC), `explain`, `addFile`, `files`, `export`, and the graph view's `graph.open`,
   `graph.explore`, `graph.find`, `graph.notShown`, `graph.inspect` and
   `graph.close`: [the protocol's reference](../docs/reference/protocol.md),
   generated from `ursa_shell::session::OPS`.

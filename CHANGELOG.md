@@ -1082,6 +1082,31 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's result tabs** (URSA-14, `design/console.md` §6). Each
+  result the console runs opens in a tab of its own, labelled with its
+  statement and row count (the ARIA tabs pattern; Delete or × closes it and
+  frees the result with `close`). A tab shows its result as a table: Arrow
+  decoded in the page, paged with `fetch` and drawn a screenful at a time,
+  so 100,000 rows scroll smoothly; each header names its column's type and
+  `ursa.*` role; numbers right-aligned, NULL dimmed as the shell shows it,
+  long text cut short with its whole value on hover and focus; a header
+  sorts the loaded rows (and says so); a cell or a range copies as
+  tab-separated text. A result whose columns make a graph has a Graph view,
+  drawn with `graph.open {result}` in the page's one graph pane, whose
+  commands (a double-click's `.expand 33`) go to a sink History will take
+  (`results.setCommandsSink`), listed under the graph until then. A Plan
+  view shows `explain`, and Export downloads CSV, Parquet, JSON or Arrow. A
+  result the session has dropped (`not_found`) offers Run again. A
+  statement with no columns says its notices instead of opening a tab.
+  `ursaConsole.run(sql)` runs SQL into the panel; the editor (URSA-13)
+  calls it.
+- **Session protocol: `query` says how its result is a graph, and
+  `explain {sql}`** (URSA-14). `query`'s reply has `graph`, the rule
+  `graph.open` would draw the result by (`nodes`, `edges`, `path`, `rings`,
+  `pattern`), read from its columns (`ursa_engine::graph::view::rules::rule_of`),
+  or `null`. `explain` gives the plan of the last statement, logical then
+  physical, as text, and runs nothing.
+
 - **The console's Catalog and Sources panels** (URSA-15, URSA-16,
   `design/console.md` §6). The Catalog is a tree of the session's
   databases, schemas, tables and views (marked by kind) and their columns

@@ -12,6 +12,7 @@
 // window.ursaConsole is also what the e2e test (tests/console.ts) reads.
 import { session } from "./session.js";
 import { setupLayout } from "./layout.js";
+import { createResults } from "./results.js";
 import { mountCatalog } from "./catalog.js";
 import { mountSources } from "./sources.js";
 
@@ -129,7 +130,12 @@ function seconds(ms) {
 showState();
 session.start();
 
-window.ursaConsole = { session, panels: layout.panels, layout };
+// The Results panel (URSA-14). `ursaConsole.run(sql)` is what the editor
+// (URSA-13, editor.js) calls to run SQL into it.
+const results = createResults({ mount: layout.panels.results, session });
+const run = (sql) => results.run(sql);
+
+window.ursaConsole = { session, panels: layout.panels, layout, results, run };
 
 // The panels (each module's header says what it does).
 window.ursaConsole.catalog = mountCatalog(layout.panels.catalog); // URSA-15

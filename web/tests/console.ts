@@ -22,7 +22,8 @@
 // - when the server stops, the page says so and tries again; when it comes
 //   back with a new token, the page says to open its link, and connects once
 //   it has been opened;
-// - the shell is still at /.
+// - the shell is still at /;
+// - the result tabs (URSA-14): tests/console-results.ts.
 //
 // With a screenshot dir, it saves the console in light and dark at 1440×900
 // and 390×844.
@@ -30,6 +31,7 @@ import { chromium, type Page } from "playwright";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { cargoTargetDir, DATA_DIR, WEB } from "../scripts/common";
+import { resultsChecks } from "./console-results";
 
 const port = Number(Bun.argv[2] ?? 8981);
 const bin = Bun.argv[3] || process.env.URSA_BIN || join(cargoTargetDir(), "release", "ursa");
@@ -118,7 +120,7 @@ const PANELS: [string, string, string][] = [
   ["sources", "Sources", "URSA-16"],
   ["catalog", "Catalog", "URSA-15"],
   ["editor", "Editor", ""],
-  ["results", "Results", "URSA-14"],
+  ["results", "Results", ""],
   ["inspector", "Inspector", ""],
   ["history", "History", "URSA-17"],
 ];
@@ -315,6 +317,10 @@ await page.waitForSelector("#running", { state: "hidden" });
 check((await page.locator("#announce").textContent()) === "Cancelled query", "and a screen reader hears it was cancelled", (await page.locator("#announce").textContent()) ?? "");
 const after1 = await page.evaluate(() => (window as any).ursaConsole.session.run("query", { sql: "SELECT 41 + 1 AS answer" }).then((r: any) => r.rows));
 check(after1 === 1, "the session goes on after a cancel", String(after1));
+
+// ---------------------------------------------------------------- results (URSA-14)
+
+await resultsChecks(page, context, check, shots);
 
 // ---------------------------------------------------------------- the server goes
 

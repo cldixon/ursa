@@ -804,7 +804,16 @@ static assets and an R2 bucket.
   the session's root, and the running request with Cancel), styled by
   `console.css` over the shell's `style.css` and `graph-pane.css`. Each
   panel's body is a mount point for the issue named in its placeholder
-  (`window.ursaConsole.panels`). The Editor panel is `editor.js` (URSA-13):
+  (`window.ursaConsole.panels`). The Results panel (URSA-14) is
+  `results.js` (a tab per kept result, the ARIA tabs pattern; Graph, Plan,
+  Export, Run again for a result that has gone; the page's one graph pane,
+  moved to the tab whose graph is shown, its commands to a sink History
+  will take with `results.setCommandsSink`) and `table.js` (the virtual
+  table: Arrow IPC decoded in the page, paged with `fetch`, typed headers
+  with the `ursa.*` role, sorting the loaded rows, copying a range), styled
+  by `results.css`. `ursaConsole.run(sql)` is the run function
+  the editor calls.
+  The Editor panel is `editor.js` (URSA-13):
   CodeMirror 6 coloured by the session's `highlight` (the shell's colours,
   `editor.css`) and completed by its `complete`; Ctrl/Cmd+Enter runs the
   statement at the cursor or the selection (`statements.js` splits them),
@@ -972,6 +981,12 @@ drawers with no sideways scroll; Cancel stopping a long query, with the
 session going on; the page saying the server stopped, then that it was
 restarted with a new link, and reconnecting once the link is opened; the
 shell still at `/`; and no page error or Content Security Policy violation.
+`tests/console-results.ts`, which it runs, checks the result tabs: DDL's
+notices, typed columns with their roles (`pagerank(karate)`), the tabs'
+keys, 100,000 rows paged and scrolled to the last, a sort of the loaded
+rows, copying, the Graph view of karate with a double-click's `.expand`
+reaching the commands sink, the Plan, a CSV export, and a result that has
+gone offering Run again. With a screenshot dir it saves `results-*.png`.
 
 `tests/console-panels.ts` (`bun run test:console-panels -- 9061`, the same
 arguments) tests the Catalog and Sources panels over `ursa serve` with a

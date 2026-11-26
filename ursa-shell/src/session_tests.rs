@@ -925,6 +925,8 @@ async fn query_gives_typed_columns_metadata_and_arrow_rows() {
     assert_eq!(r["columns"][1]["type"], "Float64");
     assert_eq!(r["columns"][0]["metadata"]["ursa.role"], "node", "{r}");
     assert_eq!(r["notices"], json!([]));
+    // A node key: the rule graph.open would draw it by.
+    assert_eq!(r["graph"], "nodes", "{r}");
     assert_eq!(
         (reply.parts.len(), reply.parts[0].name, reply.parts[0].kind),
         (1, "arrow", PartKind::Arrow)
@@ -963,11 +965,58 @@ async fn query_gives_typed_columns_metadata_and_arrow_rows() {
         (created["columns"].clone(), created["notices"].clone()),
         (json!([]), json!(["OK"]))
     );
+    assert_eq!(created["graph"], Value::Null);
     let wrong = shell
         .handle("query", json!({"sql": "SELECT nope"}), Vec::new())
         .await
         .unwrap_err();
     assert_eq!(wrong.kind, "sql");
+}
+
+/// `query`'s `graph` is the rule `graph.open` would draw a result by, read
+/// from its columns: what the console offers a Graph tab for.
+#[tokio::test]
+async fn query_says_by_which_rule_a_result_is_a_graph() {
+    let mut shell = session();
+    run(&mut shell, TIES).await;
+    run(&mut shell, CLUB).await;
+    for (sql, rule) in [
+        ("SELECT * FROM ties", json!("edges")),
+        ("SELECT * FROM pagerank(club)", json!("nodes")),
+        (
+            "SELECT * FROM hop(club, seeds => [1], steps => 1)",
+            json!("rings"),
+        ),
+        ("SELECT 1.5 AS x, 'a' AS y", Value::Null),
+        ("SELECT value FROM range(3)", Value::Null),
+    ] {
+        let r = op(&mut shell, "query", json!({ "sql": sql })).await;
+        assert_eq!(r["graph"], rule, "{sql}: {r}");
+    }
+}
+
+/// `explain` gives the last statement's plans as text, and runs nothing.
+#[tokio::test]
+async fn explain_gives_the_plan_as_text() {
+    let mut shell = session();
+    run(&mut shell, TIES).await;
+    let r = op(
+        &mut shell,
+        "explain",
+        json!({"sql": "SELECT 1; SELECT src FROM ties WHERE dst > 2;"}),
+    )
+    .await;
+    let plan = r["plan"].as_str().unwrap();
+    assert!(plan.starts_with("logical_plan\n"), "{plan}");
+    assert!(plan.contains("\nphysical_plan\n"), "{plan}");
+    assert!(plan.contains("Filter"), "{plan}");
+    assert!(r["ms"].is_number());
+    // Nothing ran: it is not the last result.
+    assert!(shell.export("csv").is_err());
+    let wrong = fails(&mut shell, "explain", json!({"sql": "SELECT nope"})).await;
+    assert_eq!(wrong.kind, "sql");
+    let missing = fails(&mut shell, "explain", json!({})).await;
+    assert_eq!(missing.kind, "protocol");
 }
 
 /// The rows of an Arrow IPC part, as their first column's `Int64`s.
