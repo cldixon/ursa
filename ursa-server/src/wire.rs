@@ -275,8 +275,8 @@ async fn reply(
     }
 }
 
-/// Put the session's id and directory in `hello`'s result: `session: {kind,
-/// id, cwd}`, beside what the session says of itself.
+/// Put the session's id and root directory in `hello`'s result: `session:
+/// {kind, id, cwd}`, beside what the session says of itself.
 fn name_session(result: &mut Value, handle: &SessionHandle) {
     let Some(result) = result.as_object_mut() else {
         return;
@@ -287,11 +287,8 @@ fn name_session(result: &mut Value, handle: &SessionHandle) {
     }
     session["kind"] = json!(if handle.shared { "shared" } else { "new" });
     session["id"] = json!(handle.id);
-    // Relative paths resolve against the process's directory, which `ursa
-    // serve` sets to the one it serves (one root per process for now).
-    if let Ok(cwd) = std::env::current_dir() {
-        session["cwd"] = json!(cwd.display().to_string());
-    }
+    // Relative paths resolve against the session's root.
+    session["cwd"] = json!(&*handle.root);
 }
 
 /// Write each reply, its JSON then its parts, until a close or the end.

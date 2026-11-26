@@ -641,6 +641,22 @@ pub(crate) async fn attach(ctx: &SessionContext, attach: Attach) -> Result<DataF
             attach.path
         )));
     }
+    // In a session with a root, a relative path is the root's, as in a query.
+    let config = ctx.state().config().clone();
+    let path = match ursa_engine::paths::root(&config) {
+        Some(_) => ursa_engine::paths::resolve(&config, &attach.path)?,
+        None => attach.path.clone(),
+    };
+    // A read-only session (`ursa serve --read-only`) opens a database
+    // read-only, and creates none.
+    let read_only = ursa_engine::paths::is_read_only(&config);
+    if read_only && !Path::new(&path).exists() {
+        return Err(DataFusionError::Plan(format!(
+            "cannot ATTACH '{}': it does not exist, and {}, so it cannot create it",
+            attach.path,
+            ursa_engine::paths::READ_ONLY
+        )));
+    }
     if defines_anything(ctx)? {
         return Err(DataFusionError::Plan(format!(
             "ATTACH must come before anything is defined: this session already has tables, \
@@ -649,13 +665,11 @@ pub(crate) async fn attach(ctx: &SessionContext, attach: Attach) -> Result<DataF
             attach.path, attach.path
         )));
     }
-    // In a session with a root, a relative path is the root's, as in a query.
-    let config = ctx.state().config().clone();
-    let path = match ursa_engine::paths::root(&config) {
-        Some(_) => ursa_engine::paths::resolve(&config, &attach.path)?,
-        None => attach.path.clone(),
+    let options = OpenOptions {
+        read_only,
+        ..OpenOptions::default()
     };
-    open_into(ctx, Path::new(&path), &OpenOptions::default()).await?;
+    open_into(ctx, Path::new(&path), &options).await?;
     graph_ddl::empty(ctx)
 }
 

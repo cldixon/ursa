@@ -7,17 +7,22 @@ protocol the browser demo speaks to its wasm engine; the design is
 §3–§5.
 
 ```sh
-cd web && bun run engine && bun run build          # web/dist and web/dist-console
-cargo run --release -p ursa-cli --features serve -- serve web/.data
+cd web && bun scripts/build.ts --no-engine          # web/dist and web/dist-console
+cargo run --release -p ursa-cli --features serve -- serve web/.data --no-open
 # Ursa is serving /…/web/.data at
 #   http://127.0.0.1:4280/console/?token=…
 ```
+
+The release binaries build the page in (`--features serve-embed`, after
+the same build of the page; `.github/workflows/cli-build.yml`).
 
 As a library:
 
 ```rust
 let config = ursa_server::Config {
-    root: ".".into(),
+    root: ".".into(),          // the sessions' root
+    database: None,            // or Some("club.ursa".into())
+    read_only: false,          // true: the sessions write no files
     port: ursa_server::DEFAULT_PORT,
     assets: ursa_server::Assets::Dirs(vec!["web/dist-console".into(), "web/dist".into()]),
     version: "0.13.0".into(),
@@ -103,15 +108,40 @@ reach, so only the user's own browser tab may reach it (§5):
   does; `/console` redirects to `/console/`.
 - **`/data/PATH`** serves a file under the served directory (no `..`, no
   hidden names) to a page with the token, with `HEAD` and a byte range, read
-  from the file as it is sent. Relative paths in queries resolve against
-  that directory too (the process's working directory, which `ursa serve`
-  sets to it).
+  from the file as it is sent.
+
+## Sessions
+
+- **Their root** is the served directory (`Config::root`,
+  `ursa_shell::session::Options::root`): relative paths in queries, `.read`
+  and `ATTACH` resolve against it, and writes (`COPY … TO`, `.output`,
+  `.once`, `INSERT INTO` a table of files) go only under it. The process's
+  working directory is left alone.
+- **`COPY … TO 'name'`:** a session of a page's own (`hello {session:
+  "new"}`, the shell's) keeps its copies in memory, at `memory://uploads/`,
+  as the browser demo does, so the shell's page behaves alike on both
+  transports (`.files` lists them, and the e2e suite checks both alike).
+  The shared session (the console's and agents') writes them to disk under
+  the root (`Options::copy_to_disk`).
+- **A database file** (`Config::database`, `ursa serve club.ursa`) is
+  opened by every session as the CLI opens one, before its first request
+  after `hello`, and again after each `start`. Its directory is the root.
+  One session at a time has it for writing; another, meanwhile, opens it
+  read-only and says so in its next output.
+- **`Config::read_only`** (`ursa serve --read-only`) makes every session
+  write no files (`ursa_engine::paths::set_read_only`): `COPY … TO` (also
+  to the session's files in memory), `INSERT INTO` a table that is not in
+  memory, `.output`, `.once`, and `ATTACH` of a database that does not
+  exist are refused, and a database is opened read-only, so what changes
+  it is refused too. Views and tables in memory still work.
 
 ## Tests
 
 `cargo test -p ursa-server` runs the security tests (`tests/security.rs`: no
 token, a wrong token or cookie, a foreign `Origin`, a wrong `Host`, loopback
-only, `/data/`) and the protocol's (`tests/protocol.rs`: the shell over a
-socket, sessions, `cancel`, stopping). In `web/`, `bun scripts/e2e-serve.ts
-PORT` runs the browser e2e suite against `ursa serve`, as CI does on every
-change to this crate (`.github/workflows/shell-e2e.yml`).
+only, `/data/`), the protocol's (`tests/protocol.rs`: the shell over a
+socket, sessions, `cancel`, stopping), and the sessions' (`tests/roots.rs`:
+the root, a database file, and each write `--read-only` refuses). In `web/`,
+`bun scripts/e2e-serve.ts PORT` runs the browser e2e suite against `ursa
+serve`, as CI does on every change to this crate
+(`.github/workflows/shell-e2e.yml`).

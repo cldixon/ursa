@@ -25,6 +25,8 @@
 //! # async fn run() -> std::io::Result<()> {
 //! let config = ursa_server::Config {
 //!     root: ".".into(),
+//!     database: None,
+//!     read_only: false,
 //!     port: ursa_server::DEFAULT_PORT,
 //!     assets: ursa_server::Assets::Dirs(vec!["web/dist-console".into(), "web/dist".into()]),
 //!     version: "0.13.0".into(),
@@ -84,10 +86,18 @@ const MAX_MESSAGE: usize = 1 << 30;
 /// How `ursa serve` runs.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The directory `/data/` serves. Relative paths in queries resolve
-    /// against the process's working directory, which `ursa serve` sets to
-    /// this one.
+    /// The sessions' root: relative paths in their queries resolve against
+    /// it, `COPY … TO` in the shared session writes under it, and `/data/`
+    /// serves its files. A relative one is made absolute when the server
+    /// binds.
     pub root: PathBuf,
+    /// A database file every session opens, as the CLI opens one (`ursa
+    /// serve club.ursa`). A relative path is the working directory's.
+    pub database: Option<PathBuf>,
+    /// Sessions write no files (`ursa serve --read-only`): `COPY … TO`,
+    /// `INSERT INTO` a table of files, `.output`, `.once`, and anything
+    /// that changes the database, which they open read-only, are refused.
+    pub read_only: bool,
     /// The port to listen on; the next free one if it is taken (up to 20
     /// further). 0 picks any free port.
     pub port: u16,
@@ -244,7 +254,11 @@ impl Bound {
 
 /// Bind to `127.0.0.1` and `::1` on the configured port, or the next free
 /// one, and make the run's token.
-pub async fn bind(config: Config) -> io::Result<Bound> {
+pub async fn bind(mut config: Config) -> io::Result<Bound> {
+    config.root = std::path::absolute(&config.root)?;
+    if let Some(database) = &mut config.database {
+        *database = std::path::absolute(&*database)?;
+    }
     let mut last = None;
     for port in config.port..=config.port.saturating_add(20) {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {

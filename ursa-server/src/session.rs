@@ -24,23 +24,32 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
-use ursa_shell::session::{Error, Options, Reply, Session};
+use ursa_shell::session::{Error, Options, Reply, Root, Session};
 
 use crate::wire::Outgoing;
 use crate::Config;
 
-/// What the server's sessions are.
+/// What the server's sessions are: rooted in the served directory (relative
+/// paths in their queries, `.read` and `ATTACH` resolve under it), with
+/// its database file, if it has one, and read-only if it is.
+///
+/// What `COPY … TO 'name'` writes depends on the session ([`Sessions`]):
+/// the shell's page asks for a session of its own (`hello {session:
+/// "new"}`), which keeps its copies in memory, at `memory://uploads/`, as
+/// the browser demo does, so the page behaves alike on both (`.files` lists
+/// them, and the e2e suite runs both); the shared session, the console's
+/// and agents', writes them to disk under the root.
 pub(crate) fn options(config: &Config) -> Options {
     Options {
         version: config.version.clone(),
         transport: "native",
         capabilities: vec!["cancel", "uploads"],
-        // The shell's page keeps imports and `COPY … TO 'name'` in memory,
-        // as the browser demo does, so the page behaves alike on both (the
-        // e2e suite runs both). A root of their own, with COPY to disk under
-        // it (URSA-6), is set by `ursa serve` in URSA-4.
+        // The files a page adds (`addFile`), and the shell's copies.
         uploads: true,
-        ..Options::default()
+        root: Some(Root::Dir(config.root.clone())),
+        copy_to_disk: false,
+        database: config.database.clone(),
+        read_only: config.read_only,
     }
 }
 
@@ -66,6 +75,8 @@ pub(crate) struct SessionHandle {
     /// later ones are answered with it, without waiting for its turn
     /// (`hello` bypasses the queue, §4.5).
     pub(crate) hello: Arc<OnceLock<Value>>,
+    /// The session's root, which relative paths resolve against.
+    pub(crate) root: Arc<str>,
     jobs: mpsc::UnboundedSender<Job>,
     /// Where the session's events go: every connection attached to it.
     listeners: Listeners,
@@ -149,18 +160,30 @@ impl Sessions {
         let (jobs, queue) = mpsc::unbounded_channel();
         let engine = self.engine.handle();
         let listeners = Listeners::default();
+        // The shared session writes its copies to disk; one of a page's
+        // own keeps them in memory ([`options`]).
+        let options = Options {
+            copy_to_disk: shared,
+            ..self.options.clone()
+        };
         let actor = Actor {
             runtime: engine,
-            options: self.options.clone(),
+            options,
             queue,
             listeners: Arc::clone(&listeners),
             live: self.live.enter(),
         };
         actor.spawn(&id)?;
+        let root = match &self.options.root {
+            Some(Root::Dir(dir)) => dir.display().to_string(),
+            Some(Root::Url(url)) => url.to_string(),
+            None => String::new(),
+        };
         Ok(SessionHandle {
             id,
             shared,
             hello: Arc::default(),
+            root: root.into(),
             jobs,
             listeners,
         })

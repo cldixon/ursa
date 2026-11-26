@@ -360,6 +360,17 @@ pub struct Options {
     /// `uploads`: these are then for the files a page adds only. Native only:
     /// the browser always keeps a copy in memory.
     pub copy_to_disk: bool,
+    /// A database file to open, as the CLI opens one (`ursa club.ursa`):
+    /// natively, by `ursa serve club.ursa`. It is opened before the first
+    /// request after `hello`, and again after each `start`. Another session
+    /// of this process holding it for writing, the session opens it
+    /// read-only, and says so.
+    pub database: Option<std::path::PathBuf>,
+    /// Write no files (`ursa serve --read-only`,
+    /// `ursa_engine::paths::set_read_only`): `COPY … TO`, `INSERT INTO` a
+    /// table of files, `.output` and `.once` are refused, and a database is
+    /// opened read-only, so what changes it is refused too.
+    pub read_only: bool,
 }
 
 impl Default for Options {
@@ -371,6 +382,8 @@ impl Default for Options {
             uploads: true,
             root: None,
             copy_to_disk: false,
+            database: None,
+            read_only: false,
         }
     }
 }
@@ -601,6 +614,8 @@ pub struct Session {
     options: Options,
     /// Whether `hello` came: every other operation waits for it.
     greeted: bool,
+    /// Whether [`Options::database`] is open (or there is none to open).
+    opened: bool,
     /// The results `query` kept, for `fetch`, `export`, `graph.open`.
     results: Results,
     /// The catalog's fingerprint when last looked at, for the `catalog`
@@ -623,6 +638,7 @@ impl Session {
         });
         ursa_engine::paths::set_root(&ctx, options.root.clone());
         ursa_engine::session_files::set_copy_to_disk(&ctx, options.copy_to_disk);
+        ursa_engine::paths::set_read_only(&ctx, options.read_only);
         let (out, err) = (Buffer::default(), Buffer::default());
         let width = Rc::new(Cell::new(80));
         let mut shell = Shell::new(ctx, OutputFormat::Table, out.clone(), err.clone());
@@ -638,12 +654,44 @@ impl Session {
             err,
             width,
             uploads,
+            opened: options.database.is_none(),
             options,
             greeted: false,
             results: Results::default(),
             catalog_seen: None,
             catalog_dirty: false,
         }
+    }
+
+    /// Open [`Options::database`], if it is not open yet: as the CLI opens
+    /// one, or read-only in a read-only session, or while another session
+    /// of this process has it open for writing (which the session's next
+    /// output says).
+    async fn open_database(&mut self) -> std::result::Result<(), Error> {
+        let Some(path) = self.options.database.clone().filter(|_| !self.opened) else {
+            return Ok(());
+        };
+        let ctx = self.shell.context().clone();
+        let options = ursa_sql::OpenOptions {
+            read_only: self.options.read_only,
+            ..Default::default()
+        };
+        match ursa_sql::open_database(&ctx, &path, &options).await {
+            Ok(()) => {}
+            Err(e) if !options.read_only && ursa_engine::database::is_in_use(&e) => {
+                let read_only = ursa_sql::OpenOptions::read_only();
+                ursa_sql::open_database(&ctx, &path, &read_only).await?;
+                let _ = writeln!(
+                    self.err,
+                    "Note: another session of this server has {} open for writing, so this \
+                     one has it read-only.",
+                    path.display()
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.opened = true;
+        Ok(())
     }
 
     /// Run the operation `op` with its JSON `args` and binary `parts`
@@ -675,6 +723,11 @@ impl Session {
                 self.catalog_seen = Some(catalog::fingerprint(self.shell.context()).await);
             }
             self.catalog_dirty = true;
+        }
+        // The database opens before the first request that may use it
+        // (`start` opens it in the session it makes).
+        if !matches!(op, "hello" | "cancel" | "memory" | "start") {
+            self.open_database().await?;
         }
         match op {
             "hello" => {
@@ -739,6 +792,8 @@ impl Session {
                     catalog_dirty: true,
                     ..Session::new(self.options.clone())
                 };
+                // The old session's database is closed: open it here.
+                self.open_database().await?;
                 if let Some(commands) = args.get("commands").and_then(Value::as_array) {
                     for command in commands {
                         let field = |i: usize| command.get(i).and_then(Value::as_str).unwrap_or("");
