@@ -75,6 +75,25 @@ struct Served {
 
 /// Run `ursa serve`, given the arguments from `serve` on.
 pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => return fail(&format!("cannot start: {e}")),
+    };
+    // Ctrl+C stops the server from here on: its handler is installed first,
+    // so one that comes while the server starts is not lost (it stops the
+    // server as soon as it is listening), nor does it end the process by
+    // SIGINT's default (URSA-22). Only one in the process's first
+    // milliseconds, before main, still does.
+    let interrupted = {
+        let _runtime = runtime.enter();
+        match interrupted() {
+            Ok(interrupted) => interrupted,
+            Err(e) => return fail(&format!("cannot handle Ctrl+C: {e}")),
+        }
+    };
     let args = ServeArgs::parse_from(args);
     let assets = match assets(args.assets) {
         Ok(assets) => assets,
@@ -99,39 +118,36 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         // commit).
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(e) => return fail(&format!("cannot start: {e}")),
-    };
     let result = runtime.block_on(async {
         let bound = ursa_server::bind(config).await?;
         if args.port != 0 && bound.port() != args.port {
-            println!("Port {} is taken; using {}.", args.port, bound.port());
+            say(&format!(
+                "Port {} is taken; using {}.",
+                args.port,
+                bound.port()
+            ));
         }
         let read_only = if args.read_only { ", read-only," } else { "" };
-        println!("Ursa is serving {what}{read_only} at");
-        println!("  {}", bound.url());
+        say(&format!("Ursa is serving {what}{read_only} at"));
+        say(&format!("  {}", bound.url()));
         if args.no_open {
-            println!("Open that link in a browser on this machine. Ctrl+C stops the server.");
+            say("Open that link in a browser on this machine. Ctrl+C stops the server.");
         } else {
-            println!("Opening it in your browser. Ctrl+C stops the server.");
+            say("Opening it in your browser. Ctrl+C stops the server.");
         }
         if bound.has_console() {
-            println!(
+            say(&format!(
                 "The Web Shell is at http://127.0.0.1:{}/ once the link has opened.",
                 bound.port()
-            );
+            ));
         }
         if !args.no_open {
             open_browser(&bound.url());
         }
         bound
             .serve_with_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                println!("Stopping.");
+                interrupted.await;
+                say("Stopping.");
             })
             .await
     });
@@ -141,8 +157,28 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     }
 }
 
+/// Once Ctrl+C (SIGINT) comes, or came after this was called: the handler
+/// is installed now, not when the future is first polled.
+fn interrupted() -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
+    #[cfg(unix)]
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(windows)]
+    let mut signal = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        signal.recv().await;
+    })
+}
+
+/// Print `line` on stdout. A stdout that is closed (`ursa serve | head -2`)
+/// is no reason to stop serving, or to panic.
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
+}
+
 fn fail(message: &str) -> ExitCode {
-    eprintln!("Error: {message}");
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "Error: {message}");
     ExitCode::FAILURE
 }
 
@@ -223,13 +259,15 @@ fn open_browser(url: &str) {
         Ok(mut child) => {
             std::thread::spawn(move || {
                 if !child.wait().is_ok_and(|status| status.success()) {
-                    println!(
+                    say(&format!(
                         "Could not open a browser ({program} failed): open the link yourself."
-                    );
+                    ));
                 }
             });
         }
-        Err(e) => println!("Could not open a browser ({program}: {e}): open the link yourself."),
+        Err(e) => say(&format!(
+            "Could not open a browser ({program}: {e}): open the link yourself."
+        )),
     }
 }
 

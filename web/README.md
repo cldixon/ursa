@@ -820,8 +820,9 @@ static assets and an R2 bucket.
   Shift with it every statement until one fails; SQL goes to
   `ursaConsole.run(sql)` (the Results panel's) or else `query`, dot-commands
   to `feed`; errors show at their statement; the text is kept per server
-  port. Other panels put SQL in it with
-  `ursaConsole.editor.insert(text, {statement, run})`. The Catalog panel is
+  port. Other panels put SQL (or a dot-command) in it with
+  `ursaConsole.editor.insert(text, {statement, run})`; as a statement, SQL
+  ends with `;` and a dot-command with none. The Catalog panel is
   `catalog.js` (URSA-15): the session's tables, views, columns and property
   graphs as an ARIA tree, refetched on the `catalog` event, with a filter;
   the Sources panel is `sources.js` (URSA-16): the root's folders and files

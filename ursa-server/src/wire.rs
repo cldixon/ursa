@@ -133,9 +133,7 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
                     let _ = answer(Err(e));
                 }
             },
-            ("cancel", _) => {
-                let _ = answer(cancel(&request.args, &running));
-            }
+            ("cancel", _) => cancel(&request.args, &running, answer),
             // The process's memory, as the session would say: it needs no
             // turn.
             ("memory", Some(_)) => {
@@ -238,17 +236,27 @@ fn submit(handle: &SessionHandle, request: Request, running: &Running) -> Waitin
 /// `cancel {target}`: stop the request `target` of this connection, queued
 /// or running; it replies `cancelled`. A request that has already replied
 /// is not an error: the two crossed.
-fn cancel(args: &Value, running: &Running) -> Result<Reply, Error> {
-    let target = args.get("target").and_then(Value::as_u64);
-    let target = target.ok_or_else(|| Error::protocol("cancel needs a target: a request's id"))?;
+///
+/// `cancel`'s own reply is handed to the writer before the target is told to
+/// stop, so it is always written first: once told, the target's `cancelled`
+/// can reach the writer at once from the session's thread.
+fn cancel<T>(args: &Value, running: &Running, answer: impl FnOnce(Result<Reply, Error>) -> T) {
+    let Some(target) = args.get("target").and_then(Value::as_u64) else {
+        answer(Err(Error::protocol(
+            "cancel needs a target: a request's id",
+        )));
+        return;
+    };
+    // Held until the target is told, so it cannot reply and leave between
+    // the two (it is removed from `running` only once it has replied).
     let running = running.lock().unwrap_or_else(|e| e.into_inner());
+    answer(Ok(Reply {
+        result: json!({}),
+        parts: Vec::new(),
+    }));
     if let Some(cancel) = u32::try_from(target).ok().and_then(|t| running.get(&t)) {
         cancel.send_replace(true);
     }
-    Ok(Reply {
-        result: json!({}),
-        parts: Vec::new(),
-    })
 }
 
 /// Wait for each reply in the order the requests were sent, and pass it to
