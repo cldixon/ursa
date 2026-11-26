@@ -174,6 +174,24 @@ pub(crate) enum Rebuild {
         node: Option<Arc<[u32]>>,
         source: Arc<dyn RowSource>,
     },
+    /// A compressed out-adjacency's (#173): the ids `rows` (each segment's
+    /// rows in row order) with each segment sorted by the rows' targets,
+    /// which `keys` reads back (`node[o]` the node of original id `o`), ties
+    /// in row order: each segment's rows by `(target, row)`, the order its
+    /// sorted neighbours are in.
+    Sorted {
+        offsets: ScalarBuffer<u64>,
+        rows: EdgeIds,
+        keys: Arc<dyn RowSource>,
+        node: Option<Arc<[u32]>>,
+    },
+    /// A compressed in-adjacency's (#173): the transpose of the compressed
+    /// out-adjacency `out`'s ids, read in its slot order, so each segment's
+    /// rows by `(source, row)`.
+    PackedTranspose {
+        out: Box<crate::topology::Adjacency>,
+        n_nodes: usize,
+    },
     /// An in-adjacency's: the transpose of the out-adjacency's ids.
     Transpose {
         out_offsets: ScalarBuffer<u64>,
@@ -305,13 +323,46 @@ impl EdgeIds {
         }
     }
 
+    /// The ids as a vector the caller owns: a copy of the held ones, or a
+    /// fresh build, not kept.
+    pub(crate) fn owned(&self) -> Vec<u32> {
+        match self.0.built.get() {
+            Some(ids) => ids.to_vec(),
+            None => self.compute_vec(),
+        }
+    }
+
     /// Build the ids.
     fn compute(&self) -> ScalarBuffer<u32> {
+        self.compute_vec().into()
+    }
+
+    /// Build the ids, as a vector.
+    fn compute_vec(&self) -> Vec<u32> {
         let len = self.0.len;
         match &self.0.rebuild {
             // `built` was set at construction.
             Rebuild::Built => unreachable!("built edge ids are always held"),
-            Rebuild::Identity => (0..len as u32).collect::<Vec<u32>>().into(),
+            Rebuild::Identity => (0..len as u32).collect::<Vec<u32>>(),
+            Rebuild::Sorted {
+                offsets,
+                rows,
+                keys,
+                node,
+            } => {
+                let mut ids = rows.owned();
+                let keys = keys.sources();
+                assert_eq!(
+                    keys.len(),
+                    len,
+                    "the edge rows read back are not the rows the index was built from"
+                );
+                sort_rows_by(offsets, &mut ids, &keys, node.as_deref());
+                ids
+            }
+            Rebuild::PackedTranspose { out, n_nodes } => out.edge_ids.with(|ids| {
+                crate::topology::transpose_packed_parts(out, *n_nodes, false, Some(ids)).2
+            }),
             Rebuild::Rows {
                 offsets,
                 node,
@@ -323,7 +374,7 @@ impl EdgeIds {
                     len,
                     "the edge rows read back are not the rows the index was built from"
                 );
-                rows_by_key(offsets, &sources, node.as_deref()).into()
+                rows_by_key(offsets, &sources, node.as_deref())
             }
             Rebuild::Transpose {
                 out_offsets,
@@ -347,7 +398,7 @@ impl EdgeIds {
                 } else {
                     out_ids.with(|ids| parts(TransposeIds::Rows(ids)))
                 };
-                ids.unwrap_or_default().into()
+                ids.unwrap_or_default()
             }
         }
     }
@@ -387,6 +438,8 @@ impl fmt::Debug for EdgeIds {
             Rebuild::Identity => "identity",
             Rebuild::Rows { .. } => "from rows",
             Rebuild::Transpose { .. } => "transpose",
+            Rebuild::Sorted { .. } => "sorted rows",
+            Rebuild::PackedTranspose { .. } => "compressed transpose",
         };
         write!(
             f,
@@ -471,6 +524,32 @@ pub(crate) fn rows_by_key(offsets: &[u64], keys: &[u32], node: Option<&[u32]>) -
         }
     });
     ids
+}
+
+/// Sort each segment of `ids` (rows, ascending within a segment) by the
+/// rows' keys `keys[row]` (mapped through `node` when given), ties in row
+/// order. Parallel over segments above a size threshold, with the same
+/// result.
+pub(crate) fn sort_rows_by(offsets: &[u64], ids: &mut [u32], keys: &[u32], node: Option<&[u32]>) {
+    use crate::parallel::*;
+    let n = offsets.len() - 1;
+    let key = |r: u32| {
+        let k = keys[r as usize];
+        node.map_or(k, |node| node[k as usize])
+    };
+    let addr = ids.as_mut_ptr() as usize;
+    let sort = |u: usize| {
+        let (s, e) = (offsets[u] as usize, offsets[u + 1] as usize);
+        // SAFETY: segments are disjoint and inside `ids`, which outlives the
+        // pass.
+        let seg = unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(s), e - s) };
+        seg.sort_unstable_by_key(|&r| (key(r), r));
+    };
+    if ids.len() < (1 << 16) || current_num_threads() <= 1 || in_worker() {
+        (0..n).for_each(sort);
+    } else {
+        (0..n).into_par_iter().for_each(sort);
+    }
 }
 
 /// What [`transpose_rows`] writes into each in-slot.

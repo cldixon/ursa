@@ -1195,6 +1195,7 @@ fn read_incoming(
                 offsets: offsets.into(),
                 targets: targets.into(),
                 edge_ids: edge_ids.into(),
+                packed: None,
             })
         }
         _ => Err("the in-adjacency is malformed".into()),
@@ -1589,6 +1590,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
         offsets: scalars(data, &take(OUT_OFFSETS, 8, Some(n_nodes + 1))?),
         targets: scalars(data, &take(OUT_TARGETS, 4, Some(n_edges))?),
         edge_ids: scalars(data, &take(OUT_EDGE_IDS, 4, Some(n_edges))?).into(),
+        packed: None,
     };
     let topology = match head.version {
         // No section CRCs to vouch for the arrays: check them in full.
@@ -1695,6 +1697,7 @@ fn mapped_incoming(
         offsets: scalars(data, &entry(IN_OFFSETS, 8, n_nodes + 1)?),
         targets: scalars(data, &entry(IN_TARGETS, 4, n_edges)?),
         edge_ids: scalars(data, &entry(IN_EDGE_IDS, 4, n_edges)?).into(),
+        packed: None,
     })
 }
 

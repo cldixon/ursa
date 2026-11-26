@@ -25,11 +25,13 @@
 pub mod algo;
 pub mod catalog;
 pub mod edge_ids;
+pub mod packed;
 pub mod id_map;
 pub(crate) mod parallel;
 pub mod topology;
 
 pub use id_map::{EdgeInterner, IdError, IdMap, KeyRows};
 pub use topology::{
-    Adjacency, Direction, EdgeIds, EdgeMask, IncomingLoader, NodeOrder, RowSource, Topology,
+    Adjacency, Direction, EdgeIds, EdgeMask, IncomingLoader, NeighborCursor, NodeOrder, Packed,
+    RowSource, Topology,
 };
