@@ -3,10 +3,12 @@
 // (ursa-viz, built here by scripts/viz.ts into dist/viz/) and its reader of
 // the engine's graphs (ursa-viz/ui/ugr.js, as dist/ugr.js), and the terminal's
 // font, IBM Plex Mono (SIL OFL 1.1), and xterm.js (MIT), the terminal, served
-// from the Worker with the page.
+// from the Worker with the page. Then the console, `ursa serve`'s page, into
+// dist-console/ (scripts/console.ts).
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ENGINE_DIR, REPO, VIZ_DIR, WEB } from "./common";
+import { buildConsole } from "./console";
 import { buildViz } from "./viz";
 
 const dist = join(WEB, "dist");
@@ -44,3 +46,7 @@ cpSync(join(XTERM, "xterm", "css", "xterm.css"), join(dist, "vendor", "xterm.css
 cpSync(join(XTERM, "addon-fit", "lib", "addon-fit.mjs"), join(dist, "vendor", "addon-fit.mjs"));
 cpSync(join(XTERM, "xterm", "LICENSE"), join(dist, "vendor", "LICENSE-xterm.txt"));
 console.log("built dist/");
+
+// The console (`ursa serve`'s page), in dist-console/: never in dist/, which
+// is deployed.
+await buildConsole();

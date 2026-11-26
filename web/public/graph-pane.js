@@ -32,11 +32,12 @@
 //
 // The pane owns its markup (a <section> with its header, search box, legend,
 // list of matches not shown and stage; ids `${prefix}-pane`,
-// `${prefix}-status`, …, which style.css styles by class), its keys (`/`
-// searches, Esc clears the selection and then closes), the not-shown counts
-// (asked again after every change), the theme (it follows the page's
-// data-theme and the system's), and graph.js, which it imports on the first
-// drawing: a host that draws no graph downloads none of it.
+// `${prefix}-status`, …, which graph-pane.css styles by class: the host
+// links it), its keys (`/` searches, Esc clears the selection and then
+// closes), the not-shown counts (asked again after every change), the theme
+// (it follows the page's data-theme and the system's), and graph.js, which it
+// imports on the first drawing: a host that draws no graph downloads none of
+// it.
 //
 // The pane runs the graph commands itself, through exec(line): `.graph ...`
 // (a drawing, `.graph detail`, `.graph history`), `.find`, and the explore

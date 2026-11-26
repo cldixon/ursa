@@ -12,7 +12,8 @@
 //! What keeps it local (§5):
 //!
 //! - it listens on `127.0.0.1` and `::1` only;
-//! - a token, 32 random bytes made at startup, opens the page (`/?token=…`,
+//! - a token, 32 random bytes made at startup, opens the page (the
+//!   console's `/console/?token=…`, or the shell's `/?token=…`,
 //!   which sets it as an `HttpOnly`, `SameSite=Strict` cookie named for the
 //!   port and drops it from the address) and is required on the WebSocket
 //!   (the cookie, or `?token=`) and on `/data/`;
@@ -25,7 +26,7 @@
 //! let config = ursa_server::Config {
 //!     root: ".".into(),
 //!     port: ursa_server::DEFAULT_PORT,
-//!     assets: ursa_server::Assets::Dirs(vec!["web/dist".into()]),
+//!     assets: ursa_server::Assets::Dirs(vec!["web/dist-console".into(), "web/dist".into()]),
 //!     version: "0.13.0".into(),
 //! };
 //! let bound = ursa_server::bind(config).await?;
@@ -96,11 +97,13 @@ pub struct Config {
     pub version: String,
 }
 
-/// Where the page's files (`web/dist`, built by `bun run build`) come from.
+/// Where the page's files come from: `web/dist-console` (the console, under
+/// `console/`) and `web/dist` (the shell, and the modules both use), built by
+/// `bun run build`.
 #[derive(Debug, Clone)]
 pub enum Assets {
     /// These directories, looked in in order: the first that has a file
-    /// serves it.
+    /// serves it (`[web/dist-console, web/dist]`).
     Dirs(Vec<PathBuf>),
     /// The files built into the binary (the `embed` feature). Without the
     /// feature, there are none.
@@ -132,12 +135,25 @@ pub struct Bound {
 }
 
 impl Bound {
-    /// The URL to open, with its token.
+    /// The URL to open, with its token: the console's (`/console/`) if the
+    /// assets have it, else the shell's (`/`).
     pub fn url(&self) -> String {
+        let page = if self.has_console() {
+            files::CONSOLE
+        } else {
+            "/"
+        };
         format!(
-            "http://127.0.0.1:{}/?token={}",
+            "http://127.0.0.1:{}{page}?token={}",
             self.shared.port, self.shared.token
         )
+    }
+
+    /// Whether the assets have the console (`web/dist-console`, which `bun
+    /// run build` makes beside `web/dist`): it is served at `/console/`, and
+    /// the shell at `/`.
+    pub fn has_console(&self) -> bool {
+        files::has_console(&self.shared.config.assets)
     }
 
     /// The port it listens on.

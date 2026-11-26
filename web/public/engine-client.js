@@ -4,9 +4,13 @@
 //   const client = connect(defaultTransport(), { name: "shell", kind: "human" }, { session: "new" });
 //   await client.ready;                        // hello's result
 //   const { out, err } = await client.call("feed", { line: "SELECT 1;" });
+//   const running = client.call("query", { sql }); client.cancel(running);
 //
 // - WorkerTransport: the browser demo's engine, ursa-wasm in a Web Worker
 //   (engine-worker.js), over postMessage. Binary parts are transferred.
+// - SocketTransport (socket-transport.js): `ursa serve`'s native engine, over
+//   a WebSocket held in a worker (socket-worker.js). Binary parts are
+//   transferred from it too.
 //
 // A transport carries these messages (docs/reference/protocol.md):
 //
@@ -15,7 +19,11 @@
 //            {id, ok: false, error: {kind, message}}
 //   event    {event, ...}
 //
-// where a part's `bytes` is its ArrayBuffer. A transport is an object with:
+// where a part's `bytes` is its ArrayBuffer. A reply's part may also carry
+// `offset`: the part is its buffer from that many bytes on (a multiple of 8;
+// none is 0). SocketTransport gives each part so, the binary frame it came
+// in, past its 8-byte header, rather than copy it out (URSA-7). A transport
+// is an object with:
 //
 //   open({reply, event, fail})  start; resolves once requests can be sent.
 //                               Calls reply(message) for each reply, in full
@@ -84,21 +92,46 @@ export function connect(transport, client = { name: "shell", kind: "human" }, { 
     fail: (message) => fail(stopped(message)),
   });
 
-  function send(op, args = {}, parts = []) {
+  // `sent`, when given, learns the request's id: what `cancel` names.
+  function send(op, args = {}, parts = [], sent = null) {
     if (closed) return Promise.reject(closed);
+    if (sent?.cancelled) return Promise.reject(problem({ kind: "cancelled", message: "cancelled before it was sent" }));
     return new Promise((resolve, reject) => {
       const id = nextId++;
+      if (sent) sent.id = id;
       calls.set(id, { resolve, reject });
       transport.send({ v: PROTOCOL, id, op, args, parts });
     });
   }
+  // Each call's promise, to the id its request was sent with.
+  const requests = new WeakMap();
 
   const ready = opened.then(() => send("hello", { protocol: PROTOCOL, client, session }));
   ready.catch(() => {});
   return {
     ready,
     /** Run `op`; `parts` are [{name, kind, bytes: ArrayBuffer}], transferred. */
-    call: (op, args, parts) => ready.then(() => send(op, args, parts)),
+    call(op, args, parts) {
+      const sent = {};
+      const reply = ready.then(() => send(op, args, parts, sent));
+      requests.set(reply, sent);
+      return reply;
+    },
+    /**
+     * Stop a call: `reply` is the promise call() returned, which then rejects
+     * with kind `cancelled`. Sends `cancel {target}` (native sessions only:
+     * hello's capabilities list `cancel`); a call that has already replied is
+     * left as it is. Resolves once the session has answered.
+     */
+    cancel(reply) {
+      const sent = requests.get(reply);
+      if (!sent) return Promise.resolve();
+      if (sent.id === undefined) {
+        sent.cancelled = true;
+        return Promise.resolve();
+      }
+      return send("cancel", { target: sent.id }).then(() => {});
+    },
     on(event, fn) {
       if (!listeners.has(event)) listeners.set(event, new Set());
       listeners.get(event).add(fn);
@@ -120,8 +153,8 @@ export function defaultTransport() {
 function flatten({ result = {}, parts = [] }) {
   const out = { ...result };
   for (const part of parts) {
-    const buffer = part.bytes;
-    out[part.name] = part.kind === "f32" ? new Float32Array(buffer) : part.kind === "u32" ? new Uint32Array(buffer) : new Uint8Array(buffer);
+    const { bytes: buffer, offset = 0 } = part;
+    out[part.name] = part.kind === "f32" ? new Float32Array(buffer, offset) : part.kind === "u32" ? new Uint32Array(buffer, offset) : new Uint8Array(buffer, offset);
   }
   return out;
 }

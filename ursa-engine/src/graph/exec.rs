@@ -105,7 +105,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use futures::{FutureExt, TryStreamExt};
-use ursa_core::{EdgeInterner, IdError, IdMap, NodeOrder, Topology};
+use ursa_core::{EdgeInterner, IdError, IdMap, NodeOrder, RowSource, Topology};
 
 use super::in_order::{read_ahead, InOrder};
 use super::index::{
@@ -1875,15 +1875,60 @@ impl Gather {
 
 /// The index of everything `interner` was given; an empty graph of
 /// `id_type` ids if it was given no node and no edge.
-fn finish_index(mut interner: EdgeInterner, id_type: &DataType) -> GraphIndex {
+fn finish_index(mut interner: EdgeInterner, id_type: &DataType, notifier: &Notifier) -> GraphIndex {
     let (n_dropped, kept) = (interner.n_dropped(), interner.kept_rows());
     let (ids, source, destination) = interner.finish();
     if ids.is_empty() {
         let (topology, ids) = ursa_io::topology::empty_topology(id_type);
         return GraphIndex::new(topology, ids).with_dropped(n_dropped, kept);
     }
-    let (topology, ids) = relabelled(ids, source, destination);
+    let (topology, ids) = relabelled(ids, source, destination, notifier);
     GraphIndex::new(Arc::new(topology), Arc::new(ids)).with_dropped(n_dropped, kept)
+}
+
+/// Where an index keeps its edges' rows (#170): an index of
+/// [`RELABEL_MIN_EDGES`] edges or more writes each row's source to an
+/// anonymous temporary file (4 B an edge, in the system's temporary
+/// directory, `TMPDIR`), and builds its edge ids from it only when a query
+/// reads them (a weight, a mask, an edge's row); a query that reads none never
+/// holds them, 4 B an edge in each direction. The file is unlinked as soon as
+/// it is created, so it goes with the index, or with the process.
+///
+/// A smaller index, a platform without one, or a file that cannot be written
+/// (no temporary directory, or no room in it: a full disk fails the write,
+/// and what was written is freed at once) builds the ids with the index, as
+/// before #170: the query goes on, with a notice for a failed write. Rows
+/// already in source order need neither: their ids are the identity.
+fn spill(sources: &[u32], notifier: &Notifier) -> Option<Arc<dyn RowSource>> {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    if sources.len() >= RELABEL_MIN_EDGES {
+        return spill_in(&std::env::temp_dir(), sources, notifier);
+    }
+    let _ = (sources, notifier);
+    None
+}
+
+/// [`spill`], into the directory `dir`.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn spill_in(
+    dir: &std::path::Path,
+    sources: &[u32],
+    notifier: &Notifier,
+) -> Option<Arc<dyn RowSource>> {
+    match ursa_core::topology::SpilledRows::write_in(dir, sources) {
+        Ok(rows) => Some(Arc::new(rows)),
+        Err(e) => {
+            notifier.say(NoticeLevel::On, || {
+                format!(
+                    "could not write the index's edge rows to {} ({e}); \
+                     its edge ids are kept in memory ({})",
+                    dir.display(),
+                    crate::notices::size(4 * sources.len() as u64)
+                )
+            });
+            None
+        }
+    }
 }
 
 /// The fewest edges an index relabels its nodes for (#172): a smaller graph's
@@ -1893,12 +1938,20 @@ const RELABEL_MIN_EDGES: usize = 1 << 16;
 /// The topology of the edges `source -> destination` (dense ids of `ids`),
 /// its nodes relabelled for locality (#172) when it has
 /// [`RELABEL_MIN_EDGES`] edges or more, and `ids` renumbered with them.
-fn relabelled(ids: IdMap, source: Vec<u32>, destination: Vec<u32>) -> (Topology, IdMap) {
+fn relabelled(
+    ids: IdMap,
+    source: Vec<u32>,
+    destination: Vec<u32>,
+    notifier: &Notifier,
+) -> (Topology, IdMap) {
     let order = match source.len() >= RELABEL_MIN_EDGES {
         true => NodeOrder::InDegree,
         false => NodeOrder::AsGiven,
     };
-    let topology = Topology::build_ordered(ids.len(), source, destination, order);
+    let topology =
+        Topology::build_with_rows(ids.len(), source, destination, order, &mut |sources| {
+            spill(sources, notifier)
+        });
     let ids = match topology.original_ids() {
         Some(original) => ids.reordered(original),
         None => ids,
@@ -2012,7 +2065,7 @@ fn take_chunk(
             .map_err(|e| build_error(graph, e))?,
         Chunk::End => {
             let interner = std::mem::replace(interner, EdgeInterner::with_capacity(0));
-            return Ok(Some(finish_index(interner, id_type)));
+            return Ok(Some(finish_index(interner, id_type, &Notifier::silent())));
         }
     }
     Ok(None)
@@ -2189,6 +2242,7 @@ fn intern_edges(
     hint: usize,
     graph: &str,
     id_type: &DataType,
+    notifier: &Notifier,
 ) -> Result<Option<GraphIndex>> {
     let error = |e| build_error(graph, e);
     let mut side = EdgeSide::new(nodes, hint);
@@ -2203,7 +2257,7 @@ fn intern_edges(
                     return Ok(None);
                 }
                 let interner = side.interner.take().expect("the node set is taken in");
-                return Ok(Some(finish_index(interner, id_type)));
+                return Ok(Some(finish_index(interner, id_type, notifier)));
             }
             Chunk::Nodes(_) | Chunk::NodesDone => {
                 return Err(DataFusionError::Internal(format!(
@@ -2298,8 +2352,10 @@ async fn build_streamed_with(
             keys = Some((reading, interning));
         }
         let (graph, id_type) = (shape.graph.clone(), shape.id_type.clone());
-        let interning =
-            tokio::task::spawn_blocking(move || intern_edges(rx, nodes, hint, &graph, &id_type));
+        let notifier = Notifier::of(context.session_config());
+        let interning = tokio::task::spawn_blocking(move || {
+            intern_edges(rx, nodes, hint, &graph, &id_type, &notifier)
+        });
         // The reader owns the sender, so the interner sees the channel close
         // when the reader stops, on an error as at the end.
         let edges_read = send_edges(edges, shape, endpoints, weights, &tx).await;
@@ -2596,7 +2652,7 @@ mod tests {
             .map(|c| (c[0].as_ref(), c[1].as_ref()))
             .collect();
         let (ids, s, d) = IdMap::from_edge_batches(&rows).unwrap();
-        let (topology, ids) = relabelled(ids, s, d);
+        let (topology, ids) = relabelled(ids, s, d, &Notifier::silent());
         let collected = GraphIndex::new(Arc::new(topology), Arc::new(ids));
         let expected = stored_bytes(&serial);
         assert_eq!(stored_bytes(&collected), expected);
@@ -2700,7 +2756,7 @@ mod tests {
             for edges in drain(&plan, &[0, 1], &context).await.unwrap() {
                 interner.push(edges[0].as_ref(), edges[1].as_ref()).unwrap();
             }
-            let before = finish_index(interner, &DataType::Int64);
+            let before = finish_index(interner, &DataType::Int64, &Notifier::silent());
             assert!(before.ids.len() > 45_000, "{file}: {}", before.ids.len());
             assert!(before.n_dropped() > 0, "{file}");
             assert!(before.topology.n_edges() > 100_000, "{file}");
@@ -2731,6 +2787,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_index_whose_rows_cannot_be_spilled_keeps_its_ids_with_a_notice() {
+        let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&said);
+        let notifier = Notifier::new(
+            Arc::new(move |s: &str| sink.lock().unwrap().push(s.to_string())),
+            NoticeLevel::On,
+        );
+        let missing = std::env::temp_dir().join("ursa-no-such-dir-170-engine");
+        assert!(spill_in(&missing, &[2, 1, 0], &notifier).is_none());
+        let said = said.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("could not write the index's edge rows to "));
+        assert!(
+            said[0].ends_with("its edge ids are kept in memory (12 B)"),
+            "{said:?}"
+        );
+        // A writable directory spills, and says nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = Notifier::silent();
+        let rows = spill_in(dir.path(), &[2, 1, 0], &quiet).expect("spilled");
+        assert_eq!(rows.sources(), vec![2, 1, 0]);
+        // The file is unlinked as soon as it is written.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
