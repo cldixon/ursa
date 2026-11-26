@@ -683,10 +683,15 @@ impl IndexStore {
         }
         let with_incoming = size > main;
         let grows_to = (!with_incoming).then(|| {
-            size.saturating_add(incoming_estimate(
+            let (n, m) = (
                 index.topology.n_nodes() as u64,
                 index.topology.n_edges() as u64,
-            ))
+            );
+            size.saturating_add(match &index.topology.out().packed {
+                None => incoming_estimate(n, m),
+                // About the out-adjacency's bytes again (#173).
+                Some(p) => compressed_incoming_estimate(n, m, p.bytes.len() as u64),
+            })
         });
         let file = format!("{:016x}.idx", key.hash());
 
@@ -1110,6 +1115,18 @@ pub fn incoming_estimate(n_nodes: u64, n_edges: u64) -> u64 {
         .saturating_add(1)
         .saturating_mul(8)
         .saturating_add(n_edges.saturating_mul(8))
+        .saturating_add(4096)
+}
+
+/// [`incoming_estimate`] for a compressed index (#173) whose out-adjacency's
+/// segments take `bytes`: its slot and byte offsets, about as many bytes,
+/// and its edge ids.
+pub fn compressed_incoming_estimate(n_nodes: u64, n_edges: u64, bytes: u64) -> u64 {
+    n_nodes
+        .saturating_add(1)
+        .saturating_mul(16)
+        .saturating_add(bytes)
+        .saturating_add(n_edges.saturating_mul(4))
         .saturating_add(4096)
 }
 

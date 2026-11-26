@@ -299,18 +299,67 @@ impl Sources {
     }
 }
 
-/// The in-neighbours of compact node `c` from `sources`, as compact ids,
-/// and, if `rows`, their edge rows (else none: the edge ids are then never
-/// built, #170).
+/// The in-neighbours of compact node `c` (node `u`) and, if `rows`, their
+/// edge rows (else none: the edge ids are then never built, #170): as
+/// compact ids from `sources`, or else as the transpose holds them.
 fn pulled_from<'a>(
     inc: &'a Adjacency,
-    s: &'a Sources,
+    sources: Option<&'a Sources>,
     c: usize,
+    u: u32,
     rows: bool,
 ) -> (&'a [u32], &'a [u32]) {
-    let (lo, hi) = s.spans[c];
-    let ids: &[u32] = if rows { &inc.edge_ids[lo..hi] } else { &[] };
-    (&s.targets[lo..hi], ids)
+    match (sources, rows) {
+        (Some(s), rows) => {
+            let (lo, hi) = s.spans[c];
+            let ids: &[u32] = if rows { &inc.edge_ids[lo..hi] } else { &[] };
+            (&s.targets[lo..hi], ids)
+        }
+        (None, true) => (inc.plain_neighbors(u), inc.edge_ids(u)),
+        (None, false) => (inc.plain_neighbors(u), &[]),
+    }
+}
+
+/// The sum of `share(v)` over the in-neighbours `v` of node `u` in the
+/// compressed transpose `inc` (#173) along edges `mask` keeps, in its
+/// (sorted) slot order.
+#[inline]
+fn pull_packed(
+    inc: &Adjacency,
+    u: u32,
+    mask: Option<&EdgeMask>,
+    share: impl Fn(u32) -> f64,
+) -> f64 {
+    let mut acc = 0.0;
+    match mask {
+        None => inc.for_each_neighbor(u, |v| acc += share(v)),
+        Some(m) => inc.for_each_neighbor_row(u, |v, e| {
+            if m.keep(e) {
+                acc += share(v);
+            }
+        }),
+    }
+    acc
+}
+
+/// [`pull_packed`] for weighted PageRank: the sum of `pull(v, e)` over the
+/// kept in-edges `e` from `v`, where it is one.
+#[inline]
+fn pull_packed_weighted(
+    inc: &Adjacency,
+    u: u32,
+    mask: Option<&EdgeMask>,
+    pull: impl Fn(u32, u32) -> Option<f64>,
+) -> f64 {
+    let mut acc = 0.0;
+    inc.for_each_neighbor_row(u, |v, e| {
+        if mask.is_none_or(|m| m.keep(e)) {
+            if let Some(x) = pull(v, e) {
+                acc += x;
+            }
+        }
+    });
+    acc
 }
 
 /// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
@@ -363,6 +412,18 @@ fn pagerank_over(
     // `share[v]` is `rank[v] / out_deg[v]`, or 0 for a dangling `v` (whose rank is
     // redistributed through `base` instead). Adding that 0 leaves the non-negative
     // accumulator bit-identical to skipping the edge.
+    // A compressed transpose (#173) is pulled from by a loop of its own, so
+    // the plain layout's stays as it was.
+    if inc.is_packed() {
+        return power_iterate(
+            n,
+            linked,
+            params,
+            &dangling_nodes,
+            Some(&out_deg),
+            |c, share| pull_packed(inc, node(c), mask, |v| share[at(v)]),
+        );
+    }
     power_iterate(
         n,
         linked,
@@ -371,30 +432,28 @@ fn pagerank_over(
         Some(&out_deg),
         |c, share| {
             let u = node(c);
+            let (from, edges) = pulled_from(inc, sources.as_ref(), c, u, mask.is_some());
             let mut acc = 0.0;
-            match (mask, &sources) {
-                (None, Some(s)) => {
-                    for &v in pulled_from(inc, s, c, false).0 {
+            match (mask, direct) {
+                // Fast path: unmasked full-graph pull.
+                (None, true) => {
+                    for &v in from {
                         acc += share[v as usize];
                     }
                 }
-                // Fast path: unmasked full-graph pull.
-                (None, None) if direct => inc.for_each_neighbor(u, |v| acc += share[v as usize]),
-                (None, None) => inc.for_each_neighbor(u, |v| acc += share[at(v)]),
+                (None, false) => {
+                    for &v in inc.plain_neighbors(u) {
+                        acc += share[at(v)];
+                    }
+                }
                 // Subgraph pull: skip in-edges whose original row is masked out.
-                (Some(m), Some(s)) => {
-                    let (from, edges) = pulled_from(inc, s, c, true);
+                (Some(m), _) => {
                     for (&v, &e) in from.iter().zip(edges) {
                         if m.keep(e) {
-                            acc += share[v as usize];
+                            acc += share[if direct { v as usize } else { at(v) }];
                         }
                     }
                 }
-                (Some(m), None) => inc.for_each_neighbor_row(u, |v, e| {
-                    if m.keep(e) {
-                        acc += share[if direct { v as usize } else { at(v) }];
-                    }
-                }),
             }
             acc
         },
@@ -463,28 +522,29 @@ fn pagerank_weighted_over(
     // Dangling nodes (zero out-strength), listed once — see the unweighted kernel.
     let dangling_nodes: Vec<usize> = (0..width).filter(|&u| out_str[u] <= 0.0).collect();
 
+    if inc.is_packed() {
+        return power_iterate(n, linked, params, &dangling_nodes, None, |c, rank| {
+            pull_packed_weighted(inc, node(c), mask, |v, e| {
+                let v = at(v);
+                let os = out_str[v];
+                (os > 0.0).then(|| weights[e as usize] * rank[v] / os)
+            })
+        });
+    }
     power_iterate(n, linked, params, &dangling_nodes, None, |c, rank| {
         let u = node(c);
         let mut acc = 0.0;
         // In-neighbours and their edge rows are aligned element-for-element.
-        let mut pull = |v: u32, e: u32| {
+        let (nbrs, edges) = pulled_from(inc, sources.as_ref(), c, u, true);
+        for (&v, &e) in nbrs.iter().zip(edges) {
             if !mask.is_none_or(|m| m.keep(e)) {
-                return;
+                continue;
             }
             let v = if direct { v as usize } else { at(v) };
             let os = out_str[v];
             if os > 0.0 {
                 acc += weights[e as usize] * rank[v] / os;
             }
-        };
-        match &sources {
-            Some(s) => {
-                let (nbrs, edges) = pulled_from(inc, s, c, true);
-                for (&v, &e) in nbrs.iter().zip(edges) {
-                    pull(v, e);
-                }
-            }
-            None => inc.for_each_neighbor_row(u, pull),
         }
         acc
     })

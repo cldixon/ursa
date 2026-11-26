@@ -4,14 +4,14 @@
 //! full key it was built for (the edge plan's fingerprint and the identity of
 //! every source file), followed by optional **chunks**: parts of the index
 //! that are built later, or that only some queries need, such as the
-//! in-adjacency. Version 5, all integers little-endian.
+//! in-adjacency. Version 6, all integers little-endian.
 //!
 //! The **main part** comes first:
 //!
 //! ```text
 //! offset  size  field
 //!      0     8  magic            "URSAIDX\0"
-//!      8     4  version          5
+//!      8     4  version          6
 //!     12     4  flags            bit 0: string ids
 //!     16     8  n_nodes
 //!     24     8  n_edges
@@ -40,7 +40,9 @@
 //! reads them whole (see `super::mapped`).
 //!
 //! Its sections, in this order: the out-adjacency's offsets (`u64`,
-//! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`);
+//! `n_nodes + 1`), targets (`u32`, `n_edges`) and edge ids (`u32`, `n_edges`),
+//! the edge ids left out when they are the identity (each slot its own row:
+//! rows grouped by source, #155), which a reader rebuilds for free;
 //! then the ids, either `i64` values (`n_nodes`) or, for string ids,
 //! Arrow-style `i32` offsets (`n_nodes + 1`, from 0) and UTF-8 bytes; then
 //! the ids' **lookup table** (kind 12, `u32`): the open-addressing table
@@ -50,6 +52,15 @@
 //! has just mapped the file finds a seed's node by reading a slot or two and
 //! comparing the id there, where before it hashed every id of the graph into
 //! a table of its own first (#421).
+//!
+//! An index in the **compressed layout** (`ursa.index_layout`, #173,
+//! `ursa_core::packed`) has, in place of the targets, each node's segment
+//! of sorted, varint-coded gaps: the byte position of each node's segment
+//! (kind 14, `u64`, `n_nodes + 1`, from 0 to the bytes' length) and the
+//! bytes (kind 15, bytes). Its offsets still count slots, and its edge ids
+//! follow the sorted segments. Its in-adjacency's chunk is compressed the
+//! same way (kinds 16 and 17 for 4 and 5). Its key is not a plain index's,
+//! so neither layout is ever read for the other.
 //!
 //! An index whose nodes were relabelled for locality (#172,
 //! `ursa_core::NodeOrder`) has one more section, the nodes' **original ids**
@@ -101,18 +112,22 @@
 //! chunk, so a reader in another process (`--readonly`) never sees them
 //! change.
 //!
+//! **Version 5** (0.13) is version 6 with the out-adjacency's edge ids
+//! always stored and no compressed layout. It is still read, and mapped as
+//! version 6 is.
+//!
 //! **Version 4** (0.12) is version 5 without the original ids: its nodes
 //! were never relabelled, and they keep their numbering when it is read. It is
-//! still read, and mapped as version 5 is.
+//! still read, and mapped as version 6 is.
 //!
 //! **Version 3** (0.11) is version 4 without the lookup table. It is still
-//! read, and mapped as version 5 is; the table is then built in memory, the
+//! read, and mapped as version 6 is; the table is then built in memory, the
 //! first time a query looks an id up (one that runs an algorithm over the
 //! whole graph and names no node never does). **Version 2** (0.10) is the
 //! same layout with 24-byte table entries (no section CRCs) and one CRC over
 //! every byte before the trailer. It is still read, whole and checked (see
 //! [`read_file`]), and its lookup table built in the same way. A writer
-//! stores any of them again as version 5 (`IndexStore`).
+//! stores any of them again as version 6 (`IndexStore`).
 //!
 //! **Why raw arrays, not Arrow IPC.** The arrays have different lengths and
 //! no schema: an IPC stream would need one record batch per array, or padding
@@ -127,7 +142,7 @@
 //! borrowed from that.
 //!
 //! **Corruption.** The main part is read only if its length matches the
-//! trailer, the trailer's CRC matches, the version is 2, 3 or 4, the key matches
+//! trailer, the trailer's CRC matches, the version is 2 to 6, the key matches
 //! the key asked for, every section lies within it, the padding is zero, the
 //! CRC of every section but the edge arrays matches (all of them, for a file
 //! that is not mapped), and the arrays form a valid topology and id map
@@ -145,7 +160,7 @@
 //!
 //! **Version 1** files (the in-adjacency, if any, inside the main part) are
 //! not read: they are a miss like any other unreadable file, so the index is
-//! built again once and stored as version 5 in their place.
+//! built again once and stored as version 6 in their place.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1715,7 +1730,7 @@ fn parse(head: &Head, data: &Buffer, mapped: bool) -> Result<Parsed, DecodeError
         _ => Topology::from_checksummed_parts(n_nodes, out)?,
     };
     // The nodes' original ids, if the build relabelled them (#172): only a
-    // version 5 file has them, and only when it was relabelled.
+    // version 5 or 6 file has them, and only when it was relabelled.
     let topology = match head.sections.iter().any(|e| e.kind == ORIGINAL_IDS) {
         true if head.version >= VERSION_5 => {
             let original = scalars::<u32>(data, &take(ORIGINAL_IDS, 4, Some(n_nodes))?);

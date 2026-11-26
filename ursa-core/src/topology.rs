@@ -209,6 +209,40 @@ pub struct Adjacency {
     pub packed: Option<Packed>,
 }
 
+/// [`Topology::for_each_neighbor`]'s visit of a compressed adjacency, out
+/// of line.
+#[inline(never)]
+fn visit_packed(adj: &Adjacency, u: u32, mask: Option<&EdgeMask>, f: &mut impl FnMut(u32)) {
+    match mask {
+        None => adj.for_each_neighbor(u, f),
+        Some(m) => adj.for_each_neighbor_row(u, |v, e| {
+            if m.keep(e) {
+                f(v);
+            }
+        }),
+    }
+}
+
+/// [`Adjacency::for_each_neighbor`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_for_each(p: &Packed, u: u32, f: impl FnMut(u32)) {
+    crate::packed::for_each(p.segment(u), f)
+}
+
+/// [`Adjacency::any_neighbor`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_any(p: &Packed, u: u32, f: impl FnMut(u32) -> bool) -> bool {
+    crate::packed::any(p.segment(u), f)
+}
+
+/// [`Adjacency::neighbors_in`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_into<'a>(p: &Packed, u: u32, buf: &'a mut Vec<u32>) -> &'a [u32] {
+    buf.clear();
+    crate::packed::decode_into(p.segment(u), buf);
+    buf
+}
+
 /// A position in one node's neighbours, for a walk that leaves a node and
 /// comes back to it (a depth-first search's frame): see
 /// [`Adjacency::cursor`]. The same for either layout.
@@ -596,6 +630,14 @@ impl Adjacency {
         &self.targets[s..e]
     }
 
+    /// A plain adjacency's neighbours of `u` (only for a plain one).
+    #[inline(always)]
+    pub(crate) fn plain_neighbors(&self, u: u32) -> &[u32] {
+        let s = self.offsets[u as usize] as usize;
+        let e = self.offsets[u as usize + 1] as usize;
+        &self.targets[s..e]
+    }
+
     /// Whether this adjacency is compressed (#173, see [`crate::packed`]).
     #[inline]
     pub fn is_packed(&self) -> bool {
@@ -612,7 +654,7 @@ impl Adjacency {
     /// adjacency's own, or a compressed one's decoded into `buf` (cleared
     /// first). The per-thread scratch decode of #173; on a plain adjacency
     /// it costs one branch.
-    #[inline]
+    #[inline(always)]
     pub fn neighbors_in<'a>(&'a self, u: u32, buf: &'a mut Vec<u32>) -> &'a [u32] {
         match &self.packed {
             None => {
@@ -620,17 +662,17 @@ impl Adjacency {
                 let e = self.offsets[u as usize + 1] as usize;
                 &self.targets[s..e]
             }
-            Some(p) => {
-                buf.clear();
-                crate::packed::decode_into(p.segment(u), buf);
-                buf
-            }
+            Some(p) => packed_into(p, u, buf),
         }
     }
 
     /// Call `f` with each neighbour of dense node `u`, in slot order,
     /// decoding a compressed segment as it goes.
-    #[inline]
+    ///
+    /// The plain layout's loop is inlined into the caller as a slice loop
+    /// would be; a compressed segment is decoded out of line, so the plain
+    /// layout's hot loops stay as small as before (#173).
+    #[inline(always)]
     pub fn for_each_neighbor(&self, u: u32, mut f: impl FnMut(u32)) {
         match &self.packed {
             None => {
@@ -640,14 +682,14 @@ impl Adjacency {
                     f(v);
                 }
             }
-            Some(p) => crate::packed::for_each(p.segment(u), f),
+            Some(p) => packed_for_each(p, u, f),
         }
     }
 
     /// Call `f(v, e)` with each neighbour `v` of dense node `u` and the edge
     /// row `e` of its slot, in slot order. Builds the edge ids on first call
     /// (see [`Self::edge_ids`]).
-    #[inline]
+    #[inline(always)]
     pub fn for_each_neighbor_row(&self, u: u32, mut f: impl FnMut(u32, u32)) {
         let ids = self.edge_ids(u);
         match &self.packed {
@@ -660,7 +702,7 @@ impl Adjacency {
             }
             Some(p) => {
                 let mut k = 0;
-                crate::packed::for_each(p.segment(u), |v| {
+                packed_for_each(p, u, |v| {
                     f(v, ids[k]);
                     k += 1;
                 });
@@ -670,7 +712,7 @@ impl Adjacency {
 
     /// Whether `f` holds for some neighbour of dense node `u`, read in slot
     /// order up to the first that does.
-    #[inline]
+    #[inline(always)]
     pub fn any_neighbor(&self, u: u32, mut f: impl FnMut(u32) -> bool) -> bool {
         match &self.packed {
             None => {
@@ -678,7 +720,7 @@ impl Adjacency {
                 let e = self.offsets[u as usize + 1] as usize;
                 self.targets[s..e].iter().any(|&v| f(v))
             }
-            Some(p) => crate::packed::any(p.segment(u), f),
+            Some(p) => packed_any(p, u, f),
         }
     }
 
@@ -2659,13 +2701,18 @@ impl Topology {
         mask: Option<&EdgeMask>,
         mut f: F,
     ) {
-        let mut visit = |adj: &Adjacency| match mask {
-            None => adj.for_each_neighbor(u, &mut f),
-            Some(m) => adj.for_each_neighbor_row(u, |v, e| {
-                if m.keep(e) {
-                    f(v);
+        // The plain layout's loops as they were before #173, the compressed
+        // layout's out of line, so these stay as small as they were.
+        let mut visit = |adj: &Adjacency| match (mask, adj.packed.is_some()) {
+            (None, false) => adj.plain_neighbors(u).iter().for_each(|&v| f(v)),
+            (Some(m), false) => {
+                for (&v, &e) in adj.plain_neighbors(u).iter().zip(adj.edge_ids(u)) {
+                    if m.keep(e) {
+                        f(v);
+                    }
                 }
-            }),
+            }
+            (_, true) => visit_packed(adj, u, mask, &mut f),
         };
         match dir {
             Direction::Out => visit(&self.out),
