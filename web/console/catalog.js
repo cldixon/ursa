@@ -245,10 +245,11 @@ export function mountCatalog(mount) {
       const chip = document.createElement("span");
       chip.className = "kind-chip";
       chip.textContent = n.type === "view" ? "view" : "files";
+      if (n.type === "external") chip.setAttribute("aria-hidden", "true");
       el.append(chip);
     }
-    if (SPOKEN[n.type] && n.type !== "view" && n.type !== "external") el.append(hidden(`, ${SPOKEN[n.type]}`));
-    else if (n.type === "view" || n.type === "external") el.append(hidden(` ${SPOKEN[n.type] === "view" ? "" : ""}`));
+    // What it is, for a screen reader (a view's and a table of files' chip says it).
+    if (SPOKEN[n.type] && n.type !== "view") el.append(hidden(n.type === "external" ? " (a table of files)" : `, ${SPOKEN[n.type]}`));
     if (n.detail) {
       const detail = document.createElement("span");
       detail.className = "detail";
