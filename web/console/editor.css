@@ -80,6 +80,7 @@
   color: var(--fg);
   font: inherit;
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .editor-run.all { padding-left: 10px; }
@@ -140,8 +141,8 @@
   text-decoration-skip-ink: none;
   text-underline-offset: 3px;
 }
+.cm-sql-error-wrap { padding: 3px 12px 6px 0; }
 .cm-sql-error {
-  margin: 4px 12px 6px 0;
   padding: 6px 10px 7px;
   border-left: 3px solid var(--error);
   border-radius: 0 6px 6px 0;

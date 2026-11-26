@@ -282,7 +282,11 @@ class ErrorWidget extends WidgetType {
     return other.error.message === this.error.message && other.error.hint === this.error.hint;
   }
   toDOM() {
-    const box = document.createElement("div");
+    // No margins on a block widget (CodeMirror measures it without them):
+    // the space around the box is the wrapper's padding.
+    const wrap = document.createElement("div");
+    wrap.className = "cm-sql-error-wrap";
+    const box = wrap.appendChild(document.createElement("div"));
     box.className = "cm-sql-error";
     box.setAttribute("role", "alert");
     const head = box.appendChild(document.createElement("div"));
@@ -296,7 +300,7 @@ class ErrorWidget extends WidgetType {
       hint.className = "cm-sql-error-hint";
       hint.textContent = this.error.hint;
     }
-    return box;
+    return wrap;
   }
   ignoreEvent() {
     return false;
@@ -649,7 +653,7 @@ keys.innerHTML = `
     <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 3.2v9.6L12.6 8z" fill="currentColor"/></svg>Run
   </button>
   <button type="button" class="editor-run all" data-run="all" title="Run every statement, stopping at the first error (Shift+Ctrl+Enter)">Run all</button>
-  <span id="editor-keys" class="editor-keys"><kbd>${isMac() ? "⌘" : "Ctrl"}</kbd>+<kbd>Enter</kbd> runs the statement at the cursor or the selection, with <kbd>Shift</kbd> every statement. <kbd>Esc</kbd> then <kbd>Tab</kbd> leaves the editor.</span>`;
+  <span id="editor-keys" class="editor-keys"><kbd>${isMac() ? "⌘" : "Ctrl"}</kbd>+<kbd>Enter</kbd> runs the statement at the cursor or the selection; with <kbd>Shift</kbd>, all of them. <kbd>Esc</kbd> then <kbd>Tab</kbd> leaves the editor.</span>`;
 const host = document.createElement("div");
 host.className = "editor-host";
 mount.append(keys, host, live);

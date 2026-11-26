@@ -304,7 +304,7 @@ check(out.map((o: any) => o.text).join("|") === "SELECT 1 AS one", "Shift+Ctrl+E
 const shown = await page.evaluate(() => {
   const box = document.querySelector(".cm-sql-error") as HTMLElement;
   const squiggle = document.querySelector(".cm-lintRange-error");
-  const line = box?.closest(".cm-content") ? box.previousElementSibling?.textContent : null;
+  const line = box?.closest(".cm-content") ? box.parentElement?.previousElementSibling?.textContent : null;
   return {
     message: box?.innerText ?? "",
     role: box?.getAttribute("role"),
