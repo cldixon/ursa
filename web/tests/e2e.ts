@@ -2249,9 +2249,14 @@ for (const scheme of ["light", "dark"] as const) {
       "a big graph: a click on a group selects its nodes",
       picked.slice(0, 160),
     );
-    // A click on empty space clears.
+    // A click on empty space clears. The camera then gives back the room
+    // it made for the inspector's panel (#493), over a few frames: the
+    // zoom below starts from where it is once it has (URSA-19: under load
+    // a cut was asked for between the room's frames, and the first zoom's
+    // cut was of a camera still moving).
     await r.mouse.click(box.x + 8, box.y + box.height - 8);
     await r.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    await roomSettled(r);
     check(/^aggregated: /.test(await statusNow()), "a big graph: a click on empty space clears the group's selection", (await statusNow()).slice(0, 80));
     // `a` forces full detail, and `a` again lets it go.
     await r.locator("#graph-stage canvas").focus();

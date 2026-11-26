@@ -2026,6 +2026,9 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   their node counts: []`, seen over `ursa serve`). The hook's `cuts.waiting`
   now also covers a cut, or the graph in place of one, that no frame has
   drawn yet; and a new check holds the animation frames to see it wait.
+  The zoom into rmat also starts once the camera has given back the room
+  it made for the inspector's panel (#493): under load the first zoom's
+  cut was of a camera still moving (76 groups for the fitted 92).
 
 - **Web Shell: a `.graph` that fails downloads none of the graph view**
   (URSA-11). The pane opens with "Loading graph view…" once the engine has
