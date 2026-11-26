@@ -12,6 +12,8 @@
 // window.ursaConsole is also what the e2e test (tests/console.ts) reads.
 import { session } from "./session.js";
 import { setupLayout } from "./layout.js";
+import { createResults } from "./results.js";
+import { createSqlBox } from "./sqlbox.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -127,4 +129,11 @@ function seconds(ms) {
 showState();
 session.start();
 
-window.ursaConsole = { session, panels: layout.panels, layout };
+// The Results panel (URSA-14), and until the editor (URSA-13) the
+// temporary box that runs SQL into it. `ursaConsole.run(sql)` is what the
+// editor calls.
+const results = createResults({ mount: layout.panels.results, session });
+const run = (sql) => results.run(sql);
+createSqlBox({ mount: layout.panels.editor, run });
+
+window.ursaConsole = { session, panels: layout.panels, layout, results, run };

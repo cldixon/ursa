@@ -141,15 +141,26 @@ pub const OPS: &[Op] = &[
     Op {
         name: "query",
         args: "`sql`, `rows?` (1,000)",
-        result: "`{result, columns, metadata, rows, more, ms, notices}`; `arrow` (`arrow`)",
+        result: "`{result, columns, metadata, rows, more, ms, notices, graph}`; `arrow` (`arrow`)",
         about: "Runs `sql` for the console. The last statement's result is kept as \
                 `result` (`\"r4\"`; `null` for a statement with no columns) for `fetch`, \
                 `export` and `graph.open`, and becomes the last result too. `columns` are \
                 `[{name, type, nullable, metadata}]`, `metadata` is the schema's \
-                (`ursa.pattern`), `rows` the whole result's count; the part holds the \
+                (`ursa.pattern`), `rows` the whole result's count, `graph` the rule \
+                `graph.open` would draw it by (`\"nodes\"`, `\"edges\"`, `\"path\"`, \
+                `\"rings\"`, `\"pattern\"`), read from its columns, or `null` for a \
+                result that is not a graph; the part holds the \
                 first `rows` rows as an Arrow IPC stream. The session keeps its last 16 \
                 results, within 256 MB, and drops the oldest first; a result over 256 MB \
                 on its own keeps only the rows the reply sent",
+    },
+    Op {
+        name: "explain",
+        args: "`sql`",
+        result: "`{plan, ms}`",
+        about: "The plan of `sql`'s last statement, as `EXPLAIN` prints it: the logical \
+                plan, then the physical plan, as text. Nothing is run, the statements \
+                before the last included",
     },
     Op {
         name: "fetch",
@@ -593,6 +604,14 @@ impl Session {
                     parts: vec![Part::arrow(arrow)],
                 })
             }
+            "explain" => {
+                let start = Instant::now();
+                let plan = self.explain(a.str("sql")?).await?;
+                Ok(Reply::json(json!({
+                    "plan": plan,
+                    "ms": start.elapsed().as_secs_f64() * 1000.0,
+                })))
+            }
             "fetch" => {
                 let id = a.str("result")?;
                 let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -825,6 +844,12 @@ impl Session {
                 .set_last_result(Arc::clone(&schema), batches.clone());
             Some(self.results.keep(Arc::clone(&schema), batches, rows)?)
         };
+        // The rule `graph.open` would draw it by, from its columns alone.
+        let graph = if columns.is_empty() {
+            None
+        } else {
+            view::rules::rule_of(&schema).ok().map(view::Rule::name)
+        };
         let result = json!({
             "result": id,
             "columns": columns,
@@ -833,8 +858,47 @@ impl Session {
             "more": total > rows,
             "ms": start.elapsed().as_secs_f64() * 1000.0,
             "notices": notices,
+            "graph": graph,
         });
         Ok((result, arrow))
+    }
+
+    /// The plan of `sql`'s last statement, as `EXPLAIN` gives it: each of
+    /// its plans (`logical_plan`, `physical_plan`) under its name, as text.
+    /// Nothing runs: not the statement, nor those before it, so a statement
+    /// that reads what an earlier one creates cannot be explained until that
+    /// one has run.
+    pub async fn explain(&mut self, sql: &str) -> Result<String> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::DataType;
+        let ctx = self.shell.context().clone();
+        let (_, text) = ursa_sql::parse_sql_with_text_for(&ctx, sql)?
+            .pop()
+            .ok_or_else(|| DataFusionError::Plan("no statement to explain".into()))?;
+        let text = text.trim().trim_end_matches(';').trim_end();
+        let explain = format!("EXPLAIN {text}");
+        let mut plan = String::new();
+        for (statement, text) in ursa_sql::parse_sql_with_text_for(&ctx, &explain)? {
+            let frame = ursa_sql::execute_with_text(&ctx, statement, &text).await?;
+            for batch in frame.collect().await? {
+                if batch.num_columns() < 2 {
+                    continue;
+                }
+                let kind = arrow::compute::cast(batch.column(0), &DataType::Utf8)?;
+                let body = arrow::compute::cast(batch.column(1), &DataType::Utf8)?;
+                let (kind, body) = (kind.as_string::<i32>(), body.as_string::<i32>());
+                for row in 0..batch.num_rows() {
+                    if !plan.is_empty() {
+                        plan.push('\n');
+                    }
+                    plan.push_str(kind.value(row));
+                    plan.push('\n');
+                    plan.push_str(body.value(row).trim_end());
+                    plan.push('\n');
+                }
+            }
+        }
+        Ok(plan)
     }
 
     /// `rows` rows of the kept result `id` from `offset`, as an Arrow IPC

@@ -22,7 +22,8 @@
 // - when the server stops, the page says so and tries again; when it comes
 //   back with a new token, the page says to open its link, and connects once
 //   it has been opened;
-// - the shell is still at /.
+// - the shell is still at /;
+// - the result tabs (URSA-14): tests/console-results.ts.
 //
 // With a screenshot dir, it saves the console in light and dark at 1440×900
 // and 390×844.
@@ -30,6 +31,7 @@ import { chromium, type Page } from "playwright";
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { cargoTargetDir, DATA_DIR, WEB } from "../scripts/common";
+import { resultsChecks } from "./console-results";
 
 const port = Number(Bun.argv[2] ?? 8981);
 const bin = Bun.argv[3] || process.env.URSA_BIN || join(cargoTargetDir(), "release", "ursa");
@@ -118,7 +120,7 @@ const PANELS: [string, string, string][] = [
   ["sources", "Sources", "URSA-16"],
   ["catalog", "Catalog", "URSA-15"],
   ["editor", "Editor", "URSA-13"],
-  ["results", "Results", "URSA-14"],
+  ["results", "Results", ""],
   ["inspector", "Inspector", ""],
   ["history", "History", "URSA-17"],
 ];
@@ -130,7 +132,9 @@ for (const [id, title, issue] of PANELS) {
   }, id);
   const visible = await panel.isVisible();
   const mount = await page.locator(`#${id} [data-mount="${id}"]`).count();
-  const placeholder = await page.locator(`#${id} .placeholder`).innerText();
+  // What the mount point shows: a placeholder, or what its issue put there
+  // (the temporary SQL box names URSA-13, which replaces it).
+  const placeholder = await page.locator(`#${id} [data-mount]`).innerText();
   check(
     visible && name === title && mount === 1 && (!issue || placeholder.includes(issue)),
     `the ${title} panel: labelled, with its mount point${issue ? ` and ${issue}` : ""}`,
@@ -193,10 +197,10 @@ check((await page.evaluate(() => document.activeElement?.id)) === "catalog", "Sh
 // Tab order: the header, then the left column, the editor and results, the
 // right column and the status bar.
 const tabOrder = await page.evaluate(() => {
-  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links"));
+  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], textarea, [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links"));
   return all.map((el) => el.id || el.dataset.split || el.className);
 });
-const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];
+const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "sql-input", "sql-run", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];
 check(JSON.stringify(tabOrder) === JSON.stringify(expected), "the focus order follows the layout", tabOrder.join(" "));
 
 // The splitters' keys.
@@ -313,6 +317,10 @@ await page.waitForSelector("#running", { state: "hidden" });
 check((await page.locator("#announce").textContent()) === "Cancelled query", "and a screen reader hears it was cancelled", (await page.locator("#announce").textContent()) ?? "");
 const after1 = await page.evaluate(() => (window as any).ursaConsole.session.run("query", { sql: "SELECT 41 + 1 AS answer" }).then((r: any) => r.rows));
 check(after1 === 1, "the session goes on after a cancel", String(after1));
+
+// ---------------------------------------------------------------- results (URSA-14)
+
+await resultsChecks(page, context, check, shots);
 
 // ---------------------------------------------------------------- the server goes
 
