@@ -668,8 +668,13 @@ fn adjacency_sections(adj: &Adjacency, kinds: [u32; 5]) -> Vec<(u32, Data<'_>)> 
             sections.push((bytes, Data::Bytes(p.bytes.inner().clone())));
         }
     }
-    if !adj.edge_ids.is_identity() {
-        sections.push((edge_ids, Data::edge_ids(&adj.edge_ids)));
+    // Ids held (an older file's, read back) are checked: up to the first
+    // that is not its slot, which for most is the first few.
+    let ids = &adj.edge_ids;
+    let identity = ids.is_identity()
+        || (ids.is_built() && ids.iter().enumerate().all(|(k, &e)| k as u32 == e));
+    if !identity {
+        sections.push((edge_ids, Data::edge_ids(ids)));
     }
     sections
 }
@@ -2614,5 +2619,136 @@ mod tests {
             );
             assert_eq!(encode(&key(), &stored.topology, &stored.ids), v5);
         }
+    }
+
+    /// The compressed layout (#173) is stored as version 6: byte offsets and
+    /// bytes in place of the targets, in the main part and in the
+    /// in-adjacency's chunk, and read back compressed, mapped or not.
+    #[test]
+    fn a_compressed_index_round_trips_as_version_6() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let mut cases: Vec<(Topology, IdMap)> = relabelled().into();
+        for (topology, ids) in graphs() {
+            let out = topology.out().clone();
+            let topology = Topology::from_parts(topology.n_nodes(), out, None).unwrap();
+            cases.push((topology, (*ids).clone()));
+        }
+        for (topology, ids) in cases {
+            // What the compressed topology decodes to.
+            let out = topology.out().clone();
+            let mut sorted = Topology::from_parts(topology.n_nodes(), out, None).unwrap();
+            if let Some(original) = topology.original_ids() {
+                sorted = sorted.with_original_ids(original.to_vec().into()).unwrap();
+            }
+            let sorted = sorted.with_sorted_segments();
+            let compressed = topology.compressed(None);
+            assert!(compressed.is_compressed());
+            let bytes = encode(&key(), &compressed, &ids);
+            assert_eq!(u32_at(&bytes, 8), VERSION);
+            let (_, len) = section_of(&bytes, OUT_BYTES);
+            assert_eq!(len, compressed.out().packed.as_ref().unwrap().bytes.len());
+            let n_sections = u32_at(&bytes, 40) as usize;
+            let table = align(HEADER_LEN + u64_at(&bytes, 32), 8) as usize;
+            assert!((0..n_sections).all(|i| u32_at(&bytes, table + 32 * i) != OUT_TARGETS));
+
+            // Read whole, and mapped (where the platform maps files).
+            let (decoded, _) = decode(&bytes, &key()).unwrap();
+            let main = write_main(&path, &compressed, &ids);
+            let incoming = compressed.incoming().clone();
+            assert!(incoming.is_packed());
+            append_chunk(&path, main, CHUNK_INCOMING, b"", |at| {
+                EncodedChunk::incoming(&incoming, at)
+            })
+            .unwrap()
+            .unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            if let Some(checks) = &stored.unverified {
+                checks.verify().unwrap();
+            }
+            for back in [&decoded, &stored.topology] {
+                assert!(back.is_compressed());
+                assert_eq!(back.out().unpacked().targets, sorted.out().targets);
+                assert_eq!(back.out().edge_ids, sorted.out().edge_ids);
+                assert_eq!(back.original_ids(), compressed.original_ids());
+                assert_eq!(
+                    ursa_core::algo::connected_components_weak(back, None),
+                    ursa_core::algo::connected_components_weak(&sorted, None)
+                );
+                assert_eq!(
+                    ursa_core::algo::bfs_distances(back, 0, ursa_core::Direction::Both),
+                    ursa_core::algo::bfs_distances(&sorted, 0, ursa_core::Direction::Both)
+                );
+            }
+            // The stored in-adjacency is read, compressed.
+            let back_in = stored.topology.incoming();
+            assert!(back_in.is_packed());
+            assert_eq!(back_in.unpacked().targets, sorted.incoming().targets);
+            assert_eq!(back_in.edge_ids, sorted.incoming().edge_ids);
+            // Stored again from the loaded index: the same main part.
+            assert_eq!(encode(&key(), &stored.topology, &stored.ids), bytes);
+            // A damaged segment is found by its checksum.
+            let (at, _) = section_of(&bytes, OUT_BYTES);
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 0x40;
+            assert!(decode(&flipped, &key()).is_err());
+            std::fs::write(&path, &flipped).unwrap();
+            if let Ok(stored) = read_file(&path, &key()) {
+                let checks = stored.unverified.expect("only a mapped file defers");
+                assert!(checks.verify().is_err());
+            }
+        }
+    }
+
+    /// #155: version 6 leaves out edge ids that are the identity (rows
+    /// grouped by source), and reads them back as the identity; version 5,
+    /// which 0.13 wrote, stored them and is still read.
+    #[test]
+    fn identity_edge_ids_are_left_out_and_version_5_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.idx");
+        let ints = |v: &[i64]| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef;
+        // Rows grouped by source.
+        let (topology, ids) = built(ints(&[1, 1, 2, 3, 3, 3]), ints(&[2, 3, 3, 1, 2, 4]));
+        assert!(topology.out().edge_ids.is_identity());
+        let v6 = encode(&key(), &topology, &ids);
+        let n_sections = u32_at(&v6, 40) as usize;
+        let table = align(HEADER_LEN + u64_at(&v6, 32), 8) as usize;
+        assert!((0..n_sections).all(|i| u32_at(&v6, table + 32 * i) != OUT_EDGE_IDS));
+        std::fs::write(&path, &v6).unwrap();
+        let stored = read_file(&path, &key()).unwrap();
+        assert!(stored.topology.out().edge_ids.is_identity());
+        same(&topology, &stored.topology);
+
+        let mut cases: Vec<(Arc<Topology>, Arc<IdMap>)> = graphs().into();
+        cases.push((topology, ids));
+        for (topology, ids) in cases {
+            let encoded = Encoded::new(&key(), &topology, &ids)
+                .unwrap()
+                .as_version_5();
+            let mut v5 = Vec::new();
+            encoded.write_to(&mut v5).unwrap();
+            assert_eq!(u32_at(&v5, 8), VERSION_5);
+            section_of(&v5, OUT_EDGE_IDS);
+            std::fs::write(&path, &v5).unwrap();
+            let stored = read_file(&path, &key()).unwrap();
+            assert_eq!(stored.version, VERSION_5);
+            same(&topology, &stored.topology);
+            finds_every_id(&stored.ids, &ids);
+            // Written again as version 6.
+            assert_eq!(
+                encode(&key(), &stored.topology, &stored.ids),
+                encode(&key(), &topology, &ids)
+            );
+        }
+        // An older version may not leave them out.
+        let mut v5 = v6.clone();
+        v5[8..12].copy_from_slice(&VERSION_5.to_le_bytes());
+        let end = table + 32 * n_sections;
+        let crc = crc32fast::hash(&v5[..end]);
+        let at = v5.len() - 8;
+        v5[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+        let e = decode(&v5, &key()).unwrap_err();
+        assert!(e.contains("is not one of version 5"), "{e}");
     }
 }

@@ -208,7 +208,9 @@ async fn the_layout_is_part_of_the_index_key() {
     const COUNT: &str = "SELECT count(*) FROM connected_components(g)";
     let before = ursa_engine::graph::index_builds(&ctx);
     let count = rows(&ctx, COUNT).await;
-    assert!(taken().iter().any(|n| n.starts_with("built the index for g")));
+    assert!(taken()
+        .iter()
+        .any(|n| n.starts_with("built the index for g")));
     // Another layout builds another index; going back finds the first.
     rows(&ctx, "SET ursa.index_layout = 'compressed'").await;
     assert_eq!(rows(&ctx, COUNT).await, count);
