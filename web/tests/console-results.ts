@@ -1,7 +1,7 @@
 // The console's result tabs (URSA-14), over `ursa serve`: tests/console.ts
 // runs these checks on its page while the server is up.
 //
-// - DDL in the temporary SQL box (Ctrl+Enter) says its notices, and opens no tab;
+// - DDL run from the editor says its notices, and opens no tab;
 // - `SELECT * FROM pagerank(karate)` opens a tab of typed columns, each
 //   header with its type and its `ursa.*` role, numbers right-aligned;
 // - the tabs are the ARIA tabs pattern: arrows move, Delete closes;
@@ -81,8 +81,11 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
 
   // ---------------------------------------------------------------- a typed table
 
-  await box.fill("-- The karate club's members, by PageRank\nSELECT * FROM pagerank(karate) ORDER BY pagerank DESC;");
-  await box.press("Control+Enter");
+  await page.evaluate(() => {
+    const editor = (window as any).ursaConsole.editor;
+    editor.setText("-- The karate club's members, by PageRank\nSELECT * FROM pagerank(karate) ORDER BY pagerank DESC;");
+    editor.runCurrent();
+  });
   await page.waitForSelector(".rs-tab[aria-selected=true]", { timeout: 30_000 });
   const pr = await ev(() => {
     const tab = document.querySelector<HTMLElement>(".rs-tab[aria-selected=true]")!;
@@ -128,6 +131,8 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
 
   // A NULL is shown as the shell shows it.
   await ev(() => (window as any).ursaConsole.run("SELECT 1 AS n, CAST(NULL AS VARCHAR) AS s, repeat('long text ', 40) AS t"));
+  // The tab exists once run resolves; its rows are drawn on the next frame.
+  await page.waitForFunction(() => document.querySelectorAll(".rs-panel:not([hidden]) .rt-body .rt-row:not([hidden]) .rt-cell").length >= 4, null, { timeout: 30_000 });
   const nulls = await ev(() => {
     const panel = document.querySelector<HTMLElement>(".rs-panel:not([hidden])")!;
     const cells = [...panel.querySelectorAll(".rt-body .rt-row:not([hidden]) .rt-cell")] as HTMLElement[];
