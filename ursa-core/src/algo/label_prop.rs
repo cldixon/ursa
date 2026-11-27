@@ -395,13 +395,13 @@ fn label_propagation_parallel(
 #[inline(always)]
 fn each_kept(adj: &Adjacency, u: u32, mask: Option<&EdgeMask>, mut f: impl FnMut(u32)) {
     match mask {
-        None => adj.neighbors(u).iter().for_each(|&v| f(v)),
+        None => adj.for_each_neighbor(u, f),
         Some(m) => {
-            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+            adj.for_each_neighbor_row(u, |v, e| {
                 if m.keep(e) {
                     f(v);
                 }
-            }
+            });
         }
     }
 }

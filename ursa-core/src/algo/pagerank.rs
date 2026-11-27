@@ -268,8 +268,11 @@ fn linked_nodes(topo: &Topology, mask: Option<&EdgeMask>) -> Option<Linked> {
 /// looking each one up per iteration (a random read of the rank directory per
 /// edge, several times slower than the pull itself). The copy is made when it
 /// costs less than the isolated nodes' share of the per-node vectors it saves.
+///
+/// A compressed transpose (#173) is never copied: the copy would undo what
+/// compressing it saved.
 fn copies_sources(topo: &Topology, linked: &Linked) -> bool {
-    topo.n_edges() <= 9 * linked.n_isolated()
+    !topo.incoming().is_packed() && topo.n_edges() <= 9 * linked.n_isolated()
 }
 
 /// The transpose's targets as compact ids, slot for slot (a slot of an edge
@@ -312,9 +315,51 @@ fn pulled_from<'a>(
             let ids: &[u32] = if rows { &inc.edge_ids[lo..hi] } else { &[] };
             (&s.targets[lo..hi], ids)
         }
-        (None, true) => (inc.neighbors(u), inc.edge_ids(u)),
-        (None, false) => (inc.neighbors(u), &[]),
+        (None, true) => (inc.plain_neighbors(u), inc.edge_ids(u)),
+        (None, false) => (inc.plain_neighbors(u), &[]),
     }
+}
+
+/// The sum of `share(v)` over the in-neighbours `v` of node `u` in the
+/// compressed transpose `inc` (#173) along edges `mask` keeps, in its
+/// (sorted) slot order.
+#[inline]
+fn pull_packed(
+    inc: &Adjacency,
+    u: u32,
+    mask: Option<&EdgeMask>,
+    share: impl Fn(u32) -> f64,
+) -> f64 {
+    let mut acc = 0.0;
+    match mask {
+        None => inc.for_each_neighbor(u, |v| acc += share(v)),
+        Some(m) => inc.for_each_neighbor_row(u, |v, e| {
+            if m.keep(e) {
+                acc += share(v);
+            }
+        }),
+    }
+    acc
+}
+
+/// [`pull_packed`] for weighted PageRank: the sum of `pull(v, e)` over the
+/// kept in-edges `e` from `v`, where it is one.
+#[inline]
+fn pull_packed_weighted(
+    inc: &Adjacency,
+    u: u32,
+    mask: Option<&EdgeMask>,
+    pull: impl Fn(u32, u32) -> Option<f64>,
+) -> f64 {
+    let mut acc = 0.0;
+    inc.for_each_neighbor_row(u, |v, e| {
+        if mask.is_none_or(|m| m.keep(e)) {
+            if let Some(x) = pull(v, e) {
+                acc += x;
+            }
+        }
+    });
+    acc
 }
 
 /// Dense PageRank vector; `result[u]` is the score of dense node `u`. Scores sum
@@ -367,6 +412,18 @@ fn pagerank_over(
     // `share[v]` is `rank[v] / out_deg[v]`, or 0 for a dangling `v` (whose rank is
     // redistributed through `base` instead). Adding that 0 leaves the non-negative
     // accumulator bit-identical to skipping the edge.
+    // A compressed transpose (#173) is pulled from by a loop of its own, so
+    // the plain layout's stays as it was.
+    if inc.is_packed() {
+        return power_iterate(
+            n,
+            linked,
+            params,
+            &dangling_nodes,
+            Some(&out_deg),
+            |c, share| pull_packed(inc, node(c), mask, |v| share[at(v)]),
+        );
+    }
     power_iterate(
         n,
         linked,
@@ -385,7 +442,7 @@ fn pagerank_over(
                     }
                 }
                 (None, false) => {
-                    for &v in inc.neighbors(u) {
+                    for &v in inc.plain_neighbors(u) {
                         acc += share[at(v)];
                     }
                 }
@@ -465,6 +522,15 @@ fn pagerank_weighted_over(
     // Dangling nodes (zero out-strength), listed once — see the unweighted kernel.
     let dangling_nodes: Vec<usize> = (0..width).filter(|&u| out_str[u] <= 0.0).collect();
 
+    if inc.is_packed() {
+        return power_iterate(n, linked, params, &dangling_nodes, None, |c, rank| {
+            pull_packed_weighted(inc, node(c), mask, |v, e| {
+                let v = at(v);
+                let os = out_str[v];
+                (os > 0.0).then(|| weights[e as usize] * rank[v] / os)
+            })
+        });
+    }
     power_iterate(n, linked, params, &dangling_nodes, None, |c, rank| {
         let u = node(c);
         let mut acc = 0.0;

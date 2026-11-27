@@ -571,9 +571,10 @@ impl IndexStore {
 
     /// Store again, in the current format, `index`, just read from a file
     /// of an older format `version`: one 0.10 wrote (version 2), so later
-    /// processes map it instead of reading it whole, or one 0.11 wrote
+    /// processes map it instead of reading it whole; one 0.11 wrote
     /// (version 3), so they find its node ids' lookup table in the file
-    /// instead of building it. Its in-adjacency, if the file has one, is
+    /// instead of building it; or one 0.12 or 0.13 wrote (version 4 or 5),
+    /// so its edge ids are left out when they are the rows' own order. Its in-adjacency, if the file has one, is
     /// read first, to be stored with it; weights stored with it are
     /// evaluated again when next needed.
     fn upgrade(
@@ -588,7 +589,10 @@ impl IndexStore {
         // What a process pays for the old format, until the file is rewritten.
         let until = match version {
             index_file::VERSION_2 => "it is read whole",
-            _ => "each process that looks a node up by its id builds the ids' lookup table",
+            index_file::VERSION_3 => {
+                "each process that looks a node up by its id builds the ids' lookup table"
+            }
+            _ => "it holds edge ids that the current format leaves out (their rows' own order)",
         };
         if has_incoming {
             index.topology.incoming();
@@ -679,10 +683,15 @@ impl IndexStore {
         }
         let with_incoming = size > main;
         let grows_to = (!with_incoming).then(|| {
-            size.saturating_add(incoming_estimate(
+            let (n, m) = (
                 index.topology.n_nodes() as u64,
                 index.topology.n_edges() as u64,
-            ))
+            );
+            size.saturating_add(match &index.topology.out().packed {
+                None => incoming_estimate(n, m),
+                // About the out-adjacency's bytes again (#173).
+                Some(p) => compressed_incoming_estimate(n, m, p.bytes.len() as u64),
+            })
         });
         let file = format!("{:016x}.idx", key.hash());
 
@@ -1106,6 +1115,18 @@ pub fn incoming_estimate(n_nodes: u64, n_edges: u64) -> u64 {
         .saturating_add(1)
         .saturating_mul(8)
         .saturating_add(n_edges.saturating_mul(8))
+        .saturating_add(4096)
+}
+
+/// [`incoming_estimate`] for a compressed index (#173) whose out-adjacency's
+/// segments take `bytes`: its slot and byte offsets, about as many bytes,
+/// and its edge ids.
+pub fn compressed_incoming_estimate(n_nodes: u64, n_edges: u64, bytes: u64) -> u64 {
+    n_nodes
+        .saturating_add(1)
+        .saturating_mul(16)
+        .saturating_add(bytes)
+        .saturating_add(n_edges.saturating_mul(4))
         .saturating_add(4096)
 }
 

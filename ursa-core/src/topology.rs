@@ -34,6 +34,7 @@ use crate::edge_ids::Rebuild;
 #[cfg(unix)]
 pub use crate::edge_ids::SpilledRows;
 pub use crate::edge_ids::{EdgeIds, KeepRows, RowSource};
+pub use crate::packed::Packed;
 
 /// Traversal direction — a *per-operation* parameter, never a property of the
 /// frame. There is no directed/undirected split.
@@ -156,11 +157,11 @@ impl EdgeMask {
             .into_par_iter()
             .filter(|&u| nodes[u as usize])
             .for_each(|u| {
-                for (&v, &e) in out.neighbors(u).iter().zip(out.edge_ids(u)) {
+                out.for_each_neighbor_row(u, |v, e| {
                     if nodes[v as usize] && within.is_none_or(|m| m.keep(e)) {
                         words[(e >> 6) as usize].fetch_or(1u64 << (e & 63), Ordering::Relaxed);
                     }
-                }
+                });
             });
         let words: Vec<u64> = words.into_iter().map(AtomicU64::into_inner).collect();
         let n_kept = words.iter().map(|w| w.count_ones() as usize).sum();
@@ -199,6 +200,77 @@ pub struct Adjacency {
     /// Built only when something reads it (#170, see [`EdgeIds`]): reading it
     /// as a slice (`&adj.edge_ids[..]`, [`Adjacency::edge_ids`]) builds it.
     pub edge_ids: EdgeIds,
+    /// The compressed layout (#173, see [`crate::packed`]): when set, the
+    /// neighbours are these sorted, varint-coded segments, and `targets` is
+    /// empty. `offsets` still counts slots, so a node's degree and its edge
+    /// ids are read without decoding. Read neighbours through
+    /// [`Self::for_each_neighbor`], [`Self::neighbors_in`] or a
+    /// [`NeighborCursor`], which serve either layout.
+    pub packed: Option<Packed>,
+}
+
+/// [`Topology::for_each_neighbor`]'s visit of a compressed adjacency, out
+/// of line.
+#[inline(never)]
+fn visit_packed(adj: &Adjacency, u: u32, mask: Option<&EdgeMask>, f: &mut impl FnMut(u32)) {
+    match mask {
+        None => adj.for_each_neighbor(u, f),
+        Some(m) => adj.for_each_neighbor_row(u, |v, e| {
+            if m.keep(e) {
+                f(v);
+            }
+        }),
+    }
+}
+
+/// [`Adjacency::for_each_neighbor`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_for_each(p: &Packed, u: u32, f: impl FnMut(u32)) {
+    crate::packed::for_each(p.segment(u), f)
+}
+
+/// [`Adjacency::any_neighbor`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_any(p: &Packed, u: u32, f: impl FnMut(u32) -> bool) -> bool {
+    crate::packed::any(p.segment(u), f)
+}
+
+/// [`Adjacency::neighbors_in`] on compressed segments, out of line.
+#[inline(never)]
+fn packed_into<'a>(p: &Packed, u: u32, buf: &'a mut Vec<u32>) -> &'a [u32] {
+    buf.clear();
+    crate::packed::decode_into(p.segment(u), buf);
+    buf
+}
+
+/// A position in one node's neighbours, for a walk that leaves a node and
+/// comes back to it (a depth-first search's frame): see
+/// [`Adjacency::cursor`]. The same for either layout.
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborCursor {
+    /// The next slot.
+    slot: usize,
+    /// The slot after the node's last.
+    end: usize,
+    /// The next byte of a compressed segment.
+    byte: usize,
+    /// The neighbour read last from a compressed segment.
+    prev: u32,
+}
+
+impl NeighborCursor {
+    /// The slot of the next neighbour, which [`Adjacency::advance`] returns
+    /// next.
+    #[inline]
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Whether every neighbour has been read.
+    #[inline]
+    pub fn is_done(&self) -> bool {
+        self.slot >= self.end
+    }
 }
 
 impl Adjacency {
@@ -206,10 +278,22 @@ impl Adjacency {
     /// [`Topology::from_parts`]). `which` names it in the message.
     fn check(&self, n_nodes: usize, which: &str) -> Result<(), String> {
         self.check_shape(n_nodes, which)?;
-        let m = self.targets.len();
+        let m = self.n_slots();
         let bad = |why: &str| Err(format!("the {which}-adjacency {why}"));
-        if self.targets.iter().any(|&t| t as usize >= n_nodes) {
-            return bad("has a target out of range");
+        match &self.packed {
+            None => {
+                if self.targets.iter().any(|&t| t as usize >= n_nodes) {
+                    return bad("has a target out of range");
+                }
+            }
+            Some(p) => {
+                for u in 0..n_nodes as u32 {
+                    let degree = self.degree(u) as usize;
+                    if let Err(why) = crate::packed::check_segment(p.segment(u), degree, n_nodes) {
+                        return bad(why);
+                    }
+                }
+            }
         }
         // Ids not built yet are built from the index itself, correct by
         // construction: only ids handed in are checked.
@@ -232,8 +316,29 @@ impl Adjacency {
     /// it leaves a memory-mapped adjacency's large arrays unread. Every
     /// neighbour slice ([`Self::neighbors`]) is then in bounds.
     fn check_shape(&self, n_nodes: usize, which: &str) -> Result<(), String> {
-        let m = self.targets.len();
         let bad = |why: String| Err(format!("the {which}-adjacency {why}"));
+        let m = match &self.packed {
+            None => self.targets.len(),
+            Some(p) => {
+                if !self.targets.is_empty() {
+                    return bad("has both targets and compressed segments".into());
+                }
+                let (offsets, bytes) = (&p.byte_offsets, p.bytes.len() as u64);
+                if offsets.len() != n_nodes + 1 {
+                    return bad(format!(
+                        "has {} byte offsets for {n_nodes} nodes",
+                        offsets.len()
+                    ));
+                }
+                if offsets[0] != 0 || offsets[n_nodes] != bytes {
+                    return bad("has byte offsets that do not span its segments".into());
+                }
+                if offsets.windows(2).any(|w| w[0] > w[1]) {
+                    return bad("has decreasing byte offsets".into());
+                }
+                self.offsets.last().map_or(0, |&m| m as usize)
+            }
+        };
         if m > u32::MAX as usize {
             return bad(format!("has {m} edges, beyond the u32 edge-id cap"));
         }
@@ -269,6 +374,7 @@ impl Adjacency {
             offsets: offsets.into(),
             targets: targets.into(),
             edge_ids: edge_ids.unwrap_or_default().into(),
+            packed: None,
         }
     }
 
@@ -451,6 +557,9 @@ impl Adjacency {
     ///
     /// [`transpose_rows`]: crate::edge_ids::transpose_rows
     fn transpose(out: &Adjacency, n_nodes: usize) -> Adjacency {
+        if out.is_packed() {
+            return Self::transpose_packed(out, n_nodes);
+        }
         let ids = &out.edge_ids;
         let lazy = |m: usize| {
             EdgeIds::lazy(
@@ -498,15 +607,179 @@ impl Adjacency {
             offsets: offsets.into(),
             targets: targets.into(),
             edge_ids,
+            packed: None,
         }
     }
 
-    /// Neighbours of dense node `u`.
+    /// Neighbours of dense node `u`, in slot order: a plain adjacency's
+    /// slice of its targets.
+    ///
+    /// # Panics
+    ///
+    /// On a compressed adjacency ([`Self::is_packed`]), which has no slice
+    /// to lend: read it through [`Self::for_each_neighbor`],
+    /// [`Self::neighbors_in`] or [`Self::cursor`], which serve both layouts.
     #[inline]
     pub fn neighbors(&self, u: u32) -> &[u32] {
+        assert!(
+            self.packed.is_none(),
+            "a compressed adjacency has no neighbour slices: use neighbors_in"
+        );
         let s = self.offsets[u as usize] as usize;
         let e = self.offsets[u as usize + 1] as usize;
         &self.targets[s..e]
+    }
+
+    /// A plain adjacency's neighbours of `u` (only for a plain one).
+    #[inline(always)]
+    pub(crate) fn plain_neighbors(&self, u: u32) -> &[u32] {
+        let s = self.offsets[u as usize] as usize;
+        let e = self.offsets[u as usize + 1] as usize;
+        &self.targets[s..e]
+    }
+
+    /// Whether this adjacency is compressed (#173, see [`crate::packed`]).
+    #[inline]
+    pub fn is_packed(&self) -> bool {
+        self.packed.is_some()
+    }
+
+    /// The number of slots (edges).
+    #[inline]
+    pub fn n_slots(&self) -> usize {
+        self.offsets.last().map_or(0, |&m| m as usize)
+    }
+
+    /// Neighbours of dense node `u`, in slot order, as a slice: a plain
+    /// adjacency's own, or a compressed one's decoded into `buf` (cleared
+    /// first). The per-thread scratch decode of #173; on a plain adjacency
+    /// it costs one branch.
+    #[inline(always)]
+    pub fn neighbors_in<'a>(&'a self, u: u32, buf: &'a mut Vec<u32>) -> &'a [u32] {
+        match &self.packed {
+            None => {
+                let s = self.offsets[u as usize] as usize;
+                let e = self.offsets[u as usize + 1] as usize;
+                &self.targets[s..e]
+            }
+            Some(p) => packed_into(p, u, buf),
+        }
+    }
+
+    /// Call `f` with each neighbour of dense node `u`, in slot order,
+    /// decoding a compressed segment as it goes.
+    ///
+    /// The plain layout's loop is inlined into the caller as a slice loop
+    /// would be; a compressed segment is decoded out of line, so the plain
+    /// layout's hot loops stay as small as before (#173).
+    #[inline(always)]
+    pub fn for_each_neighbor(&self, u: u32, mut f: impl FnMut(u32)) {
+        match &self.packed {
+            None => {
+                let s = self.offsets[u as usize] as usize;
+                let e = self.offsets[u as usize + 1] as usize;
+                for &v in &self.targets[s..e] {
+                    f(v);
+                }
+            }
+            Some(p) => packed_for_each(p, u, f),
+        }
+    }
+
+    /// Call `f(v, e)` with each neighbour `v` of dense node `u` and the edge
+    /// row `e` of its slot, in slot order. Builds the edge ids on first call
+    /// (see [`Self::edge_ids`]).
+    #[inline(always)]
+    pub fn for_each_neighbor_row(&self, u: u32, mut f: impl FnMut(u32, u32)) {
+        let ids = self.edge_ids(u);
+        match &self.packed {
+            None => {
+                let s = self.offsets[u as usize] as usize;
+                let e = self.offsets[u as usize + 1] as usize;
+                for (&v, &e) in self.targets[s..e].iter().zip(ids) {
+                    f(v, e);
+                }
+            }
+            Some(p) => {
+                let mut k = 0;
+                packed_for_each(p, u, |v| {
+                    f(v, ids[k]);
+                    k += 1;
+                });
+            }
+        }
+    }
+
+    /// Whether `f` holds for some neighbour of dense node `u`, read in slot
+    /// order up to the first that does.
+    #[inline(always)]
+    pub fn any_neighbor(&self, u: u32, mut f: impl FnMut(u32) -> bool) -> bool {
+        match &self.packed {
+            None => {
+                let s = self.offsets[u as usize] as usize;
+                let e = self.offsets[u as usize + 1] as usize;
+                self.targets[s..e].iter().any(|&v| f(v))
+            }
+            Some(p) => packed_any(p, u, f),
+        }
+    }
+
+    /// A cursor at the first neighbour of dense node `u` (see
+    /// [`Self::advance`]).
+    #[inline]
+    pub fn cursor(&self, u: u32) -> NeighborCursor {
+        NeighborCursor {
+            slot: self.offsets[u as usize] as usize,
+            end: self.offsets[u as usize + 1] as usize,
+            byte: self
+                .packed
+                .as_ref()
+                .map_or(0, |p| p.byte_offsets[u as usize] as usize),
+            prev: 0,
+        }
+    }
+
+    /// The neighbour at `cursor` and its slot, moving the cursor past it;
+    /// `None` once the node's neighbours are all read.
+    #[inline]
+    pub fn advance(&self, cursor: &mut NeighborCursor) -> Option<(u32, usize)> {
+        if cursor.slot >= cursor.end {
+            return None;
+        }
+        let k = cursor.slot;
+        cursor.slot += 1;
+        match &self.packed {
+            None => Some((self.targets[k], k)),
+            Some(p) => {
+                let (v, at) = crate::packed::next(&p.bytes, cursor.byte, cursor.prev);
+                cursor.byte = at;
+                cursor.prev = v;
+                Some((v, k))
+            }
+        }
+    }
+
+    /// Call `f` with each node's neighbours as a slice, in node order: a
+    /// plain adjacency's own, a compressed one's decoded a node at a time.
+    pub fn for_each_segment(&self, mut f: impl FnMut(u32, &[u32])) {
+        let n = self.offsets.len().saturating_sub(1);
+        let mut buf = Vec::new();
+        for u in 0..n as u32 {
+            f(u, self.neighbors_in(u, &mut buf));
+        }
+    }
+
+    /// The bytes this adjacency holds in memory: its offsets, its targets
+    /// or compressed segments, and its edge ids if they are held.
+    pub fn heap_bytes(&self) -> usize {
+        8 * self.offsets.len()
+            + 4 * self.targets.len()
+            + self.packed.as_ref().map_or(0, Packed::heap_bytes)
+            + if self.edge_ids.is_built() {
+                4 * self.edge_ids.len()
+            } else {
+                0
+            }
     }
 
     /// Original edge rows of dense node `u`'s incident edges — same order as
@@ -672,6 +945,376 @@ pub(crate) fn transpose_parts(
     }
 
     (offsets, targets, Some(edge_ids))
+}
+
+/// The rows' targets (original ids, `node[o]` the node of original id `o`
+/// when relabelled), read back to put a compressed out-adjacency's edge ids
+/// in its sorted order when they are first read (#173): see
+/// [`Topology::compressed`].
+#[derive(Clone)]
+pub(crate) struct SortKeys {
+    pub(crate) targets: Arc<dyn RowSource>,
+    pub(crate) node: Option<Arc<[u32]>>,
+}
+
+/// Run `f(scratch, u)` for every node `0..n`, in parallel over nodes when
+/// `m` (the slots) is large enough and the caller is not a rayon worker.
+fn each_node<S: Send>(
+    n: usize,
+    m: usize,
+    init: impl Fn() -> S + Sync + Send,
+    f: impl Fn(&mut S, usize) + Sync + Send,
+) {
+    use crate::parallel::*;
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    if m < PARALLEL_MIN_EDGES || current_num_threads() <= 1 || in_worker() {
+        let mut scratch = init();
+        (0..n).for_each(|u| f(&mut scratch, u));
+    } else {
+        (0..n).into_par_iter().for_each_init(init, |s, u| f(s, u));
+    }
+}
+
+/// Whether every segment of `targets` is in ascending order.
+fn segments_sorted(offsets: &[u64], targets: &[u32]) -> bool {
+    use crate::parallel::*;
+    let n = offsets.len().saturating_sub(1);
+    let sorted = |u: usize| {
+        targets[offsets[u] as usize..offsets[u + 1] as usize]
+            .windows(2)
+            .all(|w| w[0] <= w[1])
+    };
+    if targets.len() < (1 << 16) || current_num_threads() <= 1 || in_worker() {
+        (0..n).all(sorted)
+    } else {
+        (0..n).into_par_iter().all(sorted)
+    }
+}
+
+/// Sort each segment of `targets` ascending, and when given, `ids` with it,
+/// ties (parallel edges) in id order: each segment by `(target, id)`.
+fn sort_segments(offsets: &[u64], targets: &mut [u32], ids: Option<&mut [u32]>) {
+    let n = offsets.len().saturating_sub(1);
+    let m = targets.len();
+    let t_addr = targets.as_mut_ptr() as usize;
+    let e_addr = ids.map(|ids| ids.as_mut_ptr() as usize);
+    each_node(n, m, Vec::<(u32, u32)>::new, |scratch, u| {
+        let (s, e) = (offsets[u] as usize, offsets[u + 1] as usize);
+        // SAFETY: segments are disjoint across nodes and inside both
+        // buffers, which outlive the pass.
+        let ts = unsafe { std::slice::from_raw_parts_mut((t_addr as *mut u32).add(s), e - s) };
+        match e_addr {
+            None => ts.sort_unstable(),
+            Some(e_addr) => {
+                // SAFETY: as above.
+                let es =
+                    unsafe { std::slice::from_raw_parts_mut((e_addr as *mut u32).add(s), e - s) };
+                if ts
+                    .iter()
+                    .zip(es.iter())
+                    .zip(ts.iter().zip(es.iter()).skip(1))
+                    .all(|(a, b)| a < b)
+                {
+                    return;
+                }
+                scratch.clear();
+                scratch.extend(ts.iter().copied().zip(es.iter().copied()));
+                scratch.sort_unstable();
+                for (k, &(t, i)) in scratch.iter().enumerate() {
+                    ts[k] = t;
+                    es[k] = i;
+                }
+            }
+        }
+    });
+}
+
+/// The compressed segments of the sorted segments `offsets`/`targets`.
+fn encode_segments(offsets: &[u64], targets: &[u32]) -> Packed {
+    use crate::packed::{encode_segment, segment_len};
+    use crate::parallel::*;
+    let n = offsets.len().saturating_sub(1);
+    let seg = |u: usize| &targets[offsets[u] as usize..offsets[u + 1] as usize];
+    let parallel = targets.len() >= (1 << 16) && current_num_threads() > 1 && !in_worker();
+    let lens: Vec<u64> = if parallel {
+        (0..n)
+            .into_par_iter()
+            .map(|u| segment_len(seg(u)) as u64)
+            .collect()
+    } else {
+        (0..n).map(|u| segment_len(seg(u)) as u64).collect()
+    };
+    let mut byte_offsets = vec![0u64; n + 1];
+    for u in 0..n {
+        byte_offsets[u + 1] = byte_offsets[u] + lens[u];
+    }
+    drop(lens);
+    let mut bytes = vec![0u8; byte_offsets[n] as usize];
+    let addr = bytes.as_mut_ptr() as usize;
+    let at = &byte_offsets;
+    each_node(
+        n,
+        targets.len(),
+        || (),
+        |_, u| {
+            let (s, e) = (at[u] as usize, at[u + 1] as usize);
+            // SAFETY: each node's bytes are its own, inside `bytes`.
+            let out = unsafe { std::slice::from_raw_parts_mut((addr as *mut u8).add(s), e - s) };
+            encode_segment(seg(u), out);
+        },
+    );
+    Packed {
+        byte_offsets: byte_offsets.into(),
+        bytes: bytes.into(),
+    }
+}
+
+/// The values of `buffer` as a vector of their own: taken when it is the
+/// only reference, else copied.
+fn into_vec(buffer: ScalarBuffer<u32>) -> Vec<u32> {
+    match buffer.into_inner().into_vec::<u32>() {
+        Ok(v) => v,
+        Err(buffer) => buffer.typed_data::<u32>().to_vec(),
+    }
+}
+
+impl Adjacency {
+    /// This adjacency with every segment sorted, ascending, and its edge ids
+    /// in the same order (`(target, row)` within a segment): the parts of the
+    /// compressed layout before it is encoded (#173).
+    ///
+    /// Ids held are sorted with the targets. Ids not held stay unbuilt when
+    /// the segments were sorted already (a segment's rows are then in
+    /// `(target, row)` order already), or are rebuilt when first read from
+    /// the rows' targets `keys`; without `keys` they are built now.
+    fn sorted_parts(self, keys: Option<&SortKeys>) -> (ScalarBuffer<u64>, Vec<u32>, EdgeIds) {
+        assert!(self.packed.is_none(), "the adjacency is compressed already");
+        let Adjacency {
+            offsets,
+            targets,
+            edge_ids,
+            ..
+        } = self;
+        let mut targets = into_vec(targets);
+        let m = targets.len();
+        if !edge_ids.is_built() && segments_sorted(&offsets, &targets) {
+            return (offsets, targets, edge_ids);
+        }
+        let mut eager = match (edge_ids.is_built(), keys) {
+            (false, Some(_)) => None,
+            _ => Some(edge_ids.with(<[u32]>::to_vec)),
+        };
+        sort_segments(&offsets, &mut targets, eager.as_deref_mut());
+        let edge_ids = match (eager, keys) {
+            (Some(ids), _) => EdgeIds::from(ids),
+            (None, Some(keys)) => EdgeIds::lazy(
+                m,
+                Rebuild::Sorted {
+                    offsets: offsets.clone(),
+                    rows: edge_ids,
+                    keys: keys.targets.clone(),
+                    node: keys.node.clone(),
+                },
+            ),
+            (None, None) => unreachable!("ids are built now without keys"),
+        };
+        (offsets, targets, edge_ids)
+    }
+
+    /// This adjacency in the compressed layout (#173): see
+    /// [`Self::sorted_parts`] for its edge ids.
+    fn pack(self, keys: Option<&SortKeys>) -> Adjacency {
+        if self.packed.is_some() {
+            return self;
+        }
+        let (offsets, targets, edge_ids) = self.sorted_parts(keys);
+        let packed = encode_segments(&offsets, &targets);
+        drop(targets);
+        Adjacency {
+            offsets,
+            targets: ScalarBuffer::from(Vec::<u32>::new()),
+            edge_ids,
+            packed: Some(packed),
+        }
+    }
+
+    /// This adjacency plain, with every segment sorted as the compressed
+    /// layout sorts it: what a compressed adjacency decodes to.
+    fn sorted(self, keys: Option<&SortKeys>) -> Adjacency {
+        if self.packed.is_some() {
+            return self.unpacked();
+        }
+        let (offsets, targets, edge_ids) = self.sorted_parts(keys);
+        Adjacency {
+            offsets,
+            targets: targets.into(),
+            edge_ids,
+            packed: None,
+        }
+    }
+
+    /// This adjacency in the plain layout, its segments in the same order
+    /// (a compressed one's decoded, so sorted), sharing its edge ids.
+    pub fn unpacked(&self) -> Adjacency {
+        let Some(p) = &self.packed else {
+            return self.clone();
+        };
+        let n = self.offsets.len().saturating_sub(1);
+        let m = self.n_slots();
+        let mut targets = vec![0u32; m];
+        let addr = targets.as_mut_ptr() as usize;
+        each_node(
+            n,
+            m,
+            || (),
+            |_, u| {
+                let (s, e) = (self.offsets[u] as usize, self.offsets[u + 1] as usize);
+                // SAFETY: node `u`'s slots are its own, inside `targets`.
+                let out =
+                    unsafe { std::slice::from_raw_parts_mut((addr as *mut u32).add(s), e - s) };
+                let mut k = 0;
+                crate::packed::for_each(p.segment(u as u32), |v| {
+                    out[k] = v;
+                    k += 1;
+                });
+            },
+        );
+        Adjacency {
+            offsets: self.offsets.clone(),
+            targets: targets.into(),
+            edge_ids: self.edge_ids.clone(),
+            packed: None,
+        }
+    }
+
+    /// [`Self::transpose`] of a compressed adjacency: compressed too. Its
+    /// edge ids are built with it when `out`'s are held, else when first
+    /// read, from `out`'s.
+    fn transpose_packed(out: &Adjacency, n_nodes: usize) -> Adjacency {
+        let held = out.edge_ids.is_built().then(|| out.edge_ids.get());
+        let (offsets, targets, rows) =
+            transpose_packed_parts(out, n_nodes, true, held.map(|ids| &ids[..]));
+        let m = targets.len();
+        let packed = encode_segments(&offsets, &targets);
+        drop(targets);
+        let edge_ids = match held {
+            Some(_) => EdgeIds::from(rows),
+            None => EdgeIds::lazy(
+                m,
+                Rebuild::PackedTranspose {
+                    out: Box::new(out.clone()),
+                    n_nodes,
+                },
+            ),
+        };
+        Adjacency {
+            offsets: offsets.into(),
+            targets: ScalarBuffer::from(Vec::<u32>::new()),
+            edge_ids,
+            packed: Some(packed),
+        }
+    }
+}
+
+/// The transpose of the compressed out-adjacency `out`: each in-segment
+/// lists its sources in ascending order (the out-segments are read in node
+/// order), so it is sorted already, as its own compressed segments want it.
+/// Returns the offsets; with `sources`, each in-slot's source; with `ids`
+/// (the out-adjacency's, in its sorted order), each in-slot's row, which
+/// follows the same order, `(source, row)` within a segment.
+pub(crate) fn transpose_packed_parts(
+    out: &Adjacency,
+    n_nodes: usize,
+    sources: bool,
+    ids: Option<&[u32]>,
+) -> (Vec<u64>, Vec<u32>, Vec<u32>) {
+    use crate::parallel::*;
+    let p = out.packed.as_ref().expect("a compressed adjacency");
+    let m = out.n_slots();
+    let n = n_nodes;
+    const PARALLEL_MIN_EDGES: usize = 1 << 16;
+    let threads = current_num_threads();
+    let serial = m < PARALLEL_MIN_EDGES || threads <= 1 || in_worker() || n == 0;
+    // Contiguous ranges of sources of about equal slots, one a chunk. Each
+    // chunk's histogram is `n` long, so chunks are capped as in the build.
+    let n_chunks = if serial {
+        1
+    } else {
+        threads.min((m / n).max(4))
+    };
+    let mut bounds: Vec<usize> = (0..=n_chunks)
+        .map(|c| {
+            let target = (m as u128 * c as u128 / n_chunks as u128) as u64;
+            out.offsets.partition_point(|&o| o < target).min(n)
+        })
+        .collect();
+    bounds[0] = 0;
+    bounds[n_chunks] = n;
+    let ranges: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+    let hist = |&(lo, hi): &(usize, usize)| {
+        let mut h = vec![0u32; n];
+        for u in lo..hi {
+            crate::packed::for_each(p.segment(u as u32), |v| h[v as usize] += 1);
+        }
+        h
+    };
+    let mut hists: Vec<Vec<u32>> = if serial {
+        ranges.iter().map(hist).collect()
+    } else {
+        ranges.par_iter().map(hist).collect()
+    };
+    let mut offsets = vec![0u64; n + 1];
+    for h in &hists {
+        for (v, &c) in h.iter().enumerate() {
+            offsets[v + 1] += u64::from(c);
+        }
+    }
+    for v in 0..n {
+        offsets[v + 1] += offsets[v];
+    }
+    // Every write below is to a slot below the total: it must be `m`.
+    assert_eq!(
+        offsets[n], m as u64,
+        "the compressed segments do not hold their degrees' values"
+    );
+    let mut running: Vec<u32> = offsets[..n].iter().map(|&o| o as u32).collect();
+    for h in hists.iter_mut() {
+        for (slot, run) in h.iter_mut().zip(running.iter_mut()) {
+            let cnt = *slot;
+            *slot = *run;
+            *run += cnt;
+        }
+    }
+    drop(running);
+    let mut targets = vec![0u32; if sources { m } else { 0 }];
+    let mut rows = vec![0u32; if ids.is_some() { m } else { 0 }];
+    let (t_addr, r_addr) = (targets.as_mut_ptr() as usize, rows.as_mut_ptr() as usize);
+    let scatter = |(c, mut base): (usize, Vec<u32>)| {
+        let (lo, hi) = ranges[c];
+        for u in lo..hi {
+            let mut k = out.offsets[u] as usize;
+            crate::packed::for_each(p.segment(u as u32), |v| {
+                let pos = base[v as usize] as usize;
+                base[v as usize] += 1;
+                // SAFETY: `pos < m`, claimed by exactly one (chunk, slot).
+                unsafe {
+                    if sources {
+                        *(t_addr as *mut u32).add(pos) = u as u32;
+                    }
+                    if let Some(ids) = ids {
+                        *(r_addr as *mut u32).add(pos) = ids[k];
+                    }
+                }
+                k += 1;
+            });
+        }
+    };
+    if serial {
+        hists.into_iter().enumerate().for_each(scatter);
+    } else {
+        hists.into_par_iter().enumerate().for_each(scatter);
+    }
+    (offsets, targets, rows)
 }
 
 /// The edge ids [`transpose_parts`] reads and writes.
@@ -979,6 +1622,12 @@ struct Relabel {
 }
 
 impl Relabel {
+    /// The inverse permutation, shared.
+    fn node_map(&self) -> Arc<[u32]> {
+        self.nodes();
+        Arc::clone(self.node.get().expect("built just now"))
+    }
+
     /// The inverse permutation.
     fn nodes(&self) -> &[u32] {
         self.node.get_or_init(|| {
@@ -996,6 +1645,10 @@ impl Relabel {
 /// its targets renamed to their original ids, its edge ids as they are.
 fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
     use crate::parallel::*;
+    if adj.is_packed() {
+        // Renamed, a segment is no longer sorted: plain.
+        return in_original(&adj.unpacked(), relabel);
+    }
     let node = relabel.nodes();
     let n = node.len();
     let mut offsets = vec![0u64; n + 1];
@@ -1036,6 +1689,7 @@ fn in_original(adj: &Adjacency, relabel: &Relabel) -> Adjacency {
         offsets: offsets.into(),
         targets: targets.into(),
         edge_ids: edge_ids.into(),
+        packed: None,
     }
 }
 
@@ -1253,6 +1907,7 @@ fn build_in_degree(
         offsets,
         targets: targets.into(),
         edge_ids,
+        packed: None,
     };
     (adjacency, original, node)
 }
@@ -1368,7 +2023,7 @@ impl Topology {
             let identity = original.iter().enumerate().all(|(v, &o)| v as u32 == o);
             return Topology {
                 n_nodes,
-                n_edges: out.targets.len(),
+                n_edges: out.n_slots(),
                 out,
                 inc: OnceLock::new(),
                 inc_loader: LazyIncoming::default(),
@@ -1400,6 +2055,7 @@ impl Topology {
             offsets,
             targets: targets.into(),
             edge_ids,
+            packed: None,
         };
         // `src_dense`/`dst_dense` are intentionally not retained: the transpose and
         // the undirected cache are both recoverable from the out-CSR (see
@@ -1576,6 +2232,102 @@ impl Topology {
         })
     }
 
+    /// This topology in the compressed layout (#173, see [`crate::packed`]):
+    /// each node's neighbours sorted and stored as varint-coded gaps, in
+    /// both directions (the in-adjacency is transposed compressed when first
+    /// asked for). The out-adjacency is sorted and encoded in one pass after
+    /// the build, so the peak is the plain adjacency and its bytes, once.
+    ///
+    /// Its edge ids follow the sorted order: each segment's rows by
+    /// `(target, row)` (and `(source, row)` in the in-adjacency). Ids held
+    /// are sorted with the targets. Ids not held are built only when a query
+    /// reads them, as for the plain layout (#170), from the rows' targets
+    /// that `targets` reads back (the dense ids the topology was built from,
+    /// before any relabel); without it, they are built now, unless the
+    /// segments were in order already.
+    ///
+    /// Every kernel gives the results it gives on the plain layout with its
+    /// segments sorted the same way ([`Self::with_sorted_segments`]), bit
+    /// for bit.
+    pub fn compressed(self, targets: Option<Arc<dyn RowSource>>) -> Topology {
+        let keys = targets.map(|targets| SortKeys {
+            targets,
+            node: self.relabel.as_ref().map(|r| r.node_map()),
+        });
+        let Topology {
+            n_nodes,
+            n_edges,
+            out,
+            undirected,
+            symmetric,
+            self_transpose,
+            relabel,
+            ..
+        } = self;
+        Topology {
+            n_nodes,
+            n_edges,
+            out: out.pack(keys.as_ref()),
+            // A plain in-adjacency (or a stored one) is in another order.
+            inc: OnceLock::new(),
+            inc_loader: LazyIncoming::default(),
+            undirected,
+            symmetric,
+            self_transpose,
+            relabel,
+        }
+    }
+
+    /// This topology in the plain layout with every segment sorted as
+    /// [`Self::compressed`] sorts it, its edge ids built: what a compressed
+    /// topology decodes to, for comparing the two layouts.
+    #[doc(hidden)]
+    pub fn with_sorted_segments(self) -> Topology {
+        let Topology {
+            n_nodes,
+            n_edges,
+            out,
+            undirected,
+            symmetric,
+            self_transpose,
+            relabel,
+            ..
+        } = self;
+        let out = out.sorted(None);
+        let inc = OnceLock::new();
+        if !self_transpose {
+            let _ = inc.set(Adjacency::transpose(&out, n_nodes).sorted(None));
+        }
+        Topology {
+            n_nodes,
+            n_edges,
+            out,
+            inc,
+            inc_loader: LazyIncoming::default(),
+            undirected,
+            symmetric,
+            self_transpose,
+            relabel,
+        }
+    }
+
+    /// Whether this topology is in the compressed layout (#173).
+    pub fn is_compressed(&self) -> bool {
+        self.out.is_packed()
+    }
+
+    /// The bytes the adjacencies built so far hold in memory (see
+    /// [`Adjacency::heap_bytes`]): the out-adjacency, and the in-adjacency
+    /// if it is built.
+    pub fn heap_bytes(&self) -> usize {
+        self.out.heap_bytes()
+            + if self.self_transpose {
+                0
+            } else {
+                self.inc.get().map_or(0, Adjacency::heap_bytes)
+            }
+    }
+
     /// A symmetric topology taken directly from an undirected CSR: node `u`'s
     /// out-segment is its sorted, deduplicated neighbour list, and slot `k` is row
     /// `k` (`edge_ids` is the identity). That is exactly what [`Topology::build`]
@@ -1606,6 +2358,7 @@ impl Topology {
                 offsets: offsets.into(),
                 targets: targets.into(),
                 edge_ids: EdgeIds::identity(n_edges),
+                packed: None,
             },
             inc: OnceLock::new(),
             inc_loader: LazyIncoming::default(),
@@ -1639,14 +2392,14 @@ impl Topology {
             return Err(format!("{n_nodes} nodes is beyond the u32 dense-index cap"));
         }
         out.check(n_nodes, "out")?;
-        let n_edges = out.targets.len();
+        let n_edges = out.n_slots();
         let inc = OnceLock::new();
         if let Some(incoming) = incoming {
             incoming.check(n_nodes, "in")?;
-            if incoming.targets.len() != n_edges {
+            if incoming.n_slots() != n_edges {
                 return Err(format!(
                     "the in-adjacency has {} edges; the out-adjacency has {n_edges}",
-                    incoming.targets.len()
+                    incoming.n_slots()
                 ));
             }
             let _ = inc.set(incoming);
@@ -1681,7 +2434,7 @@ impl Topology {
         out.check_shape(n_nodes, "out")?;
         Ok(Topology {
             n_nodes,
-            n_edges: out.targets.len(),
+            n_edges: out.n_slots(),
             out,
             inc: OnceLock::new(),
             inc_loader: LazyIncoming::default(),
@@ -1727,7 +2480,7 @@ impl Topology {
             true => incoming.check_shape(self.n_nodes, "in"),
             false => incoming.check(self.n_nodes, "in"),
         };
-        (incoming.targets.len() == self.n_edges && checked.is_ok()).then_some(incoming)
+        (incoming.n_slots() == self.n_edges && checked.is_ok()).then_some(incoming)
     }
 
     /// Whether [`Topology::incoming`] would return without building the
@@ -1849,7 +2602,8 @@ impl Topology {
         // in slot order, from the targets: no row order, no edge ids, and no
         // in-adjacency kept (#170).
         let unordered;
-        let inc = if mask.is_none() && !self.incoming_is_cheap() {
+        // A compressed one's transpose is compressed too, and kept: small.
+        let inc = if mask.is_none() && !self.incoming_is_cheap() && !out.is_packed() {
             let (offsets, targets, _) =
                 transpose_parts(&out.offsets, &out.targets, TransposeIds::None, n);
             let m = targets.len();
@@ -1857,6 +2611,7 @@ impl Topology {
                 offsets: offsets.into(),
                 targets: targets.into(),
                 edge_ids: EdgeIds::identity(m),
+                packed: None,
             };
             &unordered
         } else {
@@ -1883,22 +2638,18 @@ impl Topology {
             let mut len = 0;
             for adj in [out, inc] {
                 match mask {
-                    None => {
-                        for &w in adj.neighbors(u) {
-                            if w != u {
-                                seg[len] = w;
-                                len += 1;
-                            }
+                    None => adj.for_each_neighbor(u, |w| {
+                        if w != u {
+                            seg[len] = w;
+                            len += 1;
                         }
-                    }
-                    Some(m) => {
-                        for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
-                            if w != u && m.keep(e) {
-                                seg[len] = w;
-                                len += 1;
-                            }
+                    }),
+                    Some(m) => adj.for_each_neighbor_row(u, |w, e| {
+                        if w != u && m.keep(e) {
+                            seg[len] = w;
+                            len += 1;
                         }
-                    }
+                    }),
                 }
             }
             let seg = &mut seg[..len];
@@ -1950,15 +2701,18 @@ impl Topology {
         mask: Option<&EdgeMask>,
         mut f: F,
     ) {
-        let mut visit = |adj: &Adjacency| match mask {
-            None => adj.neighbors(u).iter().for_each(|&v| f(v)),
-            Some(m) => {
-                for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+        // The plain layout's loops as they were before #173, the compressed
+        // layout's out of line, so these stay as small as they were.
+        let mut visit = |adj: &Adjacency| match (mask, adj.packed.is_some()) {
+            (None, false) => adj.plain_neighbors(u).iter().for_each(|&v| f(v)),
+            (Some(m), false) => {
+                for (&v, &e) in adj.plain_neighbors(u).iter().zip(adj.edge_ids(u)) {
                     if m.keep(e) {
                         f(v);
                     }
                 }
             }
+            (_, true) => visit_packed(adj, u, mask, &mut f),
         };
         match dir {
             Direction::Out => visit(&self.out),
@@ -1984,11 +2738,11 @@ impl Topology {
         mut f: F,
     ) {
         let mut visit = |adj: &Adjacency| {
-            for (&v, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+            adj.for_each_neighbor_row(u, |v, e| {
                 if mask.is_none_or(|m| m.keep(e)) {
                     f(v, weights[e as usize]);
                 }
-            }
+            })
         };
         match dir {
             Direction::Out => visit(&self.out),
@@ -2026,6 +2780,7 @@ mod tests {
             offsets: offsets.to_vec().into(),
             targets: targets.to_vec().into(),
             edge_ids: edge_ids.to_vec().into(),
+            packed: None,
         }
     }
 

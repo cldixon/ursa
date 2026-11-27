@@ -54,7 +54,7 @@ pub fn neighbor_aggregate(
     }
     (0..n as u32)
         .into_par_iter()
-        .map_init(Vec::<f64>::new, |scratch, u| {
+        .map_init(Scratch::default, |scratch, u| {
             aggregate_node(topo, attr, mask, direction, agg, u, scratch)
         })
         .collect()
@@ -71,25 +71,29 @@ fn aggregate_node(
     direction: Direction,
     agg: AggKind,
     u: u32,
-    scratch: &mut Vec<f64>,
+    scratch: &mut Scratch,
 ) -> Option<f64> {
     let out = topo.out();
     let masked = mask.is_some();
-    let out_pairs = || pairs(out, u, masked);
+    let Scratch {
+        values,
+        out_buf,
+        in_buf,
+    } = scratch;
     match direction {
-        Direction::Out => fold_neighbors(out_pairs(), attr, mask, agg, scratch),
+        Direction::Out => fold_neighbors(pairs(out, u, masked, out_buf), attr, mask, agg, values),
         Direction::In => {
             let inc = topo.incoming();
-            fold_neighbors(pairs(inc, u, masked), attr, mask, agg, scratch)
+            fold_neighbors(pairs(inc, u, masked, in_buf), attr, mask, agg, values)
         }
         Direction::Both => {
             let inc = topo.incoming();
             fold_neighbors(
-                out_pairs().chain(pairs(inc, u, masked)),
+                pairs(out, u, masked, out_buf).chain(pairs(inc, u, masked, in_buf)),
                 attr,
                 mask,
                 agg,
-                scratch,
+                values,
             )
         }
     }
@@ -101,13 +105,29 @@ fn aggregate_node(
 /// The `(neighbour, edge row)` pairs of `u` in `adj`. The rows are read only
 /// when `masked` (a mask is what reads them): otherwise each reads as 0,
 /// and the adjacency's edge ids are never built (#170).
-fn pairs(adj: &Adjacency, u: u32, masked: bool) -> impl Iterator<Item = (&u32, &u32)> {
+///
+/// A compressed adjacency's neighbours are decoded into `buf`.
+fn pairs<'a>(
+    adj: &'a Adjacency,
+    u: u32,
+    masked: bool,
+    buf: &'a mut Vec<u32>,
+) -> impl Iterator<Item = (&'a u32, &'a u32)> {
     const NO_ROW: u32 = 0;
     let ids = masked.then(|| adj.edge_ids(u));
-    adj.neighbors(u)
+    adj.neighbors_in(u, buf)
         .iter()
         .enumerate()
         .map(move |(i, v)| (v, ids.map_or(&NO_ROW, |ids| &ids[i])))
+}
+
+/// A worker's buffers: the values `NUnique` counts, and each direction's
+/// decoded neighbours (a compressed adjacency's).
+#[derive(Default)]
+struct Scratch {
+    values: Vec<f64>,
+    out_buf: Vec<u32>,
+    in_buf: Vec<u32>,
 }
 
 fn fold_neighbors<'a, I: Iterator<Item = (&'a u32, &'a u32)>>(

@@ -333,6 +333,54 @@ impl ConfigField for NoticeLevel {
     }
 }
 
+/// How a new graph index lays out its adjacency (`ursa.index_layout`,
+/// #173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IndexLayout {
+    /// Each node's neighbours as 4-byte ids, in edge-row order: the fastest
+    /// to read.
+    #[default]
+    Plain,
+    /// Each node's neighbours sorted and stored as varint-coded gaps
+    /// (`ursa_core::packed`): about 1.5 to 2 bytes a neighbour once the
+    /// nodes are numbered for locality, against 4, in both directions, for
+    /// a slower read.
+    Compressed,
+}
+
+impl IndexLayout {
+    /// `plain` (or `default`) or `compressed`, in any case.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "plain" | "default" => Ok(Self::Plain),
+            "compressed" => Ok(Self::Compressed),
+            _ => Err(DataFusionError::Configuration(format!(
+                "'{text}' is not an index layout; use 'plain' or 'compressed'"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for IndexLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Plain => "plain",
+            Self::Compressed => "compressed",
+        })
+    }
+}
+
+impl ConfigField for IndexLayout {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        *self = IndexLayout::parse(value)?;
+        Ok(())
+    }
+}
+
 extensions_options! {
     /// Ursa's settings (`SET ursa.<name> = …`).
     pub struct UrsaOptions {
@@ -364,6 +412,15 @@ extensions_options! {
         /// setting. 0 for no limit. Default 5000000, which a desktop
         /// browser draws; the web shell sets 500000 on a phone.
         pub graph_max_edges: GraphMaxEdges, default = GraphMaxEdges(crate::graph::view::MAX_EDGES)
+        /// How a new graph index lays out its adjacency: 'plain' (each
+        /// neighbour a 4-byte id) or 'compressed' (each node's neighbours
+        /// sorted and stored as varint-coded gaps, about 1.5 to 2 bytes a
+        /// neighbour on a large graph, in exchange for slower algorithms).
+        /// An index is cached and stored under its layout, so a query after
+        /// a change builds or loads the index in the new one. Results are
+        /// the same in either, but for the last bits of floating-point sums
+        /// and the choice among equally short paths. Default plain.
+        pub index_layout: IndexLayout, default = IndexLayout::Plain
     }
 }
 
@@ -416,6 +473,15 @@ pub fn graph_max_edges(config: &SessionConfig) -> usize {
     }
 }
 
+/// The session's `ursa.index_layout`.
+pub fn index_layout(config: &SessionConfig) -> IndexLayout {
+    config
+        .options()
+        .extensions
+        .get::<UrsaOptions>()
+        .map_or(IndexLayout::default(), |o| o.index_layout)
+}
+
 /// The session's `ursa.build_read_ahead`, if it was `SET`; `None` when it
 /// is `auto` (see `graph::in_order`).
 pub fn build_read_ahead_set(config: &SessionConfig) -> Option<u64> {
@@ -454,6 +520,24 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    #[test]
+    fn layouts_parse_and_print() {
+        assert_eq!(IndexLayout::default().to_string(), "plain");
+        for (text, layout) in [
+            ("plain", IndexLayout::Plain),
+            ("DEFAULT", IndexLayout::Plain),
+            (" Compressed ", IndexLayout::Compressed),
+        ] {
+            assert_eq!(IndexLayout::parse(text).unwrap(), layout, "{text}");
+        }
+        let e = IndexLayout::parse("zipped").unwrap_err().to_string();
+        assert!(
+            e.ends_with("'zipped' is not an index layout; use 'plain' or 'compressed'"),
+            "{e}"
+        );
+        assert_eq!(IndexLayout::Compressed.to_string(), "compressed");
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::parallel::*;
 use super::linked::Linked;
 use super::rng::{shuffled_order, DEFAULT_SEED};
 use super::subrounds::{places, run_of, sub_rounds};
-use crate::topology::{EdgeMask, Topology};
+use crate::topology::{Adjacency, EdgeMask, Topology};
 
 /// Run `$body` with `$w` bound to the slice (or vector) inside a [`Weights`],
 /// once per form, so the code in it is compiled for each weight type.
@@ -1075,6 +1075,19 @@ fn split_at_bounds<'a, T>(mut buf: &'a mut [T], bounds: &[usize]) -> Vec<&'a mut
     pieces
 }
 
+/// Calls `f(v, row)` for each out-slot of node `uo` in `out`: its neighbour,
+/// and its edge row from `ids` (0 without them), in slot order, decoding a
+/// compressed segment as it goes (#173).
+#[inline(always)]
+fn each_slot(out: &Adjacency, ids: Option<&[u32]>, uo: u32, mut f: impl FnMut(u32, u32)) {
+    let lo = out.offsets[uo as usize] as usize;
+    let mut i = 0;
+    out.for_each_neighbor(uo, |v| {
+        f(v, ids.map_or(0, |ids| ids[lo + i]));
+        i += 1;
+    });
+}
+
 impl Graph {
     fn n(&self) -> usize {
         self.self_loop.len()
@@ -1131,7 +1144,7 @@ impl Graph {
         let node = |u: u32| linked.map_or(u, |l| l.nodes()[u as usize]);
         let at = |v: u32| linked.map_or(v, |l| l.compact(v));
         let out = topo.out();
-        let m = out.targets.len();
+        let m = out.n_slots();
         // Under a subgraph mask, only kept edges enter the working graph. The
         // histogram and scatter below share this predicate so segment sizes match.
         let keep = |e: u32| mask.is_none_or(|m| m.keep(e));
@@ -1139,13 +1152,6 @@ impl Graph {
         // mask or a weight reads it. Without either, the edge ids are never
         // read, so never built (#170); the row then reads as 0, unused.
         let ids = (mask.is_some() || weights.is_some()).then(|| &out.edge_ids[..]);
-        let slots = |uo: u32| {
-            let lo = out.offsets[uo as usize] as usize;
-            out.neighbors(uo)
-                .iter()
-                .enumerate()
-                .map(move |(i, &v)| (v, ids.map_or(0, |ids| ids[lo + i])))
-        };
 
         // Source-node chunks of roughly equal out-slot count. Chunk count is capped
         // by mean degree, as in `transpose`, so the per-chunk histograms (n u32s
@@ -1175,13 +1181,13 @@ impl Graph {
             let mut h = vec![0u32; n];
             for u in lo as u32..hi as u32 {
                 let uo = node(u);
-                for (v, e) in slots(uo) {
+                each_slot(out, ids, uo, |v, e| {
                     let v = at(v);
                     if keep(e) && u != v {
                         h[u as usize] += 1;
                         h[v as usize] += 1;
                     }
-                }
+                });
             }
             h
         };
@@ -1219,15 +1225,15 @@ impl Graph {
             let mut loops = vec![0.0f64; hi - lo];
             for u in lo as u32..hi as u32 {
                 let uo = node(u);
-                for (v, e) in slots(uo) {
+                each_slot(out, ids, uo, |v, e| {
                     if !keep(e) {
-                        continue;
+                        return;
                     }
                     let v = at(v);
                     let w = weights.map_or(1.0, |ws| ws[e as usize]);
                     if u == v {
                         loops[u as usize - lo] += w;
-                        continue;
+                        return;
                     }
                     for (a, b) in [(u, v), (v, u)] {
                         let pos = offsets[a as usize] + cur[a as usize] as usize;
@@ -1242,7 +1248,7 @@ impl Graph {
                             }
                         }
                     }
-                }
+                });
             }
             loops
         };

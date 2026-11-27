@@ -1210,6 +1210,118 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   its archive from 40.9 to 47.0 MB): 18.7 MB for the server, 3.7 MB for the
   page.
 
+- **Opt-in compressed adjacency: `SET ursa.index_layout = 'compressed'`**
+  (#173, part of #155). A graph index can now be built in a compressed
+  layout: each node's neighbours sorted and stored as the gaps between them,
+  each gap a byte-aligned varint (`ursa_core::packed`). The plain layout
+  stays the default and is unchanged. In `ursa-core` the layout sits behind
+  the `Adjacency` seam (`Adjacency::packed`, `Topology::compressed`): every
+  kernel and the engine read neighbours through `for_each_neighbor`,
+  `for_each_neighbor_row`, `any_neighbor`, a `NeighborCursor` (the
+  depth-first searches) or `neighbors_in` (a per-thread decode into a
+  scratch buffer), so nothing reads `targets` directly any more. The slot
+  offsets are kept beside the byte offsets, so a node's degree and its edge
+  ids are read without decoding. The plain layout's loops are the same code
+  as before; a compressed segment is decoded out of line.
+  - **Edge ids** follow the sorted order: within a segment, the rows by
+    `(target, row)`, and `(source, row)` in the in-adjacency. They are still
+    built only when a query reads them (#170): the engine spills the rows'
+    targets as well as their sources (4 B an edge more on disk), and the ids
+    are rebuilt from both (`EdgeIds`' new sorted rebuild), or, in the
+    in-adjacency, transposed from the out-adjacency's.
+  - **The in-adjacency** is transposed compressed, straight from the
+    compressed out-adjacency: reading the out-segments in node order leaves
+    each in-segment sorted already. The undirected view (triangles,
+    clustering, `direction => 'both'`) stays plain, as before.
+  - **A path search** (`GRAPH_TABLE` with a quantifier) puts each node's
+    steps back in edge-row order, so it finds the same paths, in the same
+    order, on either layout.
+  - **The cache and the store key an index by its layout**, so after a `SET`
+    the next query builds (or loads) the other layout, and the first stays
+    cached. A build notice says `built the compressed index for g …`.
+  - **Stored index format version 6.** A compressed index stores its byte
+    offsets and bytes (sections 14 and 15; 16 and 17 in the in-adjacency's
+    chunk) in place of its targets. Edge ids that are the identity (rows
+    grouped by source, #155) are left out of every version 6 file, plain or
+    compressed, and read back as the identity: an index of karate stores in
+    2.7 KiB instead of 3.0. Versions 2 to 5 are still read; a writable
+    database rewrites them as version 6.
+
+  **Results are the same on both layouts.**
+  `ursa-core/tests/compressed_layout.rs` runs 44 kernel calls (PageRank,
+  weak and strong components, BFS, `hop`, shortest paths, triangles,
+  clustering, Louvain, label propagation, closeness, betweenness, degree,
+  neighbour aggregates, random walks, induced edges, the weighted symmetric
+  view; plain, weighted and masked) on 1 and 4 threads, over unsorted and
+  sorted rows, both node orders and sizes on both sides of the parallel
+  thresholds:
+  - bit for bit against the plain layout with its segments sorted the same
+    way (`Topology::with_sorted_segments`), with the edge ids built eagerly
+    and late;
+  - against the default plain layout, bit for bit wherever the result does
+    not depend on the order of a node's neighbours (all of the above but
+    what follows; `hop`'s rows compared in node order). PageRank and
+    betweenness sum in neighbour order, so they are checked within a
+    relative 1e-9; a shortest path is checked to be one of the same length
+    and ends; a random walk, which picks a neighbour by its place, only
+    against the sorted layout.
+  - `ursa-sql/tests/compressed_index.rs` runs the same through SQL on two
+    sessions, plain and compressed, on a 100,000-edge graph (relabelled and
+    spilled) and two small ones: components, `hop`, triangles, Louvain and
+    label propagation (serial, parallel, weighted), closeness, degree,
+    shortest-path lengths and costs, and `GRAPH_TABLE` (`ANY SHORTEST`,
+    `ALL SHORTEST`, `SHORTEST 3`, quantified edges) give the same rows,
+    `element_id(p)` paths included; PageRank and betweenness within 1e-9.
+
+  **Measured** with `ursa-core/examples/compressed_layout.rs`: the index
+  built as the engine builds it (in-degree relabel, edge rows spilled), on
+  a 4-core machine shared with other builds, best of two runs. "R-MAT" is
+  Graph500 R-MAT with `edges / 16` node slots; "sorted" is the same edges
+  with node ids shuffled and rows sorted by source (the shape of an
+  anonymised export). Bytes per edge, each direction:
+
+  | graph | targets | adjacency with offsets | index, both directions |
+  |---|---:|---:|---:|
+  | R-MAT / sorted 16M | 4 → 1.56 | 4.52 → 2.61 | 138 → 80 MiB |
+  | R-MAT / sorted 64M | 4 → 1.71 | 4.52 → 2.76 | 552 → 337 MiB |
+
+  The offsets cost 16 B a node in the compressed layout (slot and byte
+  offsets) against 8. Peak resident memory (process, input edge list
+  included) after the transpose at 64M: 990 → 708 MiB (R-MAT), 990 → 773
+  MiB (sorted); during each kernel, 90 to 215 MiB less at 64M. The build
+  peak is unchanged (865 / 944 MiB at 64M: the edge list and the plain CSR,
+  which is encoded in place). Build time: 0.51 → 1.35 s (R-MAT 64M), 0.40
+  → 1.30 s (sorted 64M), 0.12 → 0.35 s at 16M.
+
+  Kernel wall time, plain → compressed (s), 4 threads:
+
+  | kernel | R-MAT 16M | sorted 16M | R-MAT 64M | sorted 64M |
+  |---|---|---|---|---|
+  | transpose | 0.20 → 0.15 | 0.12 → 0.14 | 1.13 → 0.80 | 0.59 → 0.80 |
+  | PageRank (20 iterations) | 1.23 → 1.32 | 1.18 → 1.31 | 7.25 → 7.51 | 7.07 → 7.39 |
+  | weak components | 0.13 → 0.21 | 0.14 → 0.23 | 0.63 → 0.96 | 0.66 → 1.03 |
+  | strong components | 0.30 → 0.27 | 0.31 → 0.29 | 1.61 → 1.35 | 1.63 → 1.51 |
+  | `hop` (2, from the hub) | 0.029 → 0.024 | 0.025 → 0.025 | 0.10 → 0.11 | 0.12 → 0.11 |
+  | BFS (both directions) | 0.018 → 0.017 | 0.017 → 0.018 | 0.072 → 0.063 | 0.075 → 0.078 |
+  | triangles | 2.92 → 2.92 | 2.90 → 2.93 | 16.4 → 16.5 | 17.0 → 16.8 |
+  | Louvain (serial) | 2.76 → 2.82 | 2.82 → 2.88 | 14.1 → 13.8 | 14.0 → 14.0 |
+  | label propagation | 1.17 → 1.39 | 1.14 → 1.30 | 6.18 → 6.35 | 6.21 → 6.32 |
+  | betweenness (32 sources) | 2.54 → 2.46 | 2.10 → 2.24 | 11.0 → 10.8 | 12.9 → 13.0 |
+
+  Closeness at 1M edges: 3.96 → 4.69 s (R-MAT), 3.90 → 4.77 s (sorted). So
+  the decode costs weak components about 1.5 times the time (union-find
+  over every edge, little work per neighbour), label propagation and
+  closeness up to 1.2 times, PageRank 4 to 11%, and the rest nothing
+  measurable; the compressed transpose is faster on R-MAT and slower on the
+  sorted graph. The default layout is not slower: against `main` the plain
+  layout's times are within the machine's noise (a few percent either way,
+  the same result hashes).
+
+  Follow-ups: the undirected view and the symmetric view (`direction =>
+  'both'`) are still plain; the compressed build could encode from the
+  counting sort's chunks without the plain copy; and the Python library
+  (on hold) builds plain indexes only.
+
 ### Changed
 
 - **SQL: an edge with a NULL source or destination is not part of the graph,

@@ -310,12 +310,16 @@ impl Frontier {
 fn reaches(adj: &Adjacency, v: u32, mask: Option<&EdgeMask>, bits: &[u64]) -> bool {
     let set = |u: u32| bits[u as usize >> 6] >> (u & 63) & 1 == 1;
     match mask {
-        None => adj.neighbors(v).iter().any(|&u| set(u)),
-        Some(m) => adj
-            .neighbors(v)
-            .iter()
-            .zip(adj.edge_ids(v))
-            .any(|(&u, &e)| set(u) && m.keep(e)),
+        None => adj.any_neighbor(v, set),
+        Some(m) => {
+            let ids = adj.edge_ids(v);
+            let mut k = 0;
+            adj.any_neighbor(v, |u| {
+                let e = ids[k];
+                k += 1;
+                set(u) && m.keep(e)
+            })
+        }
     }
 }
 

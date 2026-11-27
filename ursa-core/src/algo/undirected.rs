@@ -77,11 +77,11 @@ pub fn symmetric_view_weighted(
         .map_init(Vec::new, |nb: &mut Vec<(u32, f64)>, u| {
             nb.clear();
             for adj in [out, inc] {
-                for (&w, &e) in adj.neighbors(u).iter().zip(adj.edge_ids(u)) {
+                adj.for_each_neighbor_row(u, |w, e| {
                     if w != u && mask.is_none_or(|m| m.keep(e)) {
                         nb.push((w, weights[e as usize]));
                     }
-                }
+                });
             }
             // Sort by neighbour, then weight, so the first entry of each run is the
             // pair's minimum weight; keep only that one.
