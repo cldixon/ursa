@@ -15,6 +15,7 @@ import { setupLayout } from "./layout.js";
 import { createResults } from "./results.js";
 import { mountCatalog } from "./catalog.js";
 import { mountSources } from "./sources.js";
+import { mountHistory } from "./history.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -140,3 +141,6 @@ window.ursaConsole = { session, panels: layout.panels, layout, results, run };
 // The panels (each module's header says what it does).
 window.ursaConsole.catalog = mountCatalog(layout.panels.catalog); // URSA-15
 window.ursaConsole.sources = mountSources(layout.panels.sources); // URSA-16
+// History (URSA-17): the session's, and the graph pane's commands go there.
+window.ursaConsole.history = mountHistory(layout.panels.history, { session, results });
+results.setCommandsSink(window.ursaConsole.history.sink);

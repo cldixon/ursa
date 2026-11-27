@@ -1082,6 +1082,32 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's History panel** (URSA-17, `design/console.md` §6, §9).
+  History lists what ran in the session: each query, statement and graph
+  step, with who ran it (`hello`'s `client`), when, how long it took, and
+  its rows, nodes or error. Graph steps (a double-click's `.expand 33`) show
+  as they happen, grouped under their drawing, and a drawing under the
+  query it drew. Choosing an entry shows its result's tab again (a step's:
+  its Graph view), or offers to run it again or put it in the editor; Copy
+  as SQL copies the history as a script the shell replays, as its share link
+  keeps one. The list is the session's, so a second tab on the shared
+  session, and later an agent (paired mode), sees the same entries, live.
+  It is a labelled list with one Tab stop and the arrow keys, and new
+  entries are announced politely. The graph pane's commands now go to
+  History; the Results panel's Steps list under the graph shows only
+  without it. `tests/console-history.ts` tests it over `ursa serve`.
+- **Session protocol: the `activity` event and the `history` op**
+  (URSA-17). After each request that runs something (`query`, a statement
+  `feed` completes, `sources.attach`, `graph.open`, `graph.explore`,
+  `graph.find`), the session sends every client attached to it `{"event":
+  "activity", id, at, client, op, summary, ms, result?, rows?, drawing?,
+  nodes?, edges?, error?}`, cancelled requests included, and keeps the
+  last 500 entries for `history {limit?}`, which a client that joins late
+  reads. `drawing` numbers the drawings, so a client can group graph steps
+  under theirs. On `ursa serve`'s shared session each request is named by
+  its own connection's client (`Session::set_client`). The browser demo's
+  worker sends them too.
+
 - **The console's result tabs** (URSA-14, `design/console.md` §6). Each
   result the console runs opens in a tab of its own, labelled with its
   statement and row count (the ARIA tabs pattern; Delete or × closes it and

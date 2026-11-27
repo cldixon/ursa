@@ -9,8 +9,8 @@
 //   reaches its last row, a sort says it sorts the loaded rows only, and a
 //   range copies as tab-separated text;
 // - the Graph view draws karate in the pane, and a double-click's `.expand`
-//   reaches the commands sink (the default list, then a sink set by
-//   setCommandsSink, as History will);
+//   reaches the commands sink (History's, which lists it; then a sink set
+//   by setCommandsSink);
 // - the Plan view shows `explain`'s text;
 // - Export downloads a CSV of every row;
 // - closing a tab frees its result (`fetch` of it is `not_found`), and a tab
@@ -206,11 +206,17 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
     await page.mouse.dblclick(box.x + at.x, box.y + at.y);
   };
   await dblclick(2);
+  // The console's History takes the sink (URSA-17): the step is run, and
+  // listed there under its drawing; the Steps list under the graph is not shown.
   const listed = await page
-    .waitForFunction(() => (window as any).ursaConsole.results.steps.some((s: any) => s.command === ".expand 2" && s.via === "view" && s.answer), null, { timeout: 30_000 })
+    .waitForFunction(() => (window as any).ursaConsole.history?.entries().some((e: any) => e.summary === ".expand 2" && e.via === "view" && e.drawing && !e.error), null, { timeout: 30_000 })
     .then(() => true, () => false);
-  const steps = await ev(() => (window as any).ursaConsole.results.steps);
-  check(listed && (await page.locator(".rs-steps li", { hasText: ".expand 2" }).isVisible()), "results: a double-click's .expand reaches the commands sink, which lists it and runs it", JSON.stringify(steps));
+  const steps = await ev(() => (window as any).ursaConsole.history?.entries().filter((e: any) => e.op.startsWith("graph.")));
+  check(
+    listed && (await page.locator("#history .hx-children .hx-row", { hasText: ".expand 2" }).isVisible()) && !(await page.locator(".rs-steps-box").isVisible()),
+    "results: a double-click's .expand reaches the commands sink (History), which runs it and lists it under its drawing",
+    JSON.stringify(steps),
+  );
   // History's hook: a sink of its own gets the pane's commands.
   await ev(() => {
     const w = window as any;
@@ -225,7 +231,8 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
   const sunk = await page
     .waitForFunction(() => (window as any).sunk.find((s: any) => s.command === ".expand 33"), null, { timeout: 30_000 })
     .then((h) => h.jsonValue(), () => null);
-  await ev(() => (window as any).ursaConsole.results.setCommandsSink(null));
+  // History's sink back.
+  await ev(() => (window as any).ursaConsole.results.setCommandsSink((window as any).ursaConsole.history?.sink ?? null));
   check((sunk as any)?.via === "view" && /^r\d+$/.test((sunk as any)?.result), "results: setCommandsSink gives the pane's commands to another sink (History's hook)", JSON.stringify(sunk));
   await page.waitForTimeout(400);
   await theme("light");
@@ -265,6 +272,8 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
 
   await ev(() => (window as any).ursaConsole.run("SELECT * FROM range(100000)"));
   await page.waitForFunction(() => (window as any).ursaConsole.results.selected()?.rows === 100000, null, { timeout: 30_000 });
+  // Its first rows are drawn in the frame after the tab is shown.
+  await page.waitForFunction(() => (window as any).ursaConsole.results.selected()?.table.state().shown.length > 0, null, { timeout: 10_000 }).catch(() => {});
   const big = await ev(() => {
     const tab = (window as any).ursaConsole.results.selected();
     return { count: tab.button.querySelector(".rs-tab-count").textContent, graph: tab.graph, state: tab.table.state() };

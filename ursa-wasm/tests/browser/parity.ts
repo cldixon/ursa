@@ -110,10 +110,17 @@ const result = await page.evaluate(async ([sql, exportSql]) => {
     const gone = JSON.parse((await shell.handle("fetch", JSON.stringify({ result: kept.result }), [])).message);
     if (gone.ok || gone.error.kind !== "not_found") throw new Error("a closed result was fetched");
     // Events: a request that changes the catalog answers with {"event": "catalog"}.
+    // Every request that runs something answers with {"event": "activity"}
+    // too, naming hello's client (URSA-17).
+    const named = (events: string, name: string) => JSON.parse(events).filter((e: any) => e.event === name);
     const defined = await shell.handle("query", JSON.stringify({ sql: "CREATE VIEW parity_v AS SELECT 1 AS x" }), []);
-    if (JSON.stringify(JSON.parse(defined.events)) !== '[{"event":"catalog"}]') throw new Error(`events: ${defined.events}`);
+    if (JSON.stringify(named(defined.events, "catalog")) !== '[{"event":"catalog"}]') throw new Error(`events: ${defined.events}`);
     const quiet = await shell.handle("query", JSON.stringify({ sql: "SELECT * FROM parity_v" }), []);
-    if (quiet.events !== "[]") throw new Error(`events of a query: ${quiet.events}`);
+    if (named(quiet.events, "catalog").length) throw new Error(`events of a query: ${quiet.events}`);
+    const [ran] = named(quiet.events, "activity");
+    if (ran?.op !== "query" || ran.summary !== "SELECT * FROM parity_v" || ran.rows !== 1 || ran.client?.name !== "parity" || !(ran.at > 0)) throw new Error(`activity: ${quiet.events}`);
+    const listed = await call("history", {});
+    if (listed.entries.length !== 3 || listed.entries[2].id !== ran.id) throw new Error(`history: ${JSON.stringify(listed)}`);
     const catalog = await call("catalog", {});
     if (!JSON.stringify(catalog).includes('"parity_v"')) throw new Error(`catalog: ${JSON.stringify(catalog)}`);
     if (hello.capabilities.includes("sources")) throw new Error("the browser has sources");

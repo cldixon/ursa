@@ -87,6 +87,9 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
     let replier = tokio::spawn(reply(waiting, out.clone(), Arc::clone(&running)));
     let mut stopping = shared.stopping.clone();
     let mut session: Option<SessionHandle> = None;
+    // Who this connection is: its first `hello`'s `client`, which names its
+    // requests in the session's history.
+    let mut client: Option<Value> = None;
     loop {
         let read = tokio::select! {
             read = read_request(&mut stream) => read,
@@ -110,6 +113,9 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
         };
         let id = request.id;
         let answer = |result| out.send(Outgoing::Reply(Some(id.into()), result));
+        if request.op == "hello" && client.is_none() {
+            client = request.args.get("client").cloned();
+        }
         match (request.op.as_str(), &session) {
             ("hello", _) => match attach(&shared, &mut session, &request.args, &out) {
                 // The shared session may be busy with another connection's
@@ -123,7 +129,7 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
                     }));
                 }
                 Ok(handle) => {
-                    let waiting = submit(&handle, request, &running);
+                    let waiting = submit(&handle, request, &running, &client);
                     let _ = queue.send(Waiting {
                         hello: Some(handle),
                         ..waiting
@@ -145,7 +151,7 @@ pub(crate) async fn connection(socket: WebSocket, shared: Arc<Shared>) {
                 )));
             }
             (_, Some(handle)) => {
-                let _ = queue.send(submit(handle, request, &running));
+                let _ = queue.send(submit(handle, request, &running, &client));
             }
         }
     }
@@ -212,7 +218,12 @@ fn attach(
 }
 
 /// Queue `request` on the session, cancellable by its id.
-fn submit(handle: &SessionHandle, request: Request, running: &Running) -> Waiting {
+fn submit(
+    handle: &SessionHandle,
+    request: Request,
+    running: &Running,
+    client: &Option<Value>,
+) -> Waiting {
     let (cancel, cancelled) = watch::channel(false);
     running
         .lock()
@@ -220,6 +231,7 @@ fn submit(handle: &SessionHandle, request: Request, running: &Running) -> Waitin
         .insert(request.id, cancel);
     let (reply, answer) = oneshot::channel();
     handle.send(Job {
+        client: client.clone(),
         op: request.op,
         args: request.args,
         parts: request.parts,

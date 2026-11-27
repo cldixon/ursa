@@ -34,11 +34,18 @@ async fn op_err(shell: &mut Session, op: &str, args: Value) -> Error {
     shell.handle(op, args, Vec::new()).await.unwrap_err()
 }
 
-/// `op`, and the events it caused.
+/// `op`, and the events it caused, but `activity` (which
+/// `session_history_tests.rs` checks).
 async fn op_events(shell: &mut Session, name: &str, args: Value) -> Value {
     let _ = shell.handle(name, args, Vec::new()).await;
     let events = shell.take_events().await;
-    Value::Array(events.iter().map(Event::to_json).collect())
+    Value::Array(
+        events
+            .iter()
+            .filter(|e| e.name != "activity")
+            .map(Event::to_json)
+            .collect(),
+    )
 }
 
 #[tokio::test]

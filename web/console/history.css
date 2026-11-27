@@ -1,0 +1,176 @@
+/* The History panel (history.js): URSA-17. On top of style.css's tokens,
+   console.css's and panels.css's (its tools and buttons), so it follows
+   light and dark. */
+
+:root {
+  --hx-hover: color-mix(in srgb, var(--fg) 4.5%, transparent);
+  --hx-guide: color-mix(in srgb, var(--fg) 12%, var(--bg));
+  --hx-icon-bg: color-mix(in srgb, var(--fg) 6%, var(--bg));
+  --hx-query: #2a78d6;
+  --hx-graph: #c4491b;
+  --hx-step: #b07728;
+  --hx-feed: #1b8f6a;
+  --hx-human: var(--dot);
+  --hx-agent: #6a3fc0;
+  --hx-agent-bg: color-mix(in srgb, #6a3fc0 11%, var(--bg));
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --hx-hover: color-mix(in srgb, var(--fg) 6%, transparent);
+    --hx-icon-bg: color-mix(in srgb, var(--fg) 8%, var(--bg));
+    --hx-query: #6aa8ff; --hx-graph: #ff8a5c; --hx-step: #e0a95a; --hx-feed: #45c79a;
+    --hx-agent: #c3a6ff;
+    --hx-agent-bg: color-mix(in srgb, #c3a6ff 14%, var(--bg));
+  }
+}
+:root[data-theme="dark"] {
+  --hx-hover: color-mix(in srgb, var(--fg) 6%, transparent);
+  --hx-icon-bg: color-mix(in srgb, var(--fg) 8%, var(--bg));
+  --hx-query: #6aa8ff; --hx-graph: #ff8a5c; --hx-step: #e0a95a; --hx-feed: #45c79a;
+  --hx-agent: #c3a6ff;
+  --hx-agent-bg: color-mix(in srgb, #c3a6ff 14%, var(--bg));
+}
+
+/* The panel fills its body: the list scrolls inside, under its tools. */
+#history-body.history-panel { overflow: hidden; display: flex; flex-direction: column; font-size: 13px; }
+#history-body.history-panel[hidden] { display: none; }
+.history-panel [hidden] { display: none !important; }
+
+.hx-tools { justify-content: space-between; padding-top: 4px; }
+.hx-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.hx-copy:disabled { opacity: 0.5; cursor: default; }
+.hx-copy.done { border-color: color-mix(in srgb, var(--state-ok) 60%, var(--border)); color: var(--state-ok); }
+
+.hx-scroll { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 0 6px 10px; scrollbar-gutter: stable; }
+
+/* ---------------------------------------------------------------- the list */
+
+.hx-list, .hx-children { margin: 0; padding: 0; list-style: none; }
+.hx-item { position: relative; }
+.hx-item.depth-0 + .hx-item.depth-0 { margin-top: 2px; }
+/* Drawings and their steps hang from their parent, on a guide line. */
+.hx-children { position: relative; margin-left: 17px; padding-left: 9px; }
+.hx-children::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 12px;
+  border-left: 1.5px solid var(--hx-guide);
+}
+.hx-children > .hx-item::before {
+  content: "";
+  position: absolute;
+  left: -9px;
+  top: 17px;
+  width: 7px;
+  border-top: 1.5px solid var(--hx-guide);
+}
+
+.hx-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.hx-row:hover { background: var(--hx-hover); }
+.hx-row[aria-expanded="true"] { background: var(--hx-hover); border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.console-page .hx-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.hx-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 6px;
+  background: var(--hx-icon-bg);
+  color: var(--hx-query);
+}
+.hx-icon svg { width: 14px; height: 14px; }
+.hx-icon.k-drawing { color: var(--hx-graph); }
+.hx-icon.k-graph-step, .hx-icon.k-search { color: var(--hx-step); }
+.hx-icon.k-statement, .hx-icon.k-command, .hx-icon.k-attach { color: var(--hx-feed); }
+.hx-children .hx-icon { width: 20px; height: 20px; background: none; }
+.hx-item.failed > .hx-row .hx-icon { color: var(--error); background: color-mix(in srgb, var(--error) 10%, var(--bg)); }
+
+.hx-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.hx-statement {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.hx-statement code { font-family: var(--mono); font-size: 12.5px; color: var(--fg); }
+.hx-children .hx-statement code { font-size: 12px; }
+.hx-of { color: var(--muted); }
+.hx-item.cancelled > .hx-row .hx-statement code { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--faint); }
+
+.hx-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 5px;
+  row-gap: 1px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+.hx-sep { color: var(--faint); }
+.hx-client { display: inline-flex; align-items: center; gap: 4px; color: var(--fg); font-weight: 500; }
+.hx-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--hx-human); }
+.hx-client.agent { padding: 0 5px 0 3px; border-radius: 9px; background: var(--hx-agent-bg); color: var(--hx-agent); }
+.hx-client.agent svg { width: 12px; height: 12px; }
+.hx-outcome { margin-left: auto; padding-left: 8px; white-space: nowrap; color: color-mix(in srgb, var(--fg) 70%, var(--muted)); }
+.hx-via { color: var(--muted); font-size: 11.5px; font-style: italic; }
+.hx-item.failed > .hx-row .hx-outcome { color: var(--error); font-weight: 500; }
+
+.hx-error {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--error);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+/* ---------------------------------------------------------------- the offer */
+
+.hx-offer {
+  margin: 0 0 4px;
+  padding: 2px 10px 10px 39px;
+  border-radius: 0 0 8px 8px;
+  background: var(--hx-hover);
+}
+.hx-offer-text { margin: 0 0 8px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.hx-offer-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---------------------------------------------------------------- empty */
+
+.hx-empty { padding: 18px 18px 8px; color: var(--muted); font-size: 12.5px; line-height: 1.5; text-align: center; }
+.hx-empty p { margin: 0 auto; max-width: 30ch; }
+.hx-empty-what { margin-bottom: 4px !important; color: var(--fg); font-weight: 600; }
+.hx-empty-art { display: flex; justify-content: center; gap: 8px; margin-bottom: 10px; color: var(--faint); }
+.hx-empty-art svg { width: 18px; height: 18px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .hx-item.new > .hx-row { animation: hx-in 600ms ease-out; }
+}
+@keyframes hx-in {
+  from { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+}
