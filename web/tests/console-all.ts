@@ -9,9 +9,10 @@
 // - `console`: tests/console.ts (the layout, the keyboard, the connection,
 //   Cancel, the shell at /) and tests/console-results.ts (the result tabs);
 // - `editor`: tests/console-editor.ts (the SQL editor);
-// - `panels`: tests/console-panels.ts (Catalog and Sources).
+// - `panels`: tests/console-panels.ts (Catalog and Sources);
+// - `history`: tests/console-history.ts (the History panel).
 //
-// Each starts `ursa serve` itself (two of them on a root of their own), so
+// Each starts `ursa serve` itself (three of them on a root of their own), so
 // each runs as a process of its own, on a port of its own: the first on PORT,
 // the next on PORT + 1, and so on. The binary is a build with `--features
 // serve` (by default $CARGO_TARGET_DIR/release/ursa; URSA_BIN= also names
@@ -34,6 +35,7 @@ const SUITES: Record<string, string> = {
   console: "console.ts",
   editor: "console-editor.ts",
   panels: "console-panels.ts",
+  history: "console-history.ts",
 };
 /** A suite that has not finished in this long has hung. */
 const TIMEOUT_MS = 15 * 60_000;

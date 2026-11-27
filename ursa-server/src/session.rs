@@ -55,6 +55,9 @@ pub(crate) fn options(config: &Config) -> Options {
 
 /// A request for a session, and where its reply goes.
 pub(crate) struct Job {
+    /// Who sent it: its connection's `hello` `client`, which the session's
+    /// history and `activity` events name.
+    pub(crate) client: Option<Value>,
     pub(crate) op: String,
     pub(crate) args: Value,
     pub(crate) parts: Vec<Vec<u8>>,
@@ -204,7 +207,7 @@ impl Actor {
     /// dropped. A panic in the engine ends it too: the requests waiting
     /// then get no reply, which their connections report as a `crash`.
     ///
-    /// After each request, the events it caused (`catalog`) go to every
+    /// After each request, the events it caused (`catalog`, `activity`) go to every
     /// connection attached to the session, and then its reply: a
     /// connection's writer takes them in that order (§4.5).
     fn spawn(self, id: &str) -> std::io::Result<()> {
@@ -223,6 +226,9 @@ impl Actor {
                 runtime.block_on(local.run_until(async move {
                     let mut session = Session::new(options);
                     while let Some(job) = queue.recv().await {
+                        // The shared session's connections take turns: each
+                        // request is its own client's.
+                        session.set_client(job.client);
                         let outcome =
                             run(&mut session, job.op, job.args, job.parts, job.cancel).await;
                         for event in session.take_events().await {

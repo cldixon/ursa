@@ -31,6 +31,7 @@
     "test:console": "bun tests/console.ts",
     "test:console-panels": "bun tests/console-panels.ts",
     "test:console-editor": "bun tests/console-editor.ts",
+    "test:console-history": "bun tests/console-history.ts",
     "test:console-all": "bun tests/console-all.ts",
     "preview": "bun scripts/preview.ts"
   }

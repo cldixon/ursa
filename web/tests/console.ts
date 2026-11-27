@@ -195,9 +195,9 @@ await page.keyboard.press("Shift+F6");
 check((await page.evaluate(() => document.activeElement?.id)) === "catalog", "Shift+F6 moves back");
 
 // Tab order: the header, then the left column, the editor and results, the
-// right column and the status bar (not what the Sources and Catalog panels hold: their own tests check them).
+// right column and the status bar (not what the Sources, Catalog and History panels hold: their own tests check them).
 const tabOrder = await page.evaluate(() => {
-  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links") && !el.closest('[data-mount="sources"], [data-mount="catalog"]'));
+  const all = [...document.querySelectorAll<HTMLElement>("button, a[href], [tabindex='0']")].filter((el) => el.offsetParent !== null && !el.closest(".skip-links") && !el.closest('[data-mount="sources"], [data-mount="catalog"], [data-mount="history"]'));
   return all.map((el) => el.id || el.dataset.split || el.className);
 });
 const expected = ["toggle-left", "brand", "toggle-right", "theme", "sources-title", "left", "catalog-title", "left-width", "editor-title", "editor-run", "editor-run all", "main", "results-title", "right-width", "inspector-title", "right", "history-title"];

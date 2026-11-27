@@ -1083,12 +1083,37 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     calls, and DuckPGQ's PageRank values are on its known differences.
 
 - **The console's e2e suites run in CI** (URSA-18). `web/tests/console-all.ts`
-  (`bun run test:console-all`) runs the console, editor and panels suites in
-  turn, each with its own `ursa serve`, prints a summary and fails if any
+  (`bun run test:console-all`) runs the console, editor, panels and history
+  suites in turn, each with its own `ursa serve`, prints a summary and fails if any
   check does. `shell-e2e.yml` runs it in a third leg, "Ursa Console (browser
   e2e over ursa serve)", built as the shell's socket leg is and sharing its
   caches, on the same paths, and keeps the console's screenshots, light and
   dark, as the `console-e2e` artifact on every run.
+- **The console's History panel** (URSA-17, `design/console.md` §6, §9).
+  History lists what ran in the session: each query, statement and graph
+  step, with who ran it (`hello`'s `client`), when, how long it took, and
+  its rows, nodes or error. Graph steps (a double-click's `.expand 33`) show
+  as they happen, grouped under their drawing, and a drawing under the
+  query it drew. Choosing an entry shows its result's tab again (a step's:
+  its Graph view), or offers to run it again or put it in the editor; Copy
+  as SQL copies the history as a script the shell replays, as its share link
+  keeps one. The list is the session's, so a second tab on the shared
+  session, and later an agent (paired mode), sees the same entries, live.
+  It is a labelled list with one Tab stop and the arrow keys, and new
+  entries are announced politely. The graph pane's commands now go to
+  History; the Results panel's Steps list under the graph shows only
+  without it. `tests/console-history.ts` tests it over `ursa serve`.
+- **Session protocol: the `activity` event and the `history` op**
+  (URSA-17). After each request that runs something (`query`, a statement
+  `feed` completes, `sources.attach`, `graph.open`, `graph.explore`,
+  `graph.find`), the session sends every client attached to it `{"event":
+  "activity", id, at, client, op, summary, ms, result?, rows?, drawing?,
+  nodes?, edges?, error?}`, cancelled requests included, and keeps the
+  last 500 entries for `history {limit?}`, which a client that joins late
+  reads. `drawing` numbers the drawings, so a client can group graph steps
+  under theirs. On `ursa serve`'s shared session each request is named by
+  its own connection's client (`Session::set_client`). The browser demo's
+  worker sends them too.
 - **The console's result tabs** (URSA-14, `design/console.md` §6). Each
   result the console runs opens in a tab of its own, labelled with its
   statement and row count (the ARIA tabs pattern; Delete or × closes it and
