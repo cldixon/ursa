@@ -123,9 +123,10 @@ for (const [i, name] of names.entries()) {
   const lines = printed.split("\n");
   const ok = lines.filter((l) => l.startsWith("ok  ")).length;
   const failed = lines.filter((l) => l.startsWith("FAIL ")).map((l) => l.slice(5));
-  // Each suite ends with "all passed" or "N failed"; without it, it stopped
-  // early (a thrown error, a server that would not start, a timeout).
-  const finished = /\n(all passed|\d+ failed)/.test(printed);
+  // Each suite ends with "all passed" (History's: "all History checks
+  // passed") or "N failed"; without it, it stopped early (a thrown error, a
+  // server that would not start, a timeout).
+  const finished = /\n(all (\w+ checks )?passed|\d+ failed)/.test(printed);
   const tail = errors.trim().split("\n").filter(Boolean).slice(-8);
   if (shots) writeFileSync(join(shots, "output.log"), printed + (errors ? `\n--- stderr\n${errors}` : ""));
   outcomes.push({ name, ok, failed, code, finished, seconds, tail });
