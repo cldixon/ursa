@@ -87,6 +87,12 @@ export async function resultsChecks(page: Page, context: BrowserContext, check: 
     editor.runCurrent();
   });
   await page.waitForSelector(".rs-tab[aria-selected=true]", { timeout: 30_000 });
+  // The tab exists once the result is in; its rows are drawn on the next frame.
+  await page.waitForFunction(() => {
+    const tab = document.querySelector(".rs-tab[aria-selected=true]");
+    const panel = tab && document.getElementById(tab.getAttribute("aria-controls")!);
+    return !!panel?.querySelector(".rt-body .rt-row:not([hidden]) .rt-cell:not(.rt-gutter)")?.textContent;
+  }, null, { timeout: 30_000 });
   const pr = await ev(() => {
     const tab = document.querySelector<HTMLElement>(".rs-tab[aria-selected=true]")!;
     const panel = document.getElementById(tab.getAttribute("aria-controls")!)!;

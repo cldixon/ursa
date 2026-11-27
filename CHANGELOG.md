@@ -2286,6 +2286,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Web shell: bold and italic text is spaced as the rest, wherever the
+  fonts load late** (URSA-18). The page waited for IBM Plex Mono's regular
+  face before opening the terminal, but not its bold or italic. xterm's DOM
+  renderer measures each character once per face and keeps the width, so a
+  bold character first drawn while the bold face was still loading (the
+  prompt's `memory U`) kept a fallback font's width after it loaded: on a
+  machine whose fallback measures differently, those characters were drawn
+  in spans of their own with letter-spacing, out of line, and a later
+  `.tables` broke apart at its `e`. That is how the console's editor suite
+  failed on CI ("each kind looks as the shell's terminal draws it": no
+  `command`), and it reproduces locally with a fallback font of another
+  width. The page now loads the bold and italic faces first too.
+  `tests/console-editor.ts` reads the shell's colours once its highlighter
+  has answered and the terminal has drawn them, not after a fixed 200 ms;
+  `tests/console-results.ts` reads the PageRank grid once its first rows are
+  drawn (a frame after its tab), not as the tab appears.
 - **Console: the editor's Tab takes a completion list just opened, and a
   dot-command inserted as a statement gets no `;`** (URSA-21). CodeMirror's
   `acceptCompletion` declines for 75 ms after the list opens (its

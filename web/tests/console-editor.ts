@@ -171,13 +171,28 @@ const shell = await context.newPage();
 watch(shell);
 await shell.goto(`${base}/`);
 await shell.waitForFunction(() => (window as any).ursaShell?.screen().includes("memory U"), null, { timeout: 60_000 });
-/** The look of each kind in the shell's input line, read from xterm's DOM rows. */
-async function shellLook(themeName: string) {
+/**
+ * The look of each kind in the shell's input line, read from xterm's DOM rows,
+ * once `typed` is coloured: the highlighter's answer is in the terminal's
+ * buffer (its first character bold or coloured), and drawn, a frame later.
+ */
+async function shellLook(themeName: string, typed: string) {
+  await shell.waitForFunction(
+    (typed) => {
+      const sh = (window as any).ursaShell;
+      const cells: { ch: string; fg: number; bold: boolean }[] = sh.cells(sh.cursor().y);
+      const at = cells.map((c) => c.ch || " ").join("").indexOf(typed);
+      return at >= 0 && (cells[at].bold || cells[at].fg !== -1);
+    },
+    typed,
+    { timeout: 30_000 },
+  );
   await shell.evaluate((n) => {
     const now = document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     if (now !== n) (document.getElementById("theme") as HTMLElement).click();
   }, themeName);
-  await shell.waitForTimeout(200);
+  // xterm draws what changed (the colours, the theme) on its next frame.
+  await shell.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   return shell.evaluate(() => {
     const want: Record<string, string> = { keyword: "SELECT", string: "'s'", comment: "--c", command: ".tables", arguments: "karate" };
     const out: Record<string, string> = {};
@@ -194,13 +209,15 @@ async function shellLook(themeName: string) {
 await shell.locator(".xterm").click();
 // One line per kind, so xterm draws each piece in its own span. A dot-command
 // and a statement: typed, not run (Ctrl+C drops each).
-await shell.keyboard.type(".tables karate");
-const shellCommandLight = await shellLook("light");
-const shellCommandDark = await shellLook("dark");
+const COMMAND_LINE = ".tables karate";
+const SQL_LINE = "SELECT 's' --c";
+await shell.keyboard.type(COMMAND_LINE);
+const shellCommandLight = await shellLook("light", COMMAND_LINE);
+const shellCommandDark = await shellLook("dark", COMMAND_LINE);
 await shell.keyboard.press("Control+c");
-await shell.keyboard.type("SELECT 's' --c");
-const shellSqlDark = await shellLook("dark");
-const shellSqlLight = await shellLook("light");
+await shell.keyboard.type(SQL_LINE);
+const shellSqlDark = await shellLook("dark", SQL_LINE);
+const shellSqlLight = await shellLook("light", SQL_LINE);
 await shell.keyboard.press("Control+c");
 const shellTerm: Record<string, Record<string, string>> = {
   light: { ...shellSqlLight, ...shellCommandLight },

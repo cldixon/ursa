@@ -113,8 +113,17 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
 // renderer draws the text with the browser's own text rendering (and
 // selection). Box drawing comes from "Ursa Box" (style.css), whose lines run
 // past each row, so a table's borders join.
+//
+// The bold face (the prompt, keywords, commands) and the italic (comments)
+// too: the DOM renderer measures each character's width once per face and
+// keeps it, to space it to its cell. A face still loading when its first
+// text is drawn (the bold prompt) is measured in a fallback font, and those
+// widths stay after it loads: the characters measured then are spaced apart
+// from the rest, each in a span of its own, misaligned.
 await Promise.all([
   document.fonts.load('13px "IBM Plex Mono"'),
+  document.fonts.load('bold 13px "IBM Plex Mono"'),
+  document.fonts.load('italic 13px "IBM Plex Mono"'),
   document.fonts.load('13px "Ursa Box"', "\u2502"),
 ]).catch(() => {});
 const term = new Terminal({
