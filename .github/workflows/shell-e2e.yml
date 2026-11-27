@@ -12,12 +12,19 @@ name: Ursa Shell e2e
 # browser-only checks (the suite fails if it skips any other). The legs share
 # the engine and datasets caches; each keeps its own cargo cache.
 #
+# And the Ursa Console (URSA-18), `ursa serve`'s own page at /console/: a third
+# leg, `console`, built as the socket leg is (the same steps and caches: the
+# engine and datasets, and the socket leg's cargo cache, as it builds the same
+# ursa-cli), runs the console's suites (web/tests/console-all.ts) and keeps
+# their screenshots of the console, light and dark, on every run.
+#
 # Runs when the page, the crates compiled into it, or the datasets' inputs
 # change: web/, ursa-wasm and ursa-shell (the engine), ursa-viz (the graph
 # view), the engine crates under them, the workspace's Cargo files and
 # toolchain (profiles, versions), the bundled CSVs and the R-MAT generator;
 # and the native server's own code: ursa-server and `ursa serve` (ursa-cli's
-# serve.rs).
+# serve.rs). The console's paths (web/console, web/public, web/tests/console*,
+# ursa-shell's session) are under web/** and ursa-shell/**.
 on:
   pull_request:
     paths:
@@ -77,14 +84,19 @@ env:
 jobs:
   e2e:
     # The worker leg keeps the job's original name (the check PRs know).
-    name: ${{ matrix.transport == 'socket' && 'Ursa Shell (browser e2e over ursa serve)' || 'Ursa Shell (browser e2e)' }}
+    name: ${{ matrix.suite == 'console' && 'Ursa Console (browser e2e over ursa serve)' || matrix.transport == 'socket' && 'Ursa Shell (browser e2e over ursa serve)' || 'Ursa Shell (browser e2e)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      # One transport failing says nothing about the other: let both finish.
+      # One leg failing says nothing about the others: let all finish.
       fail-fast: false
       matrix:
-        transport: [worker, socket]
+        # `suite` is what runs: the shell's e2e (tests/e2e.ts) over either
+        # transport, or the console's suites, which are socket only.
+        include:
+          - { transport: worker, suite: shell }
+          - { transport: socket, suite: shell }
+          - { transport: socket, suite: console }
     defaults:
       run:
         # bash -eo pipefail, so the tee'd e2e run fails the step.
@@ -101,7 +113,8 @@ jobs:
       # Dependencies only: rust-cache drops the workspace's own crates (cargo
       # would rebuild them anyway, checkout gives them new mtimes). A key per
       # leg, as the socket leg also builds the native ursa-cli's dependencies;
-      # the worker leg's key is the one this job always had.
+      # the worker leg's key is the one this job always had. The console leg
+      # builds the same ursa-cli as the socket leg, so shares its key.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
@@ -223,18 +236,41 @@ jobs:
       # the token from the link it prints, runs the suite with it, and stops
       # the server with Ctrl+C, failing if it does not stop gracefully.
       - name: Run the e2e suite over ursa serve
-        if: matrix.transport == 'socket'
+        if: matrix.transport == 'socket' && matrix.suite == 'shell'
         env:
           URSA_BIN: ${{ github.workspace }}/target/debug/ursa
         run: |
           mkdir -p e2e-out
           bun scripts/e2e-serve.ts "$PORT" "$URSA_BIN" e2e-out 2>&1 | tee e2e-out/e2e.log
 
+      # The console's suites (tests/console-all.ts): each starts its own
+      # `ursa serve` from this build, on PORT, PORT + 1, ..., with the pages
+      # from dist-console/ and dist/, and saves its screenshots in
+      # e2e-out/<suite>/. It runs them all even when one fails.
+      - name: Run the console suites
+        if: matrix.suite == 'console'
+        env:
+          URSA_BIN: ${{ github.workspace }}/target/debug/ursa
+        run: |
+          mkdir -p e2e-out
+          bun run test:console-all "$PORT" "$URSA_BIN" e2e-out 2>&1 | tee e2e-out/console-all.log
+
       - name: Upload screenshots and logs
-        if: failure()
+        if: failure() && matrix.suite == 'shell'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.transport == 'socket' && 'shell-e2e-serve' || 'shell-e2e' }}
+          path: web/e2e-out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # The console's screenshots, light and dark, on every run (not only on
+      # failure), so a reviewer can see the UI; and the suites' logs.
+      - name: Upload the console's screenshots and logs
+        if: always() && matrix.suite == 'console'
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-e2e
           path: web/e2e-out/
           if-no-files-found: ignore
           retention-days: 14

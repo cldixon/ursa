@@ -1082,6 +1082,13 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     conformance suite has a `duckpgq/` directory for DuckPGQ's algorithm
     calls, and DuckPGQ's PageRank values are on its known differences.
 
+- **The console's e2e suites run in CI** (URSA-18). `web/tests/console-all.ts`
+  (`bun run test:console-all`) runs the console, editor, panels and history
+  suites in turn, each with its own `ursa serve`, prints a summary and fails if any
+  check does. `shell-e2e.yml` runs it in a third leg, "Ursa Console (browser
+  e2e over ursa serve)", built as the shell's socket leg is and sharing its
+  caches, on the same paths, and keeps the console's screenshots, light and
+  dark, as the `console-e2e` artifact on every run.
 - **The console's History panel** (URSA-17, `design/console.md` §6, §9).
   History lists what ran in the session: each query, statement and graph
   step, with who ran it (`hello`'s `client`), when, how long it took, and
@@ -1107,7 +1114,6 @@ The distribution is `ursa-graph`; the import name is `ursa`.
   under theirs. On `ursa serve`'s shared session each request is named by
   its own connection's client (`Session::set_client`). The browser demo's
   worker sends them too.
-
 - **The console's result tabs** (URSA-14, `design/console.md` §6). Each
   result the console runs opens in a tab of its own, labelled with its
   statement and row count (the ARIA tabs pattern; Delete or × closes it and
@@ -2417,6 +2423,22 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Fixed
 
+- **Web shell: bold and italic text is spaced as the rest, wherever the
+  fonts load late** (URSA-18). The page waited for IBM Plex Mono's regular
+  face before opening the terminal, but not its bold or italic. xterm's DOM
+  renderer measures each character once per face and keeps the width, so a
+  bold character first drawn while the bold face was still loading (the
+  prompt's `memory U`) kept a fallback font's width after it loaded: on a
+  machine whose fallback measures differently, those characters were drawn
+  in spans of their own with letter-spacing, out of line, and a later
+  `.tables` broke apart at its `e`. That is how the console's editor suite
+  failed on CI ("each kind looks as the shell's terminal draws it": no
+  `command`), and it reproduces locally with a fallback font of another
+  width. The page now loads the bold and italic faces first too.
+  `tests/console-editor.ts` reads the shell's colours once its highlighter
+  has answered and the terminal has drawn them, not after a fixed 200 ms;
+  `tests/console-results.ts` reads the PageRank grid once its first rows are
+  drawn (a frame after its tab), not as the tab appears.
 - **Console: the editor's Tab takes a completion list just opened, and a
   dot-command inserted as a statement gets no `;`** (URSA-21). CodeMirror's
   `acceptCompletion` declines for 75 ms after the list opens (its
