@@ -314,7 +314,7 @@ ursa serve data/           # relative paths in queries are data/'s
 ursa serve club.ursa       # the database, as `ursa club.ursa` opens it
 ```
 
-It prints a link with a one-time token and opens it in your default browser; `--no-open` only prints it. It listens on `127.0.0.1` and `::1` only, on port 4280 or the next free one (`--port N`). Ctrl+C stops it.
+It prints a link with a one-time token and opens it in your default browser; `--no-open` only prints it. To open it, it gives the browser a page that redirects to the link, written to a temporary directory only you can read and removed when the server stops, so the token is never on a command line, where other users of the machine could see it. A browser that cannot read the temporary directory (Firefox installed as a snap, on Ubuntu, has a /tmp of its own) shows an error: open the printed link instead. It listens on `127.0.0.1` and `::1` only, on port 4280 or the next free one (`--port N`). Ctrl+C stops it.
 
 A directory, or a database file's own directory, is where relative paths resolve, and where the server writes: `COPY … TO`, `.output` and `.once` take a relative path under it. The shell's tab keeps what `COPY … TO 'name'` writes in the session, as the [Ursa Shell](https://ursa-shell.cl-dixon.workers.dev) in the browser does (`.files` lists them).
 

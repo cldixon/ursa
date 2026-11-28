@@ -455,3 +455,79 @@ fn serve_roots_its_sessions_in_a_directory_and_says_read_only() {
         "{first}"
     );
 }
+
+/// Without `--no-open`, `ursa serve` opens the browser with a redirect file
+/// only the user can read, never with its link: the token is on no command
+/// line, where every user of the machine could see it (URSA-20). The opener
+/// (`xdg-open`, or `open` on macOS) is a script on `PATH` that records its
+/// arguments and the file. The file goes when the server stops.
+#[cfg(unix)]
+#[test]
+fn serve_opens_the_browser_with_no_token_on_its_command_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let assets = page(dir.path());
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let record = dir.path().join("opened");
+    let script = format!(
+        "#!/bin/sh\n\
+         # The page, as the browser would read it, and then the arguments.\n\
+         cat \"$1\" > '{record}.html'\n\
+         ls -ld \"$1\" \"$(dirname \"$1\")\" > '{record}.mode'\n\
+         printf '%s\\n' \"$0\" \"$@\" > '{record}.tmp'\n\
+         mv '{record}.tmp' '{record}'\n",
+        record = record.display()
+    );
+    for name in ["xdg-open", "open"] {
+        let path = bin.join(name);
+        std::fs::write(&path, &script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut serving = Serving::start(
+        Command::new(env!("CARGO_BIN_EXE_ursa"))
+            .arg("serve")
+            .arg(dir.path())
+            .args(["--port", "0", "--assets"])
+            .arg(&assets)
+            .env("PATH", path),
+    );
+    let (port, token) = serving.link();
+    assert_eq!(
+        serving.line(),
+        "Opening it in your browser. Ctrl+C stops the server."
+    );
+    let start = Instant::now();
+    while !record.exists() {
+        assert!(start.elapsed() < Duration::from_secs(20), "never opened");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let argv = std::fs::read_to_string(&record).unwrap();
+    assert!(!argv.contains(&token), "{argv}");
+    assert!(!argv.contains("token"), "{argv}");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(argv.len(), 2, "{argv:?}");
+    let opened = std::path::Path::new(argv[1]);
+    assert!(opened.is_absolute(), "{argv:?}");
+    assert_eq!(opened.file_name().unwrap(), "open.html");
+    // The page leads to the link, token and all.
+    let html = std::fs::read_to_string(record.with_extension("html")).unwrap();
+    let link = format!("http://127.0.0.1:{port}/?token={token}");
+    assert!(
+        html.contains(&format!("content=\"0;url={link}\"")),
+        "{link}\n{html}"
+    );
+    // Only the user can read it, or list its directory.
+    let modes = std::fs::read_to_string(record.with_extension("mode")).unwrap();
+    let modes: Vec<&str> = modes.lines().map(|l| &l[..10]).collect();
+    assert_eq!(modes, ["drwx------", "-rw-------"], "{modes:?}");
+    assert!(opened.exists());
+    // Ctrl+C: it stops, and removes the file and its directory.
+    serving.interrupt().assert_clean();
+    assert!(!opened.exists(), "{}", opened.display());
+    assert!(!opened.parent().unwrap().exists());
+}

@@ -88,7 +88,11 @@ reach, so only the user's own browser tab may reach it (§5):
   named for the port (`ursa_token_4280`; cookies are shared across a host's
   ports) and a redirect to the same address without it, so it never ends up
   in a shared link. The WebSocket and `/data/` need it: the cookie, or
-  `?token=` for clients that are not browsers;
+  `?token=` for clients that are not browsers. `ursa serve` never puts the
+  link on a command line, where every user of the machine can read it: it
+  opens the browser with a redirect file only the user can read (URSA-20,
+  `ursa-cli/src/serve.rs`). The response to `?token=` sets the cookie even
+  when the navigation started from that `file://` page;
 - every request's `Host` must be one of the server's own names
   (`127.0.0.1:PORT`, `localhost:PORT`, `[::1]:PORT`), against DNS
   rebinding, and every WebSocket upgrade's `Origin` the server's own page;
