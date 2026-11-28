@@ -20,6 +20,13 @@
 //
 // Keys: the host focuses it (`focus()`, on `i`); Esc inside it hands the
 // focus back (`onLeave`).
+//
+// Floating or docked: by default the panel floats over the view (its host
+// puts it in the stage, and the view keeps what it draws clear of it). A
+// host with a place of its own for it (the Ursa Console's Inspector panel,
+// through graph-pane.js's `inspector` option) passes `docked: true`: the
+// panel is then a plain block that fills that place, with no close button
+// (it shows what is selected for as long as it is selected).
 
 let styled = false;
 /** Link graph-inspector.css, once. */
@@ -83,7 +90,9 @@ export function pathCommand(graph, from, to) {
  *   pin(index)            pin a node, or unpin it; returns whether it is pinned now
  *   select(index)         select a node alone (an edge's end)
  *   onLeave()             Esc was pressed in the panel: take the focus back
+ *   onShow({kind, title}) the panel shows a new subject
  *   onClose()             the panel has closed
+ *   docked                true: a block in the host's place, not floating
  *
  * It returns {element, show(subject), close(), focus(), state()}. `element`
  * is the panel, hidden until `show`. A subject may say which `side` of the
@@ -117,7 +126,7 @@ export function createInspector(host) {
     return b;
   };
 
-  const root = el("aside", "graph-inspector");
+  const root = el("aside", host.docked ? "graph-inspector docked" : "graph-inspector");
   root.hidden = true;
   root.tabIndex = -1;
   root.setAttribute("aria-label", "Inspector");
@@ -127,7 +136,9 @@ export function createInspector(host) {
   closeButton.className = "inspector-close";
   closeButton.setAttribute("aria-label", "Close the inspector");
   closeButton.textContent = "×";
-  head.append(title, closeButton);
+  // Docked, it closes with the selection: a close button would hide what is selected.
+  if (host.docked) head.append(title);
+  else head.append(title, closeButton);
   const body = el("div", "inspector-body");
   root.append(head, body);
 
@@ -377,6 +388,12 @@ export function createInspector(host) {
     shown.side = subject.side === "left" ? "left" : "right";
     root.classList.toggle("left", shown.side === "left");
     root.hidden = false;
+    host.onShow?.({ kind: shown.kind, title: shown.title });
+  }
+
+  function state() {
+    if (!shown) return null;
+    return { ...shown, text: root.innerText, focused: root.contains(document.activeElement), buttons: Array.from(root.querySelectorAll("button"), (b) => b.textContent) };
   }
 
   /** Hide the panel. The host's selection is its own affair. */
@@ -407,9 +424,6 @@ export function createInspector(host) {
      * (an edge's rows came through the graph's index, not a scan), text
      * (the panel's text), focused, …}.
      */
-    state() {
-      if (!shown) return null;
-      return { ...shown, text: root.innerText, focused: root.contains(document.activeElement), buttons: Array.from(root.querySelectorAll("button"), (b) => b.textContent) };
-    },
+    state,
   };
 }

@@ -28,7 +28,15 @@
 //              where it says things. The pane has closed by then.
 //
 // and, optionally, `focus()`: where the keyboard goes when it leaves the pane
-// (Esc, the close button); and `prefix` ("graph"), the ids' prefix.
+// (Esc, the close button); `prefix` ("graph"), the ids' prefix; and
+// `inspector`, an element of the host's where the inspector
+// (graph-inspector.js) is docked. Without it (the shell), the inspector
+// floats over the view, which keeps what it draws clear of it. With it (the
+// console's Inspector panel), the inspector is the same panel, with the same
+// rows and buttons, in that element instead; the element hears an
+// "inspectorchange" event each time it shows something new (detail: {kind,
+// title}) or closes (detail: null), so the host can show what it shows
+// when nothing is selected.
 //
 // The pane owns its markup (a <section> with its header, search box, legend,
 // list of matches not shown and stage; ids `${prefix}-pane`,
@@ -86,7 +94,7 @@ function markup(container, prefix) {
 }
 
 /** The graph pane in `container`, for a host: see the top of this file. */
-export function createPane({ container, engine, commands, status: report, focus = () => {}, prefix = "graph" }) {
+export function createPane({ container, engine, commands, status: report, focus = () => {}, prefix = "graph", inspector = null }) {
   const ui = markup(container, prefix);
   const call = (op, args = {}) => engine.call(op, args);
 
@@ -230,6 +238,7 @@ export function createPane({ container, engine, commands, status: report, focus 
         times: t,
         run: (command) => commands(command, { via: "inspector", current: () => true }),
         inspect: (args) => call("graph.inspect", args),
+        inspector,
       });
     } catch (e) {
       // Closed (Esc) before it was drawn: nothing went wrong.

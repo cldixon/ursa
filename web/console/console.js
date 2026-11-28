@@ -16,6 +16,7 @@ import { createResults } from "./results.js";
 import { mountCatalog } from "./catalog.js";
 import { mountSources } from "./sources.js";
 import { mountHistory } from "./history.js";
+import { mountInspector } from "./inspector.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -141,6 +142,9 @@ window.ursaConsole = { session, panels: layout.panels, layout, results, run };
 // The panels (each module's header says what it does).
 window.ursaConsole.catalog = mountCatalog(layout.panels.catalog); // URSA-15
 window.ursaConsole.sources = mountSources(layout.panels.sources); // URSA-16
+// The Inspector (URSA-23): the selected row, node or edge; the graph pane's
+// inspector docks in it.
+window.ursaConsole.inspector = mountInspector(layout.panels.inspector, { results });
 // History (URSA-17): the session's, and the graph pane's commands go there.
 window.ursaConsole.history = mountHistory(layout.panels.history, { session, results });
 results.setCommandsSink(window.ursaConsole.history.sink);

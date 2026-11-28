@@ -24,6 +24,11 @@
 //   go to the commands sink: History (history.js) takes it (setCommandsSink)
 //   and lists them, grouped under their drawing; without History, a small
 //   list under the graph keeps them. Either way they run in the pane.
+// - The Inspector (URSA-23, inspector.js) takes the selection:
+//   setInspector(element) docks the graph pane's inspector there (given before
+//   the first drawing), and on("row", fn) hears a table's selected row,
+//   fn({tab, row, view, ready, fields}), and on("close", fn) a tab's closing,
+//   fn(tab).
 // - Export writes the whole result with `export {format, result}`, as CSV,
 //   Parquet, JSON or Arrow, downloaded as a file.
 // - The session keeps 16 results, within 256 MB: a tab whose result has gone
@@ -115,6 +120,12 @@ function rovingTabs(list, show, { remove } = {}) {
 
 /** The Results panel in `mount`: see the top of this file. */
 export function createResults({ mount, session }) {
+  // What other panels hear: "row" (a table's selected row) and "close" (a tab closed).
+  const listeners = { row: new Set(), close: new Set() };
+  const emit = (name, value) => listeners[name].forEach((fn) => fn(value));
+  /** Where the graph pane docks its inspector (setInspector), or null: it floats. */
+  let inspectorDock = null;
+
   // ---------------------------------------------------------------- markup
 
   mount.replaceChildren();
@@ -295,6 +306,7 @@ export function createResults({ mount, session }) {
       fetch: (offset, rows) => direct("fetch", { result: tab.id, offset, rows }).then((r) => r.arrow),
     });
     tab.table.on("error", (e) => failed(tab, e, "read its rows"));
+    tab.table.on("row", (selection) => emit("row", { tab: api(tab), ...selection }));
 
     tablist.insertBefore(button, before?.button ?? null);
     panels.insertBefore(panel, before?.panel ?? null);
@@ -356,6 +368,7 @@ export function createResults({ mount, session }) {
     if (hadFocus) (selected?.button ?? document.getElementById("results"))?.focus();
     update();
     say(`Closed ${tab.label}`);
+    emit("close", api(tab));
     return freed;
   }
 
@@ -573,6 +586,7 @@ export function createResults({ mount, session }) {
       container: paneWrap,
       engine: paneEngine,
       prefix: "results-graph",
+      inspector: inspectorDock,
       commands: (command, { via, current }) => sink(command, { via, current, result: drawnFor?.id ?? null, sql: drawnFor?.sql ?? null, exec }),
       status: (text) => {
         if (drawnFor) idleSay(drawnFor, `The graph view stopped: ${text}`, true);
@@ -679,6 +693,9 @@ export function createResults({ mount, session }) {
       get closed() {
         return Boolean(tab.closed);
       },
+      get label() {
+        return tab.label;
+      },
       table: tab.table,
       element: tab.panel,
       button: tab.button,
@@ -711,6 +728,16 @@ export function createResults({ mount, session }) {
     },
     /** The commands the default sink listed. */
     steps,
+    /**
+     * Dock the graph pane's inspector in `element` (graph-pane.js's
+     * `inspector`): the Inspector panel's. Before the first drawing.
+     */
+    setInspector(element) {
+      if (pane) throw new Error("setInspector: the graph pane is made already");
+      inspectorDock = element;
+    },
+    /** Hear "row" (fn({tab, row, view, ready, fields})) or "close" (fn(tab)); returns how to stop. */
+    on: (name, fn) => (listeners[name].add(fn), () => listeners[name].delete(fn)),
     /** The graph pane, once made. */
     pane: () => pane,
     /** The tab the pane draws, or null. */

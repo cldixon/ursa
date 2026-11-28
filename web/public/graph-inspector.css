@@ -117,3 +117,22 @@
   .graph-inspector, .graph-inspector.left { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: calc(45% - 24px); }
   .graph-inspector.left { top: 8px; bottom: auto; }
 }
+
+/* Docked (`docked: true`, graph-pane.js's `inspector` option): a block that
+   fills its host's place for it, not a panel over the view. The host styles
+   the rest (the console: console/inspector.css). After the narrow view's
+   rules, which it overrides. */
+.graph-inspector.docked,
+.graph-inspector.docked.left {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  width: auto;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+.graph-inspector.docked[hidden] { display: none; }

@@ -1,0 +1,120 @@
+/* The Inspector panel (inspector.js): URSA-23. On top of style.css's tokens
+   and console.css's, so it follows light and dark; the graph's selection is
+   graph-inspector.css's panel, docked, and restyled here to sit in the
+   panel. */
+
+:root {
+  --ix-line: color-mix(in srgb, var(--border) 80%, var(--bg));
+  --ix-hover: color-mix(in srgb, var(--fg) 3.5%, transparent);
+  --ix-chip: color-mix(in srgb, var(--fg) 6%, var(--bg));
+  --ix-mark: var(--dot);
+}
+
+/* The panel fills its body: what it shows scrolls inside, under its head. */
+#inspector-body.inspector-panel { overflow: hidden; display: flex; flex-direction: column; }
+#inspector-body.inspector-panel[hidden] { display: none; }
+.ix { flex: 1; min-height: 0; display: flex; flex-direction: column; font-size: 12.5px; }
+/* What is selected is data: in the table's and the graph's monospace. */
+.ix-row, .ix-graph { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+.ix [hidden] { display: none !important; }
+
+/* ---------------------------------------------------------------- nothing selected */
+
+.ix-empty { margin: auto 0; padding: 18px 18px 22px; color: var(--muted); font-size: 12.5px; line-height: 1.5; text-align: center; }
+.ix-empty p { margin: 0 auto; max-width: 30ch; }
+.ix-empty-what { margin-bottom: 4px !important; color: var(--fg); font-weight: 600; }
+.ix-empty-art { display: flex; justify-content: center; gap: 8px; margin-bottom: 10px; color: var(--faint); }
+.ix-empty-art svg { width: 18px; height: 18px; }
+
+/* ---------------------------------------------------------------- the head (a row's, and the graph's) */
+
+.ix-row, .ix-graph { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ix-head,
+.ix .graph-inspector.docked .inspector-head {
+  flex: none;
+  display: block;
+  padding: 2px 14px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.ix-title,
+.ix .graph-inspector.docked .inspector-title {
+  margin: 0;
+  color: var(--fg);
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.ix-title::before,
+.ix .graph-inspector.docked .inspector-title::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin: 0 8px 1px 1px;
+  border-radius: 2px;
+  background: var(--ix-mark);
+  vertical-align: middle;
+}
+.ix .graph-inspector.docked .inspector-title::before { border-radius: 50%; background: var(--graph-selection); }
+.ix-source {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ix-source code { padding: 0 4px; border-radius: 4px; background: var(--ix-chip); color: var(--fg); font: inherit; }
+
+/* ---------------------------------------------------------------- a row: one field a line */
+
+.ix-fields {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 2px 0 12px;
+  overflow: auto;
+  scrollbar-color: var(--scrollbar) transparent;
+}
+.ix-fields:focus-visible { outline-offset: -2px; }
+.ix-field {
+  display: grid;
+  grid-template-columns: minmax(56px, 30%) minmax(0, 1fr);
+  gap: 12px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--ix-line);
+}
+.ix-field:last-child { border-bottom: 0; }
+.ix-field:hover { background: var(--ix-hover); }
+.ix-field dt { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ix-name { color: var(--muted); overflow-wrap: anywhere; }
+.ix-type { color: var(--faint); font-size: 10.5px; letter-spacing: 0.01em; overflow-wrap: anywhere; }
+.ix-field dd { margin: 0; min-width: 0; }
+/* Values whole: long text wraps, and can be selected and copied. */
+.ix-value { color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.ix-field.num .ix-value { font-variant-numeric: tabular-nums; }
+.ix-null, .ix-wait { color: var(--faint); }
+
+/* ---------------------------------------------------------------- the graph's, docked */
+
+.ix .graph-inspector.docked { flex: 1; min-height: 0; font-size: 12.5px; line-height: 1.5; }
+.ix .graph-inspector.docked:focus-visible { outline-offset: -2px; }
+.ix .graph-inspector.docked .inspector-body { padding: 2px 14px 12px; scrollbar-color: var(--scrollbar) transparent; }
+.ix .graph-inspector.docked .inspector-section + .inspector-section { border-top-color: var(--ix-line); }
+.ix .graph-inspector.docked .inspector-section h3,
+.ix .graph-inspector.docked .inspector-section h4 { font-size: 11px; letter-spacing: 0.02em; color: var(--muted); }
+.ix .graph-inspector.docked .inspector-props { grid-template-columns: minmax(56px, max-content) minmax(0, 1fr); gap: 0 12px; }
+.ix .graph-inspector.docked .inspector-props dt,
+.ix .graph-inspector.docked .inspector-props dd { padding: 3px 0; border-bottom: 1px solid var(--ix-line); }
+.ix .graph-inspector.docked .inspector-props dt { max-width: 16ch; }
+.ix .graph-inspector.docked .inspector-props dt:nth-last-child(2),
+.ix .graph-inspector.docked .inspector-props dd:last-child { border-bottom: 0; }
+.ix .graph-inspector.docked .inspector-actions { gap: 6px; margin-top: 10px; }
+.ix .graph-inspector.docked .inspector-actions button {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 7px;
+  background: var(--bg);
+}
+.ix .graph-inspector.docked .inspector-actions button:first-child:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.ix .graph-inspector.docked .inspector-sql { background: var(--ix-chip); }

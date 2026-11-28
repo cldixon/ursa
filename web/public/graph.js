@@ -309,13 +309,15 @@ export function positionsHint(edges, graph) {
  * the same sink, and
  * `inspect(args)` asks the engine for a node's or an edge's row (the engine
  * worker's `inspect`): the inspector's buttons and rows.
+ * `inspector`, if given, is the host's place for the inspector (an element):
+ * the panel is docked there, not floated over the view (see mountInspector).
  * `times` gets the moments each step ended (performance.now()), for
  * graphTimings. Resolves once the view is made (it draws when the layout's
  * first positions come), to {nodes, edges, backend, drawnAs, saved, graph}:
  * `saved` whether it is drawn at saved positions, `graph` the property
  * graph drawn, if it is one.
  */
-export async function show(stage, sent, { status, legend, onError, onCommand, times = {}, run, inspect }) {
+export async function show(stage, sent, { status, legend, onError, onCommand, times = {}, run, inspect, inspector = null }) {
   close();
   // What is drawn: read again from the view's result after each delta.
   let graph = drawingOf(readResult(sent.ugr), sent.skipped);
@@ -1227,7 +1229,7 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
     roomTimer = setTimeout(roomMove, ROOM_WAIT_MS);
   };
   state.roomWaits = () => roomTimer !== 0 || roomFrame !== 0;
-  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved: roomSoon });
+  state.inspector = mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved: roomSoon, dock: inspector });
   state.clearSelection = () => {
     if (!view.clearSelection()) return false;
     selectionChanged();
@@ -1745,8 +1747,14 @@ export async function show(stage, sent, { status, legend, onError, onCommand, ti
  * engine, pin a node, select an edge's end. `moved` is called when the panel
  * has opened, changed sides or closed. Returns {selectionChanged(), inset(),
  * focus(), state(), remove()}.
+ *
+ * With `dock` (the host's element for it), the panel is docked there instead
+ * of floating over the view: it covers none of the canvas (inset() is all
+ * 0), and `dock` hears an "inspectorchange" event whenever it shows a new
+ * subject or closes (detail: {kind, title}, or null once nothing is shown,
+ * the drawing's end included).
  */
-function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved }) {
+function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, moved, dock = null }) {
   const { view, graph, canvas } = state;
   // The pinned nodes: marked with a small ring (the highlight layer's).
   state.pinned = new Set();
@@ -1770,9 +1778,16 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, 
       if (view.select(index, false)) selectionChanged();
     },
     onLeave: () => canvas.focus(),
-    onClose: () => moved(),
+    onShow: (shown) => tell(shown),
+    onClose: () => {
+      tell(null);
+      moved();
+    },
+    docked: Boolean(dock),
   });
-  stage.append(panel.element);
+  /** Tell the dock what the panel shows now. */
+  const tell = (detail) => dock?.dispatchEvent(new CustomEvent("inspectorchange", { detail }));
+  (dock ?? stage).append(panel.element);
   const name = graph.name ?? null;
   // A column of a node's row can size or colour the nodes where the drawing
   // is the graph itself: there SIZE BY and COLOR BY read the vertex tables.
@@ -1843,7 +1858,7 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, 
      */
     inset() {
       const none = [0, 0, 0, 0];
-      if (panel.element.hidden) return none;
+      if (dock || panel.element.hidden) return none;
       const ratio = canvas.width / Math.max(1, canvas.clientWidth);
       const across = sheet();
       const reach = depth();
@@ -1853,7 +1868,11 @@ function mountInspector(state, stage, { run, inspect, selectionChanged, redraw, 
     },
     focus: () => panel.focus(),
     state: () => panel.state(),
-    remove: () => panel.element.remove(),
+    remove() {
+      const had = !panel.element.hidden;
+      panel.element.remove();
+      if (had) tell(null);
+    },
   };
 }
 

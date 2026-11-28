@@ -9,6 +9,7 @@
   --rs-role-bg: color-mix(in srgb, var(--dot) 11%, var(--bg));
   --rs-role-fg: color-mix(in srgb, var(--dot) 82%, var(--fg));
   --rs-active: var(--dot);
+  --rs-current: color-mix(in srgb, var(--dot) 6%, transparent);
   --rs-warn: var(--state-wait);
   --rs-ok: var(--state-ok);
   --mono: "IBM Plex Mono", ui-monospace, monospace;
@@ -298,6 +299,9 @@
 .rt-cell.selected { background-color: var(--selection) !important; }
 .rt-cell.active { box-shadow: inset 0 0 0 1px var(--faint); }
 .rt-scroll:focus .rt-cell.active { box-shadow: inset 0 0 0 2px var(--rs-active); }
+/* The selected row (the active cell's: the Inspector shows it whole). */
+.rt-body .rt-row.current .rt-cell { background-color: var(--rs-current); }
+.rt-body .rt-row.current .rt-gutter { color: var(--rs-active); font-weight: 600; box-shadow: inset 3px 0 0 var(--rs-active); background-color: color-mix(in srgb, var(--rs-active) 9%, var(--rs-gutter-bg)); }
 .rt-gutter {
   position: sticky;
   left: 0;

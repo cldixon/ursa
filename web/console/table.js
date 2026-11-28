@@ -26,6 +26,14 @@
 // a strip under the table while its cell is active. A column's header sorts
 // by it (ascending, descending, as it came): only the rows loaded, which the
 // table says, since the whole result stays in the session.
+//
+// The active cell's row is the selected row (URSA-23): once the keyboard or
+// the pointer has picked a cell, the row is marked, and `on("row", fn)`
+// hears it each time it changes, or its values come (a row not yet loaded
+// when it was picked): fn({row, view, ready, fields}), `row` the result's
+// row (0-based), `view` the table's row (they differ while sorted), and
+// `fields` [{name, type, text}] with each value's whole text (null for
+// NULL). The console's Inspector shows it.
 import { tableFromIPC } from "./vendor/arrow.mjs";
 
 /** Rows a fetch asks for. */
@@ -155,7 +163,7 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
   const pages = new Map();
   const pending = new Map();
   let failure = null;
-  const listeners = { error: new Set(), change: new Set() };
+  const listeners = { error: new Set(), change: new Set(), row: new Set() };
   const emit = (name, value) => listeners[name].forEach((fn) => fn(value));
 
   function decode(bytes) {
@@ -282,6 +290,7 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
     sayNote();
     schedule(true);
     emit("change", state());
+    rowChanged();
   }
 
   // ---------------------------------------------------------------- markup
@@ -477,6 +486,7 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
       cells[0].textContent = String((r ?? v) + 1);
       const ready = r !== undefined && loaded(r);
       row.classList.toggle("loading", !ready);
+      row.classList.toggle("current", picked && v === active.r);
       for (let c = 0; c < columns.length; c++) {
         const cell = cells[c + 1];
         const t = ready ? cellText(r, c) : undefined;
@@ -498,6 +508,34 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
     else scroller.removeAttribute("aria-activedescendant");
     showPeek();
     want();
+    // The selected row's values may have come with this draw's pages.
+    if (picked && told && !told.ready) rowChanged();
+  }
+
+  // ---------------------------------------------------------------- the selected row
+
+  /** Whether a cell has been picked (by the keyboard, the pointer or goTo): until then no row is selected. */
+  let picked = false;
+  /** The row last told to `on("row")` listeners: {row, view, ready}. */
+  let told = null;
+
+  /** The selected row as listeners hear it, or null before a cell is picked. */
+  function selectedRow() {
+    if (!picked) return null;
+    const v = active.r;
+    const r = rowOf(v);
+    if (r === undefined) return null;
+    const ready = loaded(r);
+    const fields = columns.map((col, c) => ({ name: col.name, type: shortType(col.type), fullType: col.type, numeric: numeric[c], role: col.metadata?.[ROLE] ?? null, text: ready ? cellText(r, c) : undefined }));
+    return { row: r, view: v, ready, fields };
+  }
+  /** Tell the listeners if the selected row, or whether its values are loaded, changed. */
+  function rowChanged() {
+    const sel = selectedRow();
+    if (!sel) return;
+    if (told && told.row === sel.row && told.view === sel.view && told.ready === sel.ready) return;
+    told = { row: sel.row, view: sel.view, ready: sel.ready };
+    emit("row", sel);
   }
 
   /** Under the table: the active cell's whole value, when it is cut short. */
@@ -517,8 +555,10 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
     const rowsShown = viewRows();
     active = { r: Math.max(0, Math.min(rowsShown - 1, r)), c: Math.max(0, Math.min(columns.length - 1, c)) };
     if (!extend) anchor = { ...active };
+    picked = rowsShown > 0;
     reveal(active.r, active.c);
     schedule(true);
+    rowChanged();
   }
 
   scroller.addEventListener("keydown", (e) => {
@@ -752,5 +792,7 @@ export function createTable({ container, columns, rows: total, first, fetch, lab
     state,
     /** Whether every row has been loaded. */
     complete: () => [...pages.values()].reduce((a, p) => a + p.rows, 0) >= total,
+    /** The selected row ({row, view, ready, fields}, as on("row") hears it), or null. */
+    selectedRow,
   };
 }

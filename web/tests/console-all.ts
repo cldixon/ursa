@@ -10,9 +10,10 @@
 //   Cancel, the shell at /) and tests/console-results.ts (the result tabs);
 // - `editor`: tests/console-editor.ts (the SQL editor);
 // - `panels`: tests/console-panels.ts (Catalog and Sources);
-// - `history`: tests/console-history.ts (the History panel).
+// - `history`: tests/console-history.ts (the History panel);
+// - `inspector`: tests/console-inspector.ts (the Inspector panel).
 //
-// Each starts `ursa serve` itself (three of them on a root of their own), so
+// Each starts `ursa serve` itself (four of them on a root of their own), so
 // each runs as a process of its own, on a port of its own: the first on PORT,
 // the next on PORT + 1, and so on. The binary is a build with `--features
 // serve` (by default $CARGO_TARGET_DIR/release/ursa; URSA_BIN= also names
@@ -36,6 +37,7 @@ const SUITES: Record<string, string> = {
   editor: "console-editor.ts",
   panels: "console-panels.ts",
   history: "console-history.ts",
+  inspector: "console-inspector.ts",
 };
 /** A suite that has not finished in this long has hung. */
 const TIMEOUT_MS = 15 * 60_000;
@@ -137,7 +139,7 @@ const passed = (o: Outcome) => o.code === 0 && o.finished && o.failed.length ===
 console.log("\n=== summary\n");
 for (const o of outcomes) {
   const how = passed(o) ? "passed" : [o.failed.length && `${o.failed.length} failed`, !o.finished && `did not finish (exit ${o.code})`].filter(Boolean).join(", ");
-  console.log(`${passed(o) ? "ok  " : "FAIL"} ${o.name.padEnd(8)} ${String(o.ok).padStart(4)} ok, ${how} (${o.seconds.toFixed(0)} s)`);
+  console.log(`${passed(o) ? "ok  " : "FAIL"} ${o.name.padEnd(9)} ${String(o.ok).padStart(4)} ok, ${how} (${o.seconds.toFixed(0)} s)`);
 }
 const bad = outcomes.filter((o) => !passed(o));
 for (const o of bad) {
