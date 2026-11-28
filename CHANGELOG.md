@@ -10,6 +10,12 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Added
 
+- **The Ursa Shell deploys from GitHub Actions** (`shell-deploy.yml`). After
+  the shell's e2e passes on a push to main, that commit's engine is uploaded,
+  the Worker deployed with `cf`, and the e2e suite run against the live site;
+  or by hand, optionally with the datasets. Runs in the `production`
+  environment, which can require approval.
+
 - **Ursa SQL 0.6: a SQL engine for graph analytics, and the `ursa`
   command-line tool** (crate `ursa-cli`, released as 0.6.0 on 2026-11-06;
   the engine crates are `ursa-engine` and `ursa-sql`). This is its first

@@ -884,6 +884,15 @@ bun run deploy          # assemble dist/ and deploy the Worker with cf
 Upload the engine before deploying the page that names it. The datasets only
 need uploading when they change.
 
+**From GitHub Actions** (`.github/workflows/shell-deploy.yml`): after the
+"Ursa Shell e2e" workflow passes on a push to main, the same commit is built,
+its engine uploaded, the Worker deployed with `cf`, and the e2e suite run
+against the live site. It can also be run by hand from the Actions tab, with an
+option to upload the datasets. It needs the repository (or `production`
+environment) secrets `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit, Workers R2
+Storage: Edit) and `CLOUDFLARE_ACCOUNT_ID`. Give the `production` environment
+required reviewers to make each deploy wait for approval.
+
 ## Local
 
 `cf dev` simulates the bucket under `.wrangler/state`; seed it with `--local`:
