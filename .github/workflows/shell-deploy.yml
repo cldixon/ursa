@@ -1,0 +1,176 @@
+name: Ursa Shell deploy
+
+# Deploys the Ursa Web Shell (web/) to its Cloudflare Worker, `ursa-shell`, at
+# https://ursa-shell.cl-dixon.workers.dev, with the engine in the R2 bucket
+# `ursa-graph`.
+#
+# When: after "Ursa Shell e2e" passes on a push to main, so only a commit
+# whose shell e2e is green is deployed, and exactly that commit (the run's
+# head_sha, not whatever main is by then). That workflow runs only when the
+# page, the engine's crates or the datasets' inputs change, so other merges
+# deploy nothing. Or by hand (Actions > Ursa Shell deploy > Run workflow), from
+# main, optionally uploading the sample datasets too.
+#
+# The job runs in the `production` environment: give it required reviewers
+# (Settings > Environments > production) and every deploy waits for a click.
+#
+# Needs two secrets on the repository or the environment:
+#   CLOUDFLARE_API_TOKEN  Workers Scripts: Edit and Workers R2 Storage: Edit
+#   CLOUDFLARE_ACCOUNT_ID the account that owns ursa-shell and ursa-graph
+#
+# Steps, as web/README.md's "Build and deploy": build the engine (or restore
+# the e2e workflow's build of the same sources), upload it (content-hashed, so
+# a deploy switches engines atomically and open tabs keep theirs), build the
+# page, deploy the Worker with the cf CLI, then run the e2e suite against the
+# live site.
+on:
+  workflow_run:
+    workflows: ["Ursa Shell e2e"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      datasets:
+        description: "Also upload the sample datasets (only needed when they change)"
+        type: boolean
+        default: false
+
+# One deploy at a time, and never cancel one half way (the engine is uploaded
+# before the page that names it): a newer one waits for it.
+concurrency:
+  group: shell-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PLAYWRIGHT_VERSION: "1.63.0"
+  SITE: https://ursa-shell.cl-dixon.workers.dev
+
+jobs:
+  deploy:
+    name: Deploy the Ursa Shell
+    # By hand from main; or after the e2e workflow passed on a push to main
+    # (not a pull request's run, not a failed or cancelled one).
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: production
+      url: ${{ env.SITE }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: web
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      # The commit the e2e passed on; by hand, the head of main.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Check the Cloudflare secrets are set
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::CLOUDFLARE_API_TOKEN is not set"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::CLOUDFLARE_ACCOUNT_ID is not set"; exit 1; }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The same key as the e2e workflow's worker leg: the same dependencies.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read the wasm-bindgen version from Cargo.lock
+        id: wb
+        working-directory: .
+        run: |
+          version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      # cf runs on Node 22.18 or later.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the page's dependencies
+        run: bun install --frozen-lockfile
+
+      # The e2e workflow's engine build of the same sources (the same key as
+      # shell-e2e.yml's), so a deploy after it usually builds nothing.
+      - name: Restore the engine build
+        id: engine
+        uses: actions/cache/restore@v4
+        with:
+          path: web/.engine
+          key: shell-engine-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock', 'ursa-core/**', 'ursa-io/**', 'ursa-engine/**', 'ursa-sql/**', 'ursa-shell/**', 'ursa-wasm/**', 'web/scripts/engine.ts', 'web/scripts/common.ts') }}
+
+      - name: Build the engine
+        if: steps.engine.outputs.cache-hit != 'true'
+        run: bun run engine
+
+      # Before the page that names it. Content-hashed: uploading the same
+      # engine again rewrites the same object.
+      - name: Upload the engine
+        run: bun run upload:engine
+
+      - name: Restore the datasets
+        if: inputs.datasets
+        id: data
+        uses: actions/cache/restore@v4
+        with:
+          path: web/.data
+          key: shell-data-${{ runner.os }}-${{ hashFiles('python/ursa/datasets/data/**', 'benchmarks/sql_scale/gen.py', 'web/scripts/upload-data.ts') }}
+
+      - name: Install uv
+        if: inputs.datasets && steps.data.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+
+      # Stages the datasets in .data/ (building them on a cache miss) and
+      # uploads them.
+      - name: Upload the datasets
+        if: inputs.datasets
+        run: bun run upload:data
+
+      # dist/, with the graph view, then the Worker and its assets.
+      - name: Build and deploy
+        run: bun run deploy
+
+      # The deployed site, end to end: the same suite the e2e workflow ran on
+      # this commit, now against the live Worker and bucket.
+      - name: Install Playwright and Chromium
+        run: |
+          bun add --no-save "playwright@$PLAYWRIGHT_VERSION"
+          bunx playwright install --with-deps chromium
+
+      - name: Check the live site
+        run: |
+          mkdir -p e2e-out
+          bun run test:e2e "$SITE" e2e-out 2>&1 | tee e2e-out/e2e.log
+
+      - name: Upload the live check's screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-deploy-e2e
+          path: web/e2e-out/
+          if-no-files-found: ignore
+          retention-days: 14
