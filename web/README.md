@@ -19,7 +19,7 @@ static assets and an R2 bucket.
 - `public/`: the page (`index.html`, `app.js`, `style.css`), the Datasets
   menu (`datasets.js`) and the engine's Web Worker (`engine-worker.js`).
   - **The graph pane** (`graph-pane.js`) is the Graph view for any host:
-    `createPane({container, engine, commands, status, focus?})` adds the
+    `createPane({container, engine, commands, status, focus?, inspector?})` adds the
     pane's markup to `container`, runs the graph commands (`pane.exec(line)`:
     `.graph`, `.find`, `.expand`, `.collapse`, `.hide`, `.show`, `.undo`,
     `.redo`) through the engine client, and owns the search box, the
@@ -30,7 +30,11 @@ static assets and an R2 bucket.
     history, then run by `pane.exec`); `.graph echo` is the shell's own. The
     e2e test also drives `tests/pane-host/`, a second host with no terminal
     whose sink is a History list; it is served by the test, never built or
-    deployed.
+    deployed. `inspector`, an element, docks the inspector there instead of
+    floating it over the view (the console's Inspector panel, URSA-23): the
+    same panel and buttons, with no close button, and the view keeps no room
+    for it; the element hears `inspectorchange` (detail `{kind, title}`, or
+    null once nothing is shown). The shell passes none.
   - **The engine boundary** is the session protocol (`design/console.md`
     §4): `app.js` calls the engine only through `engine-client.js`
     (`connect(transport, client, {session}).call(op, args, parts)`, which
@@ -1022,8 +1026,8 @@ dot-command through `feed`; the running mark and Cancel; Esc then Tab
 leaving the editor; `insert()`; and the text kept across a reload. With a
 screenshot dir it saves `editor-*.png`.
 
-`tests/console-all.ts` runs these four (with `tests/console-history.ts`,
-below) in turn, each a process of its own
+`tests/console-all.ts` runs these four (with `tests/console-history.ts`
+and `tests/console-inspector.ts`, below) in turn, each a process of its own
 with its own `ursa serve` (the first on PORT, the next on PORT + 1, ...),
 then prints a summary of each suite's checks and every failed one, and exits
 1 if any check failed or any suite stopped early:
@@ -1034,7 +1038,7 @@ bun run test:console-all -- 9100 "" "" --only panels             # or --skip edi
 ```
 
 With an out dir, each suite's screenshots and output go to
-`OUT/<suite>/` (`console`, `editor`, `panels`, `history`). Each runs in a process
+`OUT/<suite>/` (`console`, `editor`, `panels`, `history`, `inspector`). Each runs in a process
 group of its own, killed once it exits, so a suite that throws cannot leave
 its server running. CI runs it as a third leg of `shell-e2e.yml`, "Ursa
 Console (browser e2e over ursa serve)", built exactly as the socket leg is
@@ -1054,6 +1058,18 @@ Run again once it is closed; the keyboard; and Copy as SQL giving a script
 that, run line by line in a session of its own as a share link runs, draws
 the same graph. With a screenshot dir it saves `history-light-1440x900.png`,
 `history-dark-1440x900.png` and History's column in each theme.
+
+`tests/console-inspector.ts` (`bun run test:console-inspector -- 9131`, the
+same arguments) tests the Inspector panel: its empty state; a node selected
+in a Graph view shown in the panel (docked, none floating over the view)
+with its row, degree and buttons; `i` into it and Esc back; an edge with its
+ends and row; expand from the panel listed in History, from the inspector,
+and growing the graph; a table row picked by the pointer and the keyboard
+shown whole, one field a line, a long value wrapped in full, NULL as NULL;
+the polite announcements; and the fallback to the other selection, then the
+empty state. It waits for conditions, never a fixed time. With a screenshot
+dir it saves `inspector-node-{light,dark}-1440x900.png` and
+`inspector-row-{light,dark}-1440x900.png`.
 
 ## Datasets
 

@@ -1083,12 +1083,25 @@ The distribution is `ursa-graph`; the import name is `ursa`.
     calls, and DuckPGQ's PageRank values are on its known differences.
 
 - **The console's e2e suites run in CI** (URSA-18). `web/tests/console-all.ts`
-  (`bun run test:console-all`) runs the console, editor, panels and history
-  suites in turn, each with its own `ursa serve`, prints a summary and fails if any
+  (`bun run test:console-all`) runs the console, editor, panels, history
+  and inspector suites in turn, each with its own `ursa serve`, prints a summary and fails if any
   check does. `shell-e2e.yml` runs it in a third leg, "Ursa Console (browser
   e2e over ursa serve)", built as the shell's socket leg is and sharing its
   caches, on the same paths, and keeps the console's screenshots, light and
   dark, as the `console-e2e` artifact on every run.
+- **The console's Inspector panel** (URSA-23, `design/console.md` §6).
+  Selecting a node or an edge in a result's Graph view shows it in the
+  Inspector: its label, degree, the row or rows behind it, and the graph
+  inspector's buttons (expand, hide, pin, path from here), whose steps show
+  in History. It is the graph pane's own inspector, docked: `createPane`
+  takes an `inspector` element to put it in instead of floating it over the
+  view (the web shell passes none, so its inspector is unchanged).
+  Selecting a row of a result's table (click a cell, or move with the
+  keyboard) marks it and shows the whole row, one field per line, long
+  values in full. With nothing selected the panel says what to select.
+  It is reachable by the keyboard and announces what it shows politely.
+  `tests/console-inspector.ts` tests it, the fifth suite of
+  `test:console-all`.
 - **The console's History panel** (URSA-17, `design/console.md` §6, §9).
   History lists what ran in the session: each query, statement and graph
   step, with who ran it (`hello`'s `client`), when, how long it took, and

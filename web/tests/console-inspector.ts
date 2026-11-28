@@ -23,6 +23,8 @@
 // - no page errors.
 //
 // It waits for conditions, never a fixed time, so it holds on a slow runner.
+// URSA_CPU_THROTTLE=4 slows the page's CPU fourfold (CDP's
+// Emulation.setCPUThrottlingRate), as a slow CI runner would.
 //
 // With a screenshot dir, it saves the console at 1440×900 in light and dark
 // with a node selected (inspector-node-light-1440x900.png, …-dark-…) and with
@@ -78,6 +80,12 @@ function watch(p: Page, name: string) {
 }
 const page = await context.newPage();
 watch(page, "page");
+const throttle = Number(process.env.URSA_CPU_THROTTLE ?? 0);
+if (throttle > 1) {
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: throttle });
+  console.log(`(the page's CPU throttled ${throttle}×)`);
+}
 // Light, and room for the Inspector over History.
 await page.addInitScript(() => {
   try {
