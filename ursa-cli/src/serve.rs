@@ -10,7 +10,8 @@
 //! ```
 //!
 //! It prints the URL to open, with the run's token, opens it in the default
-//! browser (unless `--no-open`), and serves until Ctrl+C, which stops it
+//! browser (unless `--no-open`) by way of a redirect file only the user can
+//! read, so that the token is on no command line (URSA-20), and serves until Ctrl+C, which stops it
 //! gracefully: running requests are cancelled and the pages' sessions
 //! closed.
 
@@ -141,9 +142,8 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
                 bound.port()
             ));
         }
-        if !args.no_open {
-            open_browser(&bound.url());
-        }
+        // Kept until the server stops, which removes it.
+        let _opener = (!args.no_open).then(|| open_browser(&bound.url()));
         bound
             .serve_with_shutdown(async {
                 interrupted.await;
@@ -235,13 +235,81 @@ fn served(path: Option<&Path>, read_only: bool) -> Result<Served, String> {
     })
 }
 
-/// Open `url` in the default browser, without waiting for it. If that
-/// fails, say so: the link is printed above.
-fn open_browser(url: &str) {
+/// The page `ursa serve` opens in the browser, in place of its link
+/// (URSA-20): a file that redirects to the link, written where only the
+/// user can read it, in a directory of its own that goes when this does.
+///
+/// A command's arguments are visible to every user of the machine (`ps`)
+/// while it runs, and `open`, `xdg-open` or `start` may run for as long as
+/// the browser it starts. The token is the server's only credential, so it
+/// is never on a command line: the browser is given this file's path, and
+/// reads the link from the file. (Jupyter opens its server the same way.)
+struct Opener {
+    /// The redirect file, `open.html` in `dir`.
+    page: PathBuf,
+    /// Removed, with the file, when this is dropped: when the server stops.
+    _dir: tempfile::TempDir,
+}
+
+impl Opener {
+    /// Write the page that redirects to `url`: in a new directory in the
+    /// temporary directory (on Unix, mode 0700, and the file 0600; on
+    /// Windows, `%TEMP%` is the user's own, under their profile, and the
+    /// directory and file inherit its permissions).
+    fn new(url: &str) -> std::io::Result<Opener> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("ursa-serve-");
+        // tempfile makes a directory as `mkdir` does, readable by all
+        // (0755 under the usual umask), unless told.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        let dir = builder.tempdir()?;
+        let page = dir.path().join("open.html");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&page)?;
+        std::io::Write::write_all(&mut file, redirect_page(url).as_bytes())?;
+        file.sync_all()?;
+        Ok(Opener { page, _dir: dir })
+    }
+}
+
+/// A page that sends the browser on to `url` at once (a `<meta>` refresh,
+/// which needs no script), with a link to it should it not.
+fn redirect_page(url: &str) -> String {
+    let url = url
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        "<!doctype html>\n\
+         <html>\n\
+         <head>\n\
+         <meta charset=\"utf-8\">\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={url}\">\n\
+         <title>Ursa</title>\n\
+         </head>\n\
+         <body>\n\
+         <p>Opening Ursa. If nothing happens, <a href=\"{url}\">open it here</a>.</p>\n\
+         </body>\n\
+         </html>\n"
+    )
+}
+
+/// The command that opens `target` (a file, or a URL) in the default
+/// browser, without starting it: `open` on macOS, `start` on Windows,
+/// `xdg-open` elsewhere. Every argument is visible to every user of the
+/// machine while it runs, so `target` must hold no secret.
+fn open_command(target: &Path) -> Command {
     let mut command = if cfg!(target_os = "macos") {
         Command::new("open")
     } else if cfg!(windows) {
-        // `start`'s first quoted argument is the window's title.
+        // `start`'s first quoted argument is the window's title. Given a
+        // file, it opens it as Explorer would: an .html file in the default
+        // browser.
         let mut command = Command::new("cmd");
         command.args(["/C", "start", ""]);
         command
@@ -249,10 +317,28 @@ fn open_browser(url: &str) {
         Command::new("xdg-open")
     };
     command
-        .arg(url)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    command
+}
+
+/// Open `url` in the default browser, without waiting for it, by way of a
+/// redirect file ([`Opener`]), which it returns: the file must last until
+/// the server stops. If that fails, say so: the link is printed above.
+fn open_browser(url: &str) -> Option<Opener> {
+    let opener = match Opener::new(url) {
+        Ok(opener) => opener,
+        Err(e) => {
+            say(&format!(
+                "Could not open a browser (cannot write the page that opens it: {e}): \
+                 open the link yourself."
+            ));
+            return None;
+        }
+    };
+    let mut command = open_command(&opener.page);
     let program = command.get_program().to_string_lossy().into_owned();
     match command.spawn() {
         // Reaped on a thread of its own, so it leaves no zombie behind.
@@ -269,6 +355,7 @@ fn open_browser(url: &str) {
             "Could not open a browser ({program}: {e}): open the link yourself."
         )),
     }
+    Some(opener)
 }
 
 /// Whether `dir` has a page: the shell's `index.html`, or the console's.
@@ -344,5 +431,68 @@ mod tests {
         let here = served(None, false).unwrap();
         assert_eq!(here.root, std::env::current_dir().unwrap());
         assert_eq!(here.database, None);
+    }
+
+    const URL: &str = "http://127.0.0.1:4280/console/?token=abcDEF123-_xyz";
+
+    /// The browser is given the redirect file's path, never the link: the
+    /// token is on no command line (URSA-20).
+    #[test]
+    fn the_command_that_opens_the_browser_has_no_token() {
+        let opener = Opener::new(URL).unwrap();
+        let command = open_command(&opener.page);
+        let mut argv = vec![command.get_program().to_os_string()];
+        argv.extend(command.get_args().map(std::ffi::OsStr::to_os_string));
+        for arg in &argv {
+            let arg = arg.to_string_lossy();
+            assert!(!arg.contains("abcDEF123"), "{argv:?}");
+            assert!(!arg.contains("token"), "{argv:?}");
+        }
+        assert_eq!(command.get_args().last(), Some(opener.page.as_os_str()));
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(windows) {
+            "cmd"
+        } else {
+            "xdg-open"
+        };
+        assert_eq!(command.get_program(), program);
+    }
+
+    /// The file sends the browser on to the link; only the user can read
+    /// it, and it goes when the server stops.
+    #[test]
+    fn the_redirect_file_is_the_users_own_and_goes_at_the_end() {
+        let opener = Opener::new(URL).unwrap();
+        let page = std::fs::read_to_string(&opener.page).unwrap();
+        assert!(
+            page.contains(&format!(
+                "<meta http-equiv=\"refresh\" content=\"0;url={URL}\">"
+            )),
+            "{page}"
+        );
+        assert!(page.contains(&format!("<a href=\"{URL}\">")), "{page}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&opener.page), 0o600);
+            assert_eq!(mode(opener.page.parent().unwrap()), 0o700);
+        }
+        let (page, dir) = (
+            opener.page.clone(),
+            opener.page.parent().unwrap().to_owned(),
+        );
+        drop(opener);
+        assert!(!page.exists() && !dir.exists());
+    }
+
+    #[test]
+    fn the_redirect_page_escapes_its_link() {
+        let page = redirect_page("http://h/?a=1&b=\"<x>\"");
+        assert!(
+            page.contains("url=http://h/?a=1&amp;b=&quot;&lt;x&gt;&quot;\""),
+            "{page}"
+        );
     }
 }

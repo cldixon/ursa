@@ -2810,6 +2810,16 @@ The distribution is `ursa-graph`; the import name is `ursa`.
 
 ### Security
 
+- **`ursa serve` keeps its token off the command line** (URSA-20,
+  `design/console.md` §5). It opened the browser with `open`, `xdg-open` or
+  `cmd /C start` and the link, token and all, so while that ran any user of
+  the machine could read the token in `ps`. It now writes a page that
+  redirects to the link, `open.html` in a new directory in the temporary
+  directory (mode 0700 and the file 0600 on Unix; `%TEMP%`, the user's own,
+  on Windows), opens that file instead, and removes it when the server
+  stops, as Jupyter does. The page still gets its cookie the first time it
+  is opened. The printed link keeps the token, for copying; `--no-open` is
+  unchanged.
 - **The browser shell is safer to open from a link.** A shared link
   (`#run=`) lists its commands and asks `Run N shared commands? [y/N]`; only
   `y` runs them, and a link's `.export` is skipped, so it cannot download
